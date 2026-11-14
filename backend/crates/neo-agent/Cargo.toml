@@ -1,0 +1,20 @@
+[package]
+name = "neo-agent"
+description = "Neo Agent: the server and the desktop app's backend in one program."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "neo-agent"
+path = "src/main.rs"
+
+[dependencies]
+neo-app = { path = "../neo-app" }
+neo-http = { path = "../neo-http" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+neo-testkit = { path = "../neo-testkit" }

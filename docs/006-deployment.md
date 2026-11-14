@@ -1,89 +1,82 @@
 # 006 Deployment
 
-## Process model
+This document says how Neo Agent runs on a machine. It builds on [005 Sessions](005-sessions.md). The steps for installing it are in `SETUP.md`.
 
-Run the standalone ESM CLI with Bun `>=1.4.4` and `@oh-my-pi/pi-coding-agent@18.18.1`:
+## Two ways to run
 
-```sh
-bun install
-bun run build
-./lib/cli.js --config /absolute/path/config.json
-```
+One program, `neo-agent`, is the whole backend. It runs in one of two ways:
 
-`neo-agent` owns one state-directory lock. A second process on the same directory fails before opening SQLite. GitHub identity and push access are validated when `sources.github.enabled` is true, at startup and when the settings window connects it; omit that source for Web-only chat. `SIGINT`/`SIGTERM` performs ordered cleanup and exits zero on success.
+| | Desktop app | Server |
+| --- | --- | --- |
+| Started by | The app, as `neo-agent desktop-sidecar` | A person or a service manager, as `neo-agent serve` |
+| Listens on | `127.0.0.1`, a free port | `--host` and `--port`; by default `127.0.0.1:3082` |
+| Access token | One the app makes anew at each start and gives on standard input | `--token` or `NEO_TOKEN`; required unless the address is loopback |
+| Interface | The app's own window | The web app, served beside the API, or a desktop app pointed at the server |
+| Ends when | The app ends, however it ends: the app holds the backend's standard input open | It is signalled (`SIGINT`, `SIGTERM`, `SIGHUP`, Ctrl+C) |
 
-## Startup JSON
+The desktop app watches its backend: one that ends by itself is started again, with a wait that doubles from one second, and after five failures in a row the app says what the backend said last. A desktop app can also be pointed at a server instead of starting a backend.
 
-`stateDir` is required and absolute. `agentDir` is optional and defaults to `<stateDir>/omp`. Optional machine limits are `promptMaxChars` (default 100000), `admissionContextMaxPages` (10), and `admissionContextTimeoutMs` (15000). Unknown keys fail.
+On start the program prints one line on standard output — `{"port", "pid", "version", "url"}` — and everything else on standard error.
 
-The remaining keys are `paused`, `sources`, `policy`, `eval`, and `executor`, matching `SettingsSchema`. Startup JSON supplies initial settings; model selectors and the GitHub Source can also be managed in the settings window. Other changed values are saved on startup; policy changes create Inputs on open Tickets.
+## One instance
 
-### Chat Source and ticket authorization
+Only one Neo Agent runs per user on a machine. The running instance holds an exclusive lock on a file in the per-user runtime directory, and always one in its data directory; the operating system releases both when the process ends, however it ends. A second instance exits with status 3 and says on which port the first one listens. `--allow-multiple` (or `NEO_ALLOW_MULTIPLE=1`) lets instances with different data directories run side by side.
 
-Set `sources.chat` to `{ "enabled": true, "config": {} }` and list sender IDs under `policy.sources.chat.allowed`. Enabling the Source alone grants no work authorization. Web's host-controlled sender is `web:local`; WeChat uses `wechat:<user-id>` shown after binding. Direct messages from listed senders enter admission as `explicit`; other senders can be ignored by the orchestrator without creating Tickets. A request that needs work becomes a Ticket even when it is unrelated to the repository, such as news, prices or weather, since workers can browse and run commands; a follow-up attaches to the one Ticket it continues. When ordinary conversation needs no Ticket, the orchestrator can ignore the candidate and answer naturally with `orchestrator_reply` through the same durable Outbox. Inadmissible senders receive no response. Every message becomes a host-derived Trigger, with source message ID, sender, conversation, original text, and reply Channel persisted. `POST /api/chat` accepts an optional stable `messageId`; retries with the same ID return the same `triggerId` and cannot create another Ticket. To verify, send `检查 /data/crypto/research/bt20261005 的工程回测`, then watch for a candidate, an acceptance acknowledgement, and the final result in that same chat. Users never enter `trigger_id` or `ticket_id`.
+The desktop app adds its own check, so that starting it twice shows the window that is open: the first app listens on a loopback port it wrote down, and a second one asks it to come to the front and ends.
 
-For conversational messages that need no Ticket, `orchestrator_route` accepts `answer` alongside `kind=ignore`. It queues the natural response through Outbox in the same model call instead of waiting for another model turn. Normal reply ordering and failure backoff remain unchanged.
+## What the machine provides
 
-### Web conversation panel
+| Thing | Where the program looks |
+| --- | --- |
+| The `claude` and `omp` runtimes | `NEO_CLAUDE_BIN` / `NEO_OMP_BIN`, else a `runtimes` folder beside the program (in a Mac app, `Contents/Resources/runtimes`), else `PATH`. The installers bundle both |
+| The Oh My Pi extension | `NEO_SHIM`, else a `shim` folder beside the program |
+| The web app's files | `--web-dir`, else a `web` folder beside the program |
+| `git` | `PATH`. Workers that use git need it installed; nothing else does |
+| Model access | Claude Code: the `ANTHROPIC_*` environment and the user's Claude Code settings. Oh My Pi: its agent directory (`--agent-dir`, by default `<data>/omp`) |
 
-`web` defaults to `{ "enabled": true, "host": "127.0.0.1", "port": 3082 }`. The CLI prints the actual URL. Use `enabled: false` to disable the server or `port: 0` for an ephemeral port. `GET /` serves the conversation page, `GET /api/messages` returns conversation traffic only — the person's Web or WeChat entries and delivered `chat-reply` messages, never internal candidates, routing decisions, worker notices or raw model turns — and `POST /api/chat` with `{ "text": "...", "attachments": [{ "name": "payload.bin", "mediaType": "application/octet-stream", "data": "<base64>" }] }` queues a durable user message. Any file type is accepted, at most 3 files and 5 MiB each. Native images use `ImageContent` and are also stored under `<stateDir>/attachments/<requestId>/`; UTF-8 text up to 256 KiB is inlined; other and larger files are stored the same way. Every stored file's absolute path is passed to the Session for `read`/`bash` processing. Requests are limited to loopback and same origin; there are no cookies, remote assets or CORS headers.
+`neo-agent doctor` prints all of these as it finds them, and fails when no kernel can run. The application starts without a kernel too: it says so in the app, keeps messages, and works once one is installed or chosen.
 
-**重置 Session** requires confirmation, clears the visible orchestrator transcript, and creates a fresh persistent Session through `POST /api/session/reset`. It preserves tickets, worker Sessions, and the WeChat binding.
+A desktop app started from the Finder or a launcher has only the system's folders on its `PATH`; it adds the usual places of user-installed tools (`/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` and a few more) for its backend.
 
-### WeChat channel
+## Data
 
-No startup credentials are required. Open **设置 → 微信**, then scan with WeChat `>=8.0.70` and confirm. `GET /api/wechat` reports connection state, `POST /api/wechat/connect` starts QR binding, `POST /api/wechat/verify` submits `{ "code": "1234" }` when requested, and `POST /api/wechat/disconnect` removes the binding. Only the bound user can send into the orchestrator. Text, image, file, video, and voice transcription are accepted inbound; final text replies and explicit `wechat_send_file` media are sent outbound. The 100 MiB media limit applies per item. Keep the state database to resume credentials and the delivery cursor after restart.
+The data directory is `~/Library/Application Support/neo-agent` on macOS, `%LOCALAPPDATA%\neo-agent` on Windows, and `$XDG_STATE_HOME/neo-agent` (by default `~/.local/state/neo-agent`) elsewhere; `--data-dir` or `NEO_DATA_DIR` names another.
 
-### Role models
+| Path | Holds |
+| --- | --- |
+| `orchestrator.sqlite` | Triggers, Threads, Evals, Decisions, Tickets, the Outbox, the effect queue, the settings and their history, the WeChat binding |
+| `sessions/` | One journal per Session |
+| `work/` | One directory per Ticket, unless the settings name another task directory |
+| `attachments/` | Files people attached |
+| `worker-bin/` | Stand-ins for blocked commands |
+| `omp/` | Oh My Pi's agent directory: its providers, models and sign-in |
+| `instance.lock` | The data directory's lock |
 
-`eval.model` and `executor.model` accept either `null` or:
+The store has a schema version. A data directory of another version is refused with its version named; nothing is migrated. In particular, the state of the earlier TypeScript releases cannot be opened: start with a new data directory.
 
-```json
-{ "provider": "provider-id", "model": "model-id", "thinkingLevel": "low" }
-```
+## Settings
 
-Levels are `auto`, `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; `auto` lets OMP choose reasoning effort per request. Explicit models must resolve through shared `ModelRegistry.find`; startup never substitutes another model. `null` uses OMP defaults only for a new Session and preserves the persisted selection after reopen. A changed non-null model overrides the transcript selection without persisting that override back into it.
+Everything a person configures is in the app's settings and stored in the database as numbered revisions: the kernel and models, the pause, the number of workers, the task directory, the prepare command and its shell, blocked commands, proactive assessment and its rules, and who may write.
 
-`executor.advisor` takes the same shape and defaults to `null`, which turns the worker advisor off. A non-null value sets OMP's `advisor.enabled` and `modelRoles.advisor` (`provider/model[:level]`) on every worker Session: that second model reviews each worker turn and injects notes into it. Subagents never get an advisor. A `WATCHDOG.yml` in the agent directory or the Ticket repository can still define its own advisor roster, models and tools; those entries take precedence over `modelRoles.advisor`.
+The command line and the optional configuration file of `serve` carry only what belongs to the machine: the data directory, the agent directory, the address, the port, the token and the web folder. A server that should start from particular settings takes `--init-settings <file>`, which is read only when no settings are stored yet.
 
-`GET /api/settings/models` returns current role models, including `advisor`, and the credential-aware `ModelRegistry.getAvailable()` catalog. `PUT /api/settings/models` accepts `{ "eval": RoleModel | null, "executor": RoleModel | null, "advisor": RoleModel | null }`, validates all three before applying any, applies them to loaded non-disposed Sessions, and saves them. A null model selects OMP defaults for future Sessions without resetting an existing one; a null advisor turns loaded workers' advisor off at once. Startup records the config-file model baseline: unchanged config preserves online choices after restart; changing to a value different from that baseline wins. Reverting to the baseline alone does not clear an online selection. Runtime clones startup settings before applying this precedence.
+## Who may call the API
 
-## State layout
+- **Without a token**, only this machine may call, and only under a loopback name: a request from another address, with a `Host` that is not loopback, or with an `Origin` other than the server's own is refused. This keeps another site's page, and a foreign name that resolves to this machine, from reaching the API through a person's browser.
+- **With a token**, every call carries `Authorization: Bearer <token>`. The token has at least 16 characters and is compared in constant time. `GET /api/health` without it answers 401 with `authRequired`, so a client can tell that a server is there and wants a token.
+- The web app's files need no token; the page is where the token is entered, and it keeps it in the browser's storage.
+- The program refuses to listen on an address that is not loopback without a token.
 
-- `orchestrator.sqlite`: schema 1 domain state, Effects and Outbox.
-- `sessions/`: OMP JSONL transcripts; aliases map to files in SQLite.
-- `omp/`: authentication, model configuration and model cache.
-- `work/`: default Ticket directories.
-- `worker-bin`, `worker-gitconfig`: gh/blocked-command shims and isolated git configuration.
-
-Only schema 1 is accepted. An existing non-schema-1 SQLite file is preserved and rejected. DSH state, authorization, outbox and transcripts are never migrated or silently reused.
-
-## GitHub and worker environment
-
-`sources.github.config.repository` is `owner/name`; `cli` is a command name or absolute executable path. The CLI must return the agent identity and push access; the check runs without ambient `GH_TOKEN`/`GITHUB_TOKEN`, as every later call does, so it reads the wrapper's account. Workers invoke `gh` through the shim, which selects that account and removes itself from nested `PATH` lookup. Git uses the isolated config and its credential helper. Ambient GitHub tokens, repository-selection variables, interactive prompts and commit identity overrides are removed.
-
-These are account-selection guardrails, not an OS security sandbox. Workers run as the operator's OS user. `executor.blockedCommands` may add command shims, but cannot block `gh` or `git`.
-
-The documented environment names are `NEO_AGENT_DIR`, `NEO_AGENT_NAME`, `NEO_AGENT_TICKET`, `NEO_AGENT_BLOCKED_COMMANDS`, `NEO_AGENT_GITHUB_REPOSITORY`, `NEO_AGENT_GITHUB_ACCOUNT`, `NEO_AGENT_GITHUB_COMMIT_EMAIL`, `NEO_AGENT_GITHUB_NUMBER`, and `NEO_AGENT_GITHUB_PR_HEAD`.
-
-### Upgrading from omp-superagent
-
-The project was renamed from `omp-superagent` to `neo-agent`. The package, the `neo-agent` command and the bundled `neo-agent-github` skill carry the new name, and every `OMP_SUPERAGENT_*` variable is now `NEO_AGENT_*`: update `executor.prepare` commands and team prompt sections that reference the old names, since the old variables are no longer set. An existing state directory keeps working at its current path without migration: worker shims written under the old name are recognised and rewritten, Session entries with custom type `omp-superagent` still count as delivered, and GitHub comments carrying the old `<!-- omp-superagent:<id> -->` marker are still recognised, so no reply is posted twice.
-
-### Connecting from the settings window
-
-**设置 → GitHub** edits the GitHub Source. `GET /api/settings/github` returns `{ enabled, config, connection, health }`; `connection` is `{ repository, account }` while connected and `null` otherwise. `PUT /api/settings/github` accepts `{ "enabled": boolean, "config": { repository, cli, pollSeconds, failuresBeforeError, observeIssues, observePulls, observeComments, observeCi } }`. It verifies the CLI's account and push access as startup does; a failure answers 400 and changes nothing. Once verified it stops the polling loop, rewrites the worker shims and git configuration, saves the Source, restarts polling, and reopens the orchestrator Session from its transcript so its prompt names the connected account and repository. Disconnecting stops polling and leaves the worker environment in place until restart, so running workers keep the agent account. `policy.sources.github.allowed` stays in the startup JSON.
-
-Startup records the startup JSON's GitHub Source as a baseline, as it does for models: an unchanged JSON keeps the panel's connection after restart, and an edited one wins. A saved connection that no longer verifies fails the start; set `sources.github` to `{ "enabled": false }` in the startup JSON to start without it.
-
-One state directory holds the conversations of one repository, recognized by GitHub's numeric repository ID, which a rename or transfer keeps. With no GitHub Thread stored, connecting another repository clears the previous one's read cursors and CI baselines. Once a Thread exists the change is refused, since Threads are keyed by Issue and PR number alone; use a new `stateDir`.
+The server speaks plain HTTP. On a network that is not trusted, put it behind a reverse proxy that adds TLS; `SETUP.md` has an example.
 
 ## Troubleshooting
 
-- Invalid path/JSON/Zod error: fix the named config field; `--config` itself must be absolute.
-- Unknown OMP model: correct `provider`/`model` in `models.yml` or startup JSON.
-- GitHub validation error: fix the wrapper's identity or repository push permission, or disable `sources.github` in the startup JSON to start without it.
-- "This state directory holds GitHub conversations of …": the directory is bound to another repository; use a new empty `stateDir` for the new one.
-- Existing schema error: use a new empty `stateDir`; no automatic migration or clearing occurs.
-- Corrupt/missing transcript: restore the file named by the alias/path error. The service never replaces it with empty history.
-- Repeated work after restart: do not delete SQLite or JSONL; idempotency keys and persisted SessionEntries prevent replay.
+| Sign | Cause and remedy |
+| --- | --- |
+| "Neo Agent is already running" | Another instance holds the lock. Use the open window, or stop the running service. `--allow-multiple` with another data directory runs a second one |
+| "The … program was not found" | The chosen kernel's runtime is missing. Install it, set `NEO_CLAUDE_BIN` / `NEO_OMP_BIN`, or choose the other kernel in the settings. `neo-agent doctor` shows what is found |
+| "Listening on … needs an access token" | A server address that is not loopback needs `--token` or `NEO_TOKEN` |
+| The app says a token is needed | The server has one: enter it under Settings → Connection |
+| A data directory is refused for its schema version | It was written by another release line. Start with a new data directory |
+| A worker fails with a model error | The kernel's model access: for Claude Code the `ANTHROPIC_*` environment, for Oh My Pi the providers in its agent directory. The error is the runtime's own |
+| A macOS app that "cannot be opened" | An app that is not notarized must be allowed once; see `SETUP.md` |

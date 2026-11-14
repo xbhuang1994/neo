@@ -1,6 +1,5 @@
-node_modules/
-lib/
 .artifacts/
 .env
-coverage/
+dist/
+backend/target/
 service-restart.log

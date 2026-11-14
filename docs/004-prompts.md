@@ -1,21 +1,52 @@
 # 004 Prompts
 
+This document says what each Session is told and which tools it has. It builds on [003 Execution](003-execution.md).
+
 ## Composition
 
-`Prompts.compose()` combines built-in role text, team sections, execution environment, and (for the orchestrator) current Policy. The complete text is passed through OMP `customSystemPrompt`, preserving OMP's project footer. Workers additionally receive `mandateInstructions(ticket.mandate)`.
+A Session's system prompt is composed from the texts in `assets/prompts`, which are built into the program:
 
-The orchestrator loads no repository context files. Workers keep the target directory's `AGENTS.md`. Both roles disable discovered prompt templates, slash commands and rules. Only the packaged `neo-agent-github` skill is loaded into workers; the orchestrator receives no skills.
+| Role | Sections, in order |
+| --- | --- |
+| Main Session (`orchestrator`) | `shared`, `orchestrator`, the team sections, `subscriptions`, `replies`, `dispatch`, `admission`, `handoff` with `handoff-orchestrator`, the execution environment, and the current Policy: its version, the accept mode and every enabled rule |
+| Worker | `shared`, `worker`, the team sections, `subscriptions`, `replies`, `work`, `handoff` with `handoff-worker`, and the execution environment |
+| Sidecar | `sidecar` |
+| Watchdog | `watchdog`, and the execution environment |
 
-Team sections are `communication`, `scope`, and `delivery`. Versioned Prompt storage can retain team sections, custom skills and built-in overrides, with template placeholder validation and total-size limits. Runtime editing is outside this core service: startup JSON and stored versions are applied when Sessions are created/reopened, not edited by an agent tool.
+Every worker's prompt is the same text, so a model provider caches it once for all of them. The team sections are `team/communication`, `team/scope` and `team/delivery`. The texts name tools by their bare names; the Claude Code kernel rewrites them to the names that runtime gives them and adds a note on how its built-in tools map.
 
-## Tools and behavior
+A worker's first message is its assignment card, with the Mandate's instructions: for a Ticket accepted under rules, the names and instructions of those rules.
 
-Orchestrator tools cover reading, routing, retries/status/notes, trigger requeue, assessment, replies and unsubscribe. Worker tools cover reading, acknowledgement, thread follow/unrelated, handback and reports. They are adapted from Zod to JSON Schema and parsed again at execution. No settings-save, policy-sync or Prompt-save tool exists. A report's optional `topic` (one or two sentences on what the Ticket is about) becomes the Ticket's `digest` that chat routing matches; a `dropped` report never replaces it, and a topic over 200 characters is cut rather than refusing the report, which may carry an answer.
+The main Session's prompt states the Policy and the environment, so a change to either in the settings reopens it from its journal with the prompt composed anew. Workers keep the prompt they started with.
 
-For chat, `dispatch` tells the orchestrator to route by each card's `title`, `asked` and `digest`; to attach more work on what a Ticket built, and questions about it, to that Ticket without reading it first; to treat any request that needs work, repository-related or not, as work for a worker rather than answering or doing it itself; and to correct evident speech-transcript errors in titles and acknowledgements while workers read the original text.
+There is no editing of the built-in texts at run time. What a team wants the agent to do differently is a rule, in the settings.
 
-The orchestrator gets `read`, `bash` and its application tools, with background execution disabled. Workers get `read`, `bash`, `edit`, `write`, `task`, `wait` plus application tools; web, todo, MCP and discovery tools are excluded. The worker prompt says how long commands move to background jobs, which jobs outlive a handoff, and how to delegate to `ticket-task` subagents (see 003 Execution).
+## Tools
+
+| Session | Built-in tools | Application tools |
+| --- | --- | --- |
+| Main | read, bash | `orchestrator_read`, `orchestrator_route`, `orchestrator_ticket_retry`, `orchestrator_ticket_request_status`, `orchestrator_ticket_note`, `orchestrator_trigger_requeue`, `orchestrator_eval_read`, `orchestrator_eval_decide`, `orchestrator_reply`, `orchestrator_thread_unsubscribe`, `wechat_send_file` |
+| Worker | read, bash, edit, write, subagents, and waiting for them | `orchestrator_read`, `orchestrator_ack`, `orchestrator_thread_follow`, `orchestrator_thread_unrelated`, `orchestrator_trigger_handback`, `orchestrator_report` |
+| Sidecar | read | `sidecar_reply` |
+| Watchdog | read, bash | `watchdog_inspect`, `watchdog_intervene` |
+
+Each application tool has a JSON Schema, and the host checks every call again itself: an unknown argument is refused by name. `orchestrator_route` takes several decisions in one call — accept, attach, sidecar, stop, ignore — and answers each on its own, so one refused item leaves the others.
+
+`orchestrator_read` reads resources by name: the ticket list, a ticket with its inputs and reports, a trigger, a thread's page, a decision. Long texts are paged.
+
+A report's optional `topic` becomes the Ticket's digest, which routing matches follow-up messages against.
+
+## Limits on what is said
+
+A message to a person in a chat has at most 100 words, where a Chinese character counts as a word and a run of Latin letters or digits as one. The host refuses a longer acknowledgement or reply and says so to the model. This count is an approximation of word segmentation made without a dictionary.
 
 ## Environment
 
-Prompt and prepare examples use `NEO_AGENT_*` variables. A PR from a branch whose final segment is `NEO_AGENT_NAME` can bind to its Ticket. Prompt changes require restart; they do not alter authorization, Source scope, account wrappers or tool permissions.
+The prepare command and every Session are told the same variables:
+
+| Variable | Value |
+| --- | --- |
+| `NEO_AGENT_DIR` | The Ticket's directory |
+| `NEO_AGENT_NAME` | The Ticket's short name, also its directory's name |
+| `NEO_AGENT_TICKET` | The Ticket id |
+| `NEO_AGENT_BLOCKED_COMMANDS` | The blocked command names, separated by spaces |

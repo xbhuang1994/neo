@@ -1,57 +1,94 @@
 # SETUP
 
-## 1. Prepare accounts and tools
+How to install Neo Agent and give it access to a model. For how it runs, see [docs/006-deployment.md](docs/006-deployment.md); for every option, [docs/009-reference.md](docs/009-reference.md).
 
-Install Bun `>=1.4.4`, git `>=2.32` and a GitHub CLI. Create or choose a dedicated GitHub account for the agent and grant it push access to the target repository. Do not use an operator's personal account.
+## 1. Install
 
-Configure that account in a `gh` wrapper or `GH_CONFIG_DIR` and verify:
+### macOS
+
+1. Download the disk image for your Mac: `Neo-Agent-<version>-macos-arm64.dmg` for Apple silicon, `-x64.dmg` for Intel.
+2. Open it and drag **Neo Agent** to Applications.
+3. Open the app. A build that is not notarized is refused the first time ("cannot be opened"): allow it once under System Settings → Privacy & Security → Open Anyway, or run
+
+   ```sh
+   xattr -dr com.apple.quarantine "/Applications/Neo Agent.app"
+   ```
+
+Data is kept in `~/Library/Application Support/neo-agent`.
+
+### Windows
+
+1. Run `Neo-Agent-<version>-windows-x64-setup.exe`. It installs for the current user and needs no administrator rights.
+2. An installer that is not signed makes SmartScreen ask: choose More info → Run anyway.
+3. Start **Neo Agent** from the Start menu.
+
+Data is kept in `%LOCALAPPDATA%\neo-agent`.
+
+### Linux server
 
 ```sh
-gh api user --jq .login
-gh api repos/<owner>/<repo> --jq '.permissions.push'
+tar -xzf neo-agent-<version>-linux-x64.tar.gz -C /opt && mv /opt/neo-agent-<version>-linux-x64 /opt/neo-agent
+/opt/neo-agent/neo-agent doctor      # what this machine provides
+/opt/neo-agent/neo-agent serve       # http://127.0.0.1:3082/, this machine only
 ```
 
-Configure an OMP provider in an isolated agent directory. Model selectors in startup JSON are optional; `null` selects the OMP default for a new Session and preserves the persisted selection on restart.
+The package holds the backend, the web app and both runtimes, and runs from wherever it is unpacked. Data is kept in `~/.local/state/neo-agent`, or where `--data-dir` says.
 
-## 2. Write startup JSON
+## 2. Give it a model
 
-Use absolute paths and a new empty state directory. Minimal example:
+Open Settings → Kernel and models and choose the kernel. Each needs model access of its own:
 
-```json
-{
-  "stateDir": "/srv/neo-agent/state",
-  "agentDir": "/srv/neo-agent/omp",
-  "sources": {
-    "github": {
-      "enabled": true,
-      "config": { "repository": "owner/repo", "cli": "/usr/local/bin/gh-agent", "pollSeconds": 60 }
-    }
-  },
-  "policy": { "sources": { "github": { "allowed": [{ "id": "your-github-login" }] } } },
-  "eval": { "mode": "observe", "model": null },
-  "executor": {
-    "model": null,
-    "maxWorkers": 3,
-    "prepare": "git clone --quiet /srv/repositories/repo \"$NEO_AGENT_DIR\""
-  }
+**Claude Code.** It reads the environment the backend runs in, and your Claude Code settings (`~/.claude/settings.json`) for what the environment does not say:
+
+```sh
+export ANTHROPIC_API_KEY=...          # or ANTHROPIC_AUTH_TOKEN
+export ANTHROPIC_BASE_URL=...         # only for a gateway or a compatible endpoint
+```
+
+A desktop app started from the Dock or the Start menu does not see variables set in a shell profile: put them in `~/.claude/settings.json` under `env`, or sign in with `claude` once in a terminal.
+
+**Oh My Pi.** It uses the providers configured in its agent directory, `<data directory>/omp` unless `--agent-dir` names another: put a `models.yml` there, or sign in with `omp` using that directory.
+
+The settings page lists the models the chosen kernel offers; leave a role on "kernel default" to use the runtime's own choice. A missing runtime or a failing model request is shown in the app in the runtime's own words.
+
+Workers that use git need `git` installed. Nothing else is required.
+
+## 3. Use it
+
+Type what you want done in the conversation. Tasks appear under Tasks with their state, questions and reports.
+
+- **WeChat**: Settings → WeChat → Connect, scan the code with the account that should be able to write to the agent, and confirm on the phone. That account is added to the allowed senders; Disconnect removes it.
+- **Where tasks work**: Settings → Task directory. A prepare command can make each task's folder, for example `git clone https://example.com/repo.git "$NEO_AGENT_DIR"`.
+- **Pause**: Settings → Pause processing holds everything without losing messages.
+
+## 4. Run it as a server for other machines
+
+Listening on anything but loopback needs an access token of at least 16 characters:
+
+```sh
+NEO_TOKEN=$(openssl rand -hex 24) /opt/neo-agent/neo-agent serve --host 0.0.0.0 --port 3082 --data-dir /var/lib/neo-agent
+```
+
+Open `http://<server>:3082/` in a browser and enter the token under Settings → Connection, or point a desktop app at the server there (Remote server). The model access of step 2 belongs to the environment of the server process.
+
+**As a service.** The package includes `neo-agent.service` for systemd: copy it to `/etc/systemd/system/`, set the user, the paths and the token, then `systemctl daemon-reload && systemctl enable --now neo-agent`. Keep the unit readable by root only, since it holds the token.
+
+**Behind TLS.** The server speaks plain HTTP. On a network you do not trust, keep it on loopback and put a reverse proxy in front, for example Caddy:
+
+```
+neo.example.com {
+    reverse_proxy 127.0.0.1:3082
 }
 ```
 
-Only listed GitHub users may start work explicitly. `observe` evaluates proactive candidates without accepting them; use `auto` only for bounded rules you intentionally allow. `off` disables proactive evaluation.
+With a proxy the server still needs the token, because requests no longer come under a loopback name: start it with `--host 127.0.0.1` and `NEO_TOKEN` set.
 
-## 3. Start
+**Starting from given settings.** `--init-settings settings.json` is read once, when the data directory has no settings yet; after that the settings are changed in the app. `--config file.json` holds the machine's options (`dataDir`, `agentDir`, `host`, `port`, `token`, `webDir`) instead of the command line.
 
-```sh
-bun install
-bun run build
-./lib/cli.js --config /absolute/path/config.json
-```
+## 5. Upgrade
 
-Startup fails on invalid JSON/configuration, unknown explicit models, missing `gh`, account/repository errors, or an existing non-schema-1 database. Fix the reported issue instead of reusing a DSH state directory.
+Install the new package over the old one; the data directory stays. A data directory written by another release line — in particular by the TypeScript releases before 0.2 — is refused with its schema version named: start with a new data directory. Nothing is migrated.
 
-`SIGINT` and `SIGTERM` stop watchers, Sessions, Effects, environment and SQLite before exit. Models and the GitHub connection can be changed in the panel's settings window; other configuration edits require restart.
-For Web-only chat, omit `sources.github`; deployment validation and watcher are skipped, and **设置 → GitHub** can connect a repository later. The panel listens on `http://127.0.0.1:3082/` by default. Set `web.enabled` to `false` to disable it or `web.port` to `0` for an ephemeral port.
+## If something is wrong
 
-## 4. Verify
-
-From an allowed GitHub account, mention the agent in an Issue: `@<agent-login> Fix the README typo`. Expect one acknowledgement, one worker Ticket, one result, and no duplicate after restart. For a full offline check, run `bun scripts/omp-smoke.ts lib/cli.js`.
+`neo-agent doctor` prints what the machine provides: the runtimes it found, git, the directories. The app's Settings → About shows how each part of the backend is doing. [docs/006-deployment.md](docs/006-deployment.md) has a table of signs and remedies.

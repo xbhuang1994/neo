@@ -17,7 +17,7 @@ The Source records whether a message addresses the agent: `mention` for a mentio
 
 ### Subscriptions: continuing existing work
 
-Every message on a subscribed Thread reaches its subscribed Tickets as context, including messages from bots and CI. This delivery bypasses the gate and grants no new authority. Each Ticket remains limited by its Mandate.
+Every message on a subscribed Thread reaches its subscribed Tickets as context, including messages from bots. This delivery bypasses the gate and grants no new authority. Each Ticket remains limited by its Mandate.
 
 A Source may opt out of fan-out, as chat does: one conversation carries many unrelated Tickets, and fanning every message out would wake each of their Executors. Its Threads stay subscribed, so candidate cards still list their Tickets, but each message goes to Eval. The main Session attaches it to the one Ticket it follows on from, which then owns it as above, accepts it as new work, or ignores and answers plain conversation itself. Such a message belongs to a Ticket only as that Ticket's origin or Input, never by its Thread alone, so the main Session's direct answer needs no Executor's permission. Once three Tickets have handed one message back, its card tells the main Session to accept it as new work.
 
@@ -37,11 +37,11 @@ When a Ticket ends, it releases follow-ups its Executor did not read or take up.
 
 A stopped Ticket does not send its stop message to Eval again unless another Ticket handed it back. The main Session that stopped it may accept the rest of the message as new work.
 
-A person can send an owned follow-up to Eval from the panel. If the main Session then attaches it back to a live Ticket, the Executor receives it again. The panel also offers re-evaluation when no effective judgement covers the message.
+The main Session can queue a message again when no effective judgement covers it (`orchestrator_trigger_requeue`). If it then attaches it back to a live Ticket, the Executor receives it again.
 
 ### Context-only subscriptions
 
-An Executor can follow a related Thread, such as another Issue or pull request, for context. Its messages reach the Ticket but grant no authority or follow-up strength. Human messages there do not resume an ended Ticket unless the main Session attaches a message from that Thread. Notes from the main Session about other work are also context only.
+An Executor can follow a related Thread for context. Its messages reach the Ticket but grant no authority or follow-up strength. Human messages there do not resume an ended Ticket unless the main Session attaches a message from that Thread. Notes from the main Session about other work are also context only.
 
 Human messages that reach no Ticket, including Threads whose Tickets were stopped by a person, take the Eval path. Bot messages take that path independently of their delivery to subscribed Tickets.
 
@@ -57,10 +57,7 @@ For an unlisted person, an explicit admission cell takes precedence even on a Th
 
 ## Admission
 
-Each Source's Policy has an admission table. Its rows are receiving scopes:
-
-- **Feishu:** each configured chat, other chats the bot receives mentions from, and direct messages. Other chats are received only when **其他群** is set to **仅 @** on the Feishu card.
-- **GitHub:** new Issues, new pull requests, comments and the default branch's CI.
+Each Source's Policy has an admission table, whose rows are the Source's receiving scopes. The chat Source of this distribution has none: every chat message is a direct message, so the table matters only to a Source that receives messages not addressed to the agent. The settings keep the table, and the app does not show it.
 
 A row has up to three cells. Each cell decides whether a message becomes an explicit request, an inferred candidate or nothing:
 
@@ -70,15 +67,15 @@ A row has up to three cells. Each cell decides whether a message becomes an expl
 | Not on the list, addressing the agent | explicit, inferred, ignore | ignore |
 | Not on the list, not addressing the agent | inferred, ignore | ignore |
 
-Cells for unaddressed messages are available only where the Source receives every message, such as a Feishu chat set to **全部消息** or a GitHub scope with its receive-all switch enabled. A CI result has no sender, so its row offers only the last cell. Bot messages use the bot list instead of these cells.
+Cells for unaddressed messages are available only where the Source receives every message. Bot messages use the bot list instead of these cells.
 
-Setting the unlisted-addressed cell to explicit lets anyone in that scope request work by mentioning the agent. This can be useful for a dedicated support chat. Inferred candidates still depend on the accept mode. Follow-ups normally bypass this table, except that an explicit cell still grants explicit strength.
+Setting the unlisted-addressed cell to explicit lets anyone in that scope request work by mentioning the agent. Inferred candidates still depend on the accept mode. Follow-ups normally bypass this table, except that an explicit cell still grants explicit strength.
 
 The admission table is part of the Policy version. Weakening a cell does not immediately stop open Tickets accepted under it. It can revoke their Mandates when they are revalidated before resuming.
 
 ### Bots and automated reviewers
 
-The host recognizes GitHub Apps, logins ending in `[bot]`, and Feishu bots as bots. A Source can list bots such as `dependabot[bot]` whose messages may become inferred candidates. They must either address the agent or post in a scope that receives every message. They cannot make explicit requests or stop Tickets.
+A Source says which of its senders are bots, and can list bots whose messages may become inferred candidates. The chat Source has no bots. They must either address the agent or post in a scope that receives every message. They cannot make explicit requests or stop Tickets.
 
 An automated reviewer using an ordinary account counts as a person to the host. Its comments reach subscribed Tickets and generate follow-up notices. Team prompt text must identify such accounts as automated reviewers.
 
@@ -118,15 +115,15 @@ A version change discards running Evals and queues their Triggers again. It also
 
 Unaffected Tickets receive no notice. The change does not immediately revoke live Tickets' Mandates.
 
-Source configuration is separate from Policy. It controls what enters the system: which chats are read and whether a scope receives all messages or only mentions. A Mandate records its Source and receiving scope. Resuming needs the Source to still listen to the Thread, but does not require it to still receive every message there.
+Source configuration is separate from Policy. It controls what enters the system. A Mandate records its Source and receiving scope. Resuming needs the Source to still listen to the Thread, but does not require it to still receive every message there.
 
 Replies wait while their Source is off. They are dropped if the Source no longer listens to their destination.
 
-A condition on what the Executor may do with its own result, such as when it may merge, does not decide who may authorize work. It is part of the agent's instructions, not of the Policy.
+A condition on what the Executor may do with its own result does not decide who may authorize work. It is part of the agent's instructions, not of the Policy.
 
 ## Resume and stop
 
-An ended Ticket keeps its Mandate. A person's message on one of its own Threads can resume the same work without a new Eval or Decision, regardless of who sent it. Bots and CI do not wake ended Tickets. The Executor decides whether the request fits the scope and ends the round if it does not.
+An ended Ticket keeps its Mandate. A person's message on one of its own Threads can resume the same work without a new Eval or Decision, regardless of who sent it. Bots do not wake ended Tickets. The Executor decides whether the request fits the scope and ends the round if it does not.
 
 Only three operations change a Mandate: accept creates it, a person's stop withdraws it, and failed revalidation revokes it. A Ticket stopped by a person stays ended and receives nothing more. Work requested there needs a new accept.
 
@@ -143,7 +140,7 @@ The Source must still listen to the original Thread. The remaining checks depend
 If revalidation fails, the Ticket stays ended and takes none of its waiting messages. Each message is treated as having reached no Ticket; if no other Ticket owns it, it goes to Eval. The main Session is not told it reached a worker. This also applies after a processing pause. Attaching to the Ticket is refused, and further work requires a new accept.
 
 - **A person saying "stop" in a Thread is an ordinary Trigger,** and Eval decides stop. An Executor cannot declare that a person asked it to stop.
-- **Stop in the panel is a command.** It acts on the Ticket directly and is recorded as a manual stop.
+- **A stop the host makes for a person is a command.** It acts on the Ticket directly and is recorded as a manual stop.
 - **Waiting conditions belong to Sources.** A condition such as "no assignee for N hours" would be a Source that waits and checks again itself; Eval never waits.
 
 ## When Eval does not finish
@@ -151,4 +148,3 @@ If revalidation fails, the Ticket stays ended and takes none of its waiting mess
 The time limit starts when the candidate reaches the main Session. Time spent waiting for delivery does not count, and an undelivered candidate never expires.
 
 An expired Eval queues its Triggers for another attempt. After two consecutive retries, the third expiry records `unavailable`. An assessment failure also records `unavailable`; a later Trigger can start a new Eval. A Policy change or a decision made against an outdated Policy records `unavailable` and immediately queues the batch under the current version.
-

@@ -1,0 +1,19 @@
+[package]
+name = "neo-kernel"
+description = "Neo Agent kernels: persistent agent sessions over the Claude Code and Oh My Pi command-line runtimes."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+neo-core = { path = "../neo-core" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+getrandom.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+neo-testkit = { path = "../neo-testkit" }

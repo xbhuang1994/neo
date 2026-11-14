@@ -1,76 +1,94 @@
 # 007 Architecture
 
-## Closed loop
+This document maps the code. It builds on [006 Deployment](006-deployment.md).
 
-The standalone service keeps the domain chain: GitHub or chat Trigger → Eval → Decision/Mandate → Ticket → Assignment. `Runtime` locks the state directory, opens schema-1 SQLite, validates optional GitHub, writes worker shims, registers GitHub and chat Sources, applies startup settings, restores the orchestrator, resumes Tickets, then starts passes and durable Effects. The watcher waits for `ready`, or for its own stop when the start fails. `GithubConnection` owns the GitHub validation, the worker environment and the watcher, and repeats them when the settings window connects another account or repository.
-
-One persistent OMP orchestrator routes and assesses. Each Ticket has one persistent OMP worker in its own directory; its background shell jobs and `ticket-task` subagents are OMP jobs of that worker Session, bounded and stopped by `OMPExecutor` (003 Execution). Application tools call `Engine`; workers report through durable relay Effects; `Outbox` posts through GitHub or the originating chat conversation. No Cordis service or Feishu adapter exists.
-
-Chat Threads are subscribed but not fanned out (`ScopeResult.fanout: false`): a chat message reaches no worker by itself and goes to Eval as a candidate, so one orchestrator turn picks the ticket and attaches it; only that worker runs. A chat card lists up to 20 tickets in the compact `routingCard` form: `title`, `asked` (the start of the request the ticket was accepted from), `digest` (the worker's latest `orchestrator_report` `topic`, else its latest report that was not a drop), `state` and `updated`. A worker that hands the message back returns it as `handed_back`; once three tickets have, the card tells the orchestrator to accept it as new work. The main Session answers chatter itself: a message reaches a ticket only as its origin or an Input, never by its Thread alone.
+## Shape
 
 ```mermaid
 flowchart LR
-  gh[GitHub watcher] --> engine[Engine]
-  main[Orchestrator Session] -->|tools| engine
-  engine --> store[(SQLite)]
-  engine --> launch[OMPExecutor]
-  launch --> workers[Worker Sessions]
-  workers -->|reports| relay[Durable relay]
-  relay --> main
-  main -->|reply| outbox[Outbox]
-  outbox --> gh
-  main & workers --> jsonl[(OMP JSONL)]
-  web[Web / WeChat] --> chat[Chat Source]
-  chat -->|Trigger| engine
-  outbox -->|originating conversation| chat
+  subgraph app [Flutter app: desktop and web]
+    UI[Pages] --> State[AppState] --> Client[ApiClient]
+  end
+  Client -->|HTTP JSON, polled every 2 s| HTTP[neo-http]
+  subgraph backend [neo-agent: one Rust program]
+    HTTP --> App[neo-app]
+    App --> Core[neo-core: the domain Engine]
+    App --> Store[(neo-store: SQLite)]
+    App --> Kernel[neo-kernel]
+  end
+  Kernel -->|child process per Session| Claude[claude]
+  Kernel -->|child process per Session| OMP[omp + shim]
+  App -->|HTTPS| WeChat[WeChat iLink]
 ```
+
+The backend and the interface are separate programs that share only the HTTP API. The desktop app starts the backend as a child process; a server runs the backend alone and serves the web build of the same app.
+
+## Closed loop
+
+1. A chat message arrives: over the API, or from the WeChat long poll. It is written to the main Session's journal and received as a Trigger.
+2. The Engine's gate decides its strength; a pass queues an **assessment** effect, which delivers a candidate card to the main Session.
+3. The main Session routes it with a tool call: accept, attach, sidecar, stop or ignore. An accept creates a Ticket with a Mandate and queues a **launch** effect; an acknowledgement goes to the Outbox.
+4. The Executor prepares the Ticket's directory and opens its worker, whose reports reach the Engine through its tools. Later Inputs travel by the Ticket's **delivery** effect.
+5. A report that matters is **relayed** to the main Session, which replies through the Outbox; a **reply** effect sends each message to its conversation.
 
 ## Persistence and delivery
 
-Aliases remain `orchestrator-<stateKey>` and `worker-<ticketId>`; OMP UUIDs stay outside the domain model. SQLite `session-file:<alias>` records each JSONL path. Reopen uses `throwIfMissing`; missing/corrupt files fail rather than creating empty history.
-
-Every application message uses custom type `neo-agent` and durable `requestId`; entries written under the former type `omp-superagent` are read as the same. Delivery scans the full SessionManager branch and pending sends. Queue/steer/inject completes after the custom SessionEntry is visible and `flushToDisk()` succeeds; then domain acceptance and Input delivered/read commit. Duplicate IDs confirm again without another entry. Stop rejects pending sends for retry. Before-model hooks wait only for entry-visible confirmations because OMP emits initial entries after that hook.
-
-Worker tool guards reread Ticket state and block built-in/custom tools after termination, in the worker's subagents too. The orchestrator has `read`, `bash` and application tools. Workers add `read`, `bash`, `edit`, `write`, `task`, `wait`.
+- **One SQLite database** holds the domain as JSON documents with generated columns and partial indexes for what is queried. Engine commands run in transactions that nest as savepoints; what must happen only after a commit — queueing an effect's wake-up, for one — is registered and runs then.
+- **Effects** are durable rows: a kind, a key, a payload, and when to try next. A handler that fails with "later" is tried again with a growing wait and shows as waiting; one that fails three times shows as an error and is still retried. Some kinds run one at a time in order (relays, notices); launches are limited by the worker slots.
+- **Journals** make delivery to a Session idempotent by request id, as [005 Sessions](005-sessions.md) says.
+- **The Outbox** records each outbound message once by id, and marks it sent, gone or waiting.
 
 ## Concurrency and shutdown
 
-`WorkerSlots` counts actual `agent_start` separately from launch/wake reservations. Wake work precedes launches and one human follow-up may exceed `maxWorkers` by one slot. Only terminal `agent_end` finishes a turn; retry/compaction intermediate ends are ignored. OMP owns model retries.
+The Engine is synchronous and runs under the store's lock, one command at a time. Everything that waits — runtimes, the network, timers — is asynchronous and calls the Engine in short steps. Each Session's runtime is a child process in its own process group, read by one task.
 
-Ticket stop synchronously calls `beginDispose()` before awaiting disposal. Runtime shutdown stops watcher/passes, begins disposal on all Sessions, drains Sessions and Effects, restores environment, closes SQLite and releases the lock.
+Stopping goes in order: no new passes, the Watchdog and the WeChat poll end, every Session is barred from new work and closed, running effects finish. Waiting effects stay in the database for the next start.
+
+## Dependencies
+
+The backend depends on: `tokio` (processes, sockets, timers), `rusqlite` with SQLite bundled, `serde` and `serde_json`, `ureq` with rustls (the outbound HTTPS calls), `sha2`, `aes`, `base64`, `getrandom` and `libc`. The HTTP server, the command line, MD5 for WeChat uploads, UUIDs and the word count are written here.
+
+The app depends on: `cupertino_ui` (Flutter's Cupertino widgets), `cupertino_icons`, `http`, `file_selector` and `web`. Its state is a `ChangeNotifier`; its QR code encoder and its two languages are written here.
 
 ## Modules
 
-| Files | Area |
+| Files | Responsibility |
 | --- | --- |
-| `src/cli.ts`, `src/index.ts`, `src/deployment.ts`, `src/setup.ts`, `src/policy.ts`, `src/limits.ts`, `src/admission.ts`, `src/kv.ts` | Entry/configuration |
-| `src/app/runtime.ts`, `src/app/sessions.ts`, `src/app/delivery.ts`, `src/app/effects.ts`, `src/app/passes.ts`, `src/app/sidecar.ts`, `src/app/watchdog.ts`, `src/app/web.ts`, `src/app/wechat.ts`, `src/app/wechat-protocol.ts`, `src/app/workers.ts`, `src/app/model-settings.ts`, `src/app/github-connection.ts`, `web/index.html`, `web/app.js`, `web/style.css` | Runtime/Sessions/Sidecar/Watchdog/Web panel/WeChat/Worker/Settings views |
-| `src/kernel/types.ts`, `src/kernel/journal.ts`, `src/kernel/claude.ts` | Execution kernels (Claude Code) |
-| `src/executor/omp.ts`, `src/app/execution-environment.ts`, `src/app/outbox.ts`, `src/app/notices.ts` | Domain execution |
-| `src/app/assessment.ts`, `src/app/resources.ts`, `src/app/cards.ts`, `src/app/context.ts`, `src/app/links.ts` | Assessment/resources |
-| `src/app/prompts.ts`, `src/app/skill-files.ts`, `src/app/cache.ts`, `src/app/versions.ts`, `src/app/store.ts`, `src/app/store-read.ts`, `src/app/source-context.ts` | Prompt/state helpers |
-| `src/app/tools/tool.ts`, `src/app/tools/main.ts`, `src/app/tools/executor.ts` | Session tools |
-| `src/app/views/overview.ts`, `src/app/views/records.ts`, `src/app/views/sources.ts`, `src/app/views/tickets.ts`, `src/app/views/text.ts` | View projections |
-| `src/core/model.ts`, `src/core/ids.ts`, `src/core/reasons.ts`, `src/core/errors.ts`, `src/core/stage.ts` | Core model |
-| `src/core/engine.ts`, `src/core/part.ts`, `src/core/ports.ts`, `src/core/memory.ts`, `src/core/index.ts` | Core engine |
-| `src/core/intake.ts`, `src/core/evals.ts`, `src/core/tickets.ts`, `src/core/assignments.ts`, `src/core/replies.ts` | Core behavior |
-| `src/sources/github.ts`, `src/sources/github-trigger.ts`, `src/sources/github-channel.ts`, `src/sources/github-read.ts`, `src/sources/github-pull.ts` | GitHub Source |
-| `src/sources/host.ts`, `src/sources/kind.ts`, `src/sources/registry.ts`, `src/sources/poll.ts`, `src/sources/admission-context.ts` | Source infrastructure |
-| `src/sources/chat.ts` | Web/WeChat chat Source |
-| `src/infra/commands.ts`, `src/infra/environment.ts`, `src/infra/paths.ts`, `src/infra/health.ts`, `src/infra/text.ts` | Process infrastructure |
+| `backend/crates/neo-core/src/lib.rs`, `model.rs`, `ports.rs`, `errors.rs`, `reasons.rs`, `ids.rs`, `time.rs` | The domain's types, the ports the Engine needs, errors with their reasons, stable ids, time |
+| `backend/crates/neo-core/src/engine.rs`, `intake.rs`, `evals.rs`, `tickets.rs`, `assignments.rs`, `replies.rs`, `stage.rs` | The Engine: receiving Triggers, Evals and Decisions, Tickets and follow-ups, Assignments and reports, replies, a Ticket's stage |
+| `backend/crates/neo-core/src/memory.rs` | An in-memory repository, for the Engine's tests |
+| `backend/crates/neo-store/src/lib.rs`, `read.rs`, `receipts.rs`, `effects.rs` | The SQLite repository and its transactions, read models, Outbox receipts, effect rows |
+| `backend/crates/neo-kernel/src/lib.rs`, `types.rs`, `journal.rs`, `session.rs`, `process.rs` | What a kernel is to the application: messages and events, the journal, the kernel-neutral Session, child processes |
+| `backend/crates/neo-kernel/src/claude.rs`, `omp.rs` | The two kernels' protocols |
+| `backend/crates/neo-app/src/lib.rs`, `app.rs`, `settings.rs`, `policy.rs`, `health.rs`, `text.rs`, `http.rs` | The application value and its wiring, settings, the Policy the settings make, component health, text limits, the outbound HTTP client |
+| `backend/crates/neo-app/src/effects.rs`, `passes.rs`, `outbox.rs`, `notices.rs` | The effect queue, orchestration passes, outbound messages, notices and relays to the main Session |
+| `backend/crates/neo-app/src/kernels.rs`, `sessions.rs`, `prompts.rs`, `tools.rs`, `resources.rs`, `cards.rs`, `assess.rs` | Launching runtimes per role, Sessions and the conversation, prompts, the tools of each role, readable resources, cards, candidate delivery and assessment |
+| `backend/crates/neo-app/src/executor.rs`, `blocked.rs`, `sidecar.rs`, `watchdog.rs`, `procinfo.rs` | The Executor, blocked commands, the Sidecar, the Watchdog and its process sampling |
+| `backend/crates/neo-app/src/chat.rs`, `wechat.rs`, `wechat_protocol.rs`, `views.rs` | The chat Source, the WeChat bridge and its protocol, what the API shows and changes |
+| `backend/crates/neo-http/src/lib.rs`, `server.rs`, `api.rs` | The HTTP server, the API's routes, access control, the web app's files |
+| `backend/crates/neo-agent/src/main.rs`, `cli.rs`, `paths.rs`, `instance.rs` | The program: its commands, the command line, where things are on a machine, the single instance |
+| `backend/crates/neo-testkit/src/lib.rs`, `http.rs`, `models.rs`, `backend/crates/neo-testkit/src/bin/fixture-model.rs` | Test support: temporary directories, a loopback server, fake model endpoints, and one as a program |
+| `shim/neo-omp-shim.ts` | The Oh My Pi extension: the tool-call guard and background-job control |
+| `app/lib/main.dart` | The app's entry and root widget |
+| `app/lib/src/api/client.dart`, `models.dart` | The API client and what it carries |
+| `app/lib/src/state/app_state.dart` | Connection and polled state |
+| `app/lib/src/platform/host.dart`, `host_io.dart`, `host_web.dart`, `host_stub.dart` | Where the app runs: the desktop's backend process and single instance, the browser's origin and storage |
+| `app/lib/src/ui/shell.dart`, `chat_page.dart`, `workers_page.dart`, `settings_page.dart`, `scope.dart`, `widgets.dart`, `theme.dart`, `format.dart` | The frame and the three pages, shared widgets, the look, message formatting |
+| `app/lib/src/qr/qr_code.dart`, `qr_view.dart` | The QR code encoder and its painter |
+| `app/lib/src/l10n/strings.dart` | The app's words in Chinese and English |
 
 ## Tests
 
 | Files | Coverage |
 | --- | --- |
-| `tests/omp-sessions.spec.ts`, `tests/omp-executor.spec.ts`, `tests/sidecar.spec.ts`, `tests/watchdog.spec.ts`, `tests/web-panel.spec.ts`, `tests/wechat.spec.ts`, `tests/chat-source.spec.ts`, `tests/worker-panel.spec.ts`, `tests/model-settings.spec.ts`, `tests/github-settings.spec.ts` | Real OMP Sessions/delivery and subagents, executor slots and background work, read-only Sidecar and burst coalescing, Watchdog control loop, Web API, WeChat iLink/CDN, chat Ticket flow, worker progress, model settings and GitHub connection settings |
-| `tests/fixtures/omp-openai-server.ts`, `tests/fixtures/deployment.ts`, `tests/fixtures/git.ts`, `tests/fixtures/async.ts`, `tests/fixtures/web-panel-fixture.ts` | CLI/provider/browser fixtures |
-| `tests/claude-kernel.spec.ts` | Claude Code kernel |
-| `tests/deployment.spec.ts`, `tests/environment.spec.ts`, `tests/commands.spec.ts` | Deployment/environment/commands |
-| `tests/policy.spec.ts`, `tests/core-engine.spec.ts`, `tests/assessment.spec.ts` | Policy/engine/assessment |
-| `tests/store.spec.ts`, `tests/effects.spec.ts`, `tests/timeline.spec.ts` | Store/effects/timeline |
-| `tests/prompts.spec.ts`, `tests/cards.spec.ts` | Prompts/cards/resources |
-| `tests/github-read.spec.ts` | GitHub reads |
-| `tests/stage.spec.ts`, `tests/passes.spec.ts`, `tests/cache.spec.ts`, `tests/class-docs.spec.ts`, `tests/docs.spec.ts` | Remaining behavior |
-
-`tests/omp-sessions.spec.ts` uses pinned SDK, file-backed JSONL and the loopback provider. It verifies restricted tools, Ticket-ended blocks, idempotency, injection, steer/follow-up order, model restore and flush recovery. `scripts/omp-smoke.ts` additionally verifies real CLI/Runtime/Effects/Outbox behavior, completed Ticket, worker file, one acknowledgement/result, JSONL persistence, SIGINT and restart without duplicate work.
+| `backend/crates/neo-core/tests/engine.rs`, `tickets.rs`, `lifecycle.rs` | The Engine over the in-memory repository |
+| `backend/crates/neo-store/tests/core_engine.rs`, `store.rs` | The same Engine tests over SQLite; transactions, receipts, read models, effect rows, the schema version |
+| `backend/crates/neo-kernel/tests/session.rs` | The kernel-neutral Session and journal over a scripted driver |
+| `backend/crates/neo-kernel/tests/claude_real.rs`, `omp_real.rs` | Each kernel's protocol against the real runtime and a fake model endpoint (opt-in) |
+| `backend/crates/neo-app/tests/policy.rs`, `effects.rs` | The gate and Policy changes; the effect queue |
+| `backend/crates/neo-app/tests/flow.rs`, `work.rs`, `watchdog.rs`, `views.rs` | The application over a scripted kernel: the whole path of a request, workers at work, the Watchdog, what the API shows and changes |
+| `backend/crates/neo-app/tests/wechat.rs` | The WeChat bridge against a stand-in for its API |
+| `backend/crates/neo-http/tests/api.rs` | Every route's contract, access control, static files, the protocol's edges |
+| `backend/crates/neo-agent/tests/process.rs`, `real.rs`, `docs.rs` | The program as a process; the product end to end with a real kernel (opt-in); these documents |
+| `app/test/qr_code_test.dart`, `logic_test.dart`, `app_test.dart`, `host_io_test.dart`, `fake_backend.dart` | The QR encoder against an independent one; formatting, models, client and state; every page over a fake backend; the desktop host with real processes, the real backend among them |
+| `packaging/e2e/web-e2e.mjs`, `run-web-e2e.sh` | The web app in a real browser against the real backend and a real kernel |

@@ -1,45 +1,67 @@
 # 003 Execution
 
+This document says how an accepted Ticket is worked on. It builds on [002 Authorization](002-authorization.md).
+
 ## Ticket lifecycle
 
-An accepted Ticket owns its Mandate, workspace and persistent OMP worker. `OMPExecutor` prepares the directory once, ensures the worker, and sends `assignment:<ticketId>` (or `assignment:<ticketId>:<assignmentId>` for recovery). The message becomes durable before `assignmentStarted` commits. A worker therefore reports against a running Assignment.
+An accepted Ticket owns its Mandate, a directory and a worker Session. The Executor prepares the directory once: a folder named `<short-name>-<ticket id prefix>` under the task directory of the settings (by default `work/` in the data directory). When the settings have a prepare command, it runs first, in the task directory, with `NEO_AGENT_DIR`, `NEO_AGENT_NAME` and `NEO_AGENT_TICKET` set and at most ten minutes to finish — to clone a repository into the folder, for example. A prepare command that fails refuses the accept, and the person is told why.
 
-Every subsequent Input uses the Ticket's single durable delivery Effect. Before each send, the Executor rereads Ticket/Assignment and stops if either ended or was replaced. The custom entry and `flushToDisk()` complete before delivered/read commits. `agent_start` alone occupies a running slot; launch/ensure/send failure releases its reservation. `maxWorkers` caps workers, wakes take priority, and a person's follow-up may use one extra slot.
+Work then goes through the effect queue, a durable list of things to do that survives a restart:
 
-A resumed Assignment's first message carries the marker and the message that resumed it, after the restart JSON, and confirms both Inputs delivered at once: a worker that restarted on the bare marker could judge the ticket done and report `dropped` before the message arrived, ending the ticket with the message unread.
+- A **launch** effect opens the worker Session in the Ticket's directory and sends the assignment card. The card is written to the Session's journal before the Assignment is recorded as started, so a worker always reports against a running Assignment.
+- A **delivery** effect, one per Ticket, sends each later Input: a person's follow-up, an answer to the worker's question, a note from the Watchdog. Before each send the Executor rereads the Ticket, and sends nothing to one that ended or whose Assignment was replaced.
 
-Only terminal `agent_end` completes a turn. Intermediate retry/compaction ends do not. OMP handles model retries; the Executor has no second retry loop. A ready/attention/blocked/failed report is already a handoff. Otherwise the Executor writes `waiting` with the final assistant text and relays it. Final assistant error becomes `failed`.
+The settings cap how many workers run at once. A worker holds its slot from just before a message that starts a turn is sent until that turn is seen to start, and then for as long as it works; this keeps two launches from sharing the last slot. A launch that finds no slot waits in the queue.
+
+A worker reports with `orchestrator_report`:
+
+| State | Meaning | What follows |
+| --- | --- | --- |
+| `progress` | Still working | Nothing is sent, unless the report asks a person a question or answers one |
+| `ready` | The result is there | The main Session is told and sends the result; the Ticket completes |
+| `blocked`, `failed` | It cannot go on | The main Session is told; the Ticket waits for a person, who may retry it |
+| `dropped` | A follow-up was not for this Ticket | The message is handed back for routing |
+
+A worker whose turn ends without a report and with nothing running in the background gets a `waiting` report made for it, and the main Session is told so it can ask for the worker's status. A model request that fails becomes a `failed` report with the runtime's own error.
 
 ## Background work
 
-A worker command still running after 60 seconds, or when a message is steered in, becomes an OMP background job. A worker spawns subagents with `task`, each a background job of the worker. A job's end wakes the worker in the same Session with its result.
+A worker's command that runs longer than a minute moves to the background, and a worker may start subagents (`ticket-task`, at most eight at once, two levels deep). The end of a background job wakes the worker in its Session with the result. While jobs run, the worker's turn may end: it keeps its slot and is not reported as idle.
 
-A turn that ends while jobs run emits a non-terminal `agent_end` with `awaitingAsyncWork`. The Ticket keeps its slot and stays working, with no waiting report; the job's wake starts the next turn in that slot. A turn that ends with nothing running completes as above.
+A handoff to a person changes this. When the worker's last word is `ready`, a question, or `blocked` / `failed`, its subagents are stopped and its shell jobs — a development server offered for review, for example — are left running until the Assignment ends, without waking it.
 
-The Executor imposes no blind kill timer on background jobs after a turn ends: normal commands use OMP's per-command timeouts, while long `timeout: 0` jobs and `ticket-task` subagents run until they settle and wake the worker. Instead, the external `Watchdog` Control Loop samples `/proc` child-process CPU ticks and workspace file mtimes/sizes on each tick—skipping any LLM call at zero token cost while output or CPU advances, and running a pre-sampled stateless in-memory Watchdog turn only when work genuinely stalls, finishes detached work while idle, or hits transient failure, surgically cancelling hung jobs (`cancelJob`) and waking the worker; if waking fails with no job left, the Executor falls back to `waiting`.
+The Watchdog is a control loop beside the work, every three minutes:
 
-A handoff to a person frees the slot at once: a ready report or a question with no Input delivered since, or a blocked or failed report. Its subagents are cancelled. Its shell jobs, such as a server offered for review, are acknowledged and run until the Assignment ends; they hold no slot, are exempt from the limit in later turns, and their end wakes no one. OMP emits no further `agent_end` after an acknowledgement, so the Executor completes that turn itself.
+1. **Without a model call** it puts back a launch or delivery whose queue entry is missing, and reminds the main Session — twice at most — of a result, question or answer that no reply was sent for.
+2. **Without a model call** it passes every Ticket that makes progress: its workspace files or its jobs' output changed, or its processes used CPU time within half an hour of the last output. Processes are found by the job's own process ids, else by working directory inside the Ticket's directory.
+3. **Only for what is left** it starts a one-off Watchdog Session with the evidence inlined — processes, the newest files, the tail of the newest log, the latest transcript lines — and two tools: `watchdog_inspect`, and `watchdog_intervene` to wake a stranded worker, cancel one hung job and tell its worker why, retry a Ticket that failed in passing (twice at most per Ticket), or relay a report again.
 
-When an Assignment ends, Session disposal cancels every job, including those left to a person. A host restart ends them all; the recovery note tells the worker to rerun what it still needs.
+A working Ticket is inspected after six minutes without output or CPU time and at most every ten minutes; an idle one after a minute, then every three.
 
-Subagents use the session agent `ticket-task`: OMP's bundled `task` prompt with `read`, `bash`, `edit`, `write`, the worker's current model, at most 8 at once per worker and 2 levels deep. They get no application tools, so only the worker reports. The worker's Ticket guard extension is inherited and blocks their tools once the Ticket ends. `task` is refused when a repository or user agent definition named `ticket-task` would replace it. Explicit subagent names get a ticket prefix, because OMP registers subagents process-wide. A finished subagent is never continued (`write agent://…` is refused): disposing any worker Session releases every worker's finished subagents.
+The Sidecar answers a person's read-only question about a Ticket — progress, findings, a comparison — on a one-off Session with read access to the Ticket's directory, without waking or interrupting its worker.
 
 ## Stop and recovery
 
-Ticket stop rejects pending deliveries before disposal. If no new Input follows a ready/dropped report, disposal waits for terminal end; otherwise it starts after `beginDispose()`. A later authorized follow-up reopens the same JSONL.
+A person's stop ends the Ticket and withdraws its Mandate: the worker's turn is interrupted, its jobs are cancelled, its Session closes, and any tool call it still makes is refused with the reason. Inputs that arrive later go back to routing.
 
-On restart, running Assignments call `assignmentInterrupted()`: settled work resumes, while unfinished work gets a new Assignment and recovery note. Pending non-person-waiting Assignments relaunch. Unread delivered Inputs are replayed idempotently. Persisted request IDs prevent duplicate custom entries.
+A retry — by a person through the main Session, or by the Watchdog — ends the stalled Assignment and starts a new one under the same Mandate, in the same directory. When the Session's runtime context can be resumed, the new Assignment gets a short card; otherwise the whole assignment again.
 
-Workspace `prepare` runs through `execFile` as `sh -c` with a ten-minute timeout and Ticket environment. Failure does not auto-retry, because an existing directory counts as prepared and a retry could treat partial output as valid. Local/worktree credential and HTTP-header overrides are rejected.
+After a restart of the application, each Assignment that was running is marked interrupted and started again with a recovery note: inspect the directory, do not repeat an external operation that already happened, rerun what is still needed. Background jobs of the previous run ended with it. Nothing that was already sent is sent again: every message into a Session and every reply out has a request id, and the journal and the Outbox take each id once.
 
-Runtime shutdown stops watcher/passes, synchronously bars every Session from starting new work, disposes them, drains Effects, restores environment, closes SQLite and releases the lock.
+The pause in the settings holds everything: nothing is assessed, launched, delivered or sent; messages are still received and wait.
 
 ## Execution kernels
 
-`kernel` in startup JSON selects the runtime behind every Session. `omp` runs OMP `AgentSession`s. `claude` runs Claude Code through the Agent SDK: one long-lived streaming-input `query()` per Session, resumed by its SDK session id from a JSONL journal (`src/kernel/journal.ts`) that is also the delivery barrier and Web transcript. Both satisfy the `KernelSession` contract in `src/kernel/types.ts`, so delivery, executor and Watchdog are kernel-agnostic.
+A kernel is the agent runtime a Session runs on. There are two, chosen in the settings, and the application treats them alike:
 
-On the Claude Code kernel: application tools are an in-process MCP server (`mcp__omp__<name>`, prompts are rewritten); the Ticket guard is a `PreToolUse` hook that also covers subagents; `ticket-task` is an SDK agent definition; a `run_in_background` Bash command or subagent is a background job whose end wakes the worker, and `session_state_changed` plus `background_tasks_changed` drive `agent_end` with `awaitingAsyncWork`. `acknowledgeDeliveries` makes the Session interrupt and swallow the wake its job would cause; `cancel` calls `stopTask`. Differences: no advisor model, no `task.maxConcurrency`/depth settings, and shell job process ids are the Claude Code process's descendants.
+| | Claude Code (`claude`) | Oh My Pi (`omp`) |
+| --- | --- | --- |
+| Protocol | `stream-json` on standard input and output, with control requests | `--mode rpc`, plus one extension file (`shim/neo-omp-shim.ts`) |
+| The application's tools | An in-process MCP server; the model sees `mcp__neo__<name>` | Host tools; the model sees the bare names |
+| Guard on every tool call | A `PreToolUse` hook answered by the application | The extension asks the application |
+| Background jobs | Claude Code's background commands and subagents | Oh My Pi's async jobs, listed and cancelled through the extension |
+| Models | The `ANTHROPIC_*` environment; model names only; no advisor model | Providers of its agent directory; an optional advisor model |
 
-The panel switches the kernel live (`PUT /api/settings/kernel`). The choice is durable and holds until the startup JSON names another kernel than it did when the choice was made. A switch initializes the target kernel first and is refused, leaving the kernel unchanged, when it cannot start, such as a configured model OMP does not know. The main Session reopens on the new kernel with its visible chat transcript and an empty model context; a loaded worker finishes on the kernel it was opened with, and its next load uses the new kernel and is given its assignment anew.
+Each Session is one runtime process, in its own process group so that it ends with its children. The application keeps its own journal for every Session, which is what makes delivery idempotent and the transcript the same on both kernels.
 
-Each kernel has its own model choices, which follow the kernel default until set and are never shared: the settings hold the current kernel's, the other kernel's wait in KV and change places on a switch, in the panel or by the startup JSON. The panel shows only what the current kernel supports; Claude Code has no advisor model and no `minimal` thinking level, and an update naming either is dropped or refused.
+Switching the kernel applies at once: the main Session reopens on the new kernel with its transcript, and a worker stays on the kernel it started on until its Ticket ends. Each kernel keeps its own model choices. The commands the settings block are refused on both kernels the same way: stand-ins for them come first on the `PATH` of every Session and prepare command.

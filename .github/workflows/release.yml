@@ -1,0 +1,138 @@
+name: Release
+
+# Builds the installers: a disk image for each Mac architecture, a Windows setup program and a Linux server tarball,
+# each with the backend and the pinned agent runtimes inside. Runs for a version tag, or by hand.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      runtimes:
+        description: Bundle the agent runtimes (claude, omp)
+        type: boolean
+        default: true
+
+env:
+  FLUTTER_VERSION: "3.50.0"
+  WITHOUT_RUNTIMES: ${{ github.event_name == 'workflow_dispatch' && !inputs.runtimes }}
+
+jobs:
+  macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            arch: x64
+          - os: macos-14
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+      - name: Import the signing certificate
+        # Without the secrets the app is signed ad hoc, and people allow it by hand (see the install guide).
+        if: env.CERTIFICATE != ''
+        env:
+          CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          echo "$CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p build "$RUNNER_TEMP/build.keychain"
+          security set-keychain-settings -lut 21600 "$RUNNER_TEMP/build.keychain"
+          security unlock-keychain -p build "$RUNNER_TEMP/build.keychain"
+          security import "$RUNNER_TEMP/certificate.p12" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$RUNNER_TEMP/build.keychain"
+          security set-key-partition-list -S apple-tool:,apple: -k build "$RUNNER_TEMP/build.keychain"
+          security list-keychains -d user -s "$RUNNER_TEMP/build.keychain"
+      - name: Build the disk image
+        env:
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          if [ "$WITHOUT_RUNTIMES" = true ]; then packaging/macos/build-dmg.sh --without-runtimes; else packaging/macos/build-dmg.sh; fi
+      - name: Notarize
+        if: env.APPLE_ID != ''
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          xcrun notarytool submit dist/*.dmg --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple dist/*.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Put the app together
+        shell: pwsh
+        run: |
+          if ($env:WITHOUT_RUNTIMES -eq "true") { ./packaging/windows/stage.ps1 -WithoutRuntimes } else { ./packaging/windows/stage.ps1 }
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path backend/Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          choco install innosetup --no-progress -y
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" "/DStage=$PWD\dist\windows-stage" packaging\windows\neo-agent.iss
+          if ($LASTEXITCODE -ne 0) { throw "the installer did not build" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: dist/*-setup.exe
+          if-no-files-found: error
+
+  linux:
+    name: Linux server x64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+      - name: Build the tarball
+        run: |
+          if [ "$WITHOUT_RUNTIMES" = true ]; then packaging/linux/build-server.sh --without-runtimes; else packaging/linux/build-server.sh; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          draft: true

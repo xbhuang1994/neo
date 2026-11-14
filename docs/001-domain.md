@@ -1,6 +1,6 @@
 # 001 Domain model
 
-This document names the concepts of neo-agent and the rules each one keeps. The code, tools and other documents use these terms and no others. Following [000 Philosophy](000-philosophy.md), the model holds only concepts the work needs, and a business need becomes an attribute of one of them.
+This document names the concepts of Neo Agent and the rules each one keeps. The code, tools and other documents use these terms and no others. Following [000 Philosophy](000-philosophy.md), the model holds only concepts the work needs, and a business need becomes an attribute of one of them.
 
 ## Flow
 
@@ -28,13 +28,13 @@ Source, Thread, Eval, Mandate and Subscription form the core domain; the rest su
 | Trigger | One immutable event with the Source's own metadata, such as its actor | Belongs to one or more Threads. Accepting a Trigger twice creates one Ticket | The unit of audit and of idempotence |
 | Thread | Triggers in time order; the Source defines which Triggers form one Thread | At most one Eval runs on it at a time. It may have several Tickets. It holds its Subscriptions, the running Eval and its Decision history | Gives Eval a consistent view and its context |
 | Correlation | The relation between Threads that one Trigger belongs to | Adds context; never routes | Lets Eval follow related evidence |
-| Channel | The write side of a Thread; the Source defines its addresses | A Thread may have several Channels; a Ticket holds a set of them | Acknowledgements, replies, pull requests and resolved reviews are all writes |
+| Channel | The write side of a Thread; the Source defines its addresses | A Thread may have several Channels; a Ticket holds a set of them | Acknowledgements, answers, questions and results are all writes |
 | Policy | The versioned assessment rules and each Source's part: who may originate work through that Source, in that Source's own identities, how the list is synchronized, and which bots may make candidates | The Policy version covers the rules, the accept mode and the Source parts. A change that bears on a live Ticket, such as a change to a rule it was accepted under, is delivered to its Assignment; it does not revoke Mandates. Identities on different Sources are never mapped to each other | When the rules change, a running Eval must be discarded |
 | Eval | The judgement on a batch of Triggers, in two layers: gate and assessment | Input: the Trigger batch, a Thread snapshot, every Ticket on the Thread including ended ones, and the current Policy. Output: a Decision. Holds no state | Decides whether new work starts, goes on or stops |
 | Mandate | What an accept grants: the Policy version, the scope, the strength, the matched rules, the sender's identity on that Source and how the Source received the Trigger | Immutable; wider scope means a new Ticket. A Ticket's end does not end it: only a person's stop withdraws it, and a Policy that no longer holds it revokes it. Revalidated against the current Policy before an ended Ticket resumes | States why the work may be done, and how far it may go |
 | Ticket | A unit of authorized work | Only Eval creates one. Refers to its Mandate; holds its Channels and Inputs. Goes open → ended, and back to open when a person's message on one of its Threads resumes it, unless a person stopped it. Defines its own state instead of following the Executor's | Owns the execution and its reports |
 | Assignment | The binding of a Ticket to one Executor instance | A Ticket has several over time. Goes pending → running → ended independently of the Ticket. Only its final report may end the Ticket on the Executor's side | The Executor is outside the domain, but who executes must be inside it |
-| Subscription | A many-to-many relation between Tickets and Threads, held by the Thread | A matching Trigger fans out to every live subscribed Ticket, with no check of who sent it; a person's message that reaches a Ticket this way takes no Eval. A Source may opt out of fan-out (`ScopeResult.fanout: false`), as chat does, where one conversation carries unrelated Tickets: its Threads stay subscribed, but each Trigger goes to Eval, and the main Session attaches it to at most one Ticket. A Thread an Executor follows for context reaches its Ticket the same way, but lends it no authority and does not resume it. An ended Ticket keeps its Subscriptions, including that of a pull request that closed or merged: a person's message resumes it under the same Mandate, with no Eval or Decision; messages from bots and CI do not reach it, since its Executor reads its Threads again when it resumes. A Ticket a person stopped receives nothing. Outside chat, the main Session attaches a Thread to an existing Ticket only when its message points at that Ticket explicitly. A person can drop every Subscription on a Thread; an Executor can drop only its own Ticket's Subscription to a Thread it finds unrelated, except the Thread its Ticket started on and a Thread a Source made it follow, such as its pull request's | Later discussion reaches the Executor without anyone mentioning the agent again |
+| Subscription | A many-to-many relation between Tickets and Threads, held by the Thread | A matching Trigger fans out to every live subscribed Ticket, with no check of who sent it; a person's message that reaches a Ticket this way takes no Eval. A Source may opt out of fan-out (`ScopeResult.fanout: false`), as chat does, where one conversation carries unrelated Tickets: its Threads stay subscribed, but each Trigger goes to Eval, and the main Session attaches it to at most one Ticket. A Thread an Executor follows for context reaches its Ticket the same way, but lends it no authority and does not resume it. An ended Ticket keeps its Subscriptions: a person's message resumes it under the same Mandate, with no Eval or Decision; messages from bots do not reach it, since its Executor reads its Threads again when it resumes. A Ticket a person stopped receives nothing. Outside chat, the main Session attaches a Thread to an existing Ticket only when its message points at that Ticket explicitly. A person can drop every Subscription on a Thread; an Executor can drop only its own Ticket's Subscription to a Thread it finds unrelated, except the Thread its Ticket started on and a Thread a Source made it follow | Later discussion reaches the Executor without anyone mentioning the agent again |
 
 A person is not a domain concept. A Trigger carries its actor's identifier as the Source gives it. An allowed list is a Source's part of the Policy, in that Source's identities. That one person has accounts on several Sources is prompt text that the agents read when they need it.
 
@@ -53,7 +53,7 @@ Aggregates: a Source holds its read position. A Thread holds its Subscriptions, 
 | An "append to Ticket" Decision | Appending is Subscription fan-out and needs no Eval |
 | Admission checks on Subscriptions | A Subscription covers the whole Thread; the Mandate separates authorization from context |
 | Correlation that routes | Subscriptions route; Correlation only adds context |
-| Ticket state that follows the DSH Session | A Ticket can be handed off, resumed, or run by several Executors, so it defines its own state |
+| Ticket state that follows the Executor's Session | A Ticket can be handed off, resumed, or run by several Executors, so it defines its own state |
 | An Executor declaring that a person asked it to stop | Only Eval decides the strength of an end |
 | Cancelling running Tickets on a Policy change | A cancelled change leaves half-finished work; the change is recorded and delivered instead |
 | Locking all of an Executor Session's tools when it fails or blocks | It would refuse a person working directly in the Session, and the report after recovery; pausing automatic input is enough |
@@ -65,21 +65,21 @@ The concepts above and their rules are reusable. The Source implementations, the
 
 | Part | In this repository |
 | --- | --- |
-| Source | Web/WeChat direct chats: durable messages, threads and Outbox replies. GitHub: notifications, subscribed Issues and pull requests, CI changes, pull requests merged or closed, and, where switched on, every new Issue, pull request and comment in the repository and the default branch's CI |
-| Policy | Assessment rules, and each Source's allowed list, its sync, its bot list and its admission table |
-| Executor | A DSH Executor Session and a directory per Ticket, in an execution environment whose variables the Executor and the Sources register |
-| Channel | Current Web/WeChat conversation replies, GitHub comments and review thread replies |
+| Source | One: chat. Messages typed into the app or its web page, and direct messages of a bound WeChat account, each a durable message on a conversation Thread with Outbox replies. The domain keeps what other Sources would need (fan-out, admission tables, bot lists), and this distribution ships no other Source |
+| Policy | Assessment rules, the accept mode, and the chat Source's allowed list |
+| Executor | A worker Session on the chosen kernel (Claude Code or Oh My Pi) and a directory per Ticket, in an execution environment whose variables the Executor registers |
+| Channel | Replies to the app's conversation or to the bound WeChat conversation |
 
 ## Glossary
 
-A reference list of the terms this and the later documents use, with their Chinese names; the later documents explain the terms not introduced above. The panel shows one language at a time; its (?) button opens this glossary with both languages. The messages agents send to people on GitHub and Feishu use plain language, not these terms.
+A reference list of the terms this and the later documents use, with their Chinese names; the later documents explain the terms not introduced above. The app shows one language at a time. The messages agents send to people use plain language, not these terms.
 
 | Term | 中文 | Meaning |
 | --- | --- | --- |
-| Agent | 智能体 | The automated team member neo-agent runs, acting on GitHub through its dedicated account |
-| Main Session | 主 Session | The persistent OMP Session that evaluates Triggers, accepts and dispatches Tickets, and replies; `orchestrator` in code and prompts |
-| Executor Session | 执行器 Session | The persistent OMP worker Session for one Ticket; `worker` in code and prompts |
-| Source | 来源 | A stream of events: a kind that a plugin provides, plus one instance configuration |
+| Agent | 智能体 | The automated helper Neo Agent runs |
+| Main Session | 主 Session | The persistent Session that evaluates Triggers, accepts and dispatches Tickets, and replies; `orchestrator` in code and prompts |
+| Executor Session | 执行器 Session | The persistent worker Session for one Ticket; `worker` in code and prompts |
+| Source | 来源 | A stream of events |
 | Trigger | 触发 | One immutable event from a Source |
 | Thread | 线程 | Triggers in time order; the unit within which Evals run one at a time |
 | Correlation | 关联 | The relation between Threads that share a Trigger; it adds context only |
