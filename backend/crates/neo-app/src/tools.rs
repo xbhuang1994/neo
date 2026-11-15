@@ -6,7 +6,7 @@ use crate::cards::ticket_card;
 use crate::effects;
 use crate::executor::{valid_worktree_name, WORKTREE_NAME_RULE};
 use crate::notices::{receipt_notice, report_relay, thread_followed_notice};
-use crate::text::{clip, word_count, IM_WORDS};
+use crate::text::{clip, language_mismatch, word_count, IM_WORDS};
 use neo_core::assignments::{Question, WorkerReport};
 use neo_core::errors::UserError;
 use neo_core::model::{followup_owners, DecisionKind, ReportState, ThreadRef};
@@ -267,6 +267,12 @@ impl App {
         None
     }
 
+    /// Why `text`, sent as `field` in reply to a trigger, is in another language than the person wrote in.
+    pub(crate) fn wrong_language(&self, trigger_id: &str, field: &str, text: &str) -> Option<String> {
+        let trigger = self.store.trigger(trigger_id)?;
+        language_mismatch(&trigger.text, text).map(|problem| format!("{field}: {problem}"))
+    }
+
     /// Carry out one routing decision as its Engine command. `decided` holds the Triggers this call's earlier items
     /// decided, with their batches.
     fn route(&self, item: &Args, kind: &str, trigger_id: &str, decided: &HashMap<String, String>) -> Result<Result<Routed, String>, UserError> {
@@ -402,7 +408,9 @@ impl App {
                     Err("kind is accept, attach, sidecar, ignore or stop".into())
                 }
                 Ok(_) if trigger_id.is_empty() => Err("trigger_id is required".into()),
-                Ok(item) => match Self::invalid_item(&item, &kind) {
+                Ok(item) => match Self::invalid_item(&item, &kind).or_else(|| {
+                    ["acknowledgement", "answer"].into_iter().find_map(|field| self.wrong_language(&trigger_id, field, item.text(field)?))
+                }) {
                     Some(problem) => Err(problem),
                     // Each item is one Engine command, in a transaction of its own; one that is refused leaves the others.
                     None => match self.store.atomic(|| self.route(&item, &kind, &trigger_id, &decided)) {
@@ -550,6 +558,9 @@ impl App {
                 let args = Args::of(arguments, &["trigger_id", "text"])?;
                 let trigger_id = args.required("trigger_id")?;
                 let text = acknowledgement(args.required("text")?)?;
+                if let Some(problem) = self.wrong_language(trigger_id, "text", text) {
+                    return Err(problem);
+                }
                 let reply = self
                     .engine
                     .reply(ReplyRequest {
@@ -627,6 +638,11 @@ impl App {
             Some(text) => Some(acknowledgement(text)?.to_string()),
             None => None,
         };
+        if let (Some(text), Some(answered)) = (&direct, args.text("reply_to_trigger_id")) {
+            if let Some(problem) = self.wrong_language(answered, "direct_reply", text) {
+                return Err(problem);
+            }
+        }
         let report = WorkerReport {
             state,
             summary: args.required("summary")?.to_string(),

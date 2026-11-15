@@ -129,7 +129,7 @@ async fn serves_every_route_of_the_app() {
     assert_eq!(refused(json!({"message": "x"})).await, (400, json!({"error": "Expected { text: string }"})));
     assert_eq!(refused(json!({"text": "   "})).await, (400, json!({"error": "Message or attachment required; text limit 8000 characters"})));
     assert_eq!(refused(json!({"text": "长".repeat(8001)})).await.0, 400);
-    assert_eq!(refused(json!({"text": "长".repeat(8000), "messageId": "web:long"})).await.0, 202);
+    assert_eq!(refused(json!({"text": "é".repeat(8000), "messageId": "web:long"})).await.0, 202);
     let file = json!({"name": "a.bin", "data": "AA=="});
     assert_eq!(refused(json!({"text": "x", "attachments": [file, file, file, file]})).await, (400, json!({"error": "At most 3 attachments"})));
     assert_eq!(

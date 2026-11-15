@@ -249,6 +249,9 @@ impl App {
             if word_count(text) > IM_WORDS {
                 return Err(format!("An acknowledgement has at most {IM_WORDS} words; write one short sentence."));
             }
+            if let Some(problem) = self.wrong_language(trigger_id, "acknowledgement", text) {
+                return Err(problem);
+            }
         }
         let accepts =
             assessment.decision == "accept" && direction_allowed(&assessment.direction) && assessment.rule_assessments.iter().any(|rule| rule.matched);

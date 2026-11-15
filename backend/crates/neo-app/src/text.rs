@@ -46,6 +46,37 @@ pub fn checked_im_text(text: &str) -> Result<&str, String> {
     Ok(text)
 }
 
+/// CJK characters and runs of Latin letters in `text`.
+fn scripts(text: &str) -> (usize, usize) {
+    let (mut cjk, mut latin, mut in_word) = (0, 0, false);
+    for c in text.chars() {
+        if ideograph(c) {
+            cjk += 1;
+        }
+        let letter = c.is_ascii_alphabetic();
+        if letter && !in_word {
+            latin += 1;
+        }
+        in_word = letter;
+    }
+    (cjk, latin)
+}
+
+/// Why `reply` is in another language than `asked`, the message it answers, when that message's language is clear:
+/// one written mostly in Chinese (or another CJK language, code names and English terms aside) needs a reply with
+/// CJK text, and one written in English without any CJK needs a reply that is not mostly CJK.
+pub fn language_mismatch(asked: &str, reply: &str) -> Option<&'static str> {
+    let (asked_cjk, asked_latin) = scripts(asked);
+    let (cjk, latin) = scripts(reply);
+    if asked_cjk >= 2 && asked_cjk >= asked_latin && cjk == 0 {
+        Some("the person wrote in Chinese, so write it in Chinese (code names and terms may stay as they are), never English, whatever language cards, reports or earlier replies use")
+    } else if asked_cjk == 0 && asked_latin >= 3 && cjk > latin {
+        Some("the person wrote in English, so write it in English")
+    } else {
+        None
+    }
+}
+
 /// The first `limit` characters of `text`.
 pub fn clip(text: &str, limit: usize) -> String {
     text.chars().take(limit).collect()
@@ -73,5 +104,20 @@ mod tests {
         let long = "word ".repeat(IM_WORDS + 1);
         assert!(checked_im_text(&long).unwrap_err().contains("101 words"));
         assert_eq!(clip("你好世界", 2), "你好");
+    }
+
+    #[test]
+    fn a_reply_follows_the_language_the_person_wrote_in() {
+        let asked = "那测试跨不同的cpu 的CCD和相同性能CCD 做对比";
+        let english = "On it: comparing the ring buffer's alignment performance across different CPU CCDs.";
+        assert!(language_mismatch(asked, english).is_some());
+        assert_eq!(language_mismatch(asked, "收到：对比 ring buffer 在跨 CCD 与同 CCD 下的性能。"), None);
+        assert_eq!(language_mismatch("[语音转写] C加加的run buffer需要线程安全", "收到：改为线程安全。"), None);
+        assert!(language_mismatch("Please fix the save button", "收到：修复保存按钮。").is_some());
+        assert_eq!(language_mismatch("Please fix the save button", "On it: fixing the save button."), None);
+        assert_eq!(language_mismatch("Please fix the save button", "On it: fixing the “保存” button."), None);
+        // Unclear or mixed messages constrain nothing.
+        assert_eq!(language_mismatch("ok", "好的"), None);
+        assert_eq!(language_mismatch("看下 https://github.com/foo/bar/issues/12", "Looking at it."), None);
     }
 }

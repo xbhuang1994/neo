@@ -584,7 +584,7 @@ async fn sends_a_result_once_when_the_worker_replied_directly_and_the_orchestrat
                     let done = turn
                         .call(
                             "orchestrator_report",
-                            json!({"state": "ready", "summary": "Wrote the ring buffer.", "direct_reply": "写好了：ring buffer 在 src/lib.rs。"}),
+                            json!({"state": "ready", "summary": "Wrote the ring buffer.", "direct_reply": "Done: the ring buffer is in src/lib.rs."}),
                         )
                         .await?;
                     assert_eq!(done["notification"], "direct_outbox");
@@ -596,7 +596,7 @@ async fn sends_a_result_once_when_the_worker_replied_directly_and_the_orchestrat
                         if let Some(ticket) = message["worker_direct_reply"]["ticket_id"].as_str() {
                             assert_eq!(message["worker_direct_reply"]["note"], "The person already has this reply; send nothing more for it.");
                             let again = turn
-                                .call("orchestrator_reply", json!({"ticket_id": ticket, "purpose": "result", "text": "环形缓冲区已写好，代码在 src/lib.rs。"}))
+                                .call("orchestrator_reply", json!({"ticket_id": ticket, "purpose": "result", "text": "The ring buffer is written; the code is in src/lib.rs."}))
                                 .await;
                             seen.lock().unwrap().push(again.unwrap_err());
                         }
@@ -606,16 +606,16 @@ async fn sends_a_result_once_when_the_worker_replied_directly_and_the_orchestrat
             }
         })
     }));
-    f.app.receive_web("用 Rust 写一个 ringbuffer", vec![], None).await.unwrap();
+    f.app.receive_web("Write a ringbuffer in Rust", vec![], None).await.unwrap();
     f.until("the ticket completed", || f.tickets().first().is_some_and(|ticket| ticket.ended.is_some())).await;
     f.settle().await;
     // A later message starts the turn in which the orchestrator reads the notice of the worker's reply.
-    f.app.receive_web("谢谢", vec![], None).await.unwrap();
+    f.app.receive_web("Thanks", vec![], None).await.unwrap();
     f.until("the paraphrase was tried", || !refused.lock().unwrap().is_empty()).await;
     f.settle().await;
     assert!(refused.lock().unwrap()[0].starts_with("This ticket's result already went to the person"), "{:?}", refused.lock().unwrap());
     let said = replies(&f);
-    assert_eq!(said.iter().filter(|text| text.contains("ring buffer") || text.contains("环形缓冲区")).count(), 1, "{said:#?}");
-    assert_eq!(said[1], "写好了：ring buffer 在 src/lib.rs。");
+    assert_eq!(said.iter().filter(|text| text.contains("ring buffer")).count(), 1, "{said:#?}");
+    assert_eq!(said[1], "Done: the ring buffer is in src/lib.rs.");
     f.app.stop().await;
 }
