@@ -1,0 +1,25 @@
+# Neo Agent as a systemd user service, without root. Copy to ~/.config/systemd/user/neo-agent.service, set the path,
+# put NEO_TOKEN and the model access in the environment file, then: systemctl --user enable --now neo-agent
+# With linger on (loginctl enable-linger), it starts at boot and comes back after a crash, a kill or an update.
+# Environment (token, model access) lives in ~/.config/neo-agent/neo-agent.env, readable by this user only.
+# Restart after rebuilding: systemctl --user restart neo-agent
+[Unit]
+Description=Neo Agent server
+After=network-online.target
+Wants=network-online.target
+# Never give up restarting.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+EnvironmentFile=%h/.config/neo-agent/neo-agent.env
+ExecStart=/opt/neo-agent/neo-agent serve --host 0.0.0.0 --port 3082
+Restart=always
+RestartSec=3
+# Workers and their background jobs end with the service.
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

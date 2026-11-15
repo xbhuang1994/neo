@@ -25,7 +25,7 @@ The runtimes are other parties' programs under their own terms. Claude Code in p
 
 | Platform | Command | Result |
 | --- | --- | --- |
-| Linux server | `packaging/linux/build-server.sh` | `dist/neo-agent-<version>-linux-x64.tar.gz` |
+| Linux server | `packaging/linux/build-server.sh` | `dist/neo-agent-<version>-linux-x64.tar.gz`, with `neo-agent.service` (system) and `neo-agent-user.service` (user, restarts on any exit) |
 | macOS, on a Mac of the wanted architecture | `packaging/macos/build-dmg.sh` | `dist/Neo-Agent-<version>-macos-<arch>.dmg` |
 | Windows | `packaging\windows\stage.ps1`, then Inno Setup with `packaging\windows\neo-agent.iss` | `dist\Neo-Agent-<version>-windows-x64-setup.exe` |
 

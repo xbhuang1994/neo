@@ -27,7 +27,7 @@ rm -rf "$stage" && mkdir -p "$stage"
 cp "$root/backend/target/release/neo-agent" "$stage/neo-agent"
 cp -R "$root/app/build/web" "$stage/web"
 mkdir -p "$stage/shim" && cp "$root/shim/neo-omp-shim.ts" "$stage/shim/"
-cp "$root/LICENSE" "$root/packaging/linux/neo-agent.service" "$stage/"
+cp "$root/LICENSE" "$root/packaging/linux/neo-agent.service" "$root/packaging/linux/neo-agent-user.service" "$stage/"
 [ "$runtimes" = yes ] && python3 "$root/packaging/fetch-runtimes.py" "linux-$arch" "$stage/runtimes"
 
 tar -C "$root/dist" -czf "$root/dist/$name.tar.gz" "$name"

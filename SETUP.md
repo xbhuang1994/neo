@@ -73,6 +73,18 @@ Open `http://<server>:3082/` in a browser and enter the token under Settings →
 
 **As a service.** The package includes `neo-agent.service` for systemd: copy it to `/etc/systemd/system/`, set the user, the paths and the token, then `systemctl daemon-reload && systemctl enable --now neo-agent`. Keep the unit readable by root only, since it holds the token.
 
+**As a user service, without root.** `neo-agent-user.service` runs it under your own account and restarts it within 3 seconds after a crash, a kill or an update, never giving up:
+
+```sh
+mkdir -p ~/.config/neo-agent ~/.config/systemd/user
+install -m 600 /dev/null ~/.config/neo-agent/neo-agent.env   # NEO_TOKEN=…, ANTHROPIC_* and PATH, one per line
+cp /opt/neo-agent/neo-agent-user.service ~/.config/systemd/user/neo-agent.service
+systemctl --user daemon-reload && systemctl --user enable --now neo-agent
+loginctl enable-linger "$USER"                                 # start at boot, without a login
+```
+
+After replacing the program, `systemctl --user restart neo-agent`. Do not start a second copy by hand beside it: only one instance runs per user.
+
 **Behind TLS.** The server speaks plain HTTP. On a network you do not trust, keep it on loopback and put a reverse proxy in front, for example Caddy:
 
 ```
