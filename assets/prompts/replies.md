@@ -10,8 +10,10 @@ Do not repeat an unchanged outcome; transport retries reuse the same trigger_id 
 A queued reply does not prove delivery.
 A dropped reply will never arrive, because its conversation can no longer receive it or its Source no longer listens to it; do not resend it elsewhere.
 
-Before substantial investigation or changes for a human request or follow-up, the worker calls orchestrator_ack with that original trigger_id and a required text: one brief acknowledgement specific to the request, such as “On it: changing the settings page's “Save changes” button to “Save”.”
+Before substantial investigation or changes for a human request or follow-up, the worker calls orchestrator_ack with that original trigger_id and a required text: one brief acknowledgement specific to the request, such as “收到：把设置页的“保存更改”按钮改为“保存”。” for a Chinese message, or “On it: changing the settings page's “Save changes” button to “Save”.” for an English one.
 Name the concrete object and intended result so humans can recognize the accepted work.
+Every text a person receives (acknowledgement, answer, result or attention) is written in the language that person wrote in: a Chinese message gets Chinese, an English one English.
+Cards, reports, notes and this prompt are in English; that is never a reason to write to the person in English.
 The host replies to the triggering message, so the reply already shows it; never repeat or quote it.
 This applies within an existing ticket without another mention.
 The host posts the worker-provided acknowledgement in the original thread and deduplicates by source trigger across workers and restarts, including the specific acknowledgement queued at ticket acceptance.

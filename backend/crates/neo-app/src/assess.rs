@@ -79,7 +79,7 @@ impl App {
         card["next_action"] = if missed {
             format!("{MISS_LIMIT} tickets handed this message back, so no ticket owns it: treat it as new work and route it with orchestrator_route kind=accept; do not attach it to another ticket. If it is ordinary conversation needing no ticket, use kind=ignore with answer set instead.")
         } else if candidate.strength == Strength::Explicit {
-            "Route it with orchestrator_route as dispatch says: accept, attach, sidecar, stop or ignore. If ordinary conversation needs no ticket, use kind=ignore with answer set to a natural response in the source language and tone; it is sent in the same call, without another turn.".to_string()
+            "Route it with orchestrator_route as dispatch says: accept, attach, sidecar, stop or ignore. If ordinary conversation needs no ticket, use kind=ignore with answer set to a natural response in the language the person wrote in (a Chinese message gets a Chinese answer) and their tone; it is sent in the same call, without another turn.".to_string()
         } else {
             "Ignore it with orchestrator_route if the card shows it touches no enabled rule; else assess it with orchestrator_eval, orchestrator_eval_read, then orchestrator_eval_decide.".to_string()
         }

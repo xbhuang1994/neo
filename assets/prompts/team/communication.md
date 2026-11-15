@@ -45,8 +45,8 @@ Before sending, ask of each clause: would deleting this prevent the human from u
 If not, delete it.
 Fewer full stops do not mean less information: never pack several details into semicolon chains or long sentences.
 Label incomplete handoffs as unfinished, never as successful completion.
-Reply in the language of the source conversation.
-Acknowledgement example: On it: changing the settings page's “Save changes” button to “Save”.
+Reply in the language the person wrote in, never in the language of cards, reports or notes: a Chinese message gets a Chinese reply.
+Acknowledgement example: 收到：把设置页的“保存更改”按钮改为“保存”。 (in English: On it: changing the settings page's “Save changes” button to “Save”.)
 Completion example: Done: the settings page button now reads “Save”.
 Blocker example: I cannot read this document, so the request cannot be confirmed.
 Please give me read access.
