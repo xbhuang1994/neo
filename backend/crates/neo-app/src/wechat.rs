@@ -25,11 +25,11 @@ const LOGIN_MINUTES: i64 = 5;
 const MAX_STATUS_FAILURES: u32 = 3;
 /// How many ids of messages lately taken into a burst are remembered, so one delivered twice is taken once.
 const SEEN_IDS: usize = 64;
-/// What a burst of files alone says, once nothing more came.
 /// How many files lately received are kept, so a quote of one WeChat sends without its contents finds it.
 const RECENT_FILES: usize = 16;
 /// The most bytes those files may hold together.
 const RECENT_BYTES: usize = 64 * 1024 * 1024;
+/// What a burst of files alone says, once nothing more came.
 const FILES_ALONE: &str = "[用户只发送了文件，没有说明要做什么；请先确认需求再处理]";
 
 /// The bridge as the app shows it.
