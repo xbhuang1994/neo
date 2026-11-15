@@ -44,6 +44,8 @@ struct Seen {
     upload_key: Vec<u8>,
     uploads: Vec<Vec<u8>>,
     tokens: Vec<String>,
+    /// The typing statuses sent, in order: 1 to show it, 2 to take it away.
+    typing: Vec<i64>,
 }
 
 struct WeChat {
@@ -119,6 +121,15 @@ fn answer(seen: &Mutex<Seen>, request: Request) -> Response {
             let cursor = asked.unwrap_or("cursor-1").to_string();
             Response::json(200, &json!({"ret": 0, "msgs": messages, "get_updates_buf": cursor, "longpolling_timeout_ms": 100}))
         }
+        ("POST", "/ilink/bot/getconfig") => {
+            assert_eq!(body["ilink_user_id"], "bound-user");
+            Response::json(200, &json!({"ret": 0, "typing_ticket": "typing-ticket"}))
+        }
+        ("POST", "/ilink/bot/sendtyping") => {
+            assert_eq!((body["ilink_user_id"].as_str(), body["typing_ticket"].as_str()), (Some("bound-user"), Some("typing-ticket")));
+            seen.typing.push(body["status"].as_i64().unwrap_or(0));
+            Response::json(200, &json!({"ret": 0}))
+        }
         ("POST", "/ilink/bot/sendmessage") => {
             seen.sent.push(body["msg"].clone());
             Response::json(200, &json!({"ret": 0, "message_id": 9007199254740995u64}))
@@ -165,6 +176,8 @@ async fn bound_with(wechat: &WeChat, quiet: Duration, file_wait: Duration) -> Fi
         quiet,
         burst_cap: Duration::from_secs(2),
         file_wait,
+        typing_check: Duration::from_millis(20),
+        typing_keepalive: Duration::from_millis(100),
         ..Protocol::at(&wechat.server.url(), &format!("{}/cdn", wechat.server.url()))
     };
     *kernels.model.lock().unwrap() = Some(model(|turn| {
@@ -487,5 +500,34 @@ async fn finds_a_file_quoted_by_its_name_alone_among_those_lately_received() {
     assert!(chat[1].contains("<attachment name=\"plan.md\">\nquarterly numbers\n</attachment>"), "{}", chat[1]);
     // A file never received is still named, so the window shows what was quoted.
     assert_eq!(chat[2], "[引用的文件：gone.pdf（未能取回文件内容）]\n还有这个");
+    f.app.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shows_typing_while_the_orchestrator_works_and_takes_it_away_after() {
+    let (wechat, f) = quietly_bound(Duration::ZERO, Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Nothing at work: nothing is shown.
+    assert!(wechat.seen.lock().unwrap().typing.is_empty());
+    let gate = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let held = gate.clone();
+    f.script(model(move |_turn| {
+        let held = held.clone();
+        Box::pin(async move {
+            while held.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok("Done.".into())
+        })
+    }));
+    wechat.seen.lock().unwrap().batches.push_back(json!([from_bound("think-1", json!([{"type": 1, "text_item": {"text": "想一想"}}]))]));
+    // While the turn runs, "typing" is said and said again before it lapses.
+    f.until("typing is kept up", || wechat.seen.lock().unwrap().typing.iter().filter(|status| **status == 1).count() >= 3).await;
+    assert!(!wechat.seen.lock().unwrap().typing.contains(&2));
+    gate.store(false, std::sync::atomic::Ordering::SeqCst);
+    f.until("typing is taken away", || wechat.seen.lock().unwrap().typing.last() == Some(&2)).await;
+    let count = wechat.seen.lock().unwrap().typing.len();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(wechat.seen.lock().unwrap().typing.len(), count, "nothing more once idle");
     f.app.stop().await;
 }

@@ -121,7 +121,7 @@ impl Held {
 
 /// The bridge's state within the application.
 pub struct WeChatState {
-    protocol: Protocol,
+    pub(crate) protocol: Protocol,
     inner: Mutex<Inner>,
     burst: Mutex<Burst>,
     /// Files lately received, newest last.
@@ -196,7 +196,7 @@ fn message_id(message: &Value) -> String {
 }
 
 impl App {
-    fn wechat_account(&self) -> Option<Account> {
+    pub(crate) fn wechat_account(&self) -> Option<Account> {
         self.store.get::<Account>(ACCOUNT)
     }
 
@@ -448,7 +448,13 @@ impl App {
         inner.monitor = Some(Running { id, cancel });
         let app = self.clone();
         inner.monitor_task = Some(self.rt.spawn(async move {
-            app.wechat_poll(account, cancelled).await;
+            // The typing indicator lives as long as the poll, whether it is cancelled or the login ends.
+            let (done, until_done) = watch::channel(false);
+            let poll = async {
+                app.wechat_poll(account, cancelled).await;
+                done.send_replace(true);
+            };
+            tokio::join!(poll, app.wechat_typing(until_done));
             let mut inner = app.wechat.inner();
             if inner.monitor.as_ref().is_some_and(|monitor| monitor.id == id) {
                 inner.monitor = None;

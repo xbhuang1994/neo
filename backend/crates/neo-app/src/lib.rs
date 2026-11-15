@@ -27,3 +27,4 @@ pub mod views;
 pub mod watchdog;
 pub mod wechat;
 pub mod wechat_protocol;
+mod wechat_typing;

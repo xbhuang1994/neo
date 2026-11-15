@@ -169,6 +169,19 @@ impl App {
         }
         sent
     }
+    /// Whether any worker is in a turn, being started or woken, or has background work that will wake it.
+    pub fn workers_busy(&self) -> bool {
+        let inner = self.exec();
+        !inner.running.is_empty() || !inner.awaiting.is_empty() || !inner.starting.is_empty()
+    }
+
+    /// The tickets whose worker is in a turn, being started or woken, or has background work that will wake it.
+    pub fn busy_tickets(&self) -> Vec<String> {
+        let inner = self.exec();
+        let busy: std::collections::BTreeSet<&String> = inner.running.iter().chain(inner.awaiting.iter()).chain(inner.starting.keys()).collect();
+        busy.into_iter().cloned().collect()
+    }
+
     /// How many open tickets have a worker at work.
     pub fn active_workers(&self) -> usize {
         let running = self.exec().running.clone();

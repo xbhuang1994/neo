@@ -253,6 +253,10 @@ pub struct Protocol {
     pub burst_cap: Duration,
     /// How long files sent without words wait for the words that say what to do with them.
     pub file_wait: Duration,
+    /// How often the typing indicator looks whether the main Session or a worker is at work.
+    pub typing_check: Duration,
+    /// How often "typing" is said again while work goes on; WeChat lets it lapse after some seconds.
+    pub typing_keepalive: Duration,
 }
 
 impl Default for Protocol {
@@ -265,9 +269,14 @@ impl Default for Protocol {
             quiet: Duration::from_secs(3),
             burst_cap: Duration::from_secs(6),
             file_wait: Duration::from_secs(15),
+            typing_check: Duration::from_secs(1),
+            typing_keepalive: Duration::from_secs(5),
         }
     }
 }
+
+/// The most one call about the typing indicator waits, so that stopping never waits long on it.
+const TYPING_WAIT: Duration = Duration::from_secs(5);
 
 struct Call<'a> {
     method: &'static str,
@@ -351,6 +360,32 @@ impl Protocol {
         {
             Err(Error::Timeout) => Ok(json!({"ret": 0, "msgs": [], "get_updates_buf": cursor})),
             other => other,
+        }
+    }
+
+    /// The ticket that lets the bot show the bound user that it is typing.
+    pub async fn typing_ticket(&self, account: &Account) -> Result<String, Error> {
+        let body = json!({"ilink_user_id": account.user_id, "context_token": account.context_token});
+        let response = self
+            .call(&account.base_url, "ilink/bot/getconfig", Call { token: Some(&account.token), body: Some(body), timeout: TYPING_WAIT, ..Call::default() })
+            .await?;
+        match (response["ret"].as_i64(), response["typing_ticket"].as_str()) {
+            (None | Some(0), Some(ticket)) if !ticket.is_empty() => Ok(ticket.to_string()),
+            _ => Err(Error::Other(format!("微信未返回输入状态凭证：{}", response["errmsg"].as_str().unwrap_or("无说明")))),
+        }
+    }
+
+    /// Show the bound user "typing", or take it away.
+    pub async fn send_typing(&self, account: &Account, ticket: &str, typing: bool) -> Result<(), Error> {
+        let body = json!({"ilink_user_id": account.user_id, "typing_ticket": ticket, "status": if typing { 1 } else { 2 }});
+        let response = self
+            .call(&account.base_url, "ilink/bot/sendtyping", Call { token: Some(&account.token), body: Some(body), timeout: TYPING_WAIT, ..Call::default() })
+            .await?;
+        match response["ret"].as_i64() {
+            None | Some(0) => Ok(()),
+            Some(ret) => {
+                Err(Error::Other(format!("微信输入状态失败：{}", response["errmsg"].as_str().map(str::to_string).unwrap_or_else(|| format!("ret={ret}")))))
+            }
         }
     }
 
