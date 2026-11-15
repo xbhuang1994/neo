@@ -4,6 +4,7 @@ library;
 import 'package:cupertino_ui/cupertino_ui.dart';
 
 import '../l10n/strings.dart';
+import 'activity_ticker.dart';
 import 'chat_page.dart';
 import 'scope.dart';
 import 'settings_page.dart';
@@ -37,12 +38,20 @@ class _ShellState extends State<Shell> {
       (CupertinoIcons.gear, CupertinoIcons.gear_solid, strings.settings, 0),
     ];
     // Every page stays alive, so a draft or a scroll position survives a visit elsewhere.
-    final pages = IndexedStack(
-      index: _page,
+    final pages = Stack(
       children: [
-        ChatPage(onOpenSettings: () => _go(2), picker: widget.picker),
-        WorkersPage(onOpenSettings: () => _go(2)),
-        const SettingsPage(),
+        Positioned.fill(
+          child: IndexedStack(
+            index: _page,
+            children: [
+              ChatPage(onOpenSettings: () => _go(2), picker: widget.picker),
+              WorkersPage(onOpenSettings: () => _go(2)),
+              const SettingsPage(),
+            ],
+          ),
+        ),
+        // The chat page floats its own above the composer.
+        if (_page != 0) Positioned(right: 14, bottom: 10 + MediaQuery.paddingOf(context).bottom, child: const ActivityTicker()),
       ],
     );
     return LayoutBuilder(

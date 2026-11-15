@@ -11,6 +11,7 @@ import '../api/client.dart';
 import '../api/models.dart';
 import '../l10n/strings.dart';
 import '../state/app_state.dart';
+import 'activity_ticker.dart';
 import 'format.dart';
 import 'scope.dart';
 import 'theme.dart';
@@ -91,12 +92,20 @@ class ChatPage extends StatelessWidget {
           ),
           LinkNotice(onOpenSettings: onOpenSettings),
           Expanded(
-            child: state.messages.isEmpty
-                ? switch (state.link) {
-                    Link.starting || Link.connecting => const Center(child: CupertinoActivityIndicator(radius: 12)),
-                    _ => EmptyState(icon: CupertinoIcons.chat_bubble_2, title: strings.chatEmptyTitle, hint: strings.chatEmptyHint),
-                  }
-                : Transcript(messages: state.messages),
+            child: Stack(
+              children: [
+                Positioned.fill(
+                  child: state.messages.isEmpty
+                      ? switch (state.link) {
+                          Link.starting || Link.connecting => const Center(child: CupertinoActivityIndicator(radius: 12)),
+                          _ => EmptyState(icon: CupertinoIcons.chat_bubble_2, title: strings.chatEmptyTitle, hint: strings.chatEmptyHint),
+                        }
+                      : Transcript(messages: state.messages),
+                ),
+                // Floats over the newest messages, just above the composer.
+                const Positioned(right: 12, bottom: 6, child: ActivityTicker()),
+              ],
+            ),
           ),
           Composer(picker: picker),
         ],

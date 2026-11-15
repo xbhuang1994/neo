@@ -376,3 +376,33 @@ class Health {
     return null;
   }
 }
+
+/// What one busy worker is doing now, in a line.
+class WorkerDoing {
+  WorkerDoing.fromJson(Map<String, dynamic> json)
+    : ticketId = json['ticketId'] as String? ?? '',
+      title = json['title'] as String? ?? '',
+      doing = json['doing'] as String? ?? '';
+
+  final String ticketId;
+  final String title;
+  final String doing;
+}
+
+/// What is at work now: whether the router is thinking, and what each busy worker is doing.
+class Activity {
+  Activity.fromJson(Map<String, dynamic> json)
+    : router = json['router'] == true,
+      workers = [for (final worker in _list(json['workers'])) WorkerDoing.fromJson(_map(worker))],
+      raw = jsonEncode(json);
+
+  const Activity.idle() : router = false, workers = const [], raw = '';
+
+  final bool router;
+  final List<WorkerDoing> workers;
+
+  /// The JSON this was read from, to tell whether anything changed.
+  final String raw;
+
+  bool get busy => router || workers.isNotEmpty;
+}

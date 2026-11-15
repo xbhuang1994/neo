@@ -57,6 +57,57 @@ Finder nav(int index) => find.byKey(ValueKey('nav-$index'));
 Finder button(String label) => find.bySemanticsLabel(label);
 
 void main() {
+  testWidgets('floats what is at work at the bottom right and turns through it', (tester) async {
+    final backend = FakeBackend();
+    final app = await open(tester, backend);
+    final ticker = find.byKey(const ValueKey('activity-ticker'));
+    expect(ticker, findsNothing);
+
+    backend.activity = {'router': true, 'workers': <Map<String, dynamic>>[]};
+    await app.state.refresh();
+    await tester.pump();
+    expect(find.text('router 正在思考中…'), findsOneWidget);
+    // At the bottom right, above the composer.
+    final box = tester.getRect(ticker);
+    expect(box.right, greaterThan(wide.width - 40));
+    expect(box.bottom, lessThan(tester.getRect(find.byType(CupertinoTextField)).top));
+
+    backend.activity = {
+      'router': true,
+      'workers': [
+        {'ticketId': 't1', 'title': '修复首页', 'doing': 'bash · cargo test'},
+        {'ticketId': 't2', 'title': '', 'doing': '后台 · make train'},
+      ],
+    };
+    await app.state.refresh();
+    await tester.pump();
+    expect(find.text('1/3'), findsOneWidget);
+    await tester.pump(const Duration(seconds: 3));
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(find.text('修复首页 · bash · cargo test'), findsOneWidget);
+    expect(find.text('2/3'), findsOneWidget);
+    await tester.pump(const Duration(seconds: 3));
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(find.text('后台 · make train'), findsOneWidget);
+
+    // On another page it floats there too; and it goes once nothing is at work.
+    await tester.tap(nav(1));
+    await tester.pump();
+    expect(ticker, findsOneWidget);
+    backend.activity = {'router': false, 'workers': <Map<String, dynamic>>[]};
+    await app.state.refresh();
+    await tester.pump();
+    expect(ticker, findsNothing);
+
+    // A backend too old to say shows nothing.
+    backend.activity = null;
+    await app.state.refresh();
+    await tester.pump();
+    expect(ticker, findsNothing);
+    expect(app.state.link, Link.online);
+    await app.close();
+  });
+
   testWidgets('sends a message and shows the answer', (tester) async {
     final backend = FakeBackend();
     final app = await open(tester, backend);

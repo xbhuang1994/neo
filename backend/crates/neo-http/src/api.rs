@@ -130,6 +130,7 @@ async fn route(app: &Arc<App>, request: &Request) -> Result<Response, Response> 
         ("GET", "/api/health") => ok(app.health_view()),
         ("GET", "/api/messages") => ok(json!({"messages": app.panel_messages()})),
         ("GET", "/api/workers") => ok(json!({"workers": app.worker_cards().await})),
+        ("GET", "/api/activity") => ok(app.activity_view().await),
         ("GET", path) if path.starts_with("/api/workers/") => match app.worker_detail(&path["/api/workers/".len()..]).await {
             Some(worker) => ok(worker),
             None => Err(Response::error(404, "Worker not found")),

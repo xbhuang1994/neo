@@ -8,6 +8,8 @@ use neo_app::kernels::{ModelOption, SessionRole};
 use neo_app::sessions::ChatAttachment;
 use neo_app::settings::Kernel;
 use serde_json::{json, Value};
+use std::sync::Arc;
+use std::time::Duration;
 
 fn option(provider: &str, id: &str) -> ModelOption {
     ModelOption { id: id.into(), provider: provider.into(), name: format!("{provider} {id}") }
@@ -102,6 +104,51 @@ async fn shows_a_running_worker_with_its_question_and_jobs() {
     assert_eq!((card["session"]["loaded"].as_bool(), card["outcome"].is_null()), (Some(true), true));
     assert_eq!(card["progress"]["state"], "progress");
     f.app.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shows_what_is_at_work_for_the_ticker() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let f = started().await;
+    assert_eq!(f.app.activity_view().await, json!({"router": false, "workers": []}));
+    let (router_gate, worker_gate) = (Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(true)));
+    let (router_held, worker_held) = (router_gate.clone(), worker_gate.clone());
+    f.script(model(move |turn| {
+        let (router_held, worker_held) = (router_held.clone(), worker_held.clone());
+        Box::pin(async move {
+            match turn.role {
+                SessionRole::Worker => {
+                    turn.call("orchestrator_report", json!({"state": "progress", "summary": "Training the model.\nEpoch 1."})).await?;
+                    while worker_held.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    core_model()(turn).await
+                }
+                _ => {
+                    while router_held.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    core_model()(turn).await
+                }
+            }
+        })
+    }));
+    f.app.receive_web("Train it.", vec![], None).await.unwrap();
+    f.until("the router thinks", || block(f.app.activity_view())["router"] == true).await;
+    router_gate.store(false, Ordering::SeqCst);
+    f.until("the worker says what it does", || {
+        block(f.app.activity_view())["workers"].as_array().is_some_and(|workers| workers.len() == 1 && workers[0]["doing"] == "Training the model.")
+    })
+    .await;
+    assert_eq!(f.app.activity_view().await["workers"][0]["title"], "Fix fixture typo");
+    worker_gate.store(false, Ordering::SeqCst);
+    f.until("nothing is at work", || block(f.app.activity_view()) == json!({"router": false, "workers": []})).await;
+    f.app.stop().await;
+}
+
+/// Wait for a future from a synchronous condition.
+fn block<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -87,6 +87,9 @@ class AppState extends ChangeNotifier {
   List<Worker> workers = const [];
   Health? health;
 
+  /// What is at work now, for the ticker.
+  Activity activity = const Activity.idle();
+
   /// The worker whose detail is shown, with its recent activity.
   Worker? detail;
   String? selectedWorkerId;
@@ -135,6 +138,7 @@ class AppState extends ChangeNotifier {
     messages = const [];
     workers = const [];
     health = null;
+    activity = const Activity.idle();
     detail = null;
     _messagesRaw = '';
     _workersRaw = '';
@@ -218,6 +222,7 @@ class AppState extends ChangeNotifier {
       _ticks++;
       final (fetched, raw) = await api.messages();
       final fetchedWorkers = await api.workers();
+      final fetchedActivity = await api.activity();
       final fetchedHealth = wantHealth ? await api.health() : null;
       final selected = selectedWorkerId;
       Worker? fetchedDetail;
@@ -238,6 +243,10 @@ class AppState extends ChangeNotifier {
       if (workersRaw != _workersRaw) {
         _workersRaw = workersRaw;
         workers = fetchedWorkers;
+        changed = true;
+      }
+      if (fetchedActivity.raw != activity.raw) {
+        activity = fetchedActivity;
         changed = true;
       }
       if (fetchedHealth != null) {

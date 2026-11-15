@@ -72,6 +72,7 @@ JSON over HTTP, as [006 Deployment](006-deployment.md) says who may call. Errors
 | `GET /api/messages` | `{messages}`: the visible conversation, each `{id, role: user\|assistant, text, at, source, images?, files?}` |
 | `GET /api/workers` | `{workers}`: every Ticket with its worker: `{ticketId, title, stage, outcome, updatedAt, directory, digest, session, background, assignment, progress, attention, pendingInputs, delivery}` |
 | `GET /api/workers/{ticketId}` | The same with `inputs` and `recent`, the worker's latest thirty transcript entries |
+| `GET /api/activity` | `{router, workers}`: whether the main Session is thinking, and for each busy worker `{ticketId, title, doing}`, a line on what it does now: its latest tool call or line while in a turn, else its background job, else its latest report. The app's ticker polls it |
 | `POST /api/chat` | `{text, attachments?, messageId?}` → 202 `{requestId, triggerId, result: stored\|duplicate\|filtered}`. At most 8000 characters and 3 attachments of 5 MiB, each `{name, mediaType, data}` with base64 data. The same `messageId` is the same message |
 | `POST /api/session/reset` | Empties the conversation; Tickets and workers stay |
 | `GET /api/settings/models` | `{kernel, kernels, supports, current, available, problem}` |

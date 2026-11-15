@@ -90,6 +90,16 @@ class ApiClient {
     return [for (final worker in list) Worker.fromJson((worker as Map).cast<String, dynamic>())];
   }
 
+  /// What is at work now; idle from a backend too old to say.
+  Future<Activity> activity() async {
+    try {
+      return Activity.fromJson(await _object('GET', '/api/activity', timeout: const Duration(seconds: 5)));
+    } on ApiException catch (error) {
+      if (error.status == 404) return const Activity.idle();
+      rethrow;
+    }
+  }
+
   Future<Worker> worker(String ticketId) async => Worker.fromJson(await _object('GET', '/api/workers/${Uri.encodeComponent(ticketId)}'));
 
   /// Send a chat message; the same [messageId] is the same message however often it is sent.

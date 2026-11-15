@@ -45,6 +45,35 @@ fn activity(entry: &Entry) -> (&'static str, String) {
     (role, clip(&parts.join("\n"), 4000))
 }
 
+/// The longest line the activity ticker shows of what a worker does.
+const DOING_CHARS: usize = 80;
+
+/// What a tool call does, in a line: its name and its telling argument.
+fn tool_line(name: &str, arguments: &Value) -> String {
+    let telling = ["description", "command", "file_path", "path", "pattern", "query", "url", "summary", "prompt", "text"]
+        .iter()
+        .find_map(|field| arguments[*field].as_str().map(str::trim).filter(|value| !value.is_empty()));
+    match telling {
+        Some(value) => format!("{name} · {}", value.lines().next().unwrap_or(value)),
+        None => name.to_string(),
+    }
+}
+
+/// What a worker's transcript says it is doing now: its latest tool call, else the latest line it wrote.
+fn doing(entries: &[Entry]) -> Option<String> {
+    entries.iter().rev().find_map(|entry| {
+        let Entry::Message { message, .. } = entry else { return None };
+        if message.role != Role::Assistant {
+            return None;
+        }
+        message.content.iter().rev().find_map(|block| match block {
+            Block::ToolCall { name, arguments, .. } => Some(tool_line(name, arguments)),
+            Block::Text { text } => text.lines().rev().map(str::trim).find(|line| !line.is_empty()).map(str::to_string),
+            Block::Image { .. } => None,
+        })
+    })
+}
+
 /// The files a chat entry says were attached: name, media type, and whether it is an image, an inlined text or a file.
 fn attachments(entry: &Entry) -> Vec<(String, String, &'static str)> {
     let Entry::CustomMessage { details: Some(details), .. } = entry else { return Vec::new() };
@@ -101,6 +130,33 @@ impl App {
             "activeWorkers": self.active_workers(),
             "components": self.board.all(),
         })
+    }
+
+    /// What is at work now, for the app's ticker: whether the main Session is thinking, and a line for each busy
+    /// worker on what it is doing. Read from memory only, so the app may ask every few seconds.
+    pub async fn activity_view(&self) -> Value {
+        let router = self.router_thinking();
+        let mut workers = Vec::new();
+        for ticket_id in self.busy_tickets() {
+            let Some(ticket) = self.store_ticket(&ticket_id).filter(|ticket| ticket.ended.is_none()) else { continue };
+            let loaded = self.session(&worker_session_id(&ticket_id));
+            let streaming = loaded.as_ref().is_some_and(|loaded| loaded.session.is_streaming());
+            let recent = loaded.as_ref().map(|loaded| {
+                let journal = loaded.session.journal();
+                journal.entries_from(journal.len().saturating_sub(12))
+            });
+            let jobs = self.running_jobs(&ticket_id).await;
+            let job = jobs.first().map(|job| format!("后台 · {}", job.label.lines().next().unwrap_or("")));
+            let report = ticket.latest().and_then(|assignment| assignment.report.as_ref()).map(|report| report.summary.clone());
+            let line = match (streaming, recent.as_deref().and_then(doing), job) {
+                (true, Some(line), _) => line,
+                (_, _, Some(job)) => job,
+                (_, line, None) => line.or(report).unwrap_or_else(|| "准备中".to_string()),
+            };
+            let line = line.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("准备中");
+            workers.push(json!({"ticketId": ticket.id, "title": ticket.title, "doing": clip(line, DOING_CHARS)}));
+        }
+        json!({"router": router, "workers": workers})
     }
 
     /// The conversation as people see it: what they wrote, in the app or WeChat, and what they were answered.
@@ -370,6 +426,26 @@ mod tests {
         assert_eq!(stage_json(TicketStage::Working { queued: true }), json!({"stage": "working", "action": "queued"}));
         assert_eq!(stage_json(TicketStage::Working { queued: false }), json!({"stage": "working"}));
         assert_eq!((stage_json(TicketStage::Idle), stage_json(TicketStage::Ended)), (json!({"stage": "idle"}), json!({"stage": "ended"})));
+    }
+
+    #[test]
+    fn says_what_a_worker_does_by_its_latest_tool_call_or_line() {
+        let said = |role: Role, content: Vec<Block>| Entry::Message {
+            id: "1".into(),
+            timestamp: String::new(),
+            message: Message { role, content, stop_reason: None },
+        };
+        let call = |name: &str, arguments: Value| Block::ToolCall { id: "c".into(), name: name.into(), arguments };
+        let entries = vec![
+            said(Role::Assistant, vec![Block::text("Old.")]),
+            said(Role::Assistant, vec![Block::text("Running tests."), call("bash", json!({"command": "cargo test\n--all", "timeout": 60}))]),
+            said(Role::ToolResult, vec![Block::text("ok")]),
+        ];
+        assert_eq!(doing(&entries).as_deref(), Some("bash · cargo test"));
+        assert_eq!(doing(&entries[..1]).as_deref(), Some("Old."));
+        assert_eq!(doing(&[said(Role::Assistant, vec![call("todo", json!({}))])]).as_deref(), Some("todo"));
+        assert_eq!(doing(&[said(Role::Assistant, vec![Block::text("First.\n\nLast line.  \n")])]).as_deref(), Some("Last line."));
+        assert_eq!(doing(&[]), None);
     }
 
     #[test]

@@ -22,6 +22,9 @@ class FakeBackend {
   final List<Map<String, dynamic>> messages = [];
   final List<Map<String, dynamic>> workers = [];
   final Map<String, Map<String, dynamic>> details = {};
+
+  /// What `/api/activity` says is at work; null answers 404, as a backend too old to say.
+  Map<String, dynamic>? activity = {'router': false, 'workers': <Map<String, dynamic>>[]};
   final List<Map<String, dynamic>> chats = [];
   final List<String> calls = [];
   int resets = 0;
@@ -147,6 +150,9 @@ class FakeBackend {
         return _json(200, {'messages': messages});
       case ('GET', '/api/workers'):
         return _json(200, {'workers': workers});
+      case ('GET', '/api/activity'):
+        final now = activity;
+        return now == null ? _json(404, {'error': 'Not found'}) : _json(200, now);
       case ('POST', '/api/chat'):
         chats.add((body as Map).cast<String, dynamic>());
         if (chatError != null) {

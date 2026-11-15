@@ -33,6 +33,9 @@ abstract class Strings {
   String get retry;
   String get paused;
 
+  // Activity ticker
+  String get routerThinking;
+
   // Chat
   String get chatEmptyTitle;
   String get chatEmptyHint;
@@ -217,6 +220,8 @@ class ZhStrings extends Strings {
   String get retry => '重试';
   @override
   String get paused => '已暂停';
+  @override
+  String get routerThinking => 'router 正在思考中…';
 
   @override
   String get chatEmptyTitle => '开始对话';
@@ -539,6 +544,8 @@ class EnStrings extends Strings {
   String get retry => 'Retry';
   @override
   String get paused => 'Paused';
+  @override
+  String get routerThinking => 'Router is thinking…';
 
   @override
   String get chatEmptyTitle => 'Start a conversation';

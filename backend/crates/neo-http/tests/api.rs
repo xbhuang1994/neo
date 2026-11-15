@@ -69,6 +69,7 @@ async fn serves_every_route_of_the_app() {
     assert_eq!((status, health["ready"].as_bool(), health["kernel"].as_str()), (200, Some(true), Some("omp")));
     assert_eq!(api.get("/api/messages").await, (200, json!({"messages": []})));
     assert_eq!(api.get("/api/workers").await, (200, json!({"workers": []})));
+    assert_eq!(api.get("/api/activity").await, (200, json!({"router": false, "workers": []})));
 
     // A chat message is taken once, however often it is sent.
     let message = json!({"text": "  Please fix the typo in the fixture.  ", "messageId": "web:m1", "attachments": [{"name": "notes.md", "mediaType": "text/markdown", "data": "IyBOb3Rlcw=="}]});
