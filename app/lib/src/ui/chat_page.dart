@@ -45,14 +45,17 @@ class ChatPage extends StatelessWidget {
     final strings = Strings.read(context);
     final confirmed = await showCupertinoDialog<bool>(
       context: context,
-      builder: (context) => CupertinoAlertDialog(
-        title: Text(strings.resetConfirmTitle),
-        content: Text(strings.resetConfirmBody),
-        actions: [
-          CupertinoDialogAction(onPressed: () => Navigator.of(context).pop(false), child: Text(strings.cancel)),
-          CupertinoDialogAction(isDestructiveAction: true, onPressed: () => Navigator.of(context).pop(true), child: Text(strings.reset)),
-        ],
-      ),
+      builder: (context) {
+        final fonts = fallbackFonts(context);
+        return CupertinoAlertDialog(
+          title: Text(strings.resetConfirmTitle, style: fonts),
+          content: Text(strings.resetConfirmBody, style: fonts),
+          actions: [
+            CupertinoDialogAction(onPressed: () => Navigator.of(context).pop(false), child: Text(strings.cancel, style: fonts)),
+            CupertinoDialogAction(isDestructiveAction: true, onPressed: () => Navigator.of(context).pop(true), child: Text(strings.reset, style: fonts)),
+          ],
+        );
+      },
     );
     if (confirmed != true || !context.mounted) return;
     try {
@@ -61,10 +64,13 @@ class ChatPage extends StatelessWidget {
       if (!context.mounted) return;
       await showCupertinoDialog<void>(
         context: context,
-        builder: (context) => CupertinoAlertDialog(
-          content: Text(error.message),
-          actions: [CupertinoDialogAction(onPressed: () => Navigator.of(context).pop(), child: Text(strings.ok))],
-        ),
+        builder: (context) {
+          final fonts = fallbackFonts(context);
+          return CupertinoAlertDialog(
+            content: Text(error.message, style: fonts),
+            actions: [CupertinoDialogAction(onPressed: () => Navigator.of(context).pop(), child: Text(strings.ok, style: fonts))],
+          );
+        },
       );
     }
   }

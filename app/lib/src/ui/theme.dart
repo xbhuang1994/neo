@@ -80,6 +80,12 @@ class Typo {
   TextStyle get mono => _base.copyWith(fontSize: 12.5, height: 1.45, fontFamily: monospace.first, fontFamilyFallback: [...monospace.skip(1), cjkFont], letterSpacing: 0);
 }
 
+/// The theme's fallback fonts alone, for texts in widgets that set their own font instead of the theme's.
+///
+/// An alert dialog draws in fonts of its own, so the bundled Chinese font of the web build does not reach it, and its
+/// Chinese would show as empty boxes; this style, given to its texts, brings that font back.
+TextStyle fallbackFonts(BuildContext context) => TextStyle(fontFamilyFallback: CupertinoTheme.of(context).textTheme.textStyle.fontFamilyFallback);
+
 /// The app's theme: the system's blue, and the system's appearance unless [brightness] is given.
 CupertinoThemeData appTheme({Brightness? brightness, bool bundledCjk = false}) {
   final text = const CupertinoTextThemeData().textStyle.copyWith(fontFamilyFallback: bundledCjk ? const [cjkFont] : null);

@@ -8,6 +8,7 @@ import 'package:neo_agent/src/platform/host.dart';
 import 'package:neo_agent/src/qr/qr_view.dart';
 import 'package:neo_agent/src/state/app_state.dart';
 import 'package:neo_agent/src/ui/chat_page.dart';
+import 'package:neo_agent/src/ui/theme.dart' show cjkFont;
 import 'package:neo_agent/src/ui/widgets.dart';
 
 import 'fake_backend.dart';
@@ -36,13 +37,13 @@ class Running {
   }
 }
 
-Future<Running> open(WidgetTester tester, FakeBackend backend, {Size size = wide, Locale locale = const Locale('zh'), FakeHost? host, FilePicker? picker, Brightness? brightness}) async {
+Future<Running> open(WidgetTester tester, FakeBackend backend, {Size size = wide, Locale locale = const Locale('zh'), FakeHost? host, FilePicker? picker, Brightness? brightness, bool bundledCjk = false}) async {
   tester.view.physicalSize = size;
   tester.view.devicePixelRatio = 1;
   addTearDown(tester.view.reset);
   final state = stateOver(backend, host: host);
   await state.start();
-  await tester.pumpWidget(NeoAgentApp(state: state, locale: locale, brightness: brightness, picker: picker ?? () async => []));
+  await tester.pumpWidget(NeoAgentApp(state: state, locale: locale, brightness: brightness, bundledCjk: bundledCjk, picker: picker ?? () async => []));
   await settle(tester);
   return Running(tester, state);
 }
@@ -263,6 +264,21 @@ void main() {
     expect(backend.resets, 1);
     expect(find.text('你好'), findsNothing);
     expect(find.text('开始对话'), findsOneWidget);
+    await app.close();
+  });
+
+  testWidgets('draws the reset dialog in the bundled Chinese font', (tester) async {
+    final backend = FakeBackend()..say('user', '你好');
+    final app = await open(tester, backend, bundledCjk: true);
+    await tester.tap(button('重置会话'));
+    await settle(tester);
+    // The dialog sets its own font, so without the fallback its Chinese shows as empty boxes on the web.
+    for (final label in ['重置会话？', '取消', '重置']) {
+      final drawn = tester.widget<RichText>(find.descendant(of: find.text(label), matching: find.byType(RichText)));
+      expect(drawn.text.style?.fontFamilyFallback, contains(cjkFont), reason: label);
+    }
+    await tester.tap(find.text('取消'));
+    await settle(tester);
     await app.close();
   });
 
