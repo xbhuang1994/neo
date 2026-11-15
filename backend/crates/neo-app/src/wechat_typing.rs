@@ -1,6 +1,6 @@
-//! The WeChat typing indicator: a plain local loop beside the long poll, with no model in it, that keeps "正在输入"
-//! showing in the bound user's chat while the main Session thinks or a worker is at work, and takes it away once
-//! neither is.
+//! The WeChat typing indicator: a plain local loop beside the long poll, with no model in it, that makes "正在输入"
+//! blink in the bound user's chat while the main Session thinks or a worker is at work, so the person sees the work
+//! is alive, and takes it away once neither is.
 
 use crate::app::App;
 use crate::wechat_protocol::{Account, Error, Protocol};
@@ -16,8 +16,10 @@ const TICKET_LIFE: Duration = Duration::from_secs(30 * 60);
 struct Indicator {
     /// The ticket WeChat gave for it, and when.
     ticket: Option<(String, Instant)>,
-    /// When "typing" was last said, while it shows.
-    shown: Option<Instant>,
+    /// "Typing" shows now.
+    shown: bool,
+    /// When it was last shown or taken away during work.
+    since: Option<Instant>,
     /// After a failure, when to try again.
     retry_at: Option<Instant>,
     /// A failure was logged and nothing has worked since, so the next is not logged again.
@@ -28,7 +30,7 @@ impl Indicator {
     fn failed(&mut self, protocol: &Protocol, error: Error) {
         // A ticket that failed may be the reason: the next try asks for a new one.
         self.ticket = None;
-        self.retry_at = Some(Instant::now() + protocol.typing_keepalive);
+        self.retry_at = Some(Instant::now() + protocol.typing_on);
         if !std::mem::replace(&mut self.failing, true) {
             eprintln!("[neo-agent] 微信输入状态暂时失败：{error}");
         }
@@ -67,7 +69,7 @@ impl App {
                 _ = tokio::time::sleep(protocol.typing_check) => {}
             }
         }
-        if let (Some(account), Some(_), Some((ticket, _))) = (self.wechat_account(), indicator.shown, &indicator.ticket) {
+        if let (Some(account), true, Some((ticket, _))) = (self.wechat_account(), indicator.shown, &indicator.ticket) {
             let _ = protocol.send_typing(&account, ticket, false).await;
         }
     }
@@ -78,7 +80,9 @@ impl App {
             return;
         }
         if !busy {
-            if indicator.shown.take().is_some() {
+            indicator.since = None;
+            if indicator.shown {
+                indicator.shown = false;
                 if let Some((ticket, _)) = &indicator.ticket {
                     match protocol.send_typing(account, ticket, false).await {
                         Ok(()) => indicator.worked(),
@@ -88,7 +92,9 @@ impl App {
             }
             return;
         }
-        if indicator.shown.is_some_and(|at| now < at + protocol.typing_keepalive) {
+        // At work: shown for `typing_on`, away for `typing_off`, and so on.
+        let held = if indicator.shown { protocol.typing_on } else { protocol.typing_off };
+        if indicator.since.is_some_and(|since| now < since + held) {
             return;
         }
         let ticket = match indicator.ticket.clone().filter(|(_, at)| now < *at + TICKET_LIFE) {
@@ -101,9 +107,11 @@ impl App {
                 Err(error) => return indicator.failed(protocol, error),
             },
         };
-        match protocol.send_typing(account, &ticket, true).await {
+        let show = !indicator.shown;
+        match protocol.send_typing(account, &ticket, show).await {
             Ok(()) => {
-                indicator.shown = Some(now);
+                indicator.shown = show;
+                indicator.since = Some(now);
                 indicator.worked();
             }
             Err(error) => indicator.failed(protocol, error),

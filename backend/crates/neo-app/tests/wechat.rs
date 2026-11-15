@@ -177,7 +177,8 @@ async fn bound_with(wechat: &WeChat, quiet: Duration, file_wait: Duration) -> Fi
         burst_cap: Duration::from_secs(2),
         file_wait,
         typing_check: Duration::from_millis(20),
-        typing_keepalive: Duration::from_millis(100),
+        typing_on: Duration::from_millis(100),
+        typing_off: Duration::from_millis(60),
         ..Protocol::at(&wechat.server.url(), &format!("{}/cdn", wechat.server.url()))
     };
     *kernels.model.lock().unwrap() = Some(model(|turn| {
@@ -504,7 +505,7 @@ async fn finds_a_file_quoted_by_its_name_alone_among_those_lately_received() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn shows_typing_while_the_orchestrator_works_and_takes_it_away_after() {
+async fn blinks_typing_while_the_orchestrator_works_and_takes_it_away_after() {
     let (wechat, f) = quietly_bound(Duration::ZERO, Duration::from_secs(10)).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     // Nothing at work: nothing is shown.
@@ -521,9 +522,10 @@ async fn shows_typing_while_the_orchestrator_works_and_takes_it_away_after() {
         })
     }));
     wechat.seen.lock().unwrap().batches.push_back(json!([from_bound("think-1", json!([{"type": 1, "text_item": {"text": "想一想"}}]))]));
-    // While the turn runs, "typing" is said and said again before it lapses.
-    f.until("typing is kept up", || wechat.seen.lock().unwrap().typing.iter().filter(|status| **status == 1).count() >= 3).await;
-    assert!(!wechat.seen.lock().unwrap().typing.contains(&2));
+    // While the turn runs, "typing" blinks: shown, taken away, shown again, and so on.
+    f.until("typing blinks", || wechat.seen.lock().unwrap().typing.len() >= 5).await;
+    let blinks = wechat.seen.lock().unwrap().typing.clone();
+    assert!(blinks.iter().enumerate().all(|(at, status)| *status == if at % 2 == 0 { 1 } else { 2 }), "{blinks:?}");
     gate.store(false, std::sync::atomic::Ordering::SeqCst);
     f.until("typing is taken away", || wechat.seen.lock().unwrap().typing.last() == Some(&2)).await;
     let count = wechat.seen.lock().unwrap().typing.len();

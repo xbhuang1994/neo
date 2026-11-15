@@ -255,8 +255,11 @@ pub struct Protocol {
     pub file_wait: Duration,
     /// How often the typing indicator looks whether the main Session or a worker is at work.
     pub typing_check: Duration,
-    /// How often "typing" is said again while work goes on; WeChat lets it lapse after some seconds.
-    pub typing_keepalive: Duration,
+    /// While work goes on, "typing" blinks: shown this long, then taken away for `typing_off`, so the person sees the
+    /// work is alive and not stuck.
+    pub typing_on: Duration,
+    /// How long "typing" stays away between two blinks.
+    pub typing_off: Duration,
 }
 
 impl Default for Protocol {
@@ -269,8 +272,9 @@ impl Default for Protocol {
             quiet: Duration::from_secs(3),
             burst_cap: Duration::from_secs(6),
             file_wait: Duration::from_secs(15),
-            typing_check: Duration::from_secs(1),
-            typing_keepalive: Duration::from_secs(5),
+            typing_check: Duration::from_millis(250),
+            typing_on: Duration::from_secs(2),
+            typing_off: Duration::from_secs(1),
         }
     }
 }
