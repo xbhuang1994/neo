@@ -202,7 +202,7 @@ pub fn mime_of(name: &str) -> &'static str {
 }
 
 /// A file name without separators and control characters, 200 characters at most.
-fn safe_name(name: Option<&str>, fallback: &str) -> String {
+pub(crate) fn safe_name(name: Option<&str>, fallback: &str) -> String {
     let cleaned: String = name.unwrap_or("").chars().map(|c| if matches!(c, '/' | '\\') || c.is_control() { '_' } else { c }).collect();
     let cleaned: String = cleaned.trim().chars().take(200).collect();
     if cleaned.is_empty() {
@@ -245,11 +245,27 @@ pub struct Protocol {
     pub cdn_base: String,
     /// Between two questions about a login, and the first wait after a failed poll.
     pub pace: Duration,
+    /// How long one question about a login may wait for its answer; WeChat holds each for about half a minute.
+    pub status_wait: Duration,
+    /// How long the bridge waits after a message with words for more of the same burst; zero takes each at once.
+    pub quiet: Duration,
+    /// The longest a burst with words is held after its first words.
+    pub burst_cap: Duration,
+    /// How long files sent without words wait for the words that say what to do with them.
+    pub file_wait: Duration,
 }
 
 impl Default for Protocol {
     fn default() -> Self {
-        Protocol { api_base: API_URL.into(), cdn_base: CDN_URL.into(), pace: Duration::from_secs(1) }
+        Protocol {
+            api_base: API_URL.into(),
+            cdn_base: CDN_URL.into(),
+            pace: Duration::from_secs(1),
+            status_wait: Duration::from_secs(45),
+            quiet: Duration::from_secs(3),
+            burst_cap: Duration::from_secs(6),
+            file_wait: Duration::from_secs(15),
+        }
     }
 }
 
@@ -309,12 +325,18 @@ impl Protocol {
     /// Where a login stands; the call waits up to 35 seconds for a change.
     pub async fn qr_status(&self, id: &str, base: &str, verify_code: Option<&str>) -> Result<Value, Error> {
         let code = verify_code.map(|code| format!("&verify_code={}", query(code))).unwrap_or_default();
-        self.call(
-            base,
-            &format!("ilink/bot/get_qrcode_status?qrcode={}{code}", query(id)),
-            Call { method: "GET", timeout: Duration::from_secs(35), ..Call::default() },
-        )
-        .await
+        let asked = self
+            .call(
+                base,
+                &format!("ilink/bot/get_qrcode_status?qrcode={}{code}", query(id)),
+                Call { method: "GET", timeout: self.status_wait, ..Call::default() },
+            )
+            .await;
+        // WeChat holds the question open until something changes: no answer in time means nothing changed yet.
+        match asked {
+            Err(Error::Timeout) => Ok(json!({"status": "wait"})),
+            other => other,
+        }
     }
 
     /// Long-poll for messages after `cursor`; a poll that times out is an empty one.

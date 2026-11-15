@@ -767,6 +767,9 @@ pub struct Ticket {
     /// The latest failed delivery of an Input to its worker, until a delivery succeeds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery: Option<DeliveryFailure>,
+    /// When the report was made whose result a person was sent: that report's result is not sent a second time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_sent: Option<String>,
 }
 
 impl Ticket {

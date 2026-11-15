@@ -151,6 +151,16 @@ impl Engine {
             None => key(&["reply", trigger.as_ref().map(|t| t.id.as_str()).or(ticket.as_ref().map(|t| t.id.as_str())).unwrap_or(""), &request.text]),
         };
         let existing = self.o.outbox.status(&id);
+        // A result goes out once per report: the same words again reuse the message, and other words are refused, so
+        // that a worker's direct reply is not followed by the orchestrator's paraphrase of it.
+        let reported = ticket.as_ref().and_then(|ticket| ticket.latest_report().map(|report| report.at.clone()));
+        if request.purpose == Purpose::Result
+            && existing.is_none()
+            && reported.is_some()
+            && ticket.as_ref().and_then(|ticket| ticket.result_sent.clone()) == reported
+        {
+            return Err(UserError::new("resultSent"));
+        }
         let answered = match (&ticket, &trigger) {
             (Some(ticket), Some(trigger)) => ticket.answers.contains(&trigger.id),
             _ => true,
@@ -174,6 +184,12 @@ impl Engine {
             kind: MessageKind::Reply,
             ticket_id: ticket.as_ref().map(|t| t.id.clone()),
         });
+        if request.purpose == Purpose::Result {
+            if let Some(ticket) = ticket.as_mut().filter(|ticket| ticket.result_sent != reported) {
+                ticket.result_sent = reported;
+                self.repo().save_ticket(ticket);
+            }
+        }
         if request.purpose == Purpose::Answer {
             if let (Some(ticket), Some(trigger)) = (ticket.as_mut(), &trigger) {
                 if ticket.answers.contains(&trigger.id) {

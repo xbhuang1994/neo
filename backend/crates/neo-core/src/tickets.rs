@@ -49,6 +49,7 @@ impl Engine {
             origin,
             execution: None,
             delivery: None,
+            result_sent: None,
         };
         let triggers: Vec<Trigger> = trigger_ids.iter().filter_map(|trigger_id| self.repo().trigger(trigger_id)).collect();
         for channel in triggers.iter().filter_map(|trigger| trigger.channel.as_ref()) {

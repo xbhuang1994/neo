@@ -771,6 +771,9 @@ fn sends_an_answer_only_after_the_worker_reported_it_a_result_only_when_ready_an
     assert_eq!(h.engine.reply(result(&ticket_id, "Done")).unwrap().status, ReplyStatus::Pending);
     assert_eq!(h.outbox().pop().unwrap().channel, channel("1"));
     assert!(h.engine.reply(result(&ticket_id, "Done")).unwrap().reused);
+    // The same result in other words is refused: the person has it.
+    assert_eq!(Harness::code(h.engine.reply(result(&ticket_id, "It is done, in other words."))), "resultSent");
+    assert_eq!(h.outbox().iter().filter(|message| message.kind == MessageKind::Reply && message.channel == channel("1")).count(), 1);
 }
 
 #[test]

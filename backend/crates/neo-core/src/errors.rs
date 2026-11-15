@@ -32,6 +32,7 @@ pub const USER_ERRORS: &[(&str, bool, &str)] = &[
     ("ackNoChannel", false, "Acknowledgement requires an assigned human source message"),
     ("ackNotPerson", false, "Use the original human trigger, not a bot or worker report"),
     ("notReady", false, "Ticket is not ready for delivery. Keep progress internal and wait for a verified ready report; do not relabel progress as an answer or send it through another channel."),
+    ("resultSent", false, "This ticket's result already went to the person, by its worker's direct reply or an earlier reply. Do not send it again in other words; a new result needs a new ready report."),
     ("notAttention", false, "Attention requires the ticket's current attention question in human_action. Routine unfinished work stays internal."),
     ("notQuestion", false, "An answer must target the original human question, not a worker report or automated trigger"),
     ("noAnswer", false, "No worker answer is ready for this human trigger. Wait for the worker's report, or request one with orchestrator_ticket_request_status, which acts only on a worker that reported waiting; ordinary progress cannot be relabelled as an answer."),

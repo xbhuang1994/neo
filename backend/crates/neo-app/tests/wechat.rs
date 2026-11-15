@@ -32,9 +32,13 @@ struct Seen {
     /// What the status of a login is, until the verification code arrives.
     login: String,
     confirmed: bool,
+    /// How many of the next questions about a login fail.
+    status_failures: usize,
     delivered: bool,
     /// What a poll answers instead of messages, such as an expired login.
     poll: Option<Value>,
+    /// Messages for the next polls, a batch each, after the first.
+    batches: std::collections::VecDeque<Value>,
     cursors: Vec<String>,
     sent: Vec<Value>,
     upload_key: Vec<u8>,
@@ -66,6 +70,16 @@ fn answer(seen: &Mutex<Seen>, request: Request) -> Response {
             if query.contains("verify_code=1234") {
                 seen.confirmed = true;
             }
+            if seen.status_failures > 0 {
+                seen.status_failures -= 1;
+                return Response::bytes(500, Vec::new());
+            }
+            if seen.login == "slow" {
+                // Held open longer than the client waits, as when nothing happens on the phone.
+                drop(seen);
+                std::thread::sleep(Duration::from_millis(400));
+                return Response::json(200, &json!({"status": "wait"}));
+            }
             if seen.confirmed {
                 Response::json(
                     200,
@@ -79,6 +93,12 @@ fn answer(seen: &Mutex<Seen>, request: Request) -> Response {
             seen.cursors.push(body["get_updates_buf"].as_str().unwrap_or("").to_string());
             if let Some(poll) = &seen.poll {
                 return Response::json(200, poll);
+            }
+            if seen.delivered {
+                if let Some(batch) = seen.batches.pop_front() {
+                    let cursor = format!("cursor-batch-{}", seen.cursors.len());
+                    return Response::json(200, &json!({"ret": 0, "msgs": batch, "get_updates_buf": cursor, "longpolling_timeout_ms": 100}));
+                }
             }
             let text = json!({"message_id": 9007199254740993u64, "from_user_id": "bound-user", "message_type": 1, "context_token": "context-1", "create_time_ms": 1_750_000_000_000i64,
                 "item_list": [{"type": 1, "text_item": {"text": "微信文本"}}]});
@@ -94,7 +114,10 @@ fn answer(seen: &Mutex<Seen>, request: Request) -> Response {
             let group = json!({"message_id": "grouped", "from_user_id": "bound-user", "group_id": "g1", "message_type": 1, "item_list": [{"type": 1, "text_item": {"text": "群里的话"}}]});
             let messages = if seen.delivered { json!([]) } else { json!([text, text, stranger, group, media]) };
             seen.delivered = true;
-            Response::json(200, &json!({"ret": 0, "msgs": messages, "get_updates_buf": "cursor-1", "longpolling_timeout_ms": 100}))
+            // An empty poll leaves the cursor where it was.
+            let asked = body["get_updates_buf"].as_str().filter(|cursor| !cursor.is_empty() && messages.as_array().is_some_and(Vec::is_empty));
+            let cursor = asked.unwrap_or("cursor-1").to_string();
+            Response::json(200, &json!({"ret": 0, "msgs": messages, "get_updates_buf": cursor, "longpolling_timeout_ms": 100}))
         }
         ("POST", "/ilink/bot/sendmessage") => {
             seen.sent.push(body["msg"].clone());
@@ -113,6 +136,7 @@ fn answer(seen: &Mutex<Seen>, request: Request) -> Response {
             Response::bytes(200, Vec::new()).header("x-encrypted-param", &param)
         }
         ("GET", "/cdn/image") => Response::bytes(200, encrypt(&STANDARD.decode(PIXEL).unwrap(), &IMAGE_KEY)),
+        ("GET", "/cdn/report") => Response::bytes(200, encrypt(b"quarterly numbers", &FILE_KEY)),
         ("GET", "/cdn/file") => Response::bytes(200, encrypt(b"wechat file payload", &FILE_KEY)),
         _ => Response::bytes(404, Vec::new()),
     }
@@ -126,11 +150,23 @@ async fn wechat(login: &str) -> WeChat {
     WeChat { server, seen }
 }
 
-/// The application over the stand-in, with an orchestrator that answers every message in the same turn.
+/// The application over the stand-in, with an orchestrator that answers every message in the same turn; each
+/// message with words is taken at once.
 async fn bound_to(wechat: &WeChat) -> Fixture {
+    bound_with(wechat, Duration::ZERO, Duration::from_secs(15)).await
+}
+
+/// The same, holding bursts for `quiet` after words and files alone for `file_wait`.
+async fn bound_with(wechat: &WeChat, quiet: Duration, file_wait: Duration) -> Fixture {
     let kernels = Arc::new(Scripted::default());
-    *kernels.wechat.lock().unwrap() =
-        Protocol { pace: Duration::from_millis(20), ..Protocol::at(&wechat.server.url(), &format!("{}/cdn", wechat.server.url())) };
+    *kernels.wechat.lock().unwrap() = Protocol {
+        pace: Duration::from_millis(20),
+        status_wait: Duration::from_millis(150),
+        quiet,
+        burst_cap: Duration::from_secs(2),
+        file_wait,
+        ..Protocol::at(&wechat.server.url(), &format!("{}/cdn", wechat.server.url()))
+    };
     *kernels.model.lock().unwrap() = Some(model(|turn| {
         Box::pin(async move {
             if let Some(card) = turn.card("kind").filter(|card| card["kind"] == "candidate") {
@@ -325,5 +361,131 @@ async fn stops_listening_when_wechat_ends_the_login_and_retries_other_failures()
     assert_eq!(wechat.seen.lock().unwrap().cursors.len(), polls, "polling stopped");
     // A reply to that user can still be tried while the binding is kept, and a reply to another user never is.
     assert_eq!(f.app.wechat_disconnect().await.state, "disconnected");
+    f.app.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keeps_a_login_alive_through_slow_and_failed_questions() {
+    let wechat = wechat("slow").await;
+    let f = bound_to(&wechat).await;
+    f.app.wechat_connect().await;
+    // WeChat answers later than the client waits, several times over: the login still waits for the scan.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!((state(&f), f.app.wechat_status().qr_content.as_deref()), ("waiting", Some("weixin://fixture-bind")));
+    // A few failed questions in a row are ridden out, and the scan is then seen.
+    {
+        let mut seen = wechat.seen.lock().unwrap();
+        seen.status_failures = 3;
+        seen.login = "scaned".into();
+    }
+    f.until("it was scanned", || state(&f) == "scaned").await;
+    assert_eq!(wechat.seen.lock().unwrap().status_failures, 0);
+    // More than that in a row ends the login, with the reason.
+    wechat.seen.lock().unwrap().status_failures = 50;
+    f.until("the login failed", || state(&f) == "error").await;
+    assert_eq!(f.app.wechat_status().message, "微信连接失败：微信接口 HTTP 500");
+    assert_eq!(wechat.seen.lock().unwrap().qr_count, 1);
+    f.app.stop().await;
+}
+
+/// A file the bound user sends, as WeChat's CDN holds it.
+fn report(name: &str, base: &str) -> Value {
+    json!({"type": 4, "file_item": {"file_name": name, "media": {"full_url": format!("{base}/cdn/report"), "aes_key": STANDARD.encode(hex(&FILE_KEY))}}})
+}
+
+fn from_bound(id: &str, items: Value) -> Value {
+    json!({"message_id": id, "from_user_id": "bound-user", "message_type": 1, "context_token": "context-1", "item_list": items})
+}
+
+/// Bound, with the first poll's messages already taken, so only the batches given later arrive.
+async fn quietly_bound(quiet: Duration, file_wait: Duration) -> (WeChat, Fixture) {
+    let wechat = wechat("need_verifycode").await;
+    wechat.seen.lock().unwrap().delivered = true;
+    let f = bound_with(&wechat, quiet, file_wait).await;
+    f.app.wechat_connect().await;
+    f.until("the code is asked for", || state(&f) == "verify").await;
+    f.app.wechat_verify("1234").unwrap();
+    f.until("the account is bound", || state(&f) == "connected").await;
+    (wechat, f)
+}
+
+fn wechat_chat(f: &Fixture) -> Vec<String> {
+    f.chat().into_iter().filter(|(source, _)| source == "wechat").map(|(_, text)| text).collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn takes_a_file_and_the_words_after_it_as_one_message() {
+    let (wechat, f) = quietly_bound(Duration::from_millis(150), Duration::from_secs(10)).await;
+    let base = wechat.server.url();
+    wechat.seen.lock().unwrap().batches.push_back(json!([from_bound("burst-1", json!([report("report.txt", &base)]))]));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The file alone waits for its words, and its cursor is not saved while it waits.
+    assert!(wechat_chat(&f).is_empty());
+    assert!(!f.app.store.get::<String>("wechat-cursor").is_some_and(|cursor| cursor.starts_with("cursor-batch")));
+    wechat.seen.lock().unwrap().batches.push_back(json!([from_bound("burst-2", json!([{"type": 1, "text_item": {"text": "总结这个文件"}}]))]));
+    f.until("the burst arrived", || !wechat_chat(&f).is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let chat = wechat_chat(&f);
+    assert_eq!(chat.len(), 1, "{chat:#?}");
+    assert!(chat[0].starts_with("总结这个文件\n"), "{}", chat[0]);
+    assert!(chat[0].contains("<attachment name=\"report.txt\">\nquarterly numbers\n</attachment>"), "{}", chat[0]);
+    assert!(f.app.store.trigger(&neo_core::ids::key(&["trigger", CHAT_SOURCE, "wechat:burst-1"])).is_some());
+    f.until("the cursor is saved", || f.app.store.get::<String>("wechat-cursor").is_some_and(|cursor| cursor.starts_with("cursor-batch"))).await;
+    f.app.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn takes_files_alone_once_no_words_come_and_says_so() {
+    let (wechat, f) = quietly_bound(Duration::from_millis(150), Duration::from_millis(300)).await;
+    let base = wechat.server.url();
+    wechat
+        .seen
+        .lock()
+        .unwrap()
+        .batches
+        .push_back(json!([from_bound("alone-1", json!([report("a.txt", &base)])), from_bound("alone-2", json!([report("b.txt", &base)]))]));
+    f.until("the files arrived", || !wechat_chat(&f).is_empty()).await;
+    let chat = wechat_chat(&f);
+    assert_eq!(chat.len(), 1, "{chat:#?}");
+    assert!(chat[0].starts_with("[用户只发送了文件，没有说明要做什么"), "{}", chat[0]);
+    assert!(chat[0].contains("<attachment name=\"a.txt\">") && chat[0].contains("<attachment name=\"b.txt\">"), "{}", chat[0]);
+    f.app.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn takes_what_a_message_quotes() {
+    let (wechat, f) = quietly_bound(Duration::ZERO, Duration::from_secs(10)).await;
+    let base = wechat.server.url();
+    wechat.seen.lock().unwrap().batches.push_back(json!([
+        from_bound(
+            "quote-1",
+            json!([{"type": 1, "text_item": {"text": "按这个文件处理"}, "ref_msg": {"title": "plan.txt", "message_item": report("plan.txt", &base)}}])
+        ),
+        from_bound("quote-2", json!([{"type": 1, "text_item": {"text": "好的"}, "ref_msg": {"message_item": {"type": 1, "text_item": {"text": "明天开会"}}}}])),
+    ]));
+    f.until("both arrived", || wechat_chat(&f).len() == 2).await;
+    let chat = wechat_chat(&f);
+    assert!(chat[0].starts_with("[引用的文件：plan.txt]\n按这个文件处理\n"), "{}", chat[0]);
+    assert!(chat[0].contains("<attachment name=\"plan.txt\">\nquarterly numbers\n</attachment>"), "{}", chat[0]);
+    assert_eq!(chat[1], "[引用] 明天开会\n好的");
+    f.app.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn finds_a_file_quoted_by_its_name_alone_among_those_lately_received() {
+    let (wechat, f) = quietly_bound(Duration::ZERO, Duration::from_millis(200)).await;
+    let base = wechat.server.url();
+    wechat.seen.lock().unwrap().batches.push_back(json!([from_bound("named-1", json!([report("plan.md", &base)]))]));
+    f.until("the file arrived", || wechat_chat(&f).len() == 1).await;
+    wechat.seen.lock().unwrap().batches.push_back(json!([
+        from_bound("named-2", json!([{"type": 1, "text_item": {"text": "复现这个文档"}, "ref_msg": {"message_item": {"type": 4, "file_item": {"file_name": "plan.md"}}}}])),
+        from_bound("named-3", json!([{"type": 1, "text_item": {"text": "还有这个"}, "ref_msg": {"title": "gone.pdf", "message_item": {"type": 4, "file_item": {"file_name": "gone.pdf"}}}}])),
+    ]));
+    f.until("the quotes arrived", || wechat_chat(&f).len() == 3).await;
+    let chat = wechat_chat(&f);
+    assert!(chat[1].starts_with("[引用的文件：plan.md]\n复现这个文档\n"), "{}", chat[1]);
+    assert!(chat[1].contains("<attachment name=\"plan.md\">\nquarterly numbers\n</attachment>"), "{}", chat[1]);
+    // A file never received is still named, so the window shows what was quoted.
+    assert_eq!(chat[2], "[引用的文件：gone.pdf（未能取回文件内容）]\n还有这个");
     f.app.stop().await;
 }

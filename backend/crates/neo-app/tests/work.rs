@@ -570,3 +570,52 @@ async fn says_why_nothing_runs_when_the_kernel_is_missing_and_still_keeps_messag
     assert!(f.kernels.opened.lock().unwrap().is_empty());
     f.app.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sends_a_result_once_when_the_worker_replied_directly_and_the_orchestrator_tries_again() {
+    let f = started().await;
+    let refused = Arc::new(Mutex::new(Vec::new()));
+    let seen = refused.clone();
+    f.script(model(move |turn| {
+        let seen = seen.clone();
+        Box::pin(async move {
+            match turn.role {
+                SessionRole::Worker => {
+                    let done = turn
+                        .call(
+                            "orchestrator_report",
+                            json!({"state": "ready", "summary": "Wrote the ring buffer.", "direct_reply": "写好了：ring buffer 在 src/lib.rs。"}),
+                        )
+                        .await?;
+                    assert_eq!(done["notification"], "direct_outbox");
+                    Ok("Finished.".into())
+                }
+                _ => {
+                    for message in messages(&turn.text) {
+                        // Told of the worker's own reply, the orchestrator still tries to send the result in its words.
+                        if let Some(ticket) = message["worker_direct_reply"]["ticket_id"].as_str() {
+                            assert_eq!(message["worker_direct_reply"]["note"], "The person already has this reply; send nothing more for it.");
+                            let again = turn
+                                .call("orchestrator_reply", json!({"ticket_id": ticket, "purpose": "result", "text": "环形缓冲区已写好，代码在 src/lib.rs。"}))
+                                .await;
+                            seen.lock().unwrap().push(again.unwrap_err());
+                        }
+                    }
+                    orchestrate(&turn).await
+                }
+            }
+        })
+    }));
+    f.app.receive_web("用 Rust 写一个 ringbuffer", vec![], None).await.unwrap();
+    f.until("the ticket completed", || f.tickets().first().is_some_and(|ticket| ticket.ended.is_some())).await;
+    f.settle().await;
+    // A later message starts the turn in which the orchestrator reads the notice of the worker's reply.
+    f.app.receive_web("谢谢", vec![], None).await.unwrap();
+    f.until("the paraphrase was tried", || !refused.lock().unwrap().is_empty()).await;
+    f.settle().await;
+    assert!(refused.lock().unwrap()[0].starts_with("This ticket's result already went to the person"), "{:?}", refused.lock().unwrap());
+    let said = replies(&f);
+    assert_eq!(said.iter().filter(|text| text.contains("ring buffer") || text.contains("环形缓冲区")).count(), 1, "{said:#?}");
+    assert_eq!(said[1], "写好了：ring buffer 在 src/lib.rs。");
+    f.app.stop().await;
+}

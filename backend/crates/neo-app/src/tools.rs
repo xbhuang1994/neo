@@ -664,7 +664,9 @@ impl App {
                     }
                 }
                 if direct_sent {
-                    self.notify(receipt_notice(json!({"worker_direct_reply": {"ticket_id": ticket_id, "state": args.text("state"), "reply": direct}})));
+                    self.notify(receipt_notice(
+                        json!({"worker_direct_reply": {"ticket_id": ticket_id, "state": args.text("state"), "reply": direct, "note": "The person already has this reply; send nothing more for it."}}),
+                    ));
                     return Ok((json!({"reported": true, "notification": "direct_outbox"}), true));
                 }
                 let relay = report_relay(&updated, &report);

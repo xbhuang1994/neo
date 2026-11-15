@@ -88,6 +88,7 @@ fn ticket(id: &str) -> Ticket {
         origin: Origin { trigger_id: "g".into(), trigger_ids: vec!["g".into()] },
         execution: None,
         delivery: None,
+        result_sent: None,
     }
 }
 

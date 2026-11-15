@@ -298,6 +298,7 @@ fn tells_each_open_ticket_how_a_settings_change_bears_on_it() {
         origin: Origin { trigger_id: "g".into(), trigger_ids: vec![] },
         execution: None,
         delivery: None,
+        result_sent: None,
     };
     let tickets = vec![
         ticket("explicit", mandate(&auto, &room("alice", Some(Addressed::Mention), true), &alone, None)),
