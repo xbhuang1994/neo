@@ -596,7 +596,10 @@ async fn sends_a_result_once_when_the_worker_replied_directly_and_the_orchestrat
                         if let Some(ticket) = message["worker_direct_reply"]["ticket_id"].as_str() {
                             assert_eq!(message["worker_direct_reply"]["note"], "The person already has this reply; send nothing more for it.");
                             let again = turn
-                                .call("orchestrator_reply", json!({"ticket_id": ticket, "purpose": "result", "text": "The ring buffer is written; the code is in src/lib.rs."}))
+                                .call(
+                                    "orchestrator_reply",
+                                    json!({"ticket_id": ticket, "purpose": "result", "text": "The ring buffer is written; the code is in src/lib.rs."}),
+                                )
                                 .await;
                             seen.lock().unwrap().push(again.unwrap_err());
                         }

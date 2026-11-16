@@ -408,9 +408,9 @@ impl App {
                     Err("kind is accept, attach, sidecar, ignore or stop".into())
                 }
                 Ok(_) if trigger_id.is_empty() => Err("trigger_id is required".into()),
-                Ok(item) => match Self::invalid_item(&item, &kind).or_else(|| {
-                    ["acknowledgement", "answer"].into_iter().find_map(|field| self.wrong_language(&trigger_id, field, item.text(field)?))
-                }) {
+                Ok(item) => match Self::invalid_item(&item, &kind)
+                    .or_else(|| ["acknowledgement", "answer"].into_iter().find_map(|field| self.wrong_language(&trigger_id, field, item.text(field)?)))
+                {
                     Some(problem) => Err(problem),
                     // Each item is one Engine command, in a transaction of its own; one that is refused leaves the others.
                     None => match self.store.atomic(|| self.route(&item, &kind, &trigger_id, &decided)) {

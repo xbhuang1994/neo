@@ -113,10 +113,15 @@ class Sidecar implements LocalBackend {
     process.stdin.writeln(token);
     unawaited(process.stdin.flush().catchError((Object _) {}));
     final errors = <String>[];
-    process.stderr.transform(const Utf8Decoder(allowMalformed: true)).transform(const LineSplitter()).listen((line) {
-      errors.add(line);
-      if (errors.length > 40) errors.removeAt(0);
-    }, onError: (Object _) {});
+    final errorsRead = process.stderr
+        .transform(const Utf8Decoder(allowMalformed: true))
+        .transform(const LineSplitter())
+        .listen((line) {
+          errors.add(line);
+          if (errors.length > 40) errors.removeAt(0);
+        })
+        .asFuture<void>()
+        .catchError((Object _) {});
     process.stdout.transform(const Utf8Decoder(allowMalformed: true)).transform(const LineSplitter()).listen((line) {
       if (generation != _generation || _status.value.phase == BackendPhase.running) return;
       try {
@@ -130,6 +135,8 @@ class Sidecar implements LocalBackend {
       }
     }, onError: (Object _) {});
     final code = await process.exitCode;
+    // The exit can be seen before the last of what it wrote is read; a child that keeps the pipe open is not waited for.
+    await errorsRead.timeout(const Duration(seconds: 1), onTimeout: () {});
     if (generation != _generation) return;
     _process = null;
     if (_stopped) return;
