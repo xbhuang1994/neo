@@ -42,6 +42,12 @@ NEO_REAL_KERNELS=1 cargo test -p neo-agent --test real -- --test-threads=1
 
 The first pair exercises each protocol: a host tool, a refused built-in tool, resuming after a restart, a notice joining the next turn, a background job and its cancellation. The second drives the whole product as a process: a chat message over HTTP becomes a Ticket, a worker writes a file with its shell, and the result comes back. `NEO_CLAUDE_BIN` and `NEO_OMP_BIN` name the programs when they are not on `PATH`.
 
+The Antigravity CLI signs in to Google, so its protocol test runs against its real models: it needs a signed-in `agy` and the network, and is opted into on its own (`NEO_AGY_MODEL` picks the model, by default `gemini-3.8-flash-low`):
+
+```sh
+NEO_REAL_ANTIGRAVITY=1 cargo test -p neo-kernel --test antigravity_real
+```
+
 ### In a browser
 
 ```sh

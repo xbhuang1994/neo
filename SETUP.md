@@ -49,6 +49,8 @@ A desktop app started from the Dock or the Start menu does not see variables set
 
 **Oh My Pi.** It uses the providers configured in its agent directory, `<data directory>/omp` unless `--agent-dir` names another: put a `models.yml` there, or sign in with `omp` using that directory.
 
+**Antigravity CLI.** Not bundled: install `agy` and run it once in a terminal to sign in with Google. The backend finds it on `PATH` or in `~/.local/bin` (or set `NEO_AGY_BIN`), and offers the models `agy models` lists. Its workers run without background jobs or subagents.
+
 The settings page lists the models the chosen kernel offers; leave a role on "kernel default" to use the runtime's own choice. A missing runtime or a failing model request is shown in the app in the runtime's own words.
 
 Workers that use git need `git` installed. Nothing else is required.

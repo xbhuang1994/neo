@@ -294,8 +294,10 @@ impl App {
                 Err(error) => (Vec::new(), Some(error)),
             },
         };
-        let kernels: Vec<Value> =
-            [Kernel::Omp, Kernel::Claude].into_iter().map(|kernel| json!({"id": kernel.as_str(), "problem": self.kernels.unavailable(kernel)})).collect();
+        let kernels: Vec<Value> = [Kernel::Omp, Kernel::Claude, Kernel::Antigravity]
+            .into_iter()
+            .map(|kernel| json!({"id": kernel.as_str(), "problem": self.kernels.unavailable(kernel)}))
+            .collect();
         json!({
             "kernel": kernel.as_str(),
             "kernels": kernels,
@@ -346,7 +348,8 @@ impl App {
         let kernel = match fields.get("kernel").and_then(Value::as_str) {
             Some("omp") => Kernel::Omp,
             Some("claude") => Kernel::Claude,
-            _ => return Err("kernel is omp or claude".into()),
+            Some("antigravity") => Kernel::Antigravity,
+            _ => return Err("kernel is omp, claude or antigravity".into()),
         };
         let before = self.settings();
         if before.kernel == kernel {

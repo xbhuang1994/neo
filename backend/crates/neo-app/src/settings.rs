@@ -36,6 +36,8 @@ pub enum Kernel {
     Omp,
     /// Claude Code, driven over its stream-json protocol.
     Claude,
+    /// The Antigravity CLI, driven over the Agent Client Protocol.
+    Antigravity,
 }
 
 impl Kernel {
@@ -44,6 +46,7 @@ impl Kernel {
         match self {
             Kernel::Omp => "omp",
             Kernel::Claude => "claude",
+            Kernel::Antigravity => "antigravity",
         }
     }
 }

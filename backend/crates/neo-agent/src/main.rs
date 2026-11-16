@@ -58,10 +58,18 @@ fn kernels(plan: &Plan) -> RealKernels {
     let path = std::env::var_os("PATH");
     let claude = paths::find_runtime("claude", env_path("NEO_CLAUDE_BIN"), program_dir.as_deref(), path.as_deref());
     let omp = paths::find_runtime("omp", env_path("NEO_OMP_BIN"), program_dir.as_deref(), path.as_deref());
+    // The Antigravity CLI installs itself into ~/.local/bin, which a service's path may leave out.
+    let named_agy = env_path("NEO_AGY_BIN");
+    let named = named_agy.is_some();
+    let agy = paths::find_runtime("agy", named_agy, program_dir.as_deref(), path.as_deref()).or_else(|| {
+        // A program named that does not exist stays a mistake to report.
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).filter(|_| !named)?;
+        paths::on_path("agy", Some(PathBuf::from(home).join(".local").join("bin").as_os_str()))
+    });
     let shim = paths::find_shim(env_path("NEO_SHIM"), program_dir.as_deref());
     // Every Session meets the blocked commands first on its path.
     let env = [("PATH".to_string(), blocked::path_with(&plan.data_dir).to_string_lossy().to_string())].into_iter().collect();
-    RealKernels { state_dir: plan.data_dir.clone(), agent_dir: plan.agent_dir.clone(), claude, omp, shim, env }
+    RealKernels { state_dir: plan.data_dir.clone(), agent_dir: plan.agent_dir.clone(), claude, omp, agy, shim, env }
 }
 
 /// Waits until the process is asked to end: by a signal, or by `ended` (the desktop app going away).
@@ -111,12 +119,11 @@ async fn run(plan: Plan, sidecar: bool, ended: Option<tokio::sync::oneshot::Rece
         Refused::Failed(why) => fail(why),
     })?;
     let kernels = Arc::new(kernels(&plan));
-    for (kernel, name) in [(Kernel::Claude, "Claude Code"), (Kernel::Omp, "Oh My Pi")] {
+    for (kernel, name, program) in
+        [(Kernel::Claude, "Claude Code", &kernels.claude), (Kernel::Omp, "Oh My Pi", &kernels.omp), (Kernel::Antigravity, "Antigravity", &kernels.agy)]
+    {
         match kernels.unavailable(kernel) {
-            None => log(&format!(
-                "{name}: {}",
-                if kernel == Kernel::Claude { &kernels.claude } else { &kernels.omp }.as_ref().map(|path| path.display().to_string()).unwrap_or_default()
-            )),
+            None => log(&format!("{name}: {}", program.as_ref().map(|path| path.display().to_string()).unwrap_or_default())),
             Some(problem) => log(&format!("{name}: {problem}")),
         }
     }
@@ -179,7 +186,9 @@ fn doctor(options: &Common) -> i32 {
     println!("Agent directory:  {}", plan.agent_dir.display());
     println!("Instance lock:    {}", paths::runtime_dir().display());
     let mut usable = 0;
-    for (kernel, name, program) in [(Kernel::Claude, "Claude Code", &kernels.claude), (Kernel::Omp, "Oh My Pi   ", &kernels.omp)] {
+    for (kernel, name, program) in
+        [(Kernel::Claude, "Claude Code", &kernels.claude), (Kernel::Omp, "Oh My Pi   ", &kernels.omp), (Kernel::Antigravity, "Antigravity", &kernels.agy)]
+    {
         match (program, kernels.unavailable(kernel)) {
             (Some(program), None) => {
                 usable += 1;
@@ -198,7 +207,7 @@ fn doctor(options: &Common) -> i32 {
         None => println!("Web app:          not found beside the program (serve --web-dir <dir> names it)"),
     }
     if usable == 0 {
-        println!("No kernel can run: install Claude Code or Oh My Pi, or set NEO_CLAUDE_BIN / NEO_OMP_BIN.");
+        println!("No kernel can run: install Claude Code, Oh My Pi or the Antigravity CLI, or set NEO_CLAUDE_BIN / NEO_OMP_BIN / NEO_AGY_BIN.");
         return 1;
     }
     0

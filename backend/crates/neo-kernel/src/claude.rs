@@ -23,6 +23,11 @@ pub fn mcp_tool_name(name: &str) -> String {
 
 /// Prompts name host tools bare; Claude Code prefixes MCP tools, so whole-word mentions are rewritten.
 pub fn rewrite_tool_names(text: &str, names: &[String]) -> String {
+    rename_tools(text, names, mcp_tool_name)
+}
+
+/// Rewrite whole-word mentions of host tools in a prompt to the names a runtime gives them.
+pub fn rename_tools(text: &str, names: &[String], rename: impl Fn(&str) -> String) -> String {
     let word = |c: char| c.is_alphanumeric() || c == '_';
     let mut names: Vec<&String> = names.iter().filter(|name| !name.is_empty()).collect();
     names.sort_by_key(|name| std::cmp::Reverse(name.len()));
@@ -34,7 +39,7 @@ pub fn rewrite_tool_names(text: &str, names: &[String]) -> String {
         if boundary {
             for name in &names {
                 if rest.starts_with(name.as_str()) && rest[name.len()..].chars().next().is_none_or(|next| !(word(next) || next == '-')) {
-                    out.push_str(&mcp_tool_name(name));
+                    out.push_str(&rename(name));
                     before = name.chars().last();
                     rest = &rest[name.len()..];
                     continue 'scan;

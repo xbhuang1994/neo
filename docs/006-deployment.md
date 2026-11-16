@@ -29,10 +29,11 @@ The desktop app adds its own check, so that starting it twice shows the window t
 | Thing | Where the program looks |
 | --- | --- |
 | The `claude` and `omp` runtimes | `NEO_CLAUDE_BIN` / `NEO_OMP_BIN`, else a `runtimes` folder beside the program (in a Mac app, `Contents/Resources/runtimes`), else `PATH`. The installers bundle both |
+| The `agy` runtime (Antigravity CLI) | `NEO_AGY_BIN`, else a `runtimes` folder beside the program, else `PATH`, else `~/.local/bin` where it installs itself. Not bundled: install it and sign in with `agy` once |
 | The Oh My Pi extension | `NEO_SHIM`, else a `shim` folder beside the program |
 | The web app's files | `--web-dir`, else a `web` folder beside the program |
 | `git` | `PATH`. Workers that use git need it installed; nothing else does |
-| Model access | Claude Code: the `ANTHROPIC_*` environment and the user's Claude Code settings. Oh My Pi: its agent directory (`--agent-dir`, by default `<data>/omp`) |
+| Model access | Claude Code: the `ANTHROPIC_*` environment and the user's Claude Code settings. Oh My Pi: its agent directory (`--agent-dir`, by default `<data>/omp`). Antigravity: the Google account `agy` is signed in to |
 
 `neo-agent doctor` prints all of these as it finds them, and fails when no kernel can run. The application starts without a kernel too: it says so in the app, keeps messages, and works once one is installed or chosen.
 
@@ -74,9 +75,9 @@ The server speaks plain HTTP. On a network that is not trusted, put it behind a 
 | Sign | Cause and remedy |
 | --- | --- |
 | "Neo Agent is already running" | Another instance holds the lock. Use the open window, or stop the running service. `--allow-multiple` with another data directory runs a second one |
-| "The … program was not found" | The chosen kernel's runtime is missing. Install it, set `NEO_CLAUDE_BIN` / `NEO_OMP_BIN`, or choose the other kernel in the settings. `neo-agent doctor` shows what is found |
+| "The … program was not found" | The chosen kernel's runtime is missing. Install it, set `NEO_CLAUDE_BIN` / `NEO_OMP_BIN` / `NEO_AGY_BIN`, or choose another kernel in the settings. `neo-agent doctor` shows what is found |
 | "Listening on … needs an access token" | A server address that is not loopback needs `--token` or `NEO_TOKEN` |
 | The app says a token is needed | The server has one: enter it under Settings → Connection |
 | A data directory is refused for its schema version | It was written by another release line. Start with a new data directory |
-| A worker fails with a model error | The kernel's model access: for Claude Code the `ANTHROPIC_*` environment, for Oh My Pi the providers in its agent directory. The error is the runtime's own |
+| A worker fails with a model error | The kernel's model access: for Claude Code the `ANTHROPIC_*` environment, for Oh My Pi the providers in its agent directory, for Antigravity its sign-in. The error is the runtime's own |
 | A macOS app that "cannot be opened" | An app that is not notarized must be allowed once; see `SETUP.md` |

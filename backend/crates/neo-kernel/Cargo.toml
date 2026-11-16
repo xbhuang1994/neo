@@ -1,6 +1,6 @@
 [package]
 name = "neo-kernel"
-description = "Neo Agent kernels: persistent agent sessions over the Claude Code and Oh My Pi command-line runtimes."
+description = "Neo Agent kernels: persistent agent sessions over the Claude Code, Oh My Pi and Antigravity command-line runtimes."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -106,7 +106,7 @@ async fn serves_every_route_of_the_app() {
     );
     let (status, switched) = api.call("PUT", "/api/settings/kernel", Some(json!({"kernel": "claude"}))).await;
     assert_eq!((status, switched["kernel"].as_str(), switched["supports"]["advisor"].as_bool()), (200, Some("claude"), Some(false)));
-    assert_eq!(api.call("PUT", "/api/settings/kernel", Some(json!({"kernel": "other"}))).await, (400, json!({"error": "kernel is omp or claude"})));
+    assert_eq!(api.call("PUT", "/api/settings/kernel", Some(json!({"kernel": "other"}))).await, (400, json!({"error": "kernel is omp, claude or antigravity"})));
     assert_eq!(api.call("PUT", "/api/settings/kernel", Some(json!({"kernel": "omp"}))).await.1["current"], chosen);
 
     // General settings.

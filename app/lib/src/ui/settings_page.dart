@@ -497,7 +497,11 @@ class _ModelsSettingsState extends LoadingState<ModelsSettings, ModelSettings> {
     return settings;
   }
 
-  String _name(String kernel) => kernel == 'claude' ? 'Claude Code' : 'Oh My Pi';
+  String _name(String kernel) => switch (kernel) {
+        'claude' => 'Claude Code',
+        'antigravity' => 'Antigravity',
+        _ => 'Oh My Pi',
+      };
 
   Future<void> _pickModel(String title, RoleModel? current, String fallback, ValueChanged<RoleModel?> set) async {
     final settings = data!;
@@ -548,7 +552,11 @@ class _ModelsSettingsState extends LoadingState<ModelsSettings, ModelSettings> {
       children: [
         Group(
           title: strings.kernelAndModels,
-          footer: '${settings.kernel == 'claude' ? strings.kernelHintClaude : strings.kernelHintOmp} ${strings.kernelSwitchHint}',
+          footer: '${switch (settings.kernel) {
+            'claude' => strings.kernelHintClaude,
+            'antigravity' => strings.kernelHintAntigravity,
+            _ => strings.kernelHintOmp,
+          }} ${strings.kernelSwitchHint}',
           children: [
             Padding(
               padding: const EdgeInsets.all(12),
@@ -557,7 +565,7 @@ class _ModelsSettingsState extends LoadingState<ModelsSettings, ModelSettings> {
                 children: [
                   CupertinoSlidingSegmentedControl<String>(
                     groupValue: settings.kernel,
-                    children: {for (final kernel in const ['omp', 'claude']) kernel: Padding(padding: const EdgeInsets.symmetric(horizontal: 8), child: Text(_name(kernel)))},
+                    children: {for (final kernel in const ['omp', 'claude', 'antigravity']) kernel: Padding(padding: const EdgeInsets.symmetric(horizontal: 8), child: Text(_name(kernel)))},
                     onValueChanged: (kernel) {
                       if (kernel == null || kernel == settings.kernel || busy) return;
                       unawaited(run(() async => _take(await widget.api.setKernel(kernel)), done: _name(kernel)));

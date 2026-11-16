@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | 后端 `neo-agent` | Rust | 一个可执行文件：领域引擎、SQLite 存储、HTTP API、看护与微信桥 |
 | 界面 | Flutter | 同一套代码出桌面应用（macOS / Windows / Linux）和网页版，苹果风格，跟随系统明暗 |
-| 执行内核 | Claude Code 或 Oh My Pi | 真正调用模型干活的代理运行时，作为子进程由后端驱动，在设置里切换 |
+| 执行内核 | Claude Code、Oh My Pi 或 Antigravity CLI | 真正调用模型干活的代理运行时，作为子进程由后端驱动，在设置里切换 |
 
 两种用法：
 
@@ -40,7 +40,7 @@
 
 安装步骤、模型接入、服务器部署见 **[SETUP.md](SETUP.md)**。
 
-模型接入是唯一需要你准备的东西：Claude Code 内核读取 `ANTHROPIC_*` 环境变量或你已有的 Claude Code 登录；Oh My Pi 内核使用它自己目录里的 provider 配置。Worker 要用 git 时，机器上需要装有 git。
+模型接入是唯一需要你准备的东西：Claude Code 内核读取 `ANTHROPIC_*` 环境变量或你已有的 Claude Code 登录；Oh My Pi 内核使用它自己目录里的 provider 配置；Antigravity 内核使用 `agy` 已登录的 Google 账号（需自行安装 `agy` 并登录一次）。Worker 要用 git 时，机器上需要装有 git。
 
 ## 从源码运行
 

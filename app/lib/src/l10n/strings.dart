@@ -111,6 +111,7 @@ abstract class Strings {
   String get kernel;
   String get kernelHintOmp;
   String get kernelHintClaude;
+  String get kernelHintAntigravity;
   String get kernelSwitchHint;
   String get switchingKernel;
   String get orchestratorModel;
@@ -365,6 +366,8 @@ class ZhStrings extends Strings {
   String get kernelHintOmp => '模型来自 Oh My Pi 的 provider 配置。';
   @override
   String get kernelHintClaude => '运行 Claude Code：认证与默认模型取自 ANTHROPIC_* 环境，只使用模型名。';
+  @override
+  String get kernelHintAntigravity => '运行 Antigravity CLI（agy）：使用它已登录的 Google 账号与 agy models 列出的模型；不支持后台任务与子代理。';
   @override
   String get kernelSwitchHint => '切换立即生效并保留；每个内核有自己的一套模型配置。主会话在新内核上重开（对话记录保留），运行中的 Worker 在原内核上完成。';
   @override
@@ -689,6 +692,8 @@ class EnStrings extends Strings {
   String get kernelHintOmp => 'Models come from Oh My Pi\'s provider configuration.';
   @override
   String get kernelHintClaude => 'Runs Claude Code: sign-in and the default model come from the ANTHROPIC_* environment; only model names are used.';
+  @override
+  String get kernelHintAntigravity => 'Runs the Antigravity CLI (agy): it uses the Google account agy is signed in to and the models agy models lists; no background jobs or subagents.';
   @override
   String get kernelSwitchHint =>
       'A switch applies at once and is kept; each kernel has its own model choices. The main session reopens on the new kernel with its transcript; running workers finish on theirs.';

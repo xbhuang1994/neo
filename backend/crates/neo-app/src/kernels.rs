@@ -3,6 +3,7 @@
 use crate::http;
 use crate::settings::{Kernel, RoleModel};
 use neo_core::ids::key;
+use neo_kernel::antigravity::{self, Antigravity, AntigravityDriver, AntigravityOptions};
 use neo_kernel::claude::{self, Claude, ClaudeDriver, ClaudeOptions, Subagent};
 use neo_kernel::omp::{self, Omp, OmpDriver, OmpOptions};
 use neo_kernel::session::{Driver, DriverEvent};
@@ -77,6 +78,7 @@ pub fn support(kernel: Kernel) -> Support {
     match kernel {
         Kernel::Omp => Support { advisor: true, thinking_levels: vec!["auto", "off", "minimal", "low", "medium", "high", "xhigh", "max"] },
         Kernel::Claude => Support { advisor: false, thinking_levels: vec!["auto", "off", "low", "medium", "high", "xhigh", "max"] },
+        Kernel::Antigravity => Support { advisor: false, thinking_levels: vec!["auto", "low", "medium", "high"] },
     }
 }
 
@@ -90,7 +92,7 @@ pub trait Kernels: Send + Sync {
     fn unavailable(&self, kernel: Kernel) -> Option<String>;
 }
 
-/// The real runtimes: the `claude` and `omp` programs.
+/// The real runtimes: the `claude`, `omp` and `agy` programs.
 pub struct RealKernels {
     /// The data directory, where prompt files, overlays and runtime sessions are kept.
     pub state_dir: PathBuf,
@@ -100,6 +102,8 @@ pub struct RealKernels {
     pub claude: Option<PathBuf>,
     /// The `omp` program, when found.
     pub omp: Option<PathBuf>,
+    /// The Antigravity CLI program (`agy`), when found.
+    pub agy: Option<PathBuf>,
     /// The shim extension file for Oh My Pi.
     pub shim: PathBuf,
     /// Variables to set for every runtime, on top of the host's environment.
@@ -281,6 +285,37 @@ impl RealKernels {
         Ok(Arc::new(Omp(OmpDriver::new(options, host, events))))
     }
 
+    fn open_antigravity(&self, spec: &SessionSpec, host: Arc<dyn ToolHost>, events: mpsc::UnboundedSender<DriverEvent>) -> Result<Arc<dyn Driver>, String> {
+        let program = self.agy.clone().ok_or_else(|| self.unavailable(Kernel::Antigravity).unwrap_or_default())?;
+        let names: Vec<String> = host.specs().into_iter().map(|tool| tool.name).collect();
+        let worker = spec.role == SessionRole::Worker;
+        let note = if worker {
+            "Runtime note: you run in the Antigravity CLI. Tool names above map to `read_file`, `run_command`, `write_file` and `edit_file`; application tools are exposed as `mcp_neo_<name>`. There is no `task` or `wait` tool here, and no subagents: do the work yourself. Run commands in the foreground and wait for each to finish (check a long one with `command_status`) before you end your turn, because nothing wakes you after it. Do not use browser, image, scheduling or web-search tools unless the ticket asks for them."
+        } else {
+            "Runtime note: you run in the Antigravity CLI. Tool names above map to `read_file` and `run_command`; application tools are exposed as `mcp_neo_<name>`. Do not use browser, image, scheduling or web-search tools."
+        };
+        let tools: &[&str] = match spec.role {
+            SessionRole::Worker => &["read", "bash", "edit", "write"],
+            SessionRole::Sidecar => &["read"],
+            SessionRole::Orchestrator | SessionRole::Watchdog => &["read", "bash"],
+        };
+        let thinking = match spec.role {
+            // An inspection turn decides from evidence it is handed: low effort.
+            SessionRole::Watchdog => Some("low".to_string()),
+            _ => spec.model.as_ref().and_then(|model| model.thinking_level.clone()),
+        };
+        let options = AntigravityOptions {
+            program,
+            cwd: spec.cwd.clone(),
+            system_prompt: format!("{}\n\n{note}", claude::rename_tools(&spec.system_prompt, &names, antigravity::mcp_tool_name)),
+            tools: tools.iter().map(|name| name.to_string()).collect(),
+            model: spec.model.as_ref().map(|model| model.model.clone()),
+            thinking,
+            env: self.env.clone(),
+        };
+        Ok(Arc::new(Antigravity(AntigravityDriver::new(options, host, events))))
+    }
+
     async fn claude_models(&self) -> Result<Vec<ModelOption>, String> {
         let env = self.claude_env();
         let var = |name: &str| env.get(name).cloned().or_else(|| std::env::var(name).ok()).filter(|value| !value.is_empty());
@@ -326,6 +361,7 @@ impl Kernels for RealKernels {
         match kernel {
             Kernel::Claude => self.open_claude(spec, host, events),
             Kernel::Omp => self.open_omp(spec, host, events),
+            Kernel::Antigravity => self.open_antigravity(spec, host, events),
         }
     }
     fn models(&self, kernel: Kernel) -> BoxFut<'_, Result<Vec<ModelOption>, String>> {
@@ -342,15 +378,26 @@ impl Kernels for RealKernels {
                     models.sort_by(|a, b| (&a.provider, &a.id).cmp(&(&b.provider, &b.id)));
                     Ok(models)
                 }
+                Kernel::Antigravity => {
+                    let program = self.agy.clone().ok_or_else(|| self.unavailable(Kernel::Antigravity).unwrap_or_default())?;
+                    Ok(antigravity::list_models(&program, &self.env)
+                        .await?
+                        .into_iter()
+                        .map(|(id, name)| ModelOption { id, provider: "antigravity".into(), name })
+                        .collect())
+                }
             }
         })
     }
     fn unavailable(&self, kernel: Kernel) -> Option<String> {
         match kernel {
             Kernel::Claude if self.claude.is_none() => {
-                Some("The Claude Code program (claude) was not found. Install it, or choose the other kernel in Settings.".into())
+                Some("The Claude Code program (claude) was not found. Install it, or choose another kernel in Settings.".into())
             }
-            Kernel::Omp if self.omp.is_none() => Some("The Oh My Pi program (omp) was not found. Install it, or choose the other kernel in Settings.".into()),
+            Kernel::Omp if self.omp.is_none() => Some("The Oh My Pi program (omp) was not found. Install it, or choose another kernel in Settings.".into()),
+            Kernel::Antigravity if self.agy.is_none() => {
+                Some("The Antigravity CLI program (agy) was not found. Install it and sign in, or choose another kernel in Settings.".into())
+            }
             Kernel::Omp if !self.shim.is_file() => Some(format!("The Oh My Pi extension {} is missing; reinstall the application.", self.shim.display())),
             _ => None,
         }
@@ -381,6 +428,7 @@ mod tests {
     fn offers_an_advisor_and_minimal_thinking_only_on_oh_my_pi() {
         assert!(support(Kernel::Omp).advisor && support(Kernel::Omp).thinking_levels.contains(&"minimal"));
         assert!(!support(Kernel::Claude).advisor && !support(Kernel::Claude).thinking_levels.contains(&"minimal"));
+        assert!(!support(Kernel::Antigravity).advisor && !support(Kernel::Antigravity).thinking_levels.contains(&"off"));
     }
 
     #[test]
@@ -390,10 +438,12 @@ mod tests {
             agent_dir: "/a".into(),
             claude: None,
             omp: Some("/bin/omp".into()),
+            agy: None,
             shim: "/missing/shim.ts".into(),
             env: BTreeMap::new(),
         };
         assert!(kernels.unavailable(Kernel::Claude).unwrap().contains("claude"));
+        assert!(kernels.unavailable(Kernel::Antigravity).unwrap().contains("agy"));
         assert!(kernels.unavailable(Kernel::Omp).unwrap().contains("/missing/shim.ts"));
     }
 

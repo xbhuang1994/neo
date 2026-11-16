@@ -67,7 +67,7 @@ The concepts above and their rules are reusable. The Source implementations, the
 | --- | --- |
 | Source | One: chat. Messages typed into the app or its web page, and direct messages of a bound WeChat account, each a durable message on a conversation Thread with Outbox replies. The domain keeps what other Sources would need (fan-out, admission tables, bot lists), and this distribution ships no other Source |
 | Policy | Assessment rules, the accept mode, and the chat Source's allowed list |
-| Executor | A worker Session on the chosen kernel (Claude Code or Oh My Pi) and a directory per Ticket, in an execution environment whose variables the Executor registers |
+| Executor | A worker Session on the chosen kernel (Claude Code, Oh My Pi or the Antigravity CLI) and a directory per Ticket, in an execution environment whose variables the Executor registers |
 | Channel | Replies to the app's conversation or to the bound WeChat conversation |
 
 ## Glossary

@@ -59,7 +59,7 @@ The app depends on: `cupertino_ui` (Flutter's Cupertino widgets), `cupertino_ico
 | `backend/crates/neo-core/src/memory.rs` | An in-memory repository, for the Engine's tests |
 | `backend/crates/neo-store/src/lib.rs`, `read.rs`, `receipts.rs`, `effects.rs` | The SQLite repository and its transactions, read models, Outbox receipts, effect rows |
 | `backend/crates/neo-kernel/src/lib.rs`, `types.rs`, `journal.rs`, `session.rs`, `process.rs` | What a kernel is to the application: messages and events, the journal, the kernel-neutral Session, child processes |
-| `backend/crates/neo-kernel/src/claude.rs`, `omp.rs` | The two kernels' protocols |
+| `backend/crates/neo-kernel/src/claude.rs`, `omp.rs`, `antigravity.rs` | The three kernels' protocols; Antigravity's also serves the host's tools as a loopback MCP server |
 | `backend/crates/neo-app/src/lib.rs`, `app.rs`, `settings.rs`, `policy.rs`, `health.rs`, `text.rs`, `http.rs` | The application value and its wiring, settings, the Policy the settings make, component health, text limits, the outbound HTTP client |
 | `backend/crates/neo-app/src/effects.rs`, `passes.rs`, `outbox.rs`, `notices.rs` | The effect queue, orchestration passes, outbound messages, notices and relays to the main Session |
 | `backend/crates/neo-app/src/kernels.rs`, `sessions.rs`, `prompts.rs`, `tools.rs`, `resources.rs`, `cards.rs`, `assess.rs` | Launching runtimes per role, Sessions and the conversation, prompts, the tools of each role, readable resources, cards, candidate delivery and assessment |
@@ -84,7 +84,7 @@ The app depends on: `cupertino_ui` (Flutter's Cupertino widgets), `cupertino_ico
 | `backend/crates/neo-core/tests/engine.rs`, `tickets.rs`, `lifecycle.rs` | The Engine over the in-memory repository |
 | `backend/crates/neo-store/tests/core_engine.rs`, `store.rs` | The same Engine tests over SQLite; transactions, receipts, read models, effect rows, the schema version |
 | `backend/crates/neo-kernel/tests/session.rs` | The kernel-neutral Session and journal over a scripted driver |
-| `backend/crates/neo-kernel/tests/claude_real.rs`, `omp_real.rs` | Each kernel's protocol against the real runtime and a fake model endpoint (opt-in) |
+| `backend/crates/neo-kernel/tests/claude_real.rs`, `omp_real.rs`, `antigravity_real.rs` | Each kernel's protocol against the real runtime and a fake model endpoint; Antigravity's against its real models, since it signs in to Google (opt-in) |
 | `backend/crates/neo-app/tests/policy.rs`, `effects.rs` | The gate and Policy changes; the effect queue |
 | `backend/crates/neo-app/tests/flow.rs`, `work.rs`, `watchdog.rs`, `views.rs` | The application over a scripted kernel: the whole path of a request, workers at work, the Watchdog, what the API shows and changes |
 | `backend/crates/neo-app/tests/wechat.rs` | The WeChat bridge against a stand-in for its API |

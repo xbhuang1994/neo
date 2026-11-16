@@ -389,6 +389,17 @@ void main() {
     await settle(tester);
     expect(backend.kernel, 'omp');
     expect(find.text('The Claude Code program (claude) was not found.'), findsOneWidget);
+    // Antigravity is the third kernel, with its own models and no advisor.
+    await show(tester, find.text('Antigravity'));
+    await tester.tap(find.text('Antigravity'));
+    await settle(tester);
+    expect(backend.kernel, 'antigravity');
+    expect(find.text('顾问模型'), findsNothing);
+    await tester.tap(find.text('跟随内核默认').first);
+    await settle(tester);
+    await tester.tap(find.textContaining('Gemini 3.8 Flash (Low)'));
+    await settle(tester);
+    expect(find.text('antigravity/gemini-3.8-flash-low'), findsOneWidget);
     await app.close();
   });
 

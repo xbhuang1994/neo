@@ -17,7 +17,7 @@ The backend finds the other parts relative to itself, so a package runs from whe
 
 `packaging/runtimes.lock.json` pins the two runtimes by version, address and checksum for each platform: Claude Code's per-platform npm packages, and Oh My Pi's release programs. `packaging/fetch-runtimes.py <platform> <dir>` downloads them, checks each against its checksum before writing anything, and stops on a mismatch. The pinned versions are the ones the tests with real runtimes ran against; raise them together with a run of those tests.
 
-Every packaging script takes `--without-runtimes` (`-WithoutRuntimes` on Windows). Such a package uses the runtimes it finds on the machine's `PATH` or by `NEO_CLAUDE_BIN` / `NEO_OMP_BIN`.
+Every packaging script takes `--without-runtimes` (`-WithoutRuntimes` on Windows). Such a package uses the runtimes it finds on the machine's `PATH` or by `NEO_CLAUDE_BIN` / `NEO_OMP_BIN`. The Antigravity CLI (`agy`) is never bundled: it signs in to a Google account of its own and is found on the machine like an unbundled runtime.
 
 The runtimes are other parties' programs under their own terms. Claude Code in particular is not open source: check its terms before you pass a package that contains it to anyone else, and build without runtimes when in doubt.
 

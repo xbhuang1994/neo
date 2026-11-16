@@ -33,6 +33,7 @@ class FakeBackend {
   Map<String, Map<String, dynamic>> models = {
     'omp': {'eval': null, 'executor': null, 'advisor': null},
     'claude': {'eval': null, 'executor': null, 'advisor': null},
+    'antigravity': {'eval': null, 'executor': null, 'advisor': null},
   };
   Map<String, dynamic> general = {
     'paused': false,
@@ -97,10 +98,15 @@ class FakeBackend {
     'kernels': [
       {'id': 'omp', 'problem': null},
       {'id': 'claude', 'problem': claudeProblem},
+      {'id': 'antigravity', 'problem': null},
     ],
     'supports': {
       'advisor': kernel == 'omp',
-      'thinkingLevels': kernel == 'omp' ? ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] : ['auto', 'off', 'low', 'medium', 'high', 'xhigh', 'max'],
+      'thinkingLevels': switch (kernel) {
+        'omp' => ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+        'antigravity' => ['auto', 'low', 'medium', 'high'],
+        _ => ['auto', 'off', 'low', 'medium', 'high', 'xhigh', 'max'],
+      },
     },
     'current': models[kernel],
     'available': kernel == 'omp'
@@ -108,9 +114,13 @@ class FakeBackend {
             {'id': 'big', 'provider': 'fixture', 'name': 'Big'},
             {'id': 'small', 'provider': 'fixture', 'name': 'Small'},
           ]
-        : [
-            {'id': 'opus', 'provider': 'anthropic', 'name': 'Opus'},
-          ],
+        : kernel == 'antigravity'
+            ? [
+                {'id': 'gemini-3.8-flash-low', 'provider': 'antigravity', 'name': 'Gemini 3.8 Flash (Low)'},
+              ]
+            : [
+                {'id': 'opus', 'provider': 'anthropic', 'name': 'Opus'},
+              ],
     'problem': null,
   };
 

@@ -52,16 +52,16 @@ The pause in the settings holds everything: nothing is assessed, launched, deliv
 
 ## Execution kernels
 
-A kernel is the agent runtime a Session runs on. There are two, chosen in the settings, and the application treats them alike:
+A kernel is the agent runtime a Session runs on. There are three, chosen in the settings, and the application treats them alike:
 
-| | Claude Code (`claude`) | Oh My Pi (`omp`) |
-| --- | --- | --- |
-| Protocol | `stream-json` on standard input and output, with control requests | `--mode rpc`, plus one extension file (`shim/neo-omp-shim.ts`) |
-| The application's tools | An in-process MCP server; the model sees `mcp__neo__<name>` | Host tools; the model sees the bare names |
-| Guard on every tool call | A `PreToolUse` hook answered by the application | The extension asks the application |
-| Background jobs | Claude Code's background commands and subagents | Oh My Pi's async jobs, listed and cancelled through the extension |
-| Models | The `ANTHROPIC_*` environment; model names only; no advisor model | Providers of its agent directory; an optional advisor model |
+| | Claude Code (`claude`) | Oh My Pi (`omp`) | Antigravity CLI (`agy`) |
+| --- | --- | --- | --- |
+| Protocol | `stream-json` on standard input and output, with control requests | `--mode rpc`, plus one extension file (`shim/neo-omp-shim.ts`) | `agy acp`: the Agent Client Protocol (JSON-RPC); `session/resume` continues a conversation in a new process |
+| The application's tools | An in-process MCP server; the model sees `mcp__neo__<name>` | Host tools; the model sees the bare names | An MCP server on a loopback port that answers only a per-Session bearer token; the model sees `mcp_neo_<name>` |
+| Guard on every tool call | A `PreToolUse` hook answered by the application | The extension asks the application | The application answers the runtime's permission requests for its commands and edits, and judges each call of its own tools in the MCP server. A refused call ends Antigravity's turn without a reason, so the application sends the reason as a note of its own (at most three in a row). Antigravity does not ask before reading or editing files inside the working directory, so a read-only Session (a sidecar) is held to reading there by its prompt only |
+| Background jobs | Claude Code's background commands and subagents | Oh My Pi's async jobs, listed and cancelled through the extension | None reported: the protocol does not list them, so workers are told to wait for their commands and there are no subagents |
+| Models | The `ANTHROPIC_*` environment; model names only; no advisor model | Providers of its agent directory; an optional advisor model | The account `agy` is signed in to; the ids `agy models` lists; thinking `low`, `medium` or `high`; no advisor model |
 
-Each Session is one runtime process, in its own process group so that it ends with its children. The application keeps its own journal for every Session, which is what makes delivery idempotent and the transcript the same on both kernels.
+Each Session is one runtime process, in its own process group so that it ends with its children. The application keeps its own journal for every Session, which is what makes delivery idempotent and the transcript the same on every kernel.
 
-Switching the kernel applies at once: the main Session reopens on the new kernel with its transcript, and a worker stays on the kernel it started on until its Ticket ends. Each kernel keeps its own model choices. The commands the settings block are refused on both kernels the same way: stand-ins for them come first on the `PATH` of every Session and prepare command.
+Switching the kernel applies at once: the main Session reopens on the new kernel with its transcript, and a worker stays on the kernel it started on until its Ticket ends. Each kernel keeps its own model choices. The commands the settings block are refused on every kernel the same way: stand-ins for them come first on the `PATH` of every Session and prepare command.

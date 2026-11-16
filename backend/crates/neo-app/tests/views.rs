@@ -162,7 +162,7 @@ async fn chooses_models_per_kernel_and_switches_the_kernel() {
     assert_eq!(view["supports"]["advisor"], true);
     assert!(view["supports"]["thinkingLevels"].as_array().unwrap().contains(&json!("minimal")));
     assert_eq!(view["available"][0], json!({"id": "big", "provider": "fixture", "name": "fixture big"}));
-    assert_eq!(view["kernels"], json!([{"id": "omp", "problem": null}, {"id": "claude", "problem": null}]));
+    assert_eq!(view["kernels"], json!([{"id": "omp", "problem": null}, {"id": "claude", "problem": null}, {"id": "antigravity", "problem": null}]));
 
     // Refusals change nothing.
     let refused = |value: Value| {
@@ -216,7 +216,7 @@ async fn chooses_models_per_kernel_and_switches_the_kernel() {
     assert_eq!(f.app.settings().models[&Kernel::Claude].eval.as_ref().map(|model| model.model.as_str()), Some("opus"));
 
     // A kernel that cannot run here is not switched to, and says why.
-    assert_eq!(f.app.set_kernel(json!({"kernel": "pi"})).await.unwrap_err(), "kernel is omp or claude");
+    assert_eq!(f.app.set_kernel(json!({"kernel": "pi"})).await.unwrap_err(), "kernel is omp, claude or antigravity");
     *f.kernels.unavailable.lock().unwrap() = Some("The Claude Code program (claude) was not found.".into());
     assert_eq!(f.app.set_kernel(json!({"kernel": "claude"})).await.unwrap_err(), "The Claude Code program (claude) was not found.");
     assert_eq!(f.app.settings().kernel, Kernel::Omp);
