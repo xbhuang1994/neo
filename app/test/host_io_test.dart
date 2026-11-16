@@ -39,9 +39,9 @@ void main() {
   tearDown(() => dir.deleteSync(recursive: true));
 
   test('finds the backend where it is named, then beside the app, then on the path', () {
-    final files = <String>{'/Applications/Neo Agent.app/Contents/Helpers/neo-agent', '/opt/neo/neo-agent', '/usr/local/bin/neo-agent', '/custom/neo-agent'};
+    final files = <String>{'/Applications/Neo.app/Contents/Helpers/neo-agent', '/opt/neo/neo-agent', '/usr/local/bin/neo-agent', '/custom/neo-agent'};
     String? find(String executable, Map<String, String> environment) => findBackend(executable: executable, environment: environment, exists: files.contains);
-    expect(find('/Applications/Neo Agent.app/Contents/MacOS/Neo Agent', {'PATH': '/usr/bin:/usr/local/bin'}), '/Applications/Neo Agent.app/Contents/Helpers/neo-agent');
+    expect(find('/Applications/Neo.app/Contents/MacOS/Neo', {'PATH': '/usr/bin:/usr/local/bin'}), '/Applications/Neo.app/Contents/Helpers/neo-agent');
     expect(find('/opt/neo/neo_agent', {'PATH': '/usr/bin:/usr/local/bin'}), '/opt/neo/neo-agent');
     expect(find('/elsewhere/bin/app', {'PATH': '/usr/bin:/usr/local/bin'}), '/usr/local/bin/neo-agent');
     expect(find('/elsewhere/bin/app', {'PATH': '/usr/bin'}), isNull);
@@ -71,9 +71,9 @@ void main() {
   }, skip: Platform.isWindows);
 
   test('says when another instance runs, and starts one that ended by itself again', () async {
-    final already = Sidecar(program: script(dir, 'already', 'read token\necho "Neo Agent is already running on port 3082." >&2\nexit 3'))..start();
+    final already = Sidecar(program: script(dir, 'already', 'read token\necho "Neo is already running on port 3082." >&2\nexit 3'))..start();
     final refused = await reach(already, BackendPhase.alreadyRunning);
-    expect(refused.message, 'Neo Agent is already running on port 3082.');
+    expect(refused.message, 'Neo is already running on port 3082.');
     await already.stop();
 
     // The first run fails; the one after it listens.

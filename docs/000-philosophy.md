@@ -1,6 +1,6 @@
 # 000 Philosophy
 
-Neo Agent is an application, and also a way of working with an agent. Its core principle:
+Neo is an application, and also a way of working with an agent. Its core principle:
 
 **Take as little human attention as possible, and give as much value as possible.**
 

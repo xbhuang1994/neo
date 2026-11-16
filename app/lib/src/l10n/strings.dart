@@ -14,7 +14,7 @@ abstract class Strings {
   /// The words of the nearest [StringsScope].
   static Strings read(BuildContext context) => context.dependOnInheritedWidgetOfExactType<StringsScope>()?.strings ?? const ZhStrings();
 
-  String get appName => 'Neo Agent';
+  String get appName => 'Neo';
 
   // Navigation
   String get chat;
@@ -116,9 +116,11 @@ abstract class Strings {
   String get switchingKernel;
   String get orchestratorModel;
   String get workerModel;
-  String get advisorModel;
+  String get install;
+  String get installing;
+  String installed(String kernel);
+  String get antigravitySignIn;
   String get followKernelDefault;
-  String get off;
   String get thinking;
   String get current;
   String get save;
@@ -212,9 +214,9 @@ class ZhStrings extends Strings {
   @override
   String get backendFailed => '本机服务无法启动';
   @override
-  String get alreadyRunning => 'Neo Agent 已在运行';
+  String get alreadyRunning => 'Neo 已在运行';
   @override
-  String get alreadyRunningHint => '同一台电脑只能运行一个 Neo Agent。请切换到已打开的窗口，或先退出正在运行的服务。';
+  String get alreadyRunningHint => '同一台电脑只能运行一个 Neo。请切换到已打开的窗口，或先退出正在运行的服务。';
   @override
   String get tokenNeeded => '需要访问令牌';
   @override
@@ -227,7 +229,7 @@ class ZhStrings extends Strings {
   @override
   String get chatEmptyTitle => '开始对话';
   @override
-  String get chatEmptyHint => '说出要做的事，Neo Agent 会建立任务并交给 Worker 完成。';
+  String get chatEmptyHint => '说出要做的事，Neo 会建立任务并交给 Worker 完成。';
   @override
   String get you => '你';
   @override
@@ -353,7 +355,7 @@ class ZhStrings extends Strings {
   @override
   String get connectionHintLocal => '使用随应用启动的本机服务，数据保存在这台电脑上。';
   @override
-  String get connectionHintRemote => '连接到以服务器模式部署的 Neo Agent。非本机地址需要访问令牌。';
+  String get connectionHintRemote => '连接到以服务器模式部署的 Neo。非本机地址需要访问令牌。';
   @override
   String get connectionHintWeb => '此页面由服务器提供。服务器设置了访问令牌时，请在这里填写。';
   @override
@@ -377,11 +379,15 @@ class ZhStrings extends Strings {
   @override
   String get workerModel => 'Worker 模型';
   @override
-  String get advisorModel => '顾问模型';
+  String get install => '安装';
+  @override
+  String get installing => '正在安装…';
+  @override
+  String installed(String kernel) => '$kernel 已安装';
+  @override
+  String get antigravitySignIn => '首次使用前，在终端运行一次 agy 登录 Google 账号。';
   @override
   String get followKernelDefault => '跟随内核默认';
-  @override
-  String get off => '关闭';
   @override
   String get thinking => '思考档位';
   @override
@@ -538,9 +544,9 @@ class EnStrings extends Strings {
   @override
   String get backendFailed => 'The local service could not start';
   @override
-  String get alreadyRunning => 'Neo Agent is already running';
+  String get alreadyRunning => 'Neo is already running';
   @override
-  String get alreadyRunningHint => 'Only one Neo Agent runs on a computer. Switch to the window that is open, or quit the running service first.';
+  String get alreadyRunningHint => 'Only one Neo runs on a computer. Switch to the window that is open, or quit the running service first.';
   @override
   String get tokenNeeded => 'An access token is needed';
   @override
@@ -553,7 +559,7 @@ class EnStrings extends Strings {
   @override
   String get chatEmptyTitle => 'Start a conversation';
   @override
-  String get chatEmptyHint => 'Say what needs doing. Neo Agent opens a task and hands it to a worker.';
+  String get chatEmptyHint => 'Say what needs doing. Neo opens a task and hands it to a worker.';
   @override
   String get you => 'You';
   @override
@@ -679,7 +685,7 @@ class EnStrings extends Strings {
   @override
   String get connectionHintLocal => 'Uses the service that starts with the app. Data stays on this computer.';
   @override
-  String get connectionHintRemote => 'Connects to a Neo Agent deployed as a server. An address on another machine needs an access token.';
+  String get connectionHintRemote => 'Connects to a Neo deployed as a server. An address on another machine needs an access token.';
   @override
   String get connectionHintWeb => 'This page is served by the server. Enter the access token here if the server has one.';
   @override
@@ -704,11 +710,15 @@ class EnStrings extends Strings {
   @override
   String get workerModel => 'Worker model';
   @override
-  String get advisorModel => 'Advisor model';
+  String get install => 'Install';
+  @override
+  String get installing => 'Installing…';
+  @override
+  String installed(String kernel) => '$kernel is installed';
+  @override
+  String get antigravitySignIn => 'Before first use, run agy once in a terminal to sign in with Google.';
   @override
   String get followKernelDefault => 'Kernel default';
-  @override
-  String get off => 'Off';
   @override
   String get thinking => 'Thinking';
   @override

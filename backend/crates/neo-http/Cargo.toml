@@ -1,6 +1,6 @@
 [package]
 name = "neo-http"
-description = "Neo Agent HTTP API: the JSON interface of the app, access control, and the web build's static files."
+description = "Neo HTTP API: the JSON interface of the app, access control, and the web build's static files."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -7,7 +7,7 @@ class MainFlutterWindow: NSWindow {
     let windowFrame = self.frame
     self.contentViewController = flutterViewController
     self.setFrame(windowFrame, display: true)
-    self.title = "Neo Agent"
+    self.title = "Neo"
     self.minSize = NSSize(width: 420, height: 520)
     self.setFrameAutosaveName("NeoAgentMainWindow")
 

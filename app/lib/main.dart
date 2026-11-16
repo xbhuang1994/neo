@@ -41,7 +41,7 @@ class NeoAgentApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return CupertinoApp(
-      title: 'Neo Agent',
+      title: 'Neo',
       debugShowCheckedModeBanner: false,
       theme: appTheme(brightness: brightness, bundledCjk: bundledCjk),
       locale: locale,

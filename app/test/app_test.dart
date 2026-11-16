@@ -131,7 +131,7 @@ void main() {
     expect(tester.widget<CupertinoTextField>(find.byType(CupertinoTextField)).controller!.text, isEmpty);
     // Who said it and when.
     expect(find.textContaining('你 · '), findsOneWidget);
-    expect(find.textContaining('Neo Agent · '), findsOneWidget);
+    expect(find.textContaining('Neo · '), findsOneWidget);
 
     // What arrives later shows by itself.
     backend.say('assistant', '首页的错别字已修正。');
@@ -332,7 +332,7 @@ void main() {
   testWidgets('uses tabs on a narrow window, with the detail over the list', (tester) async {
     final backend = FakeBackend()..addWorker('t1', '训练模型', {'stage': 'working'}, streaming: true);
     final app = await open(tester, backend, size: narrow);
-    expect(find.text('Neo Agent'), findsNothing, reason: 'no sidebar');
+    expect(find.text('Neo'), findsNothing, reason: 'no sidebar');
     await tester.tap(nav(1));
     await settle(tester);
     expect(find.text('正在执行'), findsOneWidget);
@@ -352,7 +352,6 @@ void main() {
     await tester.tap(nav(2));
     await settle(tester);
     expect(find.text('跟随内核默认'), findsNWidgets(2));
-    expect(find.text('顾问模型'), findsOneWidget);
 
     await tester.tap(find.byKey(const ValueKey('model-评估与调度模型')));
     await settle(tester);
@@ -370,16 +369,14 @@ void main() {
     expect(backend.models['omp'], {
       'eval': {'provider': 'fixture', 'model': 'big', 'thinkingLevel': 'high'},
       'executor': null,
-      'advisor': null,
     });
     expect(find.text('已保存'), findsOneWidget);
 
-    // The other kernel has its own choices and no advisor.
+    // The other kernel has its own choices.
     await show(tester, find.text('Claude Code'));
     await tester.tap(find.text('Claude Code'));
     await settle(tester);
     expect(backend.kernel, 'claude');
-    expect(find.text('顾问模型'), findsNothing);
     expect(find.text('fixture/big'), findsNothing);
     // A kernel that cannot run says why, and nothing changes.
     backend.claudeProblem = 'The Claude Code program (claude) was not found.';
@@ -389,17 +386,30 @@ void main() {
     await settle(tester);
     expect(backend.kernel, 'omp');
     expect(find.text('The Claude Code program (claude) was not found.'), findsOneWidget);
-    // Antigravity is the third kernel, with its own models and no advisor.
+    // Antigravity is the third kernel, with its own models and no thinking level to choose.
     await show(tester, find.text('Antigravity'));
     await tester.tap(find.text('Antigravity'));
     await settle(tester);
     expect(backend.kernel, 'antigravity');
-    expect(find.text('顾问模型'), findsNothing);
     await tester.tap(find.text('跟随内核默认').first);
     await settle(tester);
     await tester.tap(find.textContaining('Gemini 3.8 Flash (Low)'));
     await settle(tester);
     expect(find.text('antigravity/gemini-3.8-flash-low'), findsOneWidget);
+    expect(find.text('  思考档位'), findsNothing);
+    // A kernel whose program is missing can be installed from here, and then chosen.
+    final install = find.byKey(const ValueKey('install-claude'));
+    await show(tester, install);
+    expect(find.textContaining('Claude Code: The Claude Code program'), findsOneWidget);
+    expect(find.byKey(const ValueKey('install-omp')), findsNothing);
+    await tester.tap(install);
+    await settle(tester);
+    expect(backend.installed, ['claude']);
+    expect(find.text('Claude Code 已安装'), findsOneWidget);
+    expect(install, findsNothing);
+    await tester.tap(find.text('Claude Code'));
+    await settle(tester);
+    expect(backend.kernel, 'claude');
     await app.close();
   });
 
@@ -522,10 +532,10 @@ void main() {
     await settle(tester);
     expect(find.text('已连接'), findsWidgets);
     expect(find.text('开始对话'), findsOneWidget);
-    host.backend.notifier.value = const BackendStatus(BackendPhase.alreadyRunning, message: 'Neo Agent is already running on port 3082.');
+    host.backend.notifier.value = const BackendStatus(BackendPhase.alreadyRunning, message: 'Neo is already running on port 3082.');
     await settle(tester);
-    expect(find.text('Neo Agent 已在运行'), findsWidgets);
-    expect(find.text('同一台电脑只能运行一个 Neo Agent。请切换到已打开的窗口，或先退出正在运行的服务。'), findsOneWidget);
+    expect(find.text('Neo 已在运行'), findsWidgets);
+    expect(find.text('同一台电脑只能运行一个 Neo。请切换到已打开的窗口，或先退出正在运行的服务。'), findsOneWidget);
     // The connection can be pointed at a server instead.
     await tester.tap(nav(2));
     await settle(tester);

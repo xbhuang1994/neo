@@ -1,4 +1,4 @@
-//! Neo Agent's program: a server (`serve`), the desktop app's backend (`desktop-sidecar`), a check of the machine
+//! Neo's program: a server (`serve`), the desktop app's backend (`desktop-sidecar`), a check of the machine
 //! (`doctor`), and — started under another name from the folder of blocked commands — a refusal to run that command.
 #![deny(missing_docs)]
 
@@ -10,7 +10,7 @@ use cli::{Command, Common, ConfigFile};
 use instance::{Instance, Refused, ALREADY_RUNNING};
 use neo_app::app::{App, Machine, Timings};
 use neo_app::blocked;
-use neo_app::kernels::{Kernels, RealKernels};
+use neo_app::kernels::{self, Kernels, RealKernels};
 use neo_app::settings::{Kernel, Settings};
 use neo_http::Access;
 use serde_json::json;
@@ -55,21 +55,20 @@ fn common(common: &Common, config: &ConfigFile) -> (PathBuf, PathBuf, bool) {
 
 fn kernels(plan: &Plan) -> RealKernels {
     let program_dir = paths::program_dir();
-    let path = std::env::var_os("PATH");
-    let claude = paths::find_runtime("claude", env_path("NEO_CLAUDE_BIN"), program_dir.as_deref(), path.as_deref());
-    let omp = paths::find_runtime("omp", env_path("NEO_OMP_BIN"), program_dir.as_deref(), path.as_deref());
-    // The Antigravity CLI installs itself into ~/.local/bin, which a service's path may leave out.
-    let named_agy = env_path("NEO_AGY_BIN");
-    let named = named_agy.is_some();
-    let agy = paths::find_runtime("agy", named_agy, program_dir.as_deref(), path.as_deref()).or_else(|| {
-        // A program named that does not exist stays a mistake to report.
-        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).filter(|_| !named)?;
-        paths::on_path("agy", Some(PathBuf::from(home).join(".local").join("bin").as_os_str()))
+    // Each program is looked for whenever it is needed, so one installed while this runs is found.
+    let find = Arc::new(|kernel: Kernel| {
+        let variable = match kernel {
+            Kernel::Claude => "NEO_CLAUDE_BIN",
+            Kernel::Omp => "NEO_OMP_BIN",
+            Kernel::Antigravity => "NEO_AGY_BIN",
+        };
+        let name = kernels::program_name(kernel);
+        paths::find_runtime(name, env_path(variable), std::env::var_os("PATH").as_deref(), &paths::install_dirs(name))
     });
     let shim = paths::find_shim(env_path("NEO_SHIM"), program_dir.as_deref());
     // Every Session meets the blocked commands first on its path.
     let env = [("PATH".to_string(), blocked::path_with(&plan.data_dir).to_string_lossy().to_string())].into_iter().collect();
-    RealKernels { state_dir: plan.data_dir.clone(), agent_dir: plan.agent_dir.clone(), claude, omp, agy, shim, env }
+    RealKernels { state_dir: plan.data_dir.clone(), agent_dir: plan.agent_dir.clone(), find, installing: Default::default(), shim, env }
 }
 
 /// Waits until the process is asked to end: by a signal, or by `ended` (the desktop app going away).
@@ -111,20 +110,17 @@ async fn run(plan: Plan, sidecar: bool, ended: Option<tokio::sync::oneshot::Rece
             let place = info.as_ref().and_then(|info| info["port"].as_u64()).map(|port| format!(" on port {port}")).unwrap_or_default();
             (
                 ALREADY_RUNNING,
-                format!(
-                    "Neo Agent is already running{place}. Only one instance runs per user; pass --allow-multiple with another --data-dir to run a second one."
-                ),
+                format!("Neo is already running{place}. Only one instance runs per user; pass --allow-multiple with another --data-dir to run a second one."),
             )
         }
         Refused::Failed(why) => fail(why),
     })?;
     let kernels = Arc::new(kernels(&plan));
-    for (kernel, name, program) in
-        [(Kernel::Claude, "Claude Code", &kernels.claude), (Kernel::Omp, "Oh My Pi", &kernels.omp), (Kernel::Antigravity, "Antigravity", &kernels.agy)]
-    {
-        match kernels.unavailable(kernel) {
-            None => log(&format!("{name}: {}", program.as_ref().map(|path| path.display().to_string()).unwrap_or_default())),
-            Some(problem) => log(&format!("{name}: {problem}")),
+    for kernel in [Kernel::Claude, Kernel::Omp, Kernel::Antigravity] {
+        let name = kernels::display_name(kernel);
+        match (kernels.program(kernel), kernels.unavailable(kernel)) {
+            (Some(program), None) => log(&format!("{name}: {}", program.display())),
+            (_, problem) => log(&format!("{name}: {}", problem.unwrap_or_default())),
         }
     }
     let machine = Machine { state_dir: plan.data_dir.clone(), wechat: Default::default(), program: std::env::current_exe().ok() };
@@ -181,20 +177,19 @@ fn doctor(options: &Common) -> i32 {
     let plan = Plan { data_dir, agent_dir, allow_multiple: true, host: String::new(), port: 0, token: None, web_dir: None, init_settings: None };
     let kernels = kernels(&plan);
     let program_dir = paths::program_dir();
-    println!("Neo Agent {}", env!("CARGO_PKG_VERSION"));
+    println!("Neo {}", env!("CARGO_PKG_VERSION"));
     println!("Data directory:   {}", plan.data_dir.display());
     println!("Agent directory:  {}", plan.agent_dir.display());
     println!("Instance lock:    {}", paths::runtime_dir().display());
     let mut usable = 0;
-    for (kernel, name, program) in
-        [(Kernel::Claude, "Claude Code", &kernels.claude), (Kernel::Omp, "Oh My Pi   ", &kernels.omp), (Kernel::Antigravity, "Antigravity", &kernels.agy)]
-    {
-        match (program, kernels.unavailable(kernel)) {
+    for kernel in [Kernel::Claude, Kernel::Omp, Kernel::Antigravity] {
+        let name = format!("{}:", kernels::display_name(kernel));
+        match (kernels.program(kernel), kernels.unavailable(kernel)) {
             (Some(program), None) => {
                 usable += 1;
-                println!("{name}:      ok — {} ({})", program.display(), version_of(program));
+                println!("{name:<18}ok — {} ({})", program.display(), version_of(&program));
             }
-            (_, problem) => println!("{name}:      missing — {}", problem.unwrap_or_default()),
+            (_, problem) => println!("{name:<18}missing — {}", problem.unwrap_or_default()),
         }
     }
     println!("OMP extension:    {}{}", kernels.shim.display(), if kernels.shim.is_file() { "" } else { " (missing)" });
@@ -207,7 +202,7 @@ fn doctor(options: &Common) -> i32 {
         None => println!("Web app:          not found beside the program (serve --web-dir <dir> names it)"),
     }
     if usable == 0 {
-        println!("No kernel can run: install Claude Code, Oh My Pi or the Antigravity CLI, or set NEO_CLAUDE_BIN / NEO_OMP_BIN / NEO_AGY_BIN.");
+        println!("No kernel can run: install Claude Code, Oh My Pi or the Antigravity CLI (the app's settings can install them), or set NEO_CLAUDE_BIN / NEO_OMP_BIN / NEO_AGY_BIN.");
         return 1;
     }
     0

@@ -96,6 +96,15 @@ fn attachments(entry: &Entry) -> Vec<(String, String, &'static str)> {
         .collect()
 }
 
+fn kernel_named(value: Option<&Value>) -> Result<Kernel, String> {
+    match value.and_then(Value::as_str) {
+        Some("omp") => Ok(Kernel::Omp),
+        Some("claude") => Ok(Kernel::Claude),
+        Some("antigravity") => Ok(Kernel::Antigravity),
+        _ => Err("kernel is omp, claude or antigravity".into()),
+    }
+}
+
 fn selection(value: Option<&Value>, name: &str) -> Result<Option<RoleModel>, String> {
     match value {
         None => Err(format!("{name} is required; null follows the kernel's default")),
@@ -296,13 +305,20 @@ impl App {
         };
         let kernels: Vec<Value> = [Kernel::Omp, Kernel::Claude, Kernel::Antigravity]
             .into_iter()
-            .map(|kernel| json!({"id": kernel.as_str(), "problem": self.kernels.unavailable(kernel)}))
+            .map(|kernel| {
+                json!({
+                    "id": kernel.as_str(),
+                    "problem": self.kernels.unavailable(kernel),
+                    "installed": self.kernels.installed(kernel),
+                    "installing": self.kernels.installing(kernel),
+                })
+            })
             .collect();
         json!({
             "kernel": kernel.as_str(),
             "kernels": kernels,
             "supports": support(kernel),
-            "current": {"eval": chosen.eval, "executor": chosen.executor, "advisor": chosen.advisor},
+            "current": {"eval": chosen.eval, "executor": chosen.executor},
             "available": available,
             "problem": problem,
         })
@@ -311,17 +327,18 @@ impl App {
     /// Choose the models of the current kernel's roles; `null` follows the kernel's default. They apply to open
     /// Sessions from their next turn.
     pub async fn update_models(self: &Arc<Self>, value: Value) -> Result<Value, String> {
-        let fields = object(value, &["eval", "executor", "advisor"])?;
+        let fields = object(value, &["eval", "executor"])?;
         let settings = self.settings();
         let kernel = settings.kernel;
         let supports = support(kernel);
-        let chosen = RoleModels {
-            eval: selection(fields.get("eval"), "eval")?,
-            executor: selection(fields.get("executor"), "executor")?,
-            // A kernel without an advisor keeps none, whatever was sent.
-            advisor: selection(fields.get("advisor"), "advisor")?.filter(|_| supports.advisor),
-        };
-        let all: Vec<&RoleModel> = [&chosen.eval, &chosen.executor, &chosen.advisor].into_iter().flatten().collect();
+        let mut chosen = RoleModels { eval: selection(fields.get("eval"), "eval")?, executor: selection(fields.get("executor"), "executor")? };
+        if supports.thinking_levels.is_empty() {
+            // The runtime picks its own effort: a level sent along is dropped.
+            for model in [&mut chosen.eval, &mut chosen.executor].into_iter().flatten() {
+                model.thinking_level = None;
+            }
+        }
+        let all: Vec<&RoleModel> = [&chosen.eval, &chosen.executor].into_iter().flatten().collect();
         for model in &all {
             if let Some(level) = model.thinking_level.as_deref().filter(|level| !supports.thinking_levels.contains(level)) {
                 return Err(format!("Thinking level {level} is not supported by the {} kernel", kernel.as_str()));
@@ -341,16 +358,30 @@ impl App {
         Ok(self.models_view().await)
     }
 
+    /// Install a kernel's program with its official installer. When it is the kernel in use, the main Session opens on
+    /// it at once.
+    pub async fn install_kernel(self: &Arc<Self>, value: Value) -> Result<Value, String> {
+        let fields = object(value, &["kernel"])?;
+        let kernel = kernel_named(fields.get("kernel"))?;
+        if !self.kernels.installed(kernel) {
+            self.kernels.install(kernel).await?;
+        }
+        if self.settings().kernel == kernel {
+            if let Some(problem) = self.kernels.unavailable(kernel) {
+                return Err(problem);
+            }
+            self.ensure_orchestrator().await?;
+            self.board.set("kernel", Health::ready(format!("Running on {}", kernel.as_str())));
+            self.passes.pump();
+        }
+        Ok(self.models_view().await)
+    }
+
     /// Switch the kernel new Sessions run on. The main Session reopens on it from its transcript; a worker stays on
     /// the kernel it started on until its ticket ends. Each kernel keeps its own model choices.
     pub async fn set_kernel(self: &Arc<Self>, value: Value) -> Result<Value, String> {
         let fields = object(value, &["kernel"])?;
-        let kernel = match fields.get("kernel").and_then(Value::as_str) {
-            Some("omp") => Kernel::Omp,
-            Some("claude") => Kernel::Claude,
-            Some("antigravity") => Kernel::Antigravity,
-            _ => return Err("kernel is omp, claude or antigravity".into()),
-        };
+        let kernel = kernel_named(fields.get("kernel"))?;
         let before = self.settings();
         if before.kernel == kernel {
             return Ok(self.models_view().await);
@@ -478,7 +509,7 @@ mod tests {
         );
         assert!(selection(None, "eval").unwrap_err().starts_with("eval is required"));
         assert!(selection(Some(&json!({"provider": "p"})), "executor").unwrap_err().starts_with("executor: "));
-        assert_eq!(selection(Some(&json!({"provider": " ", "model": "m"})), "advisor").unwrap_err(), "advisor needs a provider and a model");
+        assert_eq!(selection(Some(&json!({"provider": " ", "model": "m"})), "executor").unwrap_err(), "executor needs a provider and a model");
         assert_eq!(object(json!({"a": 1, "x": 2}), &["a", "b"]).unwrap_err(), "Unknown field x; the fields are a, b");
         assert_eq!(object(json!([1]), &["a"]).unwrap_err(), "Expected a JSON object");
     }

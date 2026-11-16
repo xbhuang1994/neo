@@ -485,7 +485,7 @@ class ModelsSettings extends StatefulWidget {
 class _ModelsSettingsState extends LoadingState<ModelsSettings, ModelSettings> {
   RoleModel? _eval;
   RoleModel? _executor;
-  RoleModel? _advisor;
+  String? _installing;
 
   @override
   Future<ModelSettings> load() async => _take(await widget.api.models());
@@ -493,7 +493,6 @@ class _ModelsSettingsState extends LoadingState<ModelsSettings, ModelSettings> {
   ModelSettings _take(ModelSettings settings) {
     _eval = settings.eval;
     _executor = settings.executor;
-    _advisor = settings.advisor;
     return settings;
   }
 
@@ -517,6 +516,15 @@ class _ModelsSettingsState extends LoadingState<ModelsSettings, ModelSettings> {
     if (picked != null && mounted) setState(() => set(picked.$1));
   }
 
+  Future<void> _install(String kernel) async {
+    final strings = Strings.read(context);
+    final name = _name(kernel);
+    final done = kernel == 'antigravity' ? '${strings.installed(name)} ${strings.antigravitySignIn}' : strings.installed(name);
+    setState(() => _installing = kernel);
+    await run(() async => _take(await widget.api.installKernel(kernel)), done: done);
+    if (mounted) setState(() => _installing = null);
+  }
+
   Future<void> _pickThinking(RoleModel model, ValueChanged<RoleModel?> set) async {
     final strings = Strings.read(context);
     final levels = data!.thinkingLevels;
@@ -533,7 +541,8 @@ class _ModelsSettingsState extends LoadingState<ModelsSettings, ModelSettings> {
         trailing: Choice(model == null ? fallback : '${model.provider}/${model.model}'),
         onTap: busy ? null : () => unawaited(_pickModel(title, model, fallback, set)),
       ),
-      if (model != null)
+      // A kernel with no levels, such as Antigravity, picks its own effort.
+      if (model != null && data!.thinkingLevels.isNotEmpty)
         Field(label: '  ${strings.thinking}', trailing: Choice(model.thinkingLevel ?? 'auto'), onTap: busy ? null : () => unawaited(_pickThinking(model, set))),
     ];
   }
@@ -545,8 +554,8 @@ class _ModelsSettingsState extends LoadingState<ModelsSettings, ModelSettings> {
     if (settings == null) return placeholder(context, strings.kernelAndModels);
     final palette = Palette.of(context);
     final typo = Typo.of(context);
-    final changed = _eval != settings.eval || _executor != settings.executor || _advisor != settings.advisor;
-    final problems = [for (final kernel in settings.kernels) if (kernel.problem != null) '${_name(kernel.id)}: ${kernel.problem}'];
+    final changed = _eval != settings.eval || _executor != settings.executor;
+    final missing = [for (final kernel in settings.kernels) if (kernel.problem != null) kernel];
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -571,14 +580,33 @@ class _ModelsSettingsState extends LoadingState<ModelsSettings, ModelSettings> {
                       unawaited(run(() async => _take(await widget.api.setKernel(kernel)), done: _name(kernel)));
                     },
                   ),
-                  for (final problem in problems) Padding(padding: const EdgeInsets.only(top: 8), child: Text(problem, style: typo.footnote.copyWith(color: palette.orange))),
-                  if (settings.problem != null && problems.isEmpty) Padding(padding: const EdgeInsets.only(top: 8), child: Text(settings.problem!, style: typo.footnote.copyWith(color: palette.orange))),
+                  for (final kernel in missing)
+                    Padding(
+                      key: ValueKey('kernel-${kernel.id}'),
+                      padding: const EdgeInsets.only(top: 8),
+                      child: Row(
+                        children: [
+                          Expanded(child: Text('${_name(kernel.id)}: ${kernel.problem}', style: typo.footnote.copyWith(color: palette.orange))),
+                          if (!kernel.installed)
+                            Padding(
+                              padding: const EdgeInsets.only(left: 8),
+                              child: ActionButton(
+                                key: ValueKey('install-${kernel.id}'),
+                                label: kernel.installing ? strings.installing : strings.install,
+                                plain: true,
+                                busy: kernel.installing || _installing == kernel.id,
+                                onPressed: busy ? null : () => unawaited(_install(kernel.id)),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                  if (settings.problem != null && missing.isEmpty) Padding(padding: const EdgeInsets.only(top: 8), child: Text(settings.problem!, style: typo.footnote.copyWith(color: palette.orange))),
                 ],
               ),
             ),
             ..._role(strings.orchestratorModel, _eval, strings.followKernelDefault, (model) => _eval = model),
             ..._role(strings.workerModel, _executor, strings.followKernelDefault, (model) => _executor = model),
-            if (settings.supportsAdvisor) ..._role(strings.advisorModel, _advisor, strings.off, (model) => _advisor = model),
             Padding(
               padding: const EdgeInsets.all(12),
               child: Row(
@@ -587,7 +615,7 @@ class _ModelsSettingsState extends LoadingState<ModelsSettings, ModelSettings> {
                   ActionButton(
                     label: strings.save,
                     busy: busy,
-                    onPressed: changed ? () => unawaited(run(() async => _take(await widget.api.saveModels(eval: _eval, executor: _executor, advisor: _advisor)), done: strings.saved)) : null,
+                    onPressed: changed ? () => unawaited(run(() async => _take(await widget.api.saveModels(eval: _eval, executor: _executor)), done: strings.saved)) : null,
                   ),
                 ],
               ),

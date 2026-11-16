@@ -1,5 +1,5 @@
 /**
- * Neo Agent's extension for Oh My Pi, loaded with `omp --mode rpc --extension <this file>`.
+ * Neo's extension for Oh My Pi, loaded with `omp --mode rpc --extension <this file>`.
  *
  * OMP's RPC mode has no command for two things the host needs, so this file adds them:
  *

@@ -1,22 +1,17 @@
 name: Release
 
 # Builds the installers: a disk image for each Mac architecture, a Windows setup program and a Linux server tarball,
-# each with the backend and the pinned agent runtimes inside. Runs for a version tag, or by hand.
+# each with the backend inside. The agent runtimes are not bundled: the app installs them. Runs for a version tag, or
+# by hand.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
-    inputs:
-      runtimes:
-        description: Bundle the agent runtimes (claude, omp)
-        type: boolean
-        default: true
 
 env:
   FLUTTER_VERSION: "3.50.0"
   # Pinned so a new Rust release cannot turn fresh lints into a red build; bump on purpose.
   RUST_VERSION: "1.100.0"
-  WITHOUT_RUNTIMES: ${{ github.event_name == 'workflow_dispatch' && !inputs.runtimes }}
 
 jobs:
   macos:
@@ -60,7 +55,7 @@ jobs:
         env:
           MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: |
-          if [ "$WITHOUT_RUNTIMES" = true ]; then packaging/macos/build-dmg.sh --arch ${{ matrix.arch }} --without-runtimes; else packaging/macos/build-dmg.sh --arch ${{ matrix.arch }}; fi
+          packaging/macos/build-dmg.sh --arch ${{ matrix.arch }}
       - name: Notarize
         if: env.APPLE_ID != ''
         env:
@@ -88,13 +83,10 @@ jobs:
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
       - name: Put the app together
         shell: pwsh
         run: |
-          if ($env:WITHOUT_RUNTIMES -eq "true") { ./packaging/windows/stage.ps1 -WithoutRuntimes } else { ./packaging/windows/stage.ps1 }
+          ./packaging/windows/stage.ps1
       - name: Build the installer
         shell: pwsh
         run: |
@@ -122,7 +114,7 @@ jobs:
           channel: stable
       - name: Build the tarball
         run: |
-          if [ "$WITHOUT_RUNTIMES" = true ]; then packaging/linux/build-server.sh --without-runtimes; else packaging/linux/build-server.sh; fi
+          packaging/linux/build-server.sh
       - uses: actions/upload-artifact@v4
         with:
           name: linux-x64

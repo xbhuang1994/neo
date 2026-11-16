@@ -1,4 +1,4 @@
-//! Neo Agent application layer: settings and policy, the effect queue, sessions, the executor, sources and tools.
+//! Neo application layer: settings and policy, the effect queue, sessions, the executor, sources and tools.
 #![deny(missing_docs)]
 
 pub mod app;

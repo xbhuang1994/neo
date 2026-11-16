@@ -1,6 +1,6 @@
 # 006 Deployment
 
-This document says how Neo Agent runs on a machine. It builds on [005 Sessions](005-sessions.md). The steps for installing it are in `SETUP.md`.
+This document says how Neo runs on a machine. It builds on [005 Sessions](005-sessions.md). The steps for installing it are in `SETUP.md`.
 
 ## Two ways to run
 
@@ -20,7 +20,7 @@ On start the program prints one line on standard output — `{"port", "pid", "ve
 
 ## One instance
 
-Only one Neo Agent runs per user on a machine. The running instance holds an exclusive lock on a file in the per-user runtime directory, and always one in its data directory; the operating system releases both when the process ends, however it ends. A second instance exits with status 3 and says on which port the first one listens. `--allow-multiple` (or `NEO_ALLOW_MULTIPLE=1`) lets instances with different data directories run side by side.
+Only one Neo runs per user on a machine. The running instance holds an exclusive lock on a file in the per-user runtime directory, and always one in its data directory; the operating system releases both when the process ends, however it ends. A second instance exits with status 3 and says on which port the first one listens. `--allow-multiple` (or `NEO_ALLOW_MULTIPLE=1`) lets instances with different data directories run side by side.
 
 The desktop app adds its own check, so that starting it twice shows the window that is open: the first app listens on a loopback port it wrote down, and a second one asks it to come to the front and ends.
 
@@ -28,8 +28,7 @@ The desktop app adds its own check, so that starting it twice shows the window t
 
 | Thing | Where the program looks |
 | --- | --- |
-| The `claude` and `omp` runtimes | `NEO_CLAUDE_BIN` / `NEO_OMP_BIN`, else a `runtimes` folder beside the program (in a Mac app, `Contents/Resources/runtimes`), else `PATH`. The installers bundle both |
-| The `agy` runtime (Antigravity CLI) | `NEO_AGY_BIN`, else a `runtimes` folder beside the program, else `PATH`, else `~/.local/bin` where it installs itself. Not bundled: install it and sign in with `agy` once |
+| The `claude`, `omp` and `agy` runtimes | `NEO_CLAUDE_BIN` / `NEO_OMP_BIN` / `NEO_AGY_BIN`, else `PATH`, else where each one's official installer puts it: `~/.local/bin`; on Windows `%USERPROFILE%\.local\bin`, `%LOCALAPPDATA%\omp` and `%LOCALAPPDATA%\agy\bin`. None is bundled. Each is looked for whenever it is needed, so one installed while the backend runs is used at once; the settings' **Install** runs the official installer. `agy` needs a sign-in with `agy` once |
 | The Oh My Pi extension | `NEO_SHIM`, else a `shim` folder beside the program |
 | The web app's files | `--web-dir`, else a `web` folder beside the program |
 | `git` | `PATH`. Workers that use git need it installed; nothing else does |
@@ -74,8 +73,9 @@ The server speaks plain HTTP. On a network that is not trusted, put it behind a 
 
 | Sign | Cause and remedy |
 | --- | --- |
-| "Neo Agent is already running" | Another instance holds the lock. Use the open window, or stop the running service. `--allow-multiple` with another data directory runs a second one |
-| "The … program was not found" | The chosen kernel's runtime is missing. Install it, set `NEO_CLAUDE_BIN` / `NEO_OMP_BIN` / `NEO_AGY_BIN`, or choose another kernel in the settings. `neo-agent doctor` shows what is found |
+| "Neo is already running" | Another instance holds the lock. Use the open window, or stop the running service. `--allow-multiple` with another data directory runs a second one |
+| "… is not installed" | The kernel's runtime is missing. Install it from the settings, set `NEO_CLAUDE_BIN` / `NEO_OMP_BIN` / `NEO_AGY_BIN`, or choose another kernel. `neo-agent doctor` shows what is found |
+| "Installing … failed" | The official installer failed; the message ends with its last lines. It needs `bash` and `curl` (PowerShell on Windows) and the network |
 | "Listening on … needs an access token" | A server address that is not loopback needs `--token` or `NEO_TOKEN` |
 | The app says a token is needed | The server has one: enter it under Settings → Connection |
 | A data directory is refused for its schema version | It was written by another release line. Start with a new data directory |

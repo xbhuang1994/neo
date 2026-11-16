@@ -1,26 +1,26 @@
 # SETUP
 
-How to install Neo Agent and give it access to a model. For how it runs, see [docs/006-deployment.md](docs/006-deployment.md); for every option, [docs/009-reference.md](docs/009-reference.md).
+How to install Neo and give it access to a model. For how it runs, see [docs/006-deployment.md](docs/006-deployment.md); for every option, [docs/009-reference.md](docs/009-reference.md).
 
 ## 1. Install
 
 ### macOS
 
-1. Download the disk image for your Mac: `Neo-Agent-<version>-macos-arm64.dmg` for Apple silicon, `-x64.dmg` for Intel.
-2. Open it and drag **Neo Agent** to Applications.
+1. Download the disk image for your Mac: `Neo-<version>-macos-arm64.dmg` for Apple silicon, `-x64.dmg` for Intel.
+2. Open it and drag **Neo** to Applications.
 3. Open the app. A build that is not notarized is refused the first time ("cannot be opened"): allow it once under System Settings → Privacy & Security → Open Anyway, or run
 
    ```sh
-   xattr -dr com.apple.quarantine "/Applications/Neo Agent.app"
+   xattr -dr com.apple.quarantine "/Applications/Neo.app"
    ```
 
 Data is kept in `~/Library/Application Support/neo-agent`.
 
 ### Windows
 
-1. Run `Neo-Agent-<version>-windows-x64-setup.exe`. It installs for the current user and needs no administrator rights.
+1. Run `Neo-<version>-windows-x64-setup.exe`. It installs for the current user and needs no administrator rights.
 2. An installer that is not signed makes SmartScreen ask: choose More info → Run anyway.
-3. Start **Neo Agent** from the Start menu.
+3. Start **Neo** from the Start menu.
 
 Data is kept in `%LOCALAPPDATA%\neo-agent`.
 
@@ -32,11 +32,13 @@ tar -xzf neo-agent-<version>-linux-x64.tar.gz -C /opt && mv /opt/neo-agent-<vers
 /opt/neo-agent/neo-agent serve       # http://127.0.0.1:3082/, this machine only
 ```
 
-The package holds the backend, the web app and both runtimes, and runs from wherever it is unpacked. Data is kept in `~/.local/state/neo-agent`, or where `--data-dir` says.
+The package holds the backend and the web app, and runs from wherever it is unpacked. Data is kept in `~/.local/state/neo-agent`, or where `--data-dir` says.
 
 ## 2. Give it a model
 
-Open Settings → Kernel and models and choose the kernel. Each needs model access of its own:
+Open Settings → Kernel and models and choose the kernel. No kernel comes with Neo: it finds the `claude`, `omp` and `agy` programs already on the machine, on `PATH` or where their installers put them (`~/.local/bin`; on Windows also `%LOCALAPPDATA%\omp` and `%LOCALAPPDATA%\agy\bin`). A kernel that is missing shows an **Install** button, which runs the vendor's official installer (`curl -fsSL <script> | bash`, or `irm <script> | iex` on Windows) on the machine the backend runs on; the kernel can be chosen as soon as it finishes, without a restart. `NEO_CLAUDE_BIN`, `NEO_OMP_BIN` and `NEO_AGY_BIN` name a program elsewhere.
+
+Each kernel needs model access of its own:
 
 **Claude Code.** It reads the environment the backend runs in, and your Claude Code settings (`~/.claude/settings.json`) for what the environment does not say:
 
@@ -49,7 +51,7 @@ A desktop app started from the Dock or the Start menu does not see variables set
 
 **Oh My Pi.** It uses the providers configured in its agent directory, `<data directory>/omp` unless `--agent-dir` names another: put a `models.yml` there, or sign in with `omp` using that directory.
 
-**Antigravity CLI.** Not bundled: install `agy` and run it once in a terminal to sign in with Google. The backend finds it on `PATH` or in `~/.local/bin` (or set `NEO_AGY_BIN`), and offers the models `agy models` lists. Its workers run without background jobs or subagents.
+**Antigravity CLI.** After installing it, run `agy` once in a terminal to sign in with Google. The backend offers the models `agy models` lists, and leaves the thinking effort to the runtime. Its workers run without background jobs or subagents.
 
 The settings page lists the models the chosen kernel offers; leave a role on "kernel default" to use the runtime's own choice. A missing runtime or a failing model request is shown in the app in the runtime's own words.
 

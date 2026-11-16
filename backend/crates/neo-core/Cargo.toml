@@ -1,6 +1,6 @@
 [package]
 name = "neo-core"
-description = "Neo Agent domain core: triggers, threads, evals, decisions, tickets and assignments, with no I/O."
+description = "Neo domain core: triggers, threads, evals, decisions, tickets and assignments, with no I/O."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "neo-agent"
-description = "Neo Agent: the server and the desktop app's backend in one program."
+description = "Neo: the server and the desktop app's backend in one program."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

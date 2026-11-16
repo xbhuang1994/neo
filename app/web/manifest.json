@@ -1,11 +1,11 @@
 {
-    "name": "Neo Agent",
-    "short_name": "Neo Agent",
+    "name": "Neo",
+    "short_name": "Neo",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
     "theme_color": "#0175C2",
-    "description": "Neo Agent",
+    "description": "Neo",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [

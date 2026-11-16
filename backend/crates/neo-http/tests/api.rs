@@ -97,16 +97,21 @@ async fn serves_every_route_of_the_app() {
     // Models and the kernel.
     let (status, models) = api.get("/api/settings/models").await;
     assert_eq!((status, models["kernel"].as_str(), models["available"][0]["id"].as_str()), (200, Some("omp"), Some("big")));
-    let chosen = json!({"eval": {"provider": "fixture", "model": "big", "thinkingLevel": "low"}, "executor": null, "advisor": null});
+    let chosen = json!({"eval": {"provider": "fixture", "model": "big", "thinkingLevel": "low"}, "executor": null});
     let (status, models) = api.call("PUT", "/api/settings/models", Some(chosen.clone())).await;
     assert_eq!((status, &models["current"]), (200, &chosen));
     assert_eq!(
-        api.call("PUT", "/api/settings/models", Some(json!({"eval": {"provider": "x", "model": "y"}, "executor": null, "advisor": null}))).await,
+        api.call("PUT", "/api/settings/models", Some(json!({"eval": {"provider": "x", "model": "y"}, "executor": null}))).await,
         (400, json!({"error": "Unknown OMP model: x/y"}))
     );
     let (status, switched) = api.call("PUT", "/api/settings/kernel", Some(json!({"kernel": "claude"}))).await;
-    assert_eq!((status, switched["kernel"].as_str(), switched["supports"]["advisor"].as_bool()), (200, Some("claude"), Some(false)));
-    assert_eq!(api.call("PUT", "/api/settings/kernel", Some(json!({"kernel": "other"}))).await, (400, json!({"error": "kernel is omp, claude or antigravity"})));
+    assert_eq!((status, switched["kernel"].as_str()), (200, Some("claude")));
+    let (status, installed) = api.call("POST", "/api/settings/kernel/install", Some(json!({"kernel": "antigravity"}))).await;
+    assert_eq!((status, installed["kernels"][2]["id"].as_str(), installed["kernels"][2]["installing"].as_bool()), (200, Some("antigravity"), Some(false)));
+    assert_eq!(
+        api.call("PUT", "/api/settings/kernel", Some(json!({"kernel": "other"}))).await,
+        (400, json!({"error": "kernel is omp, claude or antigravity"}))
+    );
     assert_eq!(api.call("PUT", "/api/settings/kernel", Some(json!({"kernel": "omp"}))).await.1["current"], chosen);
 
     // General settings.
@@ -229,7 +234,7 @@ async fn serves_the_web_build_beside_the_api() {
     let f = started().await;
     let web = f.dir.join("web");
     std::fs::create_dir_all(web.join("assets/fonts")).unwrap();
-    std::fs::write(web.join("index.html"), "<!doctype html><title>Neo Agent</title>").unwrap();
+    std::fs::write(web.join("index.html"), "<!doctype html><title>Neo</title>").unwrap();
     std::fs::write(web.join("main.dart.js"), "console.log('app')").unwrap();
     std::fs::write(web.join("assets/fonts/a.otf"), [0u8, 1, 2]).unwrap();
     std::fs::write(f.dir.join("secret.txt"), "outside the web build").unwrap();
@@ -252,7 +257,7 @@ async fn serves_the_web_build_beside_the_api() {
     let page = fetch("/").await;
     assert_eq!(
         (page.status, String::from_utf8_lossy(&page.body).as_ref(), page.headers[0].as_str(), page.headers[2].as_str()),
-        (200, "<!doctype html><title>Neo Agent</title>", "text/html; charset=utf-8", "no-cache")
+        (200, "<!doctype html><title>Neo</title>", "text/html; charset=utf-8", "no-cache")
     );
     assert!(page.headers[1].contains("default-src 'self'") && page.headers[1].contains("frame-ancestors 'none'"));
     let script = fetch("/main.dart.js").await;
@@ -260,7 +265,7 @@ async fn serves_the_web_build_beside_the_api() {
     let font = fetch("/assets/fonts/a.otf").await;
     assert_eq!((font.status, font.headers[0].as_str(), font.body.as_slice()), (200, "font/otf", &[0u8, 1, 2][..]));
     // A path that names no file is a page of the app; a missing file is missing.
-    assert_eq!(String::from_utf8_lossy(&fetch("/settings/models").await.body), "<!doctype html><title>Neo Agent</title>");
+    assert_eq!(String::from_utf8_lossy(&fetch("/settings/models").await.body), "<!doctype html><title>Neo</title>");
     assert_eq!(fetch("/missing.js").await.status, 404);
     // Nothing outside the folder is reachable.
     for path in ["/../secret.txt", "/%2e%2e/secret.txt", "/assets/..%2f..%2fsecret.txt", "/assets/%2e%2e/%2e%2e/secret.txt", "/..%5csecret.txt"] {
@@ -276,7 +281,7 @@ async fn serves_the_web_build_beside_the_api() {
     assert_eq!(api.get("/api/messages").await.0, 200);
     // A HEAD names the length and sends no body.
     let head = raw(&server, b"HEAD / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
-    assert!(head.starts_with("HTTP/1.1 200 OK\r\n") && head.contains("content-length: 39\r\n") && head.ends_with("\r\n\r\n"), "{head}");
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n") && head.contains("content-length: 33\r\n") && head.ends_with("\r\n\r\n"), "{head}");
     server.shutdown().await;
     f.app.stop().await;
 }

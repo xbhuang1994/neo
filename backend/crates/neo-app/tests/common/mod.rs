@@ -80,6 +80,8 @@ pub struct Scripted {
     pub ran: Mutex<Vec<Ran>>,
     pub opened: Mutex<Vec<SessionSpec>>,
     pub unavailable: Mutex<Option<String>>,
+    /// The kernels installed through the application; installing one makes every kernel available.
+    pub installed: Mutex<Vec<Kernel>>,
     /// Where the application finds WeChat.
     pub wechat: Mutex<neo_app::wechat_protocol::Protocol>,
     pub models: Mutex<Vec<ModelOption>>,
@@ -245,6 +247,13 @@ impl Kernels for ScriptedKernels {
     }
     fn unavailable(&self, _kernel: Kernel) -> Option<String> {
         self.0.unavailable.lock().unwrap().clone()
+    }
+    fn install(&self, kernel: Kernel) -> BoxFut<'_, Result<std::path::PathBuf, String>> {
+        Box::pin(async move {
+            self.0.installed.lock().unwrap().push(kernel);
+            *self.0.unavailable.lock().unwrap() = None;
+            Ok(std::path::PathBuf::from("/installed").join(kernel.as_str()))
+        })
     }
 }
 

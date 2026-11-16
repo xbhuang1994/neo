@@ -230,9 +230,9 @@ pub struct RoleModel {
 /// The thinking levels a role model may name.
 pub const THINKING_LEVELS: &[&str] = &["auto", "off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
-/// One kernel's model choices; `None` follows the kernel's default, and for the advisor turns it off.
+/// One kernel's model choices; `None` follows the kernel's default. Unknown keys are dropped, such as the `advisor` model
+/// earlier versions saved.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RoleModels {
     /// The orchestrator, which assesses and routes.
     #[serde(default)]
@@ -240,9 +240,6 @@ pub struct RoleModels {
     /// The workers.
     #[serde(default)]
     pub executor: Option<RoleModel>,
-    /// A second model that reviews each worker turn.
-    #[serde(default)]
-    pub advisor: Option<RoleModel>,
 }
 
 /// Everything a person configures.
@@ -305,7 +302,7 @@ impl Settings {
         self.executor.directory = self.executor.directory.trim().to_string();
         self.executor.prepare_shell = self.executor.prepare_shell.take().map(|shell| shell.trim().to_string()).filter(|shell| !shell.is_empty());
         for models in self.models.values_mut() {
-            for model in [&mut models.eval, &mut models.executor, &mut models.advisor].into_iter().flatten() {
+            for model in [&mut models.eval, &mut models.executor].into_iter().flatten() {
                 model.provider = model.provider.trim().to_string();
                 model.model = model.model.trim().to_string();
             }
@@ -367,7 +364,7 @@ impl Settings {
             }
         }
         for models in self.models.values() {
-            for model in [&models.eval, &models.executor, &models.advisor].into_iter().flatten() {
+            for model in [&models.eval, &models.executor].into_iter().flatten() {
                 if model.provider.is_empty() || model.model.is_empty() {
                     return Err("A model needs a provider and a model id".into());
                 }
@@ -532,6 +529,17 @@ mod tests {
         assert_eq!(allowed[1].name.as_deref(), Some("Me"));
         // What is stored reads back the same.
         assert_eq!(Settings::parse(serde_json::to_value(&settings).unwrap()).unwrap(), settings);
+    }
+
+    #[test]
+    fn reads_settings_saved_with_an_advisor_model_and_drops_it() {
+        let saved = json!({"models": {"omp": {"eval": null, "executor": {"provider": "p", "model": "m"}, "advisor": {"provider": "p", "model": "big"}}}});
+        let settings = Settings::parse(saved).unwrap();
+        assert_eq!(
+            settings.models[&Kernel::Omp],
+            RoleModels { eval: None, executor: Some(RoleModel { provider: "p".into(), model: "m".into(), thinking_level: None }) }
+        );
+        assert_eq!(serde_json::to_value(&settings.models[&Kernel::Omp]).unwrap(), json!({"eval": null, "executor": {"provider": "p", "model": "m"}}));
     }
 
     #[test]

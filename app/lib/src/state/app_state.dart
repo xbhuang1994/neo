@@ -45,7 +45,7 @@ enum Link {
   /// The local backend cannot start.
   backendFailed,
 
-  /// Another Neo Agent already runs on this computer.
+  /// Another Neo already runs on this computer.
   alreadyRunning,
 }
 

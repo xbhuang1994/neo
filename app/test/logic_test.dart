@@ -231,8 +231,8 @@ void main() {
       host.backend.notifier.value = const BackendStatus(BackendPhase.running, port: 4000, token: 'made-by-the-app-0123456789');
       await state.refresh();
       expect((state.link, state.client?.base.toString(), state.client?.token), (Link.online, 'http://127.0.0.1:4000', 'made-by-the-app-0123456789'));
-      host.backend.notifier.value = const BackendStatus(BackendPhase.alreadyRunning, message: 'Neo Agent is already running on port 3082.');
-      expect((state.link, state.linkDetail, state.client), (Link.alreadyRunning, 'Neo Agent is already running on port 3082.', null));
+      host.backend.notifier.value = const BackendStatus(BackendPhase.alreadyRunning, message: 'Neo is already running on port 3082.');
+      expect((state.link, state.linkDetail, state.client), (Link.alreadyRunning, 'Neo is already running on port 3082.', null));
       host.backend.notifier.value = const BackendStatus(BackendPhase.failed, message: 'neo-agent was not found beside the app');
       expect(state.link, Link.backendFailed);
       state.retry();

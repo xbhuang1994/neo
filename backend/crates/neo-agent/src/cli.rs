@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 /// The usage text.
 pub const USAGE: &str = "\
-Neo Agent
+Neo
 
 Usage:
   neo-agent serve [options]            Run as a server: the API, and the web app when its files are found.
@@ -32,7 +32,7 @@ Options for desktop-sidecar:
 
 Environment:
   NEO_CLAUDE_BIN, NEO_OMP_BIN, NEO_AGY_BIN
-                              The runtime programs, when not bundled or on PATH.
+                              The runtime programs, when not on PATH or where their installers put them.
   NEO_DATA_DIR                  Same as --data-dir.
 ";
 

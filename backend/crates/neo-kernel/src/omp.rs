@@ -42,8 +42,6 @@ pub struct OmpOptions {
     pub model: Option<String>,
     /// The thinking level.
     pub thinking: Option<String>,
-    /// Run the advisor, a second model that reviews each turn.
-    pub advisor: bool,
     /// Settings overlay files, such as background jobs and compaction thresholds.
     pub config: Vec<PathBuf>,
     /// Load the project's context files (AGENTS.md and the like); for workers only.
@@ -82,9 +80,6 @@ pub fn launch(options: &OmpOptions, resume: Option<&str>) -> Launch {
     }
     if let Some(level) = options.thinking.as_deref().filter(|level| !level.is_empty()) {
         flag(&mut args, "--thinking", level);
-    }
-    if options.advisor {
-        args.push("--advisor".into());
     }
     for overlay in &options.config {
         flag(&mut args, "--config", &overlay.display().to_string());
@@ -569,7 +564,6 @@ mod tests {
             builtin_tools: vec!["read".into(), "bash".into(), "task".into()],
             model: Some("fixture/big".into()),
             thinking: Some("high".into()),
-            advisor: true,
             config: vec!["/data/overlays/worker.yml".into()],
             context_files: true,
             ..Default::default()
@@ -579,13 +573,12 @@ mod tests {
             worker.args.join(" "),
             "--mode rpc --no-extensions --no-skills --no-rules --no-lsp --no-title --approval-mode yolo --extension /app/shim/neo-omp-shim.ts \
              --system-prompt /data/prompts/worker.md --tools read,bash,task --cwd /work/t1 --session-dir /data/sessions --resume /data/sessions/a.jsonl \
-             --model fixture/big --thinking high --advisor --config /data/overlays/worker.yml"
+             --model fixture/big --thinking high --config /data/overlays/worker.yml"
         );
         assert_eq!(worker.env.get("PI_CODING_AGENT_DIR").map(String::as_str), Some("/data/omp"));
         assert!(!worker.args.contains(&"--no-ui".to_string()), "the shim answers over UI frames");
         options.session_dir = None;
         options.context_files = false;
-        options.advisor = false;
         options.model = None;
         options.thinking = None;
         options.config.clear();

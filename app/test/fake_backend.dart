@@ -29,11 +29,13 @@ class FakeBackend {
   final List<String> calls = [];
   int resets = 0;
   String kernel = 'omp';
+  /// Why Claude Code cannot run; set, its program is not installed until the app installs it.
   String? claudeProblem;
+  final List<String> installed = [];
   Map<String, Map<String, dynamic>> models = {
-    'omp': {'eval': null, 'executor': null, 'advisor': null},
-    'claude': {'eval': null, 'executor': null, 'advisor': null},
-    'antigravity': {'eval': null, 'executor': null, 'advisor': null},
+    'omp': {'eval': null, 'executor': null},
+    'claude': {'eval': null, 'executor': null},
+    'antigravity': {'eval': null, 'executor': null},
   };
   Map<String, dynamic> general = {
     'paused': false,
@@ -96,15 +98,14 @@ class FakeBackend {
   Map<String, dynamic> _modelsView() => {
     'kernel': kernel,
     'kernels': [
-      {'id': 'omp', 'problem': null},
-      {'id': 'claude', 'problem': claudeProblem},
-      {'id': 'antigravity', 'problem': null},
+      {'id': 'omp', 'problem': null, 'installed': true, 'installing': false},
+      {'id': 'claude', 'problem': claudeProblem, 'installed': claudeProblem == null, 'installing': false},
+      {'id': 'antigravity', 'problem': null, 'installed': true, 'installing': false},
     ],
     'supports': {
-      'advisor': kernel == 'omp',
       'thinkingLevels': switch (kernel) {
         'omp' => ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
-        'antigravity' => ['auto', 'low', 'medium', 'high'],
+        'antigravity' => <String>[],
         _ => ['auto', 'off', 'low', 'medium', 'high', 'xhigh', 'max'],
       },
     },
@@ -191,6 +192,13 @@ class FakeBackend {
         final next = (body as Map)['kernel'] as String;
         if (next == 'claude' && claudeProblem != null) return _json(400, {'error': claudeProblem});
         kernel = next;
+        return _json(200, _modelsView());
+      case ('POST', '/api/settings/kernel/install'):
+        final which = (body as Map)['kernel'] as String;
+        installed.add(which);
+        if (which == 'claude') {
+          claudeProblem = null;
+        }
         return _json(200, _modelsView());
       case ('GET', '/api/settings/general'):
         return _json(200, _generalView());

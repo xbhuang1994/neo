@@ -158,28 +158,28 @@ async fn chooses_models_per_kernel_and_switches_the_kernel() {
     f.app.start().await.unwrap();
     let view = f.app.models_view().await;
     assert_eq!((view["kernel"].as_str(), view["problem"].is_null()), (Some("omp"), true));
-    assert_eq!(view["current"], json!({"eval": null, "executor": null, "advisor": null}));
-    assert_eq!(view["supports"]["advisor"], true);
+    assert_eq!(view["current"], json!({"eval": null, "executor": null}));
     assert!(view["supports"]["thinkingLevels"].as_array().unwrap().contains(&json!("minimal")));
     assert_eq!(view["available"][0], json!({"id": "big", "provider": "fixture", "name": "fixture big"}));
-    assert_eq!(view["kernels"], json!([{"id": "omp", "problem": null}, {"id": "claude", "problem": null}, {"id": "antigravity", "problem": null}]));
+    let idle = |id: &str| json!({"id": id, "problem": null, "installed": true, "installing": false});
+    assert_eq!(view["kernels"], json!([idle("omp"), idle("claude"), idle("antigravity")]));
 
     // Refusals change nothing.
     let refused = |value: Value| {
         let app = f.app.clone();
         async move { app.update_models(value).await.unwrap_err() }
     };
-    assert!(refused(json!({"eval": null, "executor": null})).await.starts_with("advisor is required"));
-    assert_eq!(refused(json!({"eval": {"provider": "fixture", "model": "huge"}, "executor": null, "advisor": null})).await, "Unknown OMP model: fixture/huge");
+    assert!(refused(json!({"eval": null})).await.starts_with("executor is required"));
+    assert_eq!(refused(json!({"eval": {"provider": "fixture", "model": "huge"}, "executor": null})).await, "Unknown OMP model: fixture/huge");
     assert_eq!(
-        refused(json!({"eval": {"provider": "fixture", "model": "big", "thinkingLevel": "ultra"}, "executor": null, "advisor": null})).await,
+        refused(json!({"eval": {"provider": "fixture", "model": "big", "thinkingLevel": "ultra"}, "executor": null})).await,
         "Thinking level ultra is not supported by the omp kernel"
     );
-    assert!(refused(json!({"eval": null, "executor": null, "advisor": null, "kernel": "omp"})).await.starts_with("Unknown field kernel"));
+    assert!(refused(json!({"eval": null, "executor": null, "advisor": null})).await.starts_with("Unknown field advisor"));
     assert!(f.app.settings().models.is_empty());
 
     // A choice is saved and reaches the open main Session.
-    let chosen = json!({"eval": {"provider": "fixture", "model": "big", "thinkingLevel": "high"}, "executor": {"provider": "fixture", "model": "small"}, "advisor": {"provider": "fixture", "model": "big"}});
+    let chosen = json!({"eval": {"provider": "fixture", "model": "big", "thinkingLevel": "high"}, "executor": {"provider": "fixture", "model": "small"}});
     let view = f.app.update_models(chosen.clone()).await.unwrap();
     assert_eq!(view["current"], chosen);
     assert_eq!(
@@ -193,24 +193,27 @@ async fn chooses_models_per_kernel_and_switches_the_kernel() {
     assert_eq!(f.app.set_kernel(json!({"kernel": "omp"})).await.unwrap()["kernel"], "omp");
     assert_eq!(f.kernels.opened.lock().unwrap().len(), opened, "the same kernel reopens nothing");
     let view = f.app.set_kernel(json!({"kernel": "claude"})).await.unwrap();
-    assert_eq!((view["kernel"].as_str(), view["supports"]["advisor"].as_bool()), (Some("claude"), Some(false)));
-    assert_eq!(view["current"], json!({"eval": null, "executor": null, "advisor": null}));
+    assert_eq!(view["kernel"].as_str(), Some("claude"));
+    assert_eq!(view["current"], json!({"eval": null, "executor": null}));
     assert!(!view["supports"]["thinkingLevels"].as_array().unwrap().contains(&json!("minimal")));
     assert_eq!(f.kernels.opened.lock().unwrap().len(), opened + 1);
     assert_eq!((f.app.settings().kernel, f.app.board.get("kernel").map(|health| health.detail)), (Kernel::Claude, Some("Running on claude".to_string())));
     assert_eq!(f.app.session(&f.app.master_id).map(|main| main.kernel), Some(Kernel::Claude));
-    // Claude Code takes model names as they are, keeps no advisor, and has no minimal effort.
-    let view = f
-        .app
-        .update_models(json!({"eval": {"provider": "anthropic", "model": "opus"}, "executor": null, "advisor": {"provider": "anthropic", "model": "sonnet"}}))
-        .await
-        .unwrap();
-    assert_eq!(view["current"], json!({"eval": {"provider": "anthropic", "model": "opus"}, "executor": null, "advisor": null}));
+    // Claude Code takes model names as they are, and has no minimal effort.
+    let view = f.app.update_models(json!({"eval": {"provider": "anthropic", "model": "opus"}, "executor": null})).await.unwrap();
+    assert_eq!(view["current"], json!({"eval": {"provider": "anthropic", "model": "opus"}, "executor": null}));
     assert_eq!(f.kernels.set_models.lock().unwrap().last().cloned(), Some((f.app.master_id.clone(), Some("opus".to_string()), None)));
     assert_eq!(
-        refused(json!({"eval": {"provider": "anthropic", "model": "opus", "thinkingLevel": "minimal"}, "executor": null, "advisor": null})).await,
+        refused(json!({"eval": {"provider": "anthropic", "model": "opus", "thinkingLevel": "minimal"}, "executor": null})).await,
         "Thinking level minimal is not supported by the claude kernel"
     );
+    // The Antigravity CLI takes no thinking level: one sent along is dropped, and none reaches the runtime.
+    let view = f.app.set_kernel(json!({"kernel": "antigravity"})).await.unwrap();
+    assert_eq!(view["supports"]["thinkingLevels"], json!([]));
+    let view = f.app.update_models(json!({"eval": {"provider": "antigravity", "model": "gemini", "thinkingLevel": "high"}, "executor": null})).await.unwrap();
+    assert_eq!(view["current"]["eval"], json!({"provider": "antigravity", "model": "gemini"}));
+    assert_eq!(f.kernels.set_models.lock().unwrap().last().cloned(), Some((f.app.master_id.clone(), Some("gemini".to_string()), None)));
+    f.app.set_kernel(json!({"kernel": "claude"})).await.unwrap();
     // Back on the first kernel its choices are as they were left.
     assert_eq!(f.app.set_kernel(json!({"kernel": "omp"})).await.unwrap()["current"], chosen);
     assert_eq!(f.app.settings().models[&Kernel::Claude].eval.as_ref().map(|model| model.model.as_str()), Some("opus"));
@@ -222,7 +225,15 @@ async fn chooses_models_per_kernel_and_switches_the_kernel() {
     assert_eq!(f.app.settings().kernel, Kernel::Omp);
     let view = f.app.models_view().await;
     assert_eq!((view["problem"].as_str(), view["available"].as_array().map(Vec::len)), (Some("The Claude Code program (claude) was not found."), Some(0)));
-    *f.kernels.unavailable.lock().unwrap() = None;
+
+    // Installing a kernel that is not in use only installs it.
+    let view = f.app.install_kernel(json!({"kernel": "claude"})).await.unwrap();
+    assert_eq!((view["kernel"].as_str(), view["problem"].is_null()), (Some("omp"), true));
+    assert_eq!(f.kernels.installed.lock().unwrap().clone(), vec![Kernel::Claude]);
+    assert_eq!(f.app.install_kernel(json!({"kernel": "gpt"})).await.unwrap_err(), "kernel is omp, claude or antigravity");
+    // One that is installed already is not installed again.
+    f.app.install_kernel(json!({"kernel": "omp"})).await.unwrap();
+    assert_eq!(f.kernels.installed.lock().unwrap().len(), 1);
 
     // The choices outlive a restart.
     let f = f.restart().await;

@@ -17,7 +17,7 @@ pub fn worker_bin(state_dir: &Path) -> PathBuf {
 
 /// What a refused command says.
 pub fn refusal(name: &str) -> String {
-    format!("{name} is blocked in this installation by the Neo Agent settings; do the work without it.")
+    format!("{name} is blocked in this installation by the Neo settings; do the work without it.")
 }
 
 /// `PATH` with the folder of stand-ins first.

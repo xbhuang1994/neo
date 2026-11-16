@@ -1,9 +1,9 @@
-# Put together what the Windows installer installs: the Flutter app, the backend beside it, the Oh My Pi extension
-# and, unless -WithoutRuntimes, the pinned agent runtimes.
+# Put together what the Windows installer installs: the Flutter app, the backend beside it and the Oh My Pi
+# extension. The agent runtimes are not in it: the backend finds them on the machine, and the app installs them with
+# their official installers.
 #
-# Usage: pwsh packaging\windows\stage.ps1 [-WithoutRuntimes]
-# Needs: cargo, flutter, python.  Output: dist\windows-stage, ready for neo-agent.iss.
-param([switch]$WithoutRuntimes)
+# Usage: pwsh packaging\windows\stage.ps1
+# Needs: cargo, flutter.  Output: dist\windows-stage, ready for neo-agent.iss.
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $stage = Join-Path $root "dist\windows-stage"
@@ -24,8 +24,4 @@ Copy-Item (Join-Path $root "backend\target\release\neo-agent.exe") $stage
 New-Item -ItemType Directory -Force (Join-Path $stage "shim") | Out-Null
 Copy-Item (Join-Path $root "shim\neo-omp-shim.ts") (Join-Path $stage "shim")
 Copy-Item (Join-Path $root "LICENSE") $stage
-if (-not $WithoutRuntimes) {
-  python (Join-Path $root "packaging\fetch-runtimes.py") windows-x64 (Join-Path $stage "runtimes")
-  if ($LASTEXITCODE -ne 0) { throw "the runtimes could not be fetched" }
-}
 Write-Output $stage

@@ -1,4 +1,4 @@
-//! Neo Agent domain core: triggers, threads, evals, decisions, tickets and assignments.
+//! Neo domain core: triggers, threads, evals, decisions, tickets and assignments.
 //!
 //! The core does no I/O. It mutates its aggregates through the [`ports::Repositories`] port inside one transaction per
 //! command and queues every side effect through the other ports, which the application implements.

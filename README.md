@@ -1,4 +1,4 @@
-# Neo Agent
+# Neo
 
 **一个替你干活的 AI 助手。** 你在应用里（或微信里）说要做什么，它先判断该不该做，然后给每件事开一个独立的 Worker，在单独的目录里写代码、跑命令，做完把结果回到你说话的那个对话里。
 
@@ -17,7 +17,7 @@
 - **桌面应用**：安装后打开即用。应用自己启动并看护本机后端，数据留在这台电脑上。
 - **服务器**：`neo-agent serve` 无界面运行，提供 API 并托管网页版；浏览器或别处的桌面应用连上来用。
 
-同一台电脑同一用户默认只运行一个 Neo Agent：第二次打开桌面应用会把已开的窗口带到前面；第二个后端会直接退出并说明。
+同一台电脑同一用户默认只运行一个 Neo：第二次打开桌面应用会把已开的窗口带到前面；第二个后端会直接退出并说明。
 
 ## 能做什么
 
@@ -30,17 +30,19 @@
 
 ## 安装
 
-发行页提供三种安装包，都自带后端和两个执行内核：
+发行页提供三种安装包，都自带后端；执行内核（Claude Code、Oh My Pi、Antigravity CLI）不随包附带：
 
 | 系统 | 安装包 |
 | --- | --- |
-| macOS（Apple 芯片 / Intel 各一个） | `Neo-Agent-<版本>-macos-arm64.dmg` / `-x64.dmg` |
-| Windows x64 | `Neo-Agent-<版本>-windows-x64-setup.exe` |
+| macOS（Apple 芯片 / Intel 各一个） | `Neo-<版本>-macos-arm64.dmg` / `-x64.dmg` |
+| Windows x64 | `Neo-<版本>-windows-x64-setup.exe` |
 | Linux 服务器 | `neo-agent-<版本>-linux-x64.tar.gz` |
 
 安装步骤、模型接入、服务器部署见 **[SETUP.md](SETUP.md)**。
 
-模型接入是唯一需要你准备的东西：Claude Code 内核读取 `ANTHROPIC_*` 环境变量或你已有的 Claude Code 登录；Oh My Pi 内核使用它自己目录里的 provider 配置；Antigravity 内核使用 `agy` 已登录的 Google 账号（需自行安装 `agy` 并登录一次）。Worker 要用 git 时，机器上需要装有 git。
+执行内核：Neo 会自动发现本机已装的 `claude`、`omp`、`agy`（`PATH` 或各自安装器的默认目录）。没装的话，在 设置 → 内核与模型 里点「安装」，Neo 会运行该内核的官方安装脚本，装好即可选用，不用重启。
+
+模型接入：Claude Code 内核读取 `ANTHROPIC_*` 环境变量或你已有的 Claude Code 登录；Oh My Pi 内核使用它自己目录里的 provider 配置；Antigravity 内核使用 `agy` 已登录的 Google 账号（装好后在终端运行一次 `agy` 登录）。Worker 要用 git 时，机器上需要装有 git。
 
 ## 从源码运行
 

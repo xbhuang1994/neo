@@ -1,7 +1,7 @@
-# A systemd unit for Neo Agent as a server. Copy it to /etc/systemd/system/neo-agent.service, set the paths, the
+# A systemd unit for Neo as a server. Copy it to /etc/systemd/system/neo-agent.service, set the paths, the
 # user and the token, then: systemctl daemon-reload && systemctl enable --now neo-agent
 [Unit]
-Description=Neo Agent
+Description=Neo
 After=network-online.target
 Wants=network-online.target
 

@@ -182,12 +182,15 @@ impl App {
 
     fn role_model(settings: &Settings, role: SessionRole) -> Option<RoleModel> {
         let models = settings.role_models();
-        match role {
+        let model = match role {
             SessionRole::Worker => models.executor,
             SessionRole::Orchestrator => models.eval,
             // One-off turns run on the orchestrator's model, else the workers'.
             SessionRole::Sidecar | SessionRole::Watchdog => models.eval.or(models.executor),
-        }
+        };
+        // A level saved before the kernel stopped taking one is not passed on.
+        let levels = crate::kernels::support(settings.kernel).thinking_levels;
+        model.map(|model| RoleModel { thinking_level: model.thinking_level.filter(|_| !levels.is_empty()), ..model })
     }
 
     /// The open Session with this id, opening it on the current kernel from its transcript when it is not.
@@ -231,7 +234,6 @@ impl App {
             cwd: cwd.to_path_buf(),
             system_prompt: prompts::compose(if role == SessionRole::Worker { prompts::Role::Worker } else { prompts::Role::Orchestrator }, &settings),
             model: Self::role_model(&settings, role),
-            advisor: settings.role_models().advisor,
         };
         let host = Arc::new(SessionTools { app: self.weak.clone(), ticket_id: ticket_id.map(str::to_string), cwd: cwd.to_path_buf() });
         let (reports, runtime) = tokio::sync::mpsc::unbounded_channel();
@@ -447,7 +449,6 @@ impl App {
             cwd: cwd.to_path_buf(),
             system_prompt,
             model: Self::role_model(&settings, role),
-            advisor: None,
         };
         let (reports, runtime) = tokio::sync::mpsc::unbounded_channel();
         let driver = self.kernels.open(kernel, &spec, Arc::new(tools), reports)?;

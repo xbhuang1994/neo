@@ -71,7 +71,7 @@ class ApiClient {
 
   Future<Map<String, dynamic>> _object(String method, String path, {Object? body, Duration timeout = const Duration(seconds: 15)}) async {
     final decoded = await _call(method, path, body: body, timeout: timeout);
-    if (decoded is! Map) throw ApiException(0, 'The server answered something that is not Neo Agent');
+    if (decoded is! Map) throw ApiException(0, 'The server answered something that is not Neo');
     return decoded.cast<String, dynamic>();
   }
 
@@ -118,17 +118,21 @@ class ApiClient {
 
   Future<ModelSettings> models() async => ModelSettings.fromJson(await _object('GET', '/api/settings/models', timeout: const Duration(seconds: 30)));
 
-  Future<ModelSettings> saveModels({RoleModel? eval, RoleModel? executor, RoleModel? advisor}) async => ModelSettings.fromJson(
+  Future<ModelSettings> saveModels({RoleModel? eval, RoleModel? executor}) async => ModelSettings.fromJson(
     await _object(
       'PUT',
       '/api/settings/models',
-      body: {'eval': eval?.toJson(), 'executor': executor?.toJson(), 'advisor': advisor?.toJson()},
+      body: {'eval': eval?.toJson(), 'executor': executor?.toJson()},
       timeout: const Duration(seconds: 60),
     ),
   );
 
   Future<ModelSettings> setKernel(String kernel) async =>
       ModelSettings.fromJson(await _object('PUT', '/api/settings/kernel', body: {'kernel': kernel}, timeout: const Duration(seconds: 60)));
+
+  /// Install a kernel's program on the backend's machine with its official installer; that can take minutes.
+  Future<ModelSettings> installKernel(String kernel) async =>
+      ModelSettings.fromJson(await _object('POST', '/api/settings/kernel/install', body: {'kernel': kernel}, timeout: const Duration(minutes: 11)));
 
   Future<GeneralSettings> general() async => GeneralSettings.fromJson(await _object('GET', '/api/settings/general'));
 

@@ -1,6 +1,6 @@
 [package]
 name = "neo-testkit"
-description = "Neo Agent test support: local fake model servers and scripted stand-ins for external programs."
+description = "Neo test support: local fake model servers and scripted stand-ins for external programs."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,4 +1,4 @@
-//! Where things are on this machine: the per-user data directory, the place of the instance lock, the bundled
+//! Where things are on this machine: the per-user data directory, the place of the instance lock, the agent
 //! runtimes, the Oh My Pi extension and the web app's files.
 
 use std::path::{Path, PathBuf};
@@ -85,17 +85,32 @@ pub fn on_path(name: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     std::env::split_paths(path).flat_map(|dir| names(name).into_iter().map(move |file| dir.join(file))).find(|candidate| executable(candidate))
 }
 
-/// A runtime program: the one the environment names, else the bundled one, else the one on `PATH`.
-pub fn find_runtime(name: &str, named: Option<PathBuf>, program_dir: Option<&Path>, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+/// Where an agent's official installer puts its program: `~/.local/bin` on macOS and Linux; on Windows Claude Code's
+/// `%USERPROFILE%\.local\bin`, Oh My Pi's `%LOCALAPPDATA%\omp` and the Antigravity CLI's `%LOCALAPPDATA%\agy\bin`.
+pub fn install_dirs(name: &str) -> Vec<PathBuf> {
+    let local_bin = home().join(".local").join("bin");
+    if !cfg!(windows) {
+        return vec![local_bin];
+    }
+    let app_data = var("LOCALAPPDATA").unwrap_or_else(|| home().join("AppData").join("Local"));
+    match name {
+        "omp" => vec![app_data.join("omp"), local_bin],
+        "agy" => vec![app_data.join("agy").join("bin"), local_bin],
+        _ => vec![local_bin],
+    }
+}
+
+/// A runtime program: the one the environment names, else the one on `PATH`, else the one where its installer puts
+/// it, which a service's `PATH` may leave out. Nothing is bundled.
+pub fn find_runtime(name: &str, named: Option<PathBuf>, path: Option<&std::ffi::OsStr>, install_dirs: &[PathBuf]) -> Option<PathBuf> {
     if let Some(named) = named {
         // A name that does not exist is a mistake to report, not a reason to look elsewhere.
         return executable(&named).then_some(named);
     }
-    let bundled = program_dir
-        .into_iter()
-        .flat_map(|dir| bundled(dir, "runtimes"))
-        .flat_map(|dir| names(name).into_iter().flat_map(move |file| [dir.join(&file), dir.join(name).join(&file)]));
-    bundled.into_iter().find(|candidate| executable(candidate)).or_else(|| on_path(name, path))
+    on_path(name, path).or_else(|| {
+        let dirs = std::env::join_paths(install_dirs).ok()?;
+        on_path(name, Some(&dirs))
+    })
 }
 
 /// The Oh My Pi extension file: the one `NEO_SHIM` names, else the bundled one, else the one of a source checkout.
@@ -130,42 +145,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn finds_a_runtime_where_it_is_named_then_bundled_then_on_the_path() {
+    fn finds_a_runtime_where_it_is_named_then_on_the_path_then_where_it_installs_itself() {
         let dir = TempDir::new("paths");
-        let (bin, usr) = (dir.join("app/bin"), dir.join("usr/bin"));
-        std::fs::create_dir_all(&bin).unwrap();
+        let (local, usr) = (dir.join("home/.local/bin"), dir.join("usr/bin"));
+        let installed = [local.clone()];
+        program(&local.join("claude"));
+        program(&local.join("agy"));
         program(&usr.join("claude"));
-        program(&usr.join("omp"));
         let path = std::env::join_paths([dir.join("empty"), usr.clone()]).unwrap();
-        // Only on the path.
-        assert_eq!(find_runtime("claude", None, Some(&bin), Some(&path)), Some(usr.join("claude")));
-        // Bundled one level up wins over the path; beside the program wins over that; a folder per runtime is found too.
-        program(&dir.join("app/runtimes/claude"));
-        assert_eq!(find_runtime("claude", None, Some(&bin), Some(&path)), Some(dir.join("app/runtimes/claude")));
-        program(&bin.join("runtimes/claude"));
-        assert_eq!(find_runtime("claude", None, Some(&bin), Some(&path)), Some(bin.join("runtimes/claude")));
-        program(&dir.join("app/Resources/runtimes/omp/omp"));
-        assert_eq!(find_runtime("omp", None, Some(&bin), Some(&path)), Some(dir.join("app/Resources/runtimes/omp/omp")));
+        // The path wins over the installer's folder, which is found when the path leaves it out.
+        assert_eq!(find_runtime("claude", None, Some(&path), &installed), Some(usr.join("claude")));
+        assert_eq!(find_runtime("agy", None, Some(&path), &installed), Some(local.join("agy")));
+        assert_eq!(find_runtime("agy", None, None, &installed), Some(local.join("agy")));
         // The environment's choice wins over all, and a wrong one is not papered over.
         program(&dir.join("custom/claude"));
-        assert_eq!(find_runtime("claude", Some(dir.join("custom/claude")), Some(&bin), Some(&path)), Some(dir.join("custom/claude")));
-        assert_eq!(find_runtime("claude", Some(dir.join("custom/missing")), Some(&bin), Some(&path)), None);
+        assert_eq!(find_runtime("claude", Some(dir.join("custom/claude")), Some(&path), &installed), Some(dir.join("custom/claude")));
+        assert_eq!(find_runtime("agy", Some(dir.join("custom/missing")), Some(&path), &installed), None);
         // A file that cannot be run is no program.
         std::fs::write(usr.join("plain"), "text").unwrap();
-        assert_eq!(find_runtime("plain", None, None, Some(&path)), None);
-        assert_eq!(find_runtime("nothing", None, Some(&bin), Some(&path)), None);
-        assert_eq!(find_runtime("claude", None, None, None), None);
+        assert_eq!(find_runtime("plain", None, Some(&path), &[]), None);
+        assert_eq!(find_runtime("omp", None, Some(&path), &installed), None);
+        assert_eq!(find_runtime("claude", None, None, &[]), None);
     }
 
     #[test]
     fn finds_the_extension_and_the_web_files_of_an_installation() {
         let dir = TempDir::new("bundle");
-        let bin = dir.join("Neo Agent.app/Contents/Helpers");
+        let bin = dir.join("Neo.app/Contents/Helpers");
         std::fs::create_dir_all(&bin).unwrap();
         // A source checkout has the extension; an installation's own comes first.
         assert!(find_shim(None, Some(&bin)).ends_with("shim/neo-omp-shim.ts"));
         assert!(find_shim(None, Some(&bin)).is_file(), "the repository's shim is found from a development build");
-        let resources = dir.join("Neo Agent.app/Contents/Resources");
+        let resources = dir.join("Neo.app/Contents/Resources");
         std::fs::create_dir_all(resources.join("shim")).unwrap();
         std::fs::write(resources.join("shim/neo-omp-shim.ts"), "// shim").unwrap();
         assert_eq!(find_shim(None, Some(&bin)), resources.join("shim/neo-omp-shim.ts"));

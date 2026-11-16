@@ -546,7 +546,7 @@ impl AntigravityDriver {
                 let reasons = std::mem::take(&mut shared.refused).join("\n");
                 Some((
                     None,
-                    json!([{"type": "text", "text": format!("[Neo Agent] These tool calls were refused and did not run:\n{reasons}\nContinue without them.")}]),
+                    json!([{"type": "text", "text": format!("[Neo] These tool calls were refused and did not run:\n{reasons}\nContinue without them.")}]),
                 ))
             } else {
                 shared.refused.clear();

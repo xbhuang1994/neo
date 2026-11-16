@@ -223,12 +223,18 @@ class RoleModel {
   int get hashCode => Object.hash(provider, model, thinkingLevel);
 }
 
-/// A kernel and whether it can run on the backend's machine.
+/// A kernel, whether its program is installed on the backend's machine, and whether it can run there.
 class KernelInfo {
-  KernelInfo.fromJson(Map<String, dynamic> json) : id = json['id'] as String? ?? '', problem = _text(json['problem']);
+  KernelInfo.fromJson(Map<String, dynamic> json)
+    : id = json['id'] as String? ?? '',
+      problem = _text(json['problem']),
+      installed = json['installed'] != false,
+      installing = json['installing'] == true;
 
   final String id;
   final String? problem;
+  final bool installed;
+  final bool installing;
 }
 
 /// The kernel and model settings, with what may be chosen.
@@ -236,21 +242,17 @@ class ModelSettings {
   ModelSettings.fromJson(Map<String, dynamic> json)
     : kernel = json['kernel'] as String? ?? 'omp',
       kernels = [for (final kernel in _list(json['kernels'])) KernelInfo.fromJson(_map(kernel))],
-      supportsAdvisor = _map(json['supports'])['advisor'] == true,
       thinkingLevels = _list(_map(json['supports'])['thinkingLevels']).cast<String>(),
       eval = RoleModel.fromJson(_map(json['current'])['eval']),
       executor = RoleModel.fromJson(_map(json['current'])['executor']),
-      advisor = RoleModel.fromJson(_map(json['current'])['advisor']),
       available = [for (final option in _list(json['available'])) ModelOption.fromJson(_map(option))],
       problem = _text(json['problem']);
 
   final String kernel;
   final List<KernelInfo> kernels;
-  final bool supportsAdvisor;
   final List<String> thinkingLevels;
   final RoleModel? eval;
   final RoleModel? executor;
-  final RoleModel? advisor;
   final List<ModelOption> available;
   final String? problem;
 }

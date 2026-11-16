@@ -1,6 +1,6 @@
 # neo_agent
 
-Neo Agent
+Neo
 
 ## Getting Started
 

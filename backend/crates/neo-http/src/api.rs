@@ -138,6 +138,7 @@ async fn route(app: &Arc<App>, request: &Request) -> Result<Response, Response> 
         ("GET", "/api/settings/models") => ok(app.models_view().await),
         ("PUT", "/api/settings/models") => done(app.update_models(json_body(request)?).await),
         ("PUT", "/api/settings/kernel") => done(app.set_kernel(json_body(request)?).await),
+        ("POST", "/api/settings/kernel/install") => done(app.install_kernel(json_body(request)?).await),
         ("GET", "/api/settings/general") => ok(app.general_view()),
         ("PUT", "/api/settings/general") => done(app.update_general(json_body(request)?).await),
         ("POST", "/api/session/reset") => done(app.reset_orchestrator().await.map(|()| json!({"reset": true}))),

@@ -48,8 +48,6 @@ pub struct SessionSpec {
     pub system_prompt: String,
     /// The model, or the runtime's default.
     pub model: Option<RoleModel>,
-    /// A second model that reviews each turn, where the kernel has one.
-    pub advisor: Option<RoleModel>,
 }
 
 /// A model a role may use.
@@ -67,18 +65,51 @@ pub struct ModelOption {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Support {
-    /// It can run an advisor model.
-    pub advisor: bool,
-    /// The thinking levels it takes.
+    /// The thinking levels it takes; none when the runtime decides for itself.
     pub thinking_levels: Vec<&'static str>,
 }
 
 /// What each kernel's settings offer.
 pub fn support(kernel: Kernel) -> Support {
     match kernel {
-        Kernel::Omp => Support { advisor: true, thinking_levels: vec!["auto", "off", "minimal", "low", "medium", "high", "xhigh", "max"] },
-        Kernel::Claude => Support { advisor: false, thinking_levels: vec!["auto", "off", "low", "medium", "high", "xhigh", "max"] },
-        Kernel::Antigravity => Support { advisor: false, thinking_levels: vec!["auto", "low", "medium", "high"] },
+        Kernel::Omp => Support { thinking_levels: vec!["auto", "off", "minimal", "low", "medium", "high", "xhigh", "max"] },
+        Kernel::Claude => Support { thinking_levels: vec!["auto", "off", "low", "medium", "high", "xhigh", "max"] },
+        // The Antigravity CLI picks its own effort for the model.
+        Kernel::Antigravity => Support { thinking_levels: Vec::new() },
+    }
+}
+
+/// The program each kernel runs.
+pub fn program_name(kernel: Kernel) -> &'static str {
+    match kernel {
+        Kernel::Omp => "omp",
+        Kernel::Claude => "claude",
+        Kernel::Antigravity => "agy",
+    }
+}
+
+/// The kernel's name for people.
+pub fn display_name(kernel: Kernel) -> &'static str {
+    match kernel {
+        Kernel::Omp => "Oh My Pi",
+        Kernel::Claude => "Claude Code",
+        Kernel::Antigravity => "Antigravity CLI",
+    }
+}
+
+/// The official installer of each kernel's program, as a shell command: a script fetched from the vendor that puts
+/// the program in the user's own folders, with no administrator rights.
+pub fn install_command(kernel: Kernel) -> (&'static str, Vec<String>) {
+    let (script, windows_script) = match kernel {
+        Kernel::Claude => ("https://claude.ai/install.sh", "https://claude.ai/install.ps1"),
+        Kernel::Omp => ("https://omp.sh/install", "https://omp.sh/install.ps1"),
+        Kernel::Antigravity => ("https://antigravity.google/cli/install.sh", "https://antigravity.google/cli/install.ps1"),
+    };
+    if cfg!(windows) {
+        let command = format!("$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; irm {windows_script} | iex");
+        ("powershell", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &command].map(String::from).to_vec())
+    } else {
+        ("bash", vec!["-c".into(), format!("set -o pipefail; curl -fsSL {script} | bash")])
     }
 }
 
@@ -90,20 +121,34 @@ pub trait Kernels: Send + Sync {
     fn models(&self, kernel: Kernel) -> BoxFut<'_, Result<Vec<ModelOption>, String>>;
     /// Why the kernel cannot run here, such as its program not being installed; `None` when it can.
     fn unavailable(&self, kernel: Kernel) -> Option<String>;
+    /// Install the kernel's program with its official installer, and say where it went.
+    fn install(&self, kernel: Kernel) -> BoxFut<'_, Result<PathBuf, String>> {
+        Box::pin(async move { Err(format!("{} cannot be installed from here", display_name(kernel))) })
+    }
+    /// Whether the kernel's program is on this machine, whether or not the kernel can run.
+    fn installed(&self, kernel: Kernel) -> bool {
+        self.unavailable(kernel).is_none()
+    }
+    /// Whether the kernel's program is being installed now.
+    fn installing(&self, _kernel: Kernel) -> bool {
+        false
+    }
 }
 
-/// The real runtimes: the `claude`, `omp` and `agy` programs.
+/// Finds a kernel's program on this machine.
+pub type Finder = Arc<dyn Fn(Kernel) -> Option<PathBuf> + Send + Sync>;
+
+/// The real runtimes: the `claude`, `omp` and `agy` programs installed on this machine. None is bundled; each is
+/// looked for again whenever it is needed, so one installed while the application runs is used at once.
 pub struct RealKernels {
     /// The data directory, where prompt files, overlays and runtime sessions are kept.
     pub state_dir: PathBuf,
     /// Oh My Pi's agent directory.
     pub agent_dir: PathBuf,
-    /// The `claude` program, when found.
-    pub claude: Option<PathBuf>,
-    /// The `omp` program, when found.
-    pub omp: Option<PathBuf>,
-    /// The Antigravity CLI program (`agy`), when found.
-    pub agy: Option<PathBuf>,
+    /// Finds each kernel's program.
+    pub find: Finder,
+    /// The kernels whose programs are being installed.
+    pub installing: std::sync::Mutex<std::collections::BTreeSet<Kernel>>,
     /// The shim extension file for Oh My Pi.
     pub shim: PathBuf,
     /// Variables to set for every runtime, on top of the host's environment.
@@ -112,7 +157,7 @@ pub struct RealKernels {
 
 const OVERLAY_COMMON: &str = "launch:\n  enabled: false\nretry:\n  enabled: true\ncompaction:\n  enabled: true\n";
 
-fn overlay(role: SessionRole, advisor: Option<&RoleModel>) -> String {
+fn overlay(role: SessionRole) -> String {
     let mut text = OVERLAY_COMMON.to_string();
     if role == SessionRole::Worker {
         // A worker's long commands and subagents run as background jobs, whose ends wake it.
@@ -121,18 +166,7 @@ fn overlay(role: SessionRole, advisor: Option<&RoleModel>) -> String {
         // The orchestrator resends its whole history with every candidate: compact it early.
         text.push_str("  thresholdTokens: 60000\n  keepRecentTokens: 8000\nasync:\n  enabled: false\nbash:\n  autoBackground:\n    enabled: false\n");
     }
-    if let Some(model) = advisor {
-        text.push_str(&format!("advisor:\n  enabled: true\nmodelRoles:\n  advisor: {}\n", selector(model)));
-    }
     text
-}
-
-/// Oh My Pi's selector for a role model: `provider/model`, with `:level` when a thinking level is set.
-fn selector(model: &RoleModel) -> String {
-    match model.thinking_level.as_deref() {
-        Some(level) => format!("{}/{}:{level}", model.provider, model.model),
-        None => format!("{}/{}", model.provider, model.model),
-    }
 }
 
 fn write_if_changed(path: &Path, text: &str) -> Result<(), String> {
@@ -166,6 +200,34 @@ pub fn overrides_subagent(cwd: &Path) -> bool {
 }
 
 impl RealKernels {
+    /// The kernel's program, looked for now.
+    pub fn program(&self, kernel: Kernel) -> Option<PathBuf> {
+        (self.find)(kernel)
+    }
+
+    fn require(&self, kernel: Kernel) -> Result<PathBuf, String> {
+        self.program(kernel).ok_or_else(|| self.unavailable(kernel).unwrap_or_default())
+    }
+
+    async fn run_installer(&self, kernel: Kernel) -> Result<PathBuf, String> {
+        let name = display_name(kernel);
+        let (program, args) = install_command(kernel);
+        let mut command = tokio::process::Command::new(program);
+        command.args(&args).stdin(std::process::Stdio::null()).kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(600), command.output())
+            .await
+            .map_err(|_| format!("Installing {name} took longer than 10 minutes and was stopped"))?
+            .map_err(|error| format!("Cannot run {program} to install {name}: {error}"))?;
+        if !output.status.success() {
+            let text = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            let lines: Vec<&str> = text.lines().map(str::trim_end).filter(|line| !line.trim().is_empty()).collect();
+            let tail = lines[lines.len().saturating_sub(12)..].join("\n");
+            return Err(format!("Installing {name} failed ({}):\n{tail}", output.status));
+        }
+        self.program(kernel)
+            .ok_or_else(|| format!("The {name} installer finished, but its program ({}) was not found where it installs itself", program_name(kernel)))
+    }
+
     fn claude_env(&self) -> BTreeMap<String, String> {
         // The user's Claude Code settings fill in what the process environment does not say.
         let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_default();
@@ -176,7 +238,7 @@ impl RealKernels {
     }
 
     fn open_claude(&self, spec: &SessionSpec, host: Arc<dyn ToolHost>, events: mpsc::UnboundedSender<DriverEvent>) -> Result<Arc<dyn Driver>, String> {
-        let program = self.claude.clone().ok_or_else(|| self.unavailable(Kernel::Claude).unwrap_or_default())?;
+        let program = self.require(Kernel::Claude)?;
         let names: Vec<String> = host.specs().into_iter().map(|tool| tool.name).collect();
         let worker = spec.role == SessionRole::Worker;
         let note = if worker {
@@ -234,11 +296,10 @@ impl RealKernels {
     }
 
     fn open_omp(&self, spec: &SessionSpec, host: Arc<dyn ToolHost>, events: mpsc::UnboundedSender<DriverEvent>) -> Result<Arc<dyn Driver>, String> {
-        let program = self.omp.clone().ok_or_else(|| self.unavailable(Kernel::Omp).unwrap_or_default())?;
+        let program = self.require(Kernel::Omp)?;
         let kernel_dir = self.state_dir.join("kernel");
         let worker = spec.role == SessionRole::Worker;
-        let advisor = spec.advisor.as_ref().filter(|_| worker);
-        let overlay_text = overlay(spec.role, advisor);
+        let overlay_text = overlay(spec.role);
         let overlay_file = kernel_dir.join("overlays").join(format!("{}.yml", key(&[&overlay_text])));
         write_if_changed(&overlay_file, &overlay_text)?;
         let prompt_file = kernel_dir.join("prompts").join(format!("{}.md", key(&[&spec.system_prompt])));
@@ -271,7 +332,6 @@ impl RealKernels {
                 SessionRole::Watchdog => Some("low".into()),
                 _ => spec.model.as_ref().and_then(|model| model.thinking_level.clone()),
             },
-            advisor: advisor.is_some(),
             config: vec![overlay_file],
             context_files: worker,
             // One-off Sessions of a kind share a prefix, which the provider caches once.
@@ -286,7 +346,7 @@ impl RealKernels {
     }
 
     fn open_antigravity(&self, spec: &SessionSpec, host: Arc<dyn ToolHost>, events: mpsc::UnboundedSender<DriverEvent>) -> Result<Arc<dyn Driver>, String> {
-        let program = self.agy.clone().ok_or_else(|| self.unavailable(Kernel::Antigravity).unwrap_or_default())?;
+        let program = self.require(Kernel::Antigravity)?;
         let names: Vec<String> = host.specs().into_iter().map(|tool| tool.name).collect();
         let worker = spec.role == SessionRole::Worker;
         let note = if worker {
@@ -299,11 +359,8 @@ impl RealKernels {
             SessionRole::Sidecar => &["read"],
             SessionRole::Orchestrator | SessionRole::Watchdog => &["read", "bash"],
         };
-        let thinking = match spec.role {
-            // An inspection turn decides from evidence it is handed: low effort.
-            SessionRole::Watchdog => Some("low".to_string()),
-            _ => spec.model.as_ref().and_then(|model| model.thinking_level.clone()),
-        };
+        // The runtime picks its own effort; only an inspection turn, which decides from evidence it is handed, asks for low.
+        let thinking = (spec.role == SessionRole::Watchdog).then(|| "low".to_string());
         let options = AntigravityOptions {
             program,
             cwd: spec.cwd.clone(),
@@ -369,7 +426,7 @@ impl Kernels for RealKernels {
             match kernel {
                 Kernel::Claude => self.claude_models().await,
                 Kernel::Omp => {
-                    let program = self.omp.clone().ok_or_else(|| self.unavailable(Kernel::Omp).unwrap_or_default())?;
+                    let program = self.require(Kernel::Omp)?;
                     let mut models: Vec<ModelOption> = omp::list_models(&program, &self.agent_dir, &self.state_dir)
                         .await?
                         .into_iter()
@@ -379,7 +436,7 @@ impl Kernels for RealKernels {
                     Ok(models)
                 }
                 Kernel::Antigravity => {
-                    let program = self.agy.clone().ok_or_else(|| self.unavailable(Kernel::Antigravity).unwrap_or_default())?;
+                    let program = self.require(Kernel::Antigravity)?;
                     Ok(antigravity::list_models(&program, &self.env)
                         .await?
                         .into_iter()
@@ -390,17 +447,33 @@ impl Kernels for RealKernels {
         })
     }
     fn unavailable(&self, kernel: Kernel) -> Option<String> {
-        match kernel {
-            Kernel::Claude if self.claude.is_none() => {
-                Some("The Claude Code program (claude) was not found. Install it, or choose another kernel in Settings.".into())
-            }
-            Kernel::Omp if self.omp.is_none() => Some("The Oh My Pi program (omp) was not found. Install it, or choose another kernel in Settings.".into()),
-            Kernel::Antigravity if self.agy.is_none() => {
-                Some("The Antigravity CLI program (agy) was not found. Install it and sign in, or choose another kernel in Settings.".into())
-            }
-            Kernel::Omp if !self.shim.is_file() => Some(format!("The Oh My Pi extension {} is missing; reinstall the application.", self.shim.display())),
-            _ => None,
+        if self.program(kernel).is_none() {
+            let installing = self.installing(kernel);
+            return Some(format!(
+                "{} ({}) is {}",
+                display_name(kernel),
+                program_name(kernel),
+                if installing { "being installed" } else { "not installed. Install it, or choose another kernel" }
+            ));
         }
+        (kernel == Kernel::Omp && !self.shim.is_file())
+            .then(|| format!("The Oh My Pi extension {} is missing; reinstall the application.", self.shim.display()))
+    }
+    fn install(&self, kernel: Kernel) -> BoxFut<'_, Result<PathBuf, String>> {
+        Box::pin(async move {
+            if !self.installing.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(kernel) {
+                return Err(format!("{} is already being installed", display_name(kernel)));
+            }
+            let result = self.run_installer(kernel).await;
+            self.installing.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&kernel);
+            result
+        })
+    }
+    fn installed(&self, kernel: Kernel) -> bool {
+        self.program(kernel).is_some()
+    }
+    fn installing(&self, kernel: Kernel) -> bool {
+        self.installing.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).contains(&kernel)
     }
 }
 
@@ -410,7 +483,7 @@ mod tests {
 
     #[test]
     fn writes_a_worker_overlay_with_background_jobs_and_an_orchestrator_one_without() {
-        let worker = overlay(SessionRole::Worker, None);
+        let worker = overlay(SessionRole::Worker);
         assert!(
             worker.contains("async:\n  enabled: true")
                 && worker.contains("thresholdMs: 60000")
@@ -418,17 +491,25 @@ mod tests {
                 && worker.contains("maxConcurrency: 8")
         );
         assert!(!worker.contains("advisor"));
-        let main = overlay(SessionRole::Orchestrator, None);
+        let main = overlay(SessionRole::Orchestrator);
         assert!(main.contains("async:\n  enabled: false") && main.contains("thresholdTokens: 60000") && !main.contains("cacheWarming"));
-        let advised = overlay(SessionRole::Worker, Some(&RoleModel { provider: "fixture".into(), model: "big".into(), thinking_level: Some("high".into()) }));
-        assert!(advised.ends_with("advisor:\n  enabled: true\nmodelRoles:\n  advisor: fixture/big:high\n"));
     }
 
     #[test]
-    fn offers_an_advisor_and_minimal_thinking_only_on_oh_my_pi() {
-        assert!(support(Kernel::Omp).advisor && support(Kernel::Omp).thinking_levels.contains(&"minimal"));
-        assert!(!support(Kernel::Claude).advisor && !support(Kernel::Claude).thinking_levels.contains(&"minimal"));
-        assert!(!support(Kernel::Antigravity).advisor && !support(Kernel::Antigravity).thinking_levels.contains(&"off"));
+    fn offers_minimal_thinking_only_on_oh_my_pi_and_no_levels_on_antigravity() {
+        assert!(support(Kernel::Omp).thinking_levels.contains(&"minimal"));
+        assert!(!support(Kernel::Claude).thinking_levels.contains(&"minimal") && support(Kernel::Claude).thinking_levels.contains(&"max"));
+        assert!(support(Kernel::Antigravity).thinking_levels.is_empty());
+    }
+
+    #[test]
+    fn installs_each_kernel_with_its_vendors_script() {
+        for (kernel, script) in
+            [(Kernel::Claude, "claude.ai/install"), (Kernel::Omp, "omp.sh/install"), (Kernel::Antigravity, "antigravity.google/cli/install")]
+        {
+            let (_, args) = install_command(kernel);
+            assert!(args.last().unwrap().contains(&format!("https://{script}")), "{args:?}");
+        }
     }
 
     #[test]
@@ -436,15 +517,16 @@ mod tests {
         let kernels = RealKernels {
             state_dir: "/s".into(),
             agent_dir: "/a".into(),
-            claude: None,
-            omp: Some("/bin/omp".into()),
-            agy: None,
+            find: Arc::new(|kernel| (kernel == Kernel::Omp).then(|| PathBuf::from("/bin/omp"))),
+            installing: Default::default(),
             shim: "/missing/shim.ts".into(),
             env: BTreeMap::new(),
         };
         assert!(kernels.unavailable(Kernel::Claude).unwrap().contains("claude"));
         assert!(kernels.unavailable(Kernel::Antigravity).unwrap().contains("agy"));
         assert!(kernels.unavailable(Kernel::Omp).unwrap().contains("/missing/shim.ts"));
+        kernels.installing.lock().unwrap().insert(Kernel::Claude);
+        assert!(kernels.unavailable(Kernel::Claude).unwrap().contains("being installed"));
     }
 
     #[test]

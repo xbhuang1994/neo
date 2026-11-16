@@ -1,6 +1,6 @@
 [package]
 name = "neo-store"
-description = "Neo Agent SQLite persistence: domain aggregates, key-value state, the outbox and the effect queue."
+description = "Neo SQLite persistence: domain aggregates, key-value state, the outbox and the effect queue."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

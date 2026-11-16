@@ -1,6 +1,6 @@
 [package]
 name = "neo-app"
-description = "Neo Agent application: settings, policy, effects, sessions, executor, sources and tools."
+description = "Neo application: settings, policy, effects, sessions, executor, sources and tools."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -17,7 +17,7 @@ enum BackendPhase {
   /// It cannot start; [BackendStatus.message] says why.
   failed,
 
-  /// Another Neo Agent already runs for this user.
+  /// Another Neo already runs for this user.
   alreadyRunning,
 }
 

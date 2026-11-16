@@ -1,6 +1,6 @@
 # 001 Domain model
 
-This document names the concepts of Neo Agent and the rules each one keeps. The code, tools and other documents use these terms and no others. Following [000 Philosophy](000-philosophy.md), the model holds only concepts the work needs, and a business need becomes an attribute of one of them.
+This document names the concepts of Neo and the rules each one keeps. The code, tools and other documents use these terms and no others. Following [000 Philosophy](000-philosophy.md), the model holds only concepts the work needs, and a business need becomes an attribute of one of them.
 
 ## Flow
 
@@ -76,7 +76,7 @@ A reference list of the terms this and the later documents use, with their Chine
 
 | Term | 中文 | Meaning |
 | --- | --- | --- |
-| Agent | 智能体 | The automated helper Neo Agent runs |
+| Agent | 智能体 | The automated helper Neo runs |
 | Main Session | 主 Session | The persistent Session that evaluates Triggers, accepts and dispatches Tickets, and replies; `orchestrator` in code and prompts |
 | Executor Session | 执行器 Session | The persistent worker Session for one Ticket; `worker` in code and prompts |
 | Source | 来源 | A stream of events |

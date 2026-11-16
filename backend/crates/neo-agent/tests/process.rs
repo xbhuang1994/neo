@@ -169,25 +169,25 @@ fn serves_the_api_as_one_instance_and_stops_cleanly() {
     let dir = TempDir::new("agent-serve");
     std::fs::write(dir.join("settings.json"), json!({"executor": {"maxWorkers": 7}}).to_string()).unwrap();
     std::fs::create_dir_all(dir.join("web")).unwrap();
-    std::fs::write(dir.join("web/index.html"), "<!doctype html><title>Neo Agent</title>").unwrap();
+    std::fs::write(dir.join("web/index.html"), "<!doctype html><title>Neo</title>").unwrap();
     let init = dir.join("settings.json");
     let web = dir.join("web");
     let first = Running::start(serve(&dir, "data", &["--init-settings", init.to_str().unwrap(), "--web-dir", web.to_str().unwrap()]), None);
     // It runs without a kernel, says so, and takes settings; the page is served beside the API.
     let (status, health) = first.get("/api/health", None);
     assert_eq!((status, health["ready"].as_bool(), health["components"]["kernel"]["state"].as_str()), (200, Some(true), Some("error")));
-    assert!(health["components"]["kernel"]["detail"].as_str().unwrap().contains("was not found"));
+    assert!(health["components"]["kernel"]["detail"].as_str().unwrap().contains("is not installed"));
     assert_eq!(first.get("/api/settings/general", None).1["executor"]["maxWorkers"], 7);
     assert_eq!(first.get("/api/messages", None), (200, json!({"messages": []})));
     assert_eq!(call(first.port, "PUT", "/api/settings/general", Some(json!({"executor": {"maxWorkers": 4}})), None).0, 200);
     assert_eq!(first.get("/", None).0, 200);
     let (status, refused) = call(first.port, "POST", "/api/chat", Some(json!({"text": "hello"})), None);
-    assert!(status == 400 && refused["error"].as_str().unwrap().contains("was not found"), "{refused}");
+    assert!(status == 400 && refused["error"].as_str().unwrap().contains("is not installed"), "{refused}");
 
     // A second instance of this user is refused and told where the first one is, whatever data directory it names.
     let second = run(&mut serve(&dir, "other", &[]));
     assert_eq!(second.status.code(), Some(3));
-    assert!(text(&second.stderr).contains(&format!("Neo Agent is already running on port {}", first.port)), "{}", text(&second.stderr));
+    assert!(text(&second.stderr).contains(&format!("Neo is already running on port {}", first.port)), "{}", text(&second.stderr));
     assert!(second.stdout.is_empty());
     // Allowed several, another data directory runs beside it, and the same one does not.
     let same = run(&mut serve(&dir, "data", &["--allow-multiple"]));
@@ -242,7 +242,7 @@ fn refuses_to_run_as_a_blocked_command() {
     std::fs::copy(PROGRAM, folder.join(name)).unwrap();
     let refused = Command::new(folder.join(name)).args(["run", "--rm", "alpine"]).output().unwrap();
     assert_eq!(refused.status.code(), Some(126));
-    assert_eq!(text(&refused.stderr), "docker is blocked in this installation by the Neo Agent settings; do the work without it.\n");
+    assert_eq!(text(&refused.stderr), "docker is blocked in this installation by the Neo settings; do the work without it.\n");
     assert!(refused.stdout.is_empty());
     // Under its own name elsewhere it is itself.
     let elsewhere = dir.join(if cfg!(windows) { "renamed.exe" } else { "renamed" });

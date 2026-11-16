@@ -1,4 +1,4 @@
-//! Neo Agent's HTTP interface: the JSON API the app calls, access control, and the web build's static files.
+//! Neo's HTTP interface: the JSON API the app calls, access control, and the web build's static files.
 #![deny(missing_docs)]
 
 pub mod api;

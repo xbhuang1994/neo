@@ -5,10 +5,10 @@
 // 'flutter create' template.
 
 // The application's name. By default this is also the title of the Flutter window.
-PRODUCT_NAME = Neo Agent
+PRODUCT_NAME = Neo
 
 // The application's bundle identifier
 PRODUCT_BUNDLE_IDENTIFIER = dev.neoagent.neoAgent
 
 // The copyright displayed in application information
-PRODUCT_COPYRIGHT = Neo Agent contributors. MIT License.
+PRODUCT_COPYRIGHT = Neo contributors. MIT License.
