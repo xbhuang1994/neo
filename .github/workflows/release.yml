@@ -26,15 +26,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Both on Intel runners: hosted arm64 Macs were not acquired within their queue time. The backend is
+          # cross-compiled and the Flutter app is universal, so the arm64 image is built here as well.
           - os: macos-15-intel
             arch: x64
-          - os: macos-15
+          - os: macos-15-intel
             arch: arm64
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_VERSION }}
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
@@ -57,7 +60,7 @@ jobs:
         env:
           MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: |
-          if [ "$WITHOUT_RUNTIMES" = true ]; then packaging/macos/build-dmg.sh --without-runtimes; else packaging/macos/build-dmg.sh; fi
+          if [ "$WITHOUT_RUNTIMES" = true ]; then packaging/macos/build-dmg.sh --arch ${{ matrix.arch }} --without-runtimes; else packaging/macos/build-dmg.sh --arch ${{ matrix.arch }}; fi
       - name: Notarize
         if: env.APPLE_ID != ''
         env:
