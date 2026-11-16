@@ -85,6 +85,11 @@ pub fn on_path(name: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     std::env::split_paths(path).flat_map(|dir| names(name).into_iter().map(move |file| dir.join(file))).find(|candidate| executable(candidate))
 }
 
+/// Oh My Pi's own agent directory, `~/.omp/agent`: the providers, models and sign-in the person's `omp` uses.
+pub fn omp_agent_dir() -> PathBuf {
+    home().join(".omp").join("agent")
+}
+
 /// Where an agent's official installer puts its program: `~/.local/bin` on macOS and Linux; on Windows Claude Code's
 /// `%USERPROFILE%\.local\bin`, Oh My Pi's `%LOCALAPPDATA%\omp` and the Antigravity CLI's `%LOCALAPPDATA%\agy\bin`.
 pub fn install_dirs(name: &str) -> Vec<PathBuf> {

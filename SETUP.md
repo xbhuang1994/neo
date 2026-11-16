@@ -49,7 +49,7 @@ export ANTHROPIC_BASE_URL=...         # only for a gateway or a compatible endpo
 
 A desktop app started from the Dock or the Start menu does not see variables set in a shell profile: put them in `~/.claude/settings.json` under `env`, or sign in with `claude` once in a terminal.
 
-**Oh My Pi.** It uses the providers configured in its agent directory, `<data directory>/omp` unless `--agent-dir` names another: put a `models.yml` there, or sign in with `omp` using that directory.
+**Oh My Pi.** It uses the providers, models and sign-in of your own `omp`: the agent directory `~/.omp/agent` (or `PI_CODING_AGENT_DIR`), unless `--agent-dir` names another. Configure `omp` as usual and Neo offers the same models.
 
 **Antigravity CLI.** After installing it, run `agy` once in a terminal to sign in with Google. The backend offers the models `agy models` lists, and leaves the thinking effort to the runtime. Its workers run without background jobs or subagents.
 

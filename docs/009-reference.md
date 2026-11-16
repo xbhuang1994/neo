@@ -14,7 +14,7 @@ neo-agent version
 | Option | For | Meaning |
 | --- | --- | --- |
 | `--data-dir <dir>` | all | Where state is kept. Default: the per-user data directory |
-| `--agent-dir <dir>` | all | Oh My Pi's agent directory. Default: `<data-dir>/omp` |
+| `--agent-dir <dir>` | all | Oh My Pi's agent directory. Default: `PI_CODING_AGENT_DIR`, else `~/.omp/agent` |
 | `--allow-multiple` | serve, desktop-sidecar | Allow another instance with a different data directory |
 | `--config <file>` | serve | A JSON file with `dataDir`, `agentDir`, `host`, `port`, `token`, `webDir`; the command line wins over it |
 | `--host <host>` | serve | Address to listen on. Default `127.0.0.1` |

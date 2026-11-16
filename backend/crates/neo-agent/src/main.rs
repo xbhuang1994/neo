@@ -48,7 +48,9 @@ fn absolute(path: PathBuf) -> PathBuf {
 fn common(common: &Common, config: &ConfigFile) -> (PathBuf, PathBuf, bool) {
     let data_dir =
         absolute(common.data_dir.clone().or_else(|| env_path("NEO_DATA_DIR")).or_else(|| config.data_dir.clone()).unwrap_or_else(paths::default_data_dir));
-    let agent_dir = absolute(common.agent_dir.clone().or_else(|| config.agent_dir.clone()).unwrap_or_else(|| data_dir.join("omp")));
+    let agent_dir = absolute(
+        common.agent_dir.clone().or_else(|| config.agent_dir.clone()).or_else(|| env_path("PI_CODING_AGENT_DIR")).unwrap_or_else(paths::omp_agent_dir),
+    );
     let allow_multiple = common.allow_multiple || std::env::var("NEO_ALLOW_MULTIPLE").is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
     (data_dir, agent_dir, allow_multiple)
 }

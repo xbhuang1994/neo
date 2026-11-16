@@ -17,7 +17,7 @@ Usage:
 Options for serve:
   --config <file>         A JSON file with dataDir, agentDir, host, port, token, webDir.
   --data-dir <dir>        Where state is kept. Default: the per-user data directory.
-  --agent-dir <dir>       Oh My Pi's agent directory. Default: <data-dir>/omp.
+  --agent-dir <dir>       Oh My Pi's agent directory. Default: $PI_CODING_AGENT_DIR, else ~/.omp/agent.
   --host <host>           Address to listen on. Default: 127.0.0.1.
   --port <port>           Port to listen on. Default: 3082; 0 picks a free one.
   --token <token>         Access token (at least 16 characters); also NEO_TOKEN. Required unless listening on loopback.

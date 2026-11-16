@@ -32,7 +32,7 @@ The desktop app adds its own check, so that starting it twice shows the window t
 | The Oh My Pi extension | `NEO_SHIM`, else a `shim` folder beside the program |
 | The web app's files | `--web-dir`, else a `web` folder beside the program |
 | `git` | `PATH`. Workers that use git need it installed; nothing else does |
-| Model access | Claude Code: the `ANTHROPIC_*` environment and the user's Claude Code settings. Oh My Pi: its agent directory (`--agent-dir`, by default `<data>/omp`). Antigravity: the Google account `agy` is signed in to |
+| Model access | Claude Code: the `ANTHROPIC_*` environment and the user's Claude Code settings. Oh My Pi: its agent directory (`--agent-dir`, by default `PI_CODING_AGENT_DIR` or `~/.omp/agent`, the one the person's `omp` uses). Antigravity: the Google account `agy` is signed in to |
 
 `neo-agent doctor` prints all of these as it finds them, and fails when no kernel can run. The application starts without a kernel too: it says so in the app, keeps messages, and works once one is installed or chosen.
 
@@ -49,7 +49,6 @@ The data directory is `~/Library/Application Support/neo-agent` on macOS, `%LOCA
 | `work/` | One directory per Ticket, unless the settings name another task directory |
 | `attachments/` | Files people attached |
 | `worker-bin/` | Stand-ins for blocked commands |
-| `omp/` | Oh My Pi's agent directory: its providers, models and sign-in |
 | `instance.lock` | The data directory's lock |
 
 The store has a schema version. A data directory of another version is refused with its version named; nothing is migrated. In particular, the state of the earlier TypeScript releases cannot be opened: start with a new data directory.
