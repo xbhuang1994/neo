@@ -187,20 +187,20 @@ const MAX_NOTES: u32 = 3;
 /// The largest request body the tool server reads.
 const MCP_BODY_LIMIT: usize = 16 << 20;
 
-async fn start_mcp(host: Arc<dyn ToolHost>) -> Result<McpServer, String> {
+async fn start_mcp(host: Arc<dyn ToolHost>, on_tool_call: Option<Arc<dyn Fn() + Send + Sync>>) -> Result<McpServer, String> {
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|error| format!("Cannot open the tool server: {error}"))?;
     let port = listener.local_addr().map_err(|error| format!("Cannot open the tool server: {error}"))?.port();
     let token = format!("{}{}", uuid().replace('-', ""), uuid().replace('-', ""));
     let expected = format!("Bearer {token}");
     let task = tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
-            tokio::spawn(serve_connection(stream, host.clone(), expected.clone()));
+            tokio::spawn(serve_connection(stream, host.clone(), expected.clone(), on_tool_call.clone()));
         }
     });
     Ok(McpServer { url: format!("http://127.0.0.1:{port}/mcp"), token, task })
 }
 
-async fn serve_connection(stream: TcpStream, host: Arc<dyn ToolHost>, expected: String) {
+async fn serve_connection(stream: TcpStream, host: Arc<dyn ToolHost>, expected: String, on_tool_call: Option<Arc<dyn Fn() + Send + Sync>>) {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     loop {
@@ -244,7 +244,7 @@ async fn serve_connection(stream: TcpStream, host: Arc<dyn ToolHost>, expected: 
             (405, None)
         } else {
             match serde_json::from_slice::<Value>(&body) {
-                Ok(message) => match mcp_answer(host.as_ref(), &message).await {
+                Ok(message) => match mcp_answer(host.as_ref(), &message, on_tool_call.as_deref()).await {
                     Some(answer) => (200, Some(answer)),
                     None => (202, None),
                 },
@@ -278,7 +278,7 @@ async fn respond(writer: &mut tokio::net::tcp::OwnedWriteHalf, status: u16, body
 }
 
 /// Answer one MCP message; `None` for a notification. The guard judges every tool call before it runs.
-async fn mcp_answer(host: &dyn ToolHost, message: &Value) -> Option<Value> {
+async fn mcp_answer(host: &dyn ToolHost, message: &Value, on_tool_call: Option<&(dyn Fn() + Send + Sync)>) -> Option<Value> {
     let id = message.get("id").filter(|id| !id.is_null())?.clone();
     let result = match message["method"].as_str().unwrap_or("") {
         "initialize" => json!({
@@ -291,6 +291,10 @@ async fn mcp_answer(host: &dyn ToolHost, message: &Value) -> Option<Value> {
             json!({"tools": host.specs().iter().map(|spec| json!({"name": spec.name, "description": spec.description, "inputSchema": spec.schema})).collect::<Vec<_>>()})
         }
         "tools/call" => {
+            if let Some(on_call) = on_tool_call {
+                on_call();
+                tokio::task::yield_now().await;
+            }
             let name = message["params"]["name"].as_str().unwrap_or("");
             let specs = host.specs();
             let arguments =
@@ -322,9 +326,9 @@ struct Shared {
     in_flight: usize,
     /// Follow-ups waiting for the running turn to end: their submission id and content.
     queued: VecDeque<(String, Value)>,
-    /// Prompts sent that the runtime has not taken into a step yet, oldest first: a submission's id, or `None` for a
-    /// note of the driver's own.
-    unechoed: VecDeque<Option<String>>,
+    /// Prompts sent that the runtime has not confirmed taking into a step yet, oldest first: the request id and a
+    /// submission's id, or `None` for a note of the driver's own.
+    unechoed: VecDeque<(u64, Option<String>)>,
     /// Why the guard refused tool calls of the running turn. The runtime ends a turn on a refusal without telling
     /// the model why, so the reasons follow as a note of their own.
     refused: Vec<String>,
@@ -366,6 +370,43 @@ impl AntigravityDriver {
         let _ = self.events.send(event);
     }
 
+    /// Mark the prompt that started the running turn taken once the runtime acts on it without echoing the user message.
+    fn take_started(&self) {
+        let taken = {
+            let mut shared = lock(&self.shared);
+            if shared.in_flight > 0 && shared.unechoed.len() >= shared.in_flight {
+                shared.unechoed.pop_front().and_then(|(_, submission)| submission)
+            } else {
+                None
+            }
+        };
+        if let Some(id) = taken {
+            self.emit(DriverEvent::Taken(id));
+        }
+    }
+
+    /// Reset a broken runtime process and report its exit so un-taken submissions stay pending without wedging the turn.
+    async fn reset_broken(&self, error: String) {
+        let process = {
+            let mut shared = lock(&self.shared);
+            shared.generation += 1;
+            shared.session_id = None;
+            shared.in_flight = 0;
+            shared.queued.clear();
+            shared.unechoed.clear();
+            shared.refused.clear();
+            shared.text.clear();
+            for (_, answer) in shared.requests.drain() {
+                let _ = answer.send(Err("Antigravity ended before answering".into()));
+            }
+            shared.process.take()
+        };
+        if let Some(process) = process {
+            process.close(Duration::from_secs(3)).await;
+        }
+        self.emit(DriverEvent::Exited { error: Some(error), awaited: false });
+    }
+
     /// The running process and its conversation, starting one that resumes `resume` when none runs.
     async fn process(self: &Arc<Self>, resume: Option<String>) -> Result<(Arc<Proc>, String), String> {
         let _one = self.starting.lock().await;
@@ -380,7 +421,13 @@ impl AntigravityDriver {
             (true, _) => None,
             (false, Some(server)) => Some(server),
             (false, None) => {
-                let server = Arc::new(start_mcp(self.host.clone()).await?);
+                let weak = Arc::downgrade(self);
+                let on_call: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                    if let Some(driver) = weak.upgrade() {
+                        driver.take_started();
+                    }
+                });
+                let server = Arc::new(start_mcp(self.host.clone(), Some(on_call)).await?);
                 lock(&self.shared).mcp = Some(server.clone());
                 Some(server)
             }
@@ -495,7 +542,7 @@ impl AntigravityDriver {
             if submission.is_some() {
                 shared.notes = 0;
             }
-            shared.unechoed.push_back(submission.clone());
+            shared.unechoed.push_back((id, submission));
             shared.generation
         };
         self.emit(DriverEvent::Running);
@@ -504,64 +551,100 @@ impl AntigravityDriver {
             let mut shared = lock(&self.shared);
             shared.requests.remove(&id);
             shared.in_flight -= 1;
-            shared.unechoed.retain(|known| *known != submission);
+            shared.unechoed.retain(|(known, _)| *known != id);
             return Err(error);
         }
         let driver = self.clone();
         tokio::spawn(async move {
             let answer = answered.await.unwrap_or_else(|_| Err("Antigravity ended before answering".into()));
-            driver.answered(generation, answer).await;
+            driver.answered(generation, id, answer).await;
         });
         Ok(())
     }
 
     /// A prompt's answer came: record what the model said, then run the next follow-up or report the runtime idle.
-    async fn answered(self: &Arc<Self>, generation: u64, answer: Result<Value, String>) {
-        let (said, next) = {
+    async fn answered(self: &Arc<Self>, generation: u64, request_id: u64, answer: Result<Value, String>) {
+        let (taken, broken, said, next) = {
             let mut shared = lock(&self.shared);
             if shared.generation != generation {
                 return;
             }
             shared.in_flight = shared.in_flight.saturating_sub(1);
+            let untaken = shared
+                .unechoed
+                .iter()
+                .position(|(known, _)| *known == request_id)
+                .and_then(|index| shared.unechoed.remove(index))
+                .and_then(|(_, submission)| submission);
             let text = std::mem::take(&mut shared.text);
-            let said = match &answer {
-                Ok(result) => (!text.trim().is_empty()).then(|| Message {
+            if let Err(error) = &answer {
+                if untaken.is_some() {
+                    let detail = format!("{text}{error}").trim().to_string();
+                    (None, Some(detail), None, None)
+                } else {
+                    let said = Some(Message {
+                        role: Role::Assistant,
+                        content: vec![Block::text(format!("{text}{error}").trim().to_string())],
+                        stop_reason: Some("error".into()),
+                    });
+                    let next = if shared.in_flight > 0 {
+                        None
+                    } else {
+                        shared.refused.clear();
+                        shared.queued.pop_front().map(|(id, content)| (Some(id), content))
+                    };
+                    (None, None, said, next.map(|next| (next, shared.process.clone(), shared.session_id.clone())))
+                }
+            } else {
+                let result = answer.as_ref().expect("checked Ok");
+                let taken = untaken;
+                let said = (!text.trim().is_empty()).then(|| Message {
                     role: Role::Assistant,
                     content: vec![Block::text(text)],
                     stop_reason: Some(stop_reason(result["stopReason"].as_str().unwrap_or("end_turn")).into()),
-                }),
-                Err(error) => Some(Message {
-                    role: Role::Assistant,
-                    content: vec![Block::text(format!("{text}{error}").trim().to_string())],
-                    stop_reason: Some("error".into()),
-                }),
-            };
-            if answer.as_ref().is_ok_and(|result| result["stopReason"] == "cancelled") {
-                shared.refused.clear();
+                });
+                if result["stopReason"] == "cancelled" {
+                    shared.refused.clear();
+                }
+                let next = if shared.in_flight > 0 {
+                    None
+                } else if !shared.refused.is_empty() && shared.notes < MAX_NOTES {
+                    shared.notes += 1;
+                    let reasons = std::mem::take(&mut shared.refused).join("\n");
+                    Some((
+                        None,
+                        json!([{"type": "text", "text": format!("[Neo] These tool calls were refused and did not run:\n{reasons}\nContinue without them.")}]),
+                    ))
+                } else {
+                    shared.refused.clear();
+                    shared.queued.pop_front().map(|(id, content)| (Some(id), content))
+                };
+                (taken, None, said, next.map(|next| (next, shared.process.clone(), shared.session_id.clone())))
             }
-            let next = if shared.in_flight > 0 {
-                None
-            } else if !shared.refused.is_empty() && shared.notes < MAX_NOTES {
-                shared.notes += 1;
-                let reasons = std::mem::take(&mut shared.refused).join("\n");
-                Some((
-                    None,
-                    json!([{"type": "text", "text": format!("[Neo] These tool calls were refused and did not run:\n{reasons}\nContinue without them.")}]),
-                ))
-            } else {
-                shared.refused.clear();
-                shared.queued.pop_front().map(|(id, content)| (Some(id), content))
-            };
-            (said, next.map(|next| (next, shared.process.clone(), shared.session_id.clone())))
         };
+        if let Some(detail) = broken {
+            self.reset_broken(detail).await;
+            return;
+        }
+        if let Some(id) = taken {
+            self.emit(DriverEvent::Taken(id));
+        }
         if let Some(message) = said {
             self.emit(DriverEvent::Message(message));
         }
         match next {
             Some(((submission, content), Some(process), Some(session))) => {
-                if let Err(error) = self.prompt(process, session, submission, content).await {
-                    self.emit(DriverEvent::Message(Message { role: Role::Assistant, content: vec![Block::text(error)], stop_reason: Some("error".into()) }));
-                    self.emit(DriverEvent::Idle { awaiting_async: false });
+                if let Err(error) = self.prompt(process, session, submission.clone(), content).await {
+                    if submission.is_some() {
+                        self.reset_broken(error).await;
+                    } else {
+                        self.emit(DriverEvent::Message(Message {
+                            role: Role::Assistant,
+                            content: vec![Block::text(error)],
+                            stop_reason: Some("error".into()),
+                        }));
+                        self.emit(DriverEvent::Idle { awaiting_async: false });
+                    }
                 }
             }
             Some(_) => {}
@@ -633,11 +716,23 @@ impl AntigravityDriver {
                 return;
             }
             let echoing = std::mem::replace(&mut shared.echoing, kind == "user_message_chunk");
+            if matches!(kind, "agent_thought_chunk" | "thought_chunk" | "agent_message_chunk" | "tool_call" | "tool_call_update" | "plan")
+                && shared.unechoed.len() >= shared.in_flight
+            {
+                // Antigravity 1.5.10+ begins the model's step without echoing `user_message_chunk`.
+                if let Some((_, submission)) = shared.unechoed.pop_front() {
+                    if let Some(id) = submission {
+                        emitted.push(DriverEvent::Taken(id));
+                    }
+                }
+            }
             match kind {
                 "user_message_chunk" if !echoing => {
-                    // The runtime took a submission into a step; its blocks arrive as consecutive chunks.
-                    if let Some(Some(id)) = shared.unechoed.pop_front() {
-                        emitted.push(DriverEvent::Taken(id));
+                    // The runtime echoed a submission it took into a step; its blocks arrive as consecutive chunks.
+                    if let Some((_, submission)) = shared.unechoed.pop_front() {
+                        if let Some(id) = submission {
+                            emitted.push(DriverEvent::Taken(id));
+                        }
                     }
                 }
                 "agent_message_chunk" => {
@@ -677,6 +772,7 @@ impl AntigravityDriver {
         let id = line["id"].clone();
         let answer = match line["method"].as_str().unwrap_or("") {
             "session/request_permission" => {
+                self.take_started();
                 let params = &line["params"];
                 let call = &params["toolCall"];
                 let tool = call["name"].as_str().unwrap_or("");
@@ -901,7 +997,7 @@ mod tests {
 
     #[tokio::test]
     async fn serves_the_host_tools_over_mcp_to_the_token_holder_only() {
-        let server = start_mcp(Arc::new(Echo)).await.unwrap();
+        let server = start_mcp(Arc::new(Echo), None).await.unwrap();
         let (status, _) = post(&server.url, "wrong", &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).await;
         assert_eq!(status, 401);
         let (_, listed) = post(&server.url, &server.token, &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).await;
@@ -914,5 +1010,144 @@ mod tests {
         assert_eq!(blocked.unwrap()["result"], json!({"isError": true, "content": [{"type": "text", "text": "refused"}]}));
         let (_, unknown) = post(&server.url, &server.token, &json!({"jsonrpc": "2.0", "id": 3, "method": "server/discover"})).await;
         assert_eq!(unknown.unwrap()["error"]["code"], -32601);
+    }
+
+    #[cfg(unix)]
+    mod lifecycle {
+        use super::*;
+        use crate::journal::Journal;
+        use crate::session::{Mode, Presentation, Session};
+        use crate::types::KernelEvent;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn fake_acp(dir: &std::path::Path, script_body: &str) -> PathBuf {
+            let path = dir.join("fake-agy.py");
+            let script = format!("#!/usr/bin/env python3\nimport json, sys, time, urllib.request\n{script_body}\n");
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        }
+
+        #[tokio::test]
+        async fn marks_prompts_taken_and_ends_turns_without_user_message_chunks_or_on_steered_prompts() {
+            let dir = std::env::temp_dir().join(format!("neo-agy-test-{}-{}", std::process::id(), uuid()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let program = fake_acp(
+                &dir,
+                r#"
+mcp_url = None
+mcp_auth = None
+held = []
+for raw in sys.stdin:
+    msg = json.loads(raw)
+    mid = msg.get("id")
+    method = msg.get("method")
+    if method == "initialize":
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1}}) + "\n")
+        sys.stdout.flush()
+    elif method == "session/new":
+        servers = msg["params"].get("mcpServers") or []
+        if servers:
+            mcp_url = servers[0]["url"]
+            mcp_auth = servers[0]["headers"][0]["value"]
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "s-1"}}) + "\n")
+        sys.stdout.flush()
+    elif method == "session/prompt":
+        text = msg["params"]["prompt"][0]["text"]
+        if "turn1" in text:
+            # Antigravity 1.5.10+: no user_message_chunk; call MCP tool directly then emit agent_message_chunk.
+            req = urllib.request.Request(
+                mcp_url,
+                data=json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "echo", "arguments": {"text": "ok"}}}).encode(),
+                headers={"Authorization": mcp_auth, "Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=5).read()
+            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Done 1"}}}}) + "\n")
+            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}}) + "\n")
+            sys.stdout.flush()
+        elif "hold" in text:
+            held.append(mid)
+        elif "release" in text:
+            held.append(mid)
+            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Done steered"}}}}) + "\n")
+            for hid in held:
+                sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": hid, "result": {"stopReason": "end_turn"}}) + "\n")
+            held.clear()
+            sys.stdout.flush()
+        elif "fail_rpc" in text:
+            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": "rpc failed"}}) + "\n")
+            sys.stdout.flush()
+"#,
+            );
+
+            struct RecordingHost {
+                pending_on_call: Mutex<Vec<usize>>,
+                journal: Arc<Journal>,
+            }
+            impl ToolHost for RecordingHost {
+                fn specs(&self) -> Vec<ToolSpec> {
+                    Echo.specs()
+                }
+                fn call<'a>(&'a self, _name: &'a str, arguments: Value) -> BoxFut<'a, Result<Value, String>> {
+                    Box::pin(async move {
+                        self.pending_on_call.lock().unwrap().push(self.journal.pending().len());
+                        Ok(arguments)
+                    })
+                }
+            }
+
+            let journal = Arc::new(Journal::create(&dir, &dir).unwrap());
+            let host = Arc::new(RecordingHost { pending_on_call: Mutex::new(Vec::new()), journal: journal.clone() });
+            let options = AntigravityOptions { program, cwd: dir.clone(), tools: vec!["read".into()], ..Default::default() };
+            let (reports, runtime) = mpsc::unbounded_channel();
+            let driver = AntigravityDriver::new(options, host.clone(), reports);
+            let session = Session::new(journal.clone(), Arc::new(Antigravity(driver)), runtime);
+            let mut events = session.subscribe();
+
+            async fn wait_turn(events: &mut tokio::sync::broadcast::Receiver<KernelEvent>) -> Vec<KernelEvent> {
+                let mut seen = Vec::new();
+                loop {
+                    let event = tokio::time::timeout(Duration::from_secs(10), events.recv()).await.expect("turn finishes").unwrap();
+                    let done = matches!(event, KernelEvent::AgentEnd { .. });
+                    seen.push(event);
+                    if done {
+                        return seen;
+                    }
+                }
+            }
+
+            // 1. Single prompt without user_message_chunk: Taken fires before MCP tool call and turn ends cleanly.
+            session.send("r1", vec![Block::text("turn1")], Mode::Steer, &Presentation::default(), &[]).await.unwrap();
+            let seen = wait_turn(&mut events).await;
+            assert!(seen.contains(&KernelEvent::Taken { request_ids: vec!["r1".into()] }), "{seen:?}");
+            assert!(!session.is_streaming() && !session.has_admitted_submission());
+            assert!(journal.pending().is_empty());
+            assert_eq!(*host.pending_on_call.lock().unwrap(), vec![0], "submission is already marked taken when MCP tool executes");
+
+            // 2. Concurrent Mode::Steer prompts answered together without user_message_chunk: all are taken and turn ends.
+            session.send("r2", vec![Block::text("hold-1")], Mode::Steer, &Presentation::default(), &[]).await.unwrap();
+            session.send("r3", vec![Block::text("hold-2")], Mode::Steer, &Presentation::default(), &[]).await.unwrap();
+            session.send("r4", vec![Block::text("release")], Mode::Steer, &Presentation::default(), &[]).await.unwrap();
+            let seen = wait_turn(&mut events).await;
+            for req in ["r2", "r3", "r4"] {
+                assert!(
+                    seen.iter().any(|e| matches!(e, KernelEvent::Taken { request_ids } if request_ids.contains(&req.to_string()))),
+                    "missing {req}: {seen:?}"
+                );
+            }
+            assert!(!session.is_streaming() && !session.has_admitted_submission());
+            assert!(journal.pending().is_empty());
+
+            // 3. Un-taken prompt rejected with JSON-RPC error: turn ends cleanly while entry stays pending for retry.
+            session.send("r5", vec![Block::text("fail_rpc")], Mode::Steer, &Presentation::default(), &[]).await.unwrap();
+            let _ = wait_turn(&mut events).await;
+            assert!(!session.is_streaming() && !session.has_admitted_submission());
+            assert_eq!(journal.last_stop_reason().as_deref(), Some("error"));
+            assert_eq!(journal.pending().len(), 1);
+
+            session.dispose().await;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
