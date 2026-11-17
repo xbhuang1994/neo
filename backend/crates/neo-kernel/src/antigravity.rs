@@ -720,19 +720,15 @@ impl AntigravityDriver {
                 && shared.unechoed.len() >= shared.in_flight
             {
                 // Antigravity 1.5.10+ begins the model's step without echoing `user_message_chunk`.
-                if let Some((_, submission)) = shared.unechoed.pop_front() {
-                    if let Some(id) = submission {
-                        emitted.push(DriverEvent::Taken(id));
-                    }
+                if let Some((_, Some(id))) = shared.unechoed.pop_front() {
+                    emitted.push(DriverEvent::Taken(id));
                 }
             }
             match kind {
                 "user_message_chunk" if !echoing => {
                     // The runtime echoed a submission it took into a step; its blocks arrive as consecutive chunks.
-                    if let Some((_, submission)) = shared.unechoed.pop_front() {
-                        if let Some(id) = submission {
-                            emitted.push(DriverEvent::Taken(id));
-                        }
+                    if let Some((_, Some(id))) = shared.unechoed.pop_front() {
+                        emitted.push(DriverEvent::Taken(id));
                     }
                 }
                 "agent_message_chunk" => {
