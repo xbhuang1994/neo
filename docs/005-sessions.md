@@ -38,7 +38,7 @@ Attachments: an image is shown to the model with the candidate and also saved; a
 
 Replies — acknowledgements, answers, questions and results — go through the Outbox to the conversation the request came from, and each is written to the journal as a visible entry under the reply's own id. What people see is therefore exactly what was sent, not the model's own turn text.
 
-Messages that arrive while a candidate is being decided are batched into the next Eval of that conversation. WeChat messages wait 1.8 seconds for more parts before routing, since people send several in a row.
+Messages that arrive while a candidate is being decided are batched into the next Eval of that conversation. The WeChat bridge holds a message 1.5 seconds for more parts before routing (up to 6 seconds in all), since people send several in a row.
 
 Resetting the conversation closes the main Session and starts an empty journal under the same id. Tickets, workers, attachments and the WeChat binding stay.
 

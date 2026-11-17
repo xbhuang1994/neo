@@ -269,7 +269,7 @@ impl Default for Protocol {
             cdn_base: CDN_URL.into(),
             pace: Duration::from_secs(1),
             status_wait: Duration::from_secs(45),
-            quiet: Duration::from_secs(3),
+            quiet: Duration::from_millis(1500),
             burst_cap: Duration::from_secs(6),
             file_wait: Duration::from_secs(15),
             typing_check: Duration::from_millis(250),

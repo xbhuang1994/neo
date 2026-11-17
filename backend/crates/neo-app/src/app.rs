@@ -40,7 +40,8 @@ pub struct Machine {
 /// How long to wait for more chat messages before routing a burst.
 #[derive(Clone, Copy, Debug)]
 pub struct Timings {
-    /// After a WeChat message, which people often send in several parts.
+    /// After a WeChat message. The bridge already holds a WeChat burst until it is over, so by default nothing more
+    /// is waited here.
     pub wechat_burst: Duration,
     /// After a message typed into the app.
     pub web_burst: Duration,
@@ -50,7 +51,7 @@ pub struct Timings {
 
 impl Default for Timings {
     fn default() -> Self {
-        Timings { wechat_burst: Duration::from_millis(1800), web_burst: Duration::ZERO, watchdog: Default::default() }
+        Timings { wechat_burst: Duration::ZERO, web_burst: Duration::ZERO, watchdog: Default::default() }
     }
 }
 
