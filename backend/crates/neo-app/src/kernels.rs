@@ -5,6 +5,7 @@ use crate::settings::{Kernel, RoleModel};
 use neo_core::ids::key;
 use neo_kernel::antigravity::{self, Antigravity, AntigravityDriver, AntigravityOptions};
 use neo_kernel::claude::{self, Claude, ClaudeDriver, ClaudeOptions, Subagent};
+use neo_kernel::hermes::{self, Hermes, HermesDriver, HermesOptions};
 use neo_kernel::omp::{self, Omp, OmpDriver, OmpOptions};
 use neo_kernel::session::{Driver, DriverEvent};
 use neo_kernel::types::{BoxFut, ToolHost};
@@ -72,7 +73,7 @@ pub struct Support {
 /// What each kernel's settings offer.
 pub fn support(kernel: Kernel) -> Support {
     match kernel {
-        Kernel::Omp => Support { thinking_levels: vec!["auto", "off", "minimal", "low", "medium", "high", "xhigh", "max"] },
+        Kernel::Omp | Kernel::Hermes => Support { thinking_levels: vec!["auto", "off", "minimal", "low", "medium", "high", "xhigh", "max"] },
         Kernel::Claude => Support { thinking_levels: vec!["auto", "off", "low", "medium", "high", "xhigh", "max"] },
         // The Antigravity CLI picks its own effort for the model.
         Kernel::Antigravity => Support { thinking_levels: Vec::new() },
@@ -85,6 +86,7 @@ pub fn program_name(kernel: Kernel) -> &'static str {
         Kernel::Omp => "omp",
         Kernel::Claude => "claude",
         Kernel::Antigravity => "agy",
+        Kernel::Hermes => "hermes",
     }
 }
 
@@ -94,16 +96,26 @@ pub fn display_name(kernel: Kernel) -> &'static str {
         Kernel::Omp => "Oh My Pi",
         Kernel::Claude => "Claude Code",
         Kernel::Antigravity => "Antigravity CLI",
+        Kernel::Hermes => "Hermes Agent",
     }
 }
 
 /// The official installer of each kernel's program, as a shell command: a script fetched from the vendor that puts
 /// the program in the user's own folders, with no administrator rights.
 pub fn install_command(kernel: Kernel) -> (&'static str, Vec<String>) {
+    if kernel == Kernel::Hermes {
+        return if cfg!(windows) {
+            let command = "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; & ([scriptblock]::Create((irm https://hermes-agent.nousresearch.com/install.ps1))) -NonInteractive";
+            ("powershell", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command].map(String::from).to_vec())
+        } else {
+            ("bash", vec!["-c".into(), "set -o pipefail; curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --non-interactive".into()])
+        };
+    }
     let (script, windows_script) = match kernel {
         Kernel::Claude => ("https://claude.ai/install.sh", "https://claude.ai/install.ps1"),
         Kernel::Omp => ("https://omp.sh/install", "https://omp.sh/install.ps1"),
         Kernel::Antigravity => ("https://antigravity.google/cli/install.sh", "https://antigravity.google/cli/install.ps1"),
+        Kernel::Hermes => unreachable!(),
     };
     if cfg!(windows) {
         let command = format!("$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; irm {windows_script} | iex");
@@ -385,6 +397,51 @@ impl RealKernels {
         Ok(Arc::new(Antigravity(AntigravityDriver::new(options, host, events))))
     }
 
+    fn hermes_bridge_file(&self) -> PathBuf {
+        self.state_dir.join("kernel").join(format!("neo-hermes-bridge-{}.py", key(&[hermes::BRIDGE_SOURCE])))
+    }
+
+    fn open_hermes(&self, spec: &SessionSpec, host: Arc<dyn ToolHost>, events: mpsc::UnboundedSender<DriverEvent>) -> Result<Arc<dyn Driver>, String> {
+        let program = self.require(Kernel::Hermes)?;
+        let worker = spec.role == SessionRole::Worker;
+        let note = match spec.role {
+            SessionRole::Worker => "Runtime note: you run in Hermes Agent. Tool names above map to `read_file` (and `search_files`), `terminal` (and `process_manage`), `patch`, `write_file`, and `delegate_task` for subagents; application tools keep their bare names above. Run any command that may take longer than a minute with `terminal` setting `background: true` and `notify: true`, and stop one you no longer need with `process_manage` (`action: \"kill\"`). A finished background command wakes you in this Session with its result; end your turn to wait for it. Do not use browser or web-search tools unless the ticket asks for them.",
+            SessionRole::Sidecar => "Runtime note: you run in Hermes Agent. Tool names above map to `read_file` and `search_files`; application tools keep their bare names above.",
+            SessionRole::Orchestrator | SessionRole::Watchdog => "Runtime note: you run in Hermes Agent. Tool names above map to `read_file` (and `search_files`) and `terminal`; application tools keep their bare names above. Do not use web-search tools.",
+        };
+        let tools: &[&str] = match spec.role {
+            SessionRole::Worker => &["read", "bash", "edit", "write", "task"],
+            SessionRole::Sidecar => &["read"],
+            SessionRole::Orchestrator | SessionRole::Watchdog => &["read", "bash"],
+        };
+        let thinking = match spec.role {
+            SessionRole::Watchdog => {
+                Some(if spec.model.as_ref().and_then(|model| model.thinking_level.as_deref()) == Some("off") { "off" } else { "low" }.to_string())
+            }
+            _ => spec.model.as_ref().and_then(|model| model.thinking_level.clone()),
+        };
+        let options = HermesOptions {
+            program,
+            bridge_file: self.hermes_bridge_file(),
+            cwd: spec.cwd.clone(),
+            system_prompt: format!("{}\n\n{note}", spec.system_prompt),
+            builtin_tools: tools.iter().map(|name| name.to_string()).collect(),
+            model: spec.model.as_ref().map(|model| format!("{}/{}", model.provider, model.model)),
+            thinking,
+            persist: matches!(spec.role, SessionRole::Orchestrator | SessionRole::Worker),
+            context_files: worker,
+            memory: worker,
+            background_review: worker,
+            max_turns: match spec.role {
+                SessionRole::Sidecar => Some(20),
+                SessionRole::Watchdog => Some(30),
+                _ => None,
+            },
+            env: self.env.clone(),
+        };
+        Ok(Arc::new(Hermes(HermesDriver::new(options, host, events))))
+    }
+
     async fn claude_models(&self) -> Result<Vec<ModelOption>, String> {
         let env = self.claude_env();
         let var = |name: &str| env.get(name).cloned().or_else(|| std::env::var(name).ok()).filter(|value| !value.is_empty());
@@ -431,6 +488,7 @@ impl Kernels for RealKernels {
             Kernel::Claude => self.open_claude(spec, host, events),
             Kernel::Omp => self.open_omp(spec, host, events),
             Kernel::Antigravity => self.open_antigravity(spec, host, events),
+            Kernel::Hermes => self.open_hermes(spec, host, events),
         }
     }
     fn models(&self, kernel: Kernel) -> BoxFut<'_, Result<Vec<ModelOption>, String>> {
@@ -454,6 +512,17 @@ impl Kernels for RealKernels {
                         .into_iter()
                         .map(|(id, name)| ModelOption { id, provider: "antigravity".into(), name })
                         .collect())
+                }
+                Kernel::Hermes => {
+                    let program = self.require(Kernel::Hermes)?;
+                    let bridge = self.hermes_bridge_file();
+                    let mut models: Vec<ModelOption> = hermes::list_models(&program, &bridge, &self.state_dir, &self.env)
+                        .await?
+                        .into_iter()
+                        .map(|model| ModelOption { id: model.id, provider: model.provider, name: model.name })
+                        .collect();
+                    models.sort_by(|a, b| (&a.provider, &a.id).cmp(&(&b.provider, &b.id)));
+                    Ok(models)
                 }
             }
         })
@@ -508,17 +577,21 @@ mod tests {
     }
 
     #[test]
-    fn offers_minimal_thinking_only_on_oh_my_pi_and_no_levels_on_antigravity() {
+    fn offers_minimal_thinking_only_on_oh_my_pi_and_hermes_and_no_levels_on_antigravity() {
         assert!(support(Kernel::Omp).thinking_levels.contains(&"minimal"));
+        assert!(support(Kernel::Hermes).thinking_levels.contains(&"minimal") && support(Kernel::Hermes).thinking_levels.contains(&"max"));
         assert!(!support(Kernel::Claude).thinking_levels.contains(&"minimal") && support(Kernel::Claude).thinking_levels.contains(&"max"));
         assert!(support(Kernel::Antigravity).thinking_levels.is_empty());
     }
 
     #[test]
     fn installs_each_kernel_with_its_vendors_script() {
-        for (kernel, script) in
-            [(Kernel::Claude, "claude.ai/install"), (Kernel::Omp, "omp.sh/install"), (Kernel::Antigravity, "antigravity.google/cli/install")]
-        {
+        for (kernel, script) in [
+            (Kernel::Claude, "claude.ai/install"),
+            (Kernel::Omp, "omp.sh/install"),
+            (Kernel::Antigravity, "antigravity.google/cli/install"),
+            (Kernel::Hermes, "hermes-agent.nousresearch.com/install"),
+        ] {
             let (_, args) = install_command(kernel);
             assert!(args.last().unwrap().contains(&format!("https://{script}")), "{args:?}");
         }
@@ -537,6 +610,7 @@ mod tests {
         };
         assert!(kernels.unavailable(Kernel::Claude).unwrap().contains("claude"));
         assert!(kernels.unavailable(Kernel::Antigravity).unwrap().contains("agy"));
+        assert!(kernels.unavailable(Kernel::Hermes).unwrap().contains("hermes"));
         assert!(kernels.unavailable(Kernel::Omp).unwrap().contains("/missing/shim.ts"));
         kernels.installing.lock().unwrap().insert(Kernel::Claude);
         assert!(kernels.unavailable(Kernel::Claude).unwrap().contains("being installed"));

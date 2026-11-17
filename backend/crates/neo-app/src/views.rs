@@ -113,7 +113,8 @@ fn kernel_named(value: Option<&Value>) -> Result<Kernel, String> {
         Some("omp") => Ok(Kernel::Omp),
         Some("claude") => Ok(Kernel::Claude),
         Some("antigravity") => Ok(Kernel::Antigravity),
-        _ => Err("kernel is omp, claude or antigravity".into()),
+        Some("hermes") => Ok(Kernel::Hermes),
+        _ => Err("kernel is omp, claude, antigravity or hermes".into()),
     }
 }
 
@@ -385,7 +386,7 @@ impl App {
         let chosen = settings.role_models();
         let mut loading = false;
         let mut offers = BTreeMap::new();
-        let kernels: Vec<Value> = [Kernel::Omp, Kernel::Claude, Kernel::Antigravity]
+        let kernels: Vec<Value> = [Kernel::Omp, Kernel::Claude, Kernel::Antigravity, Kernel::Hermes]
             .into_iter()
             .map(|each| {
                 let (available, problem, listing) = self.offered(each);
@@ -460,7 +461,7 @@ impl App {
         let worker_kernel = match fields.get("workerKernel") {
             None => before.worker_kernel,
             Some(Value::Null) => None,
-            Some(value) => Some(kernel_named(Some(value)).map_err(|_| "workerKernel is omp, claude, antigravity or null".to_string())?),
+            Some(value) => Some(kernel_named(Some(value)).map_err(|_| "workerKernel is omp, claude, antigravity, hermes or null".to_string())?),
         };
         let workers = worker_kernel.unwrap_or(kernel);
         for each in [kernel, workers] {
@@ -529,7 +530,7 @@ impl App {
         let workers = match fields.get("workerKernel") {
             None => None,
             Some(Value::Null) => Some(None),
-            Some(value) => Some(Some(kernel_named(Some(value)).map_err(|_| "workerKernel is omp, claude, antigravity or null".to_string())?)),
+            Some(value) => Some(Some(kernel_named(Some(value)).map_err(|_| "workerKernel is omp, claude, antigravity, hermes or null".to_string())?)),
         };
         for kernel in [main, workers.flatten()].into_iter().flatten() {
             if let Some(problem) = self.kernels.unavailable(kernel) {

@@ -14,7 +14,7 @@ The backend finds the other parts relative to itself, so a package runs from whe
 
 ## The runtimes
 
-No package carries an agent runtime. Claude Code, Oh My Pi and the Antigravity CLI are other parties' programs under their own terms, and each updates itself. The backend finds them on the machine ([006 Deployment](006-deployment.md) says where), and the settings install a missing one with its vendor's script: `https://claude.ai/install.sh`, `https://omp.sh/install` and `https://antigravity.google/cli/install.sh`, or the `.ps1` of each on Windows.
+No package carries an agent runtime. Claude Code, Oh My Pi, the Antigravity CLI and Hermes Agent are other parties' programs under their own terms, and each updates itself. The backend finds them on the machine ([006 Deployment](006-deployment.md) says where), and the settings install a missing one with its vendor's script: `https://claude.ai/install.sh`, `https://omp.sh/install`, `https://antigravity.google/cli/install.sh` and `https://hermes-agent.nousresearch.com/install.sh`, or the `.ps1` of each on Windows.
 
 ## Building
 

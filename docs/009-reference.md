@@ -31,7 +31,7 @@ Exit status: 0 after a clean stop, 1 for a failure, 2 for a wrong command line, 
 | `NEO_DATA_DIR` | Same as `--data-dir` |
 | `NEO_TOKEN` | Same as `--token` |
 | `NEO_ALLOW_MULTIPLE=1` | Same as `--allow-multiple` |
-| `NEO_CLAUDE_BIN`, `NEO_OMP_BIN`, `NEO_AGY_BIN` | The runtime programs, when not on `PATH` or where their installers put them |
+| `NEO_CLAUDE_BIN`, `NEO_OMP_BIN`, `NEO_AGY_BIN`, `NEO_HERMES_BIN` | The runtime programs, when not on `PATH` or where their installers put them |
 | `NEO_SHIM` | The Oh My Pi extension file, when not beside the program |
 | `NEO_RUNTIME_DIR` | Where the per-user instance lock is kept |
 | `NEO_AGENT_BIN` | For the desktop app: the backend program, when not installed beside it |
@@ -44,7 +44,7 @@ Stored in the database; changed in the app or through the API. As JSON:
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `paused` | `false` | While true nothing is assessed, launched or sent; messages are still received |
-| `kernel` | `omp` | The kernel the main Session, the Sidecar and the Watchdog run on: `omp`, `claude` or `antigravity` |
+| `kernel` | `omp` | The kernel the main Session, the Sidecar and the Watchdog run on: `omp`, `claude`, `antigravity` or `hermes` |
 | `workerKernel` | unset | The kernel workers run on; unset follows `kernel` |
 | `models.<kernel>.eval` | `null` | The main Session's model when it runs on that kernel: `{provider, model, thinkingLevel?}`, or `null` for the kernel's default |
 | `models.<kernel>.executor` | `null` | The workers' model when they run on that kernel, likewise |
@@ -58,7 +58,7 @@ Stored in the database; changed in the app or through the API. As JSON:
 | `policy.rules` | two examples | Each `{id, name, enabled, instruction}`: a kind of proactive work |
 | `policy.sources.chat.allowed` | `[{id: "web:local"}]` | Who may write: `web:local` is the app; a bound WeChat user is `wechat:<id>` |
 
-Thinking levels are `auto`, `off`, `minimal`, `low`, `medium`, `high`, `xhigh` and `max`; Claude Code has no `minimal`. With the Claude Code kernel `provider` is ignored and `model` is the name that runtime takes, such as `sonnet` or `opus`. With the Antigravity kernel `provider` is ignored too, `model` is an id `agy models` lists, such as `gemini-3.8-flash-medium`, and it takes no thinking level: the runtime keeps the effort the model id names.
+Thinking levels are `auto`, `off`, `minimal`, `low`, `medium`, `high`, `xhigh` and `max`; Claude Code has no `minimal`. With Oh My Pi and Hermes Agent, `provider` and `model` name the provider and model id. With the Claude Code kernel `provider` is ignored and `model` is the name that runtime takes, such as `sonnet` or `opus`. With the Antigravity kernel `provider` is ignored too, `model` is an id `agy models` lists, such as `gemini-3.8-flash-medium`, and it takes no thinking level: the runtime keeps the effort the model id names.
 
 With this distribution's one Source every message is a direct request, so proactive assessment and its rules have nothing to act on: they are kept for Sources that receive messages not addressed to the agent.
 

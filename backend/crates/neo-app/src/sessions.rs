@@ -318,7 +318,7 @@ impl App {
             let Some(model) = Self::role_model(&settings, loaded.role) else { continue };
             let name = match loaded.kernel {
                 Kernel::Claude | Kernel::Antigravity => model.model.clone(),
-                Kernel::Omp => format!("{}/{}", model.provider, model.model),
+                Kernel::Omp | Kernel::Hermes => format!("{}/{}", model.provider, model.model),
             };
             loaded.session.driver().set_model(Some(&name), model.thinking_level.as_deref()).await;
         }

@@ -32,15 +32,15 @@ None of these call a model or WeChat. The application tests replace the runtime 
 
 ### With the real runtimes
 
-These start the real `claude` and `omp` programs against a model endpoint on a loopback port that the test scripts. They need the runtimes installed, no account and no network, and take a few minutes:
+These start the real `claude`, `omp` and `hermes` programs against a model endpoint on a loopback port that the test scripts. They need the runtimes installed, no account and no network, and take a few minutes:
 
 ```sh
 cd backend
-NEO_REAL_KERNELS=1 cargo test -p neo-kernel --test claude_real --test omp_real -- --test-threads=1
+NEO_REAL_KERNELS=1 cargo test -p neo-kernel --test claude_real --test omp_real --test hermes_real -- --test-threads=1
 NEO_REAL_KERNELS=1 cargo test -p neo-agent --test real -- --test-threads=1
 ```
 
-The first pair exercises each protocol: a host tool, a refused built-in tool, resuming after a restart, a notice joining the next turn, a background job and its cancellation. The second drives the whole product as a process: a chat message over HTTP becomes a Ticket, a worker writes a file with its shell, and the result comes back. `NEO_CLAUDE_BIN` and `NEO_OMP_BIN` name the programs when they are not on `PATH`.
+The first group exercises each protocol: a host tool, a refused built-in tool, resuming after a restart, a notice joining the next turn, a background job and its cancellation. The second drives the whole product as a process: a chat message over HTTP becomes a Ticket, a worker writes a file with its shell, and the result comes back. `NEO_CLAUDE_BIN`, `NEO_OMP_BIN` and `NEO_HERMES_BIN` name the programs when they are not on `PATH`.
 
 The Antigravity CLI signs in to Google, so its tests run against its real models: they need a signed-in `agy` and the network, and are opted into on their own (`NEO_AGY_MODEL` picks the model, by default `gemini-3.8-flash-low`). The protocol test also needs `python3`, which stands in for the hook relay; the product test uses `neo-agent agy-hook` itself:
 

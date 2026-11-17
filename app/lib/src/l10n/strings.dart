@@ -112,6 +112,7 @@ abstract class Strings {
   String get kernelHintOmp;
   String get kernelHintClaude;
   String get kernelHintAntigravity;
+  String get kernelHintHermes;
   String get kernelSwitchHint;
   String get switchingKernel;
   String get orchestratorModel;
@@ -125,6 +126,7 @@ abstract class Strings {
   String get installing;
   String installed(String kernel);
   String get antigravitySignIn;
+  String get hermesSetup;
   String get followKernelDefault;
   String get thinking;
   String get current;
@@ -376,6 +378,8 @@ class ZhStrings extends Strings {
   @override
   String get kernelHintAntigravity => '运行 Antigravity CLI（agy）：使用它已登录的 Google 账号与 agy models 列出的模型；后台任务与子代理结束时会唤醒 worker，但不能单独取消。';
   @override
+  String get kernelHintHermes => '运行 Hermes Agent（hermes）：模型与认证来自 ~/.hermes 配置，Worker 启用跨会话记忆与技能演进。';
+  @override
   String get kernelSwitchHint => '选好内核与模型后点「保存」才生效；每个内核有自己的一套模型配置。调度换内核时主会话在新内核上重开（对话记录保留），运行中的 Worker 在原内核上完成。';
   @override
   String get switchingKernel => '正在切换内核…';
@@ -401,6 +405,8 @@ class ZhStrings extends Strings {
   String installed(String kernel) => '$kernel 已安装';
   @override
   String get antigravitySignIn => '首次使用前，在终端运行一次 agy 登录 Google 账号。';
+  @override
+  String get hermesSetup => '首次使用前，在终端运行 hermes setup 配置模型提供商。';
   @override
   String get followKernelDefault => '跟随内核默认';
   @override
@@ -716,6 +722,8 @@ class EnStrings extends Strings {
   @override
   String get kernelHintAntigravity => 'Runs the Antigravity CLI (agy): it uses the Google account agy is signed in to and the models agy models lists; background jobs and subagents wake the worker when they end but cannot be cancelled one by one.';
   @override
+  String get kernelHintHermes => 'Runs Hermes Agent (hermes): models and sign-in come from ~/.hermes, and workers keep cross-session memory and learned skills.';
+  @override
   String get kernelSwitchHint =>
       'Kernels and models apply when you save; each kernel has its own model choices. A new main kernel reopens the main session on it with its transcript; running workers finish on theirs.';
   @override
@@ -742,6 +750,8 @@ class EnStrings extends Strings {
   String installed(String kernel) => '$kernel is installed';
   @override
   String get antigravitySignIn => 'Before first use, run agy once in a terminal to sign in with Google.';
+  @override
+  String get hermesSetup => 'Before first use, run hermes setup in a terminal to configure a model provider.';
   @override
   String get followKernelDefault => 'Kernel default';
   @override

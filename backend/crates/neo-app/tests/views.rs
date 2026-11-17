@@ -168,7 +168,7 @@ async fn chooses_models_per_kernel_and_switches_the_kernel() {
         .iter()
         .map(|kernel| json!({"id": kernel["id"], "problem": kernel["problem"], "installed": kernel["installed"], "installing": kernel["installing"]}))
         .collect();
-    assert_eq!(state, vec![idle("omp"), idle("claude"), idle("antigravity")]);
+    assert_eq!(state, vec![idle("omp"), idle("claude"), idle("antigravity"), idle("hermes")]);
     // Every kernel's models and kept choices come along, so a page can prepare a switch without asking again.
     assert_eq!(view["kernels"][2]["available"], view["available"]);
     assert_eq!(view["kernels"][1]["models"], json!({"eval": null, "executor": null}));
@@ -222,13 +222,26 @@ async fn chooses_models_per_kernel_and_switches_the_kernel() {
     let view = f.app.update_models(json!({"eval": {"provider": "antigravity", "model": "gemini", "thinkingLevel": "high"}, "executor": null})).await.unwrap();
     assert_eq!(view["current"]["eval"], json!({"provider": "antigravity", "model": "gemini"}));
     assert_eq!(f.kernels.set_models.lock().unwrap().last().cloned(), Some((f.app.master_id.clone(), Some("gemini".to_string()), None)));
+    // Hermes Agent takes provider/model names and minimal through max effort.
+    let view = f.app.set_kernel(json!({"kernel": "hermes"})).await.unwrap();
+    assert!(view["supports"]["thinkingLevels"].as_array().unwrap().contains(&json!("minimal")));
+    let view = f
+        .app
+        .update_models(json!({"eval": {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.6", "thinkingLevel": "minimal"}, "executor": null}))
+        .await
+        .unwrap();
+    assert_eq!(view["current"]["eval"], json!({"provider": "openrouter", "model": "anthropic/claude-sonnet-4.6", "thinkingLevel": "minimal"}));
+    assert_eq!(
+        f.kernels.set_models.lock().unwrap().last().cloned(),
+        Some((f.app.master_id.clone(), Some("openrouter/anthropic/claude-sonnet-4.6".to_string()), Some("minimal".to_string())))
+    );
     f.app.set_kernel(json!({"kernel": "claude"})).await.unwrap();
     // Back on the first kernel its choices are as they were left.
     assert_eq!(f.app.set_kernel(json!({"kernel": "omp"})).await.unwrap()["current"], chosen);
     assert_eq!(f.app.settings().models[&Kernel::Claude].eval.as_ref().map(|model| model.model.as_str()), Some("opus"));
 
     // A kernel that cannot run here is not switched to, and says why.
-    assert_eq!(f.app.set_kernel(json!({"kernel": "pi"})).await.unwrap_err(), "kernel is omp, claude or antigravity");
+    assert_eq!(f.app.set_kernel(json!({"kernel": "pi"})).await.unwrap_err(), "kernel is omp, claude, antigravity or hermes");
     *f.kernels.unavailable.lock().unwrap() = Some("The Claude Code program (claude) was not found.".into());
     assert_eq!(f.app.set_kernel(json!({"kernel": "claude"})).await.unwrap_err(), "The Claude Code program (claude) was not found.");
     assert_eq!(f.app.settings().kernel, Kernel::Omp);
@@ -239,7 +252,7 @@ async fn chooses_models_per_kernel_and_switches_the_kernel() {
     let view = f.app.install_kernel(json!({"kernel": "claude"})).await.unwrap();
     assert_eq!((view["kernel"].as_str(), view["problem"].is_null()), (Some("omp"), true));
     assert_eq!(f.kernels.installed.lock().unwrap().clone(), vec![Kernel::Claude]);
-    assert_eq!(f.app.install_kernel(json!({"kernel": "gpt"})).await.unwrap_err(), "kernel is omp, claude or antigravity");
+    assert_eq!(f.app.install_kernel(json!({"kernel": "gpt"})).await.unwrap_err(), "kernel is omp, claude, antigravity or hermes");
     // One that is installed already is not installed again.
     f.app.install_kernel(json!({"kernel": "omp"})).await.unwrap();
     assert_eq!(f.kernels.installed.lock().unwrap().len(), 1);
@@ -291,7 +304,7 @@ async fn chooses_the_workers_kernel_and_model_apart_from_the_main_sessions() {
     let view = f.app.set_kernel(json!({"kernel": "omp", "workerKernel": null})).await.unwrap();
     assert_eq!((view["kernel"].as_str(), view["workerKernel"].as_str()), (Some("omp"), Some("omp")));
     assert_eq!(f.app.set_kernel(json!({})).await.unwrap_err(), "kernel or workerKernel is required");
-    assert_eq!(f.app.set_kernel(json!({"workerKernel": "pi"})).await.unwrap_err(), "workerKernel is omp, claude, antigravity or null");
+    assert_eq!(f.app.set_kernel(json!({"workerKernel": "pi"})).await.unwrap_err(), "workerKernel is omp, claude, antigravity, hermes or null");
     *f.kernels.unavailable.lock().unwrap() = Some("The Claude Code program (claude) was not found.".into());
     assert_eq!(f.app.set_kernel(json!({"workerKernel": "claude"})).await.unwrap_err(), "The Claude Code program (claude) was not found.");
     assert_eq!(f.app.settings().worker_kernel, None);

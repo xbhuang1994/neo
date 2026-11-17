@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | 后端 `neo-agent` | Rust | 一个可执行文件：领域引擎、SQLite 存储、HTTP API、看护与微信桥 |
 | 界面 | Flutter | 同一套代码出桌面应用（macOS / Windows / Linux）和网页版，苹果风格，跟随系统明暗 |
-| 执行内核 | Claude Code、Oh My Pi 或 Antigravity CLI | 真正调用模型干活的代理运行时，作为子进程由后端驱动，在设置里切换 |
+| 执行内核 | Claude Code、Oh My Pi、Antigravity CLI 或 Hermes Agent | 真正调用模型干活的代理运行时，作为子进程由后端驱动，在设置里切换 |
 
 两种用法：
 
@@ -30,7 +30,7 @@
 
 ## 安装
 
-发行页提供三种安装包，都自带后端；执行内核（Claude Code、Oh My Pi、Antigravity CLI）不随包附带：
+发行页提供三种安装包，都自带后端；执行内核（Claude Code、Oh My Pi、Antigravity CLI、Hermes Agent）不随包附带：
 
 | 系统 | 安装包 |
 | --- | --- |
@@ -40,9 +40,9 @@
 
 安装步骤、模型接入、服务器部署见 **[SETUP.md](SETUP.md)**。
 
-执行内核：Neo 会自动发现本机已装的 `claude`、`omp`、`agy`（`PATH` 或各自安装器的默认目录）。没装的话，在 设置 → 内核与模型 里点「安装」，Neo 会运行该内核的官方安装脚本，装好即可选用，不用重启。
+执行内核：Neo 会自动发现本机已装的 `claude`、`omp`、`agy`、`hermes`（`PATH` 或各自安装器的默认目录）。没装的话，在 设置 → 内核与模型 里点「安装」，Neo 会运行该内核的官方安装脚本，装好即可选用，不用重启。
 
-模型接入：Claude Code 内核读取 `ANTHROPIC_*` 环境变量或你已有的 Claude Code 登录；Oh My Pi 内核使用它自己目录里的 provider 配置；Antigravity 内核使用 `agy` 已登录的 Google 账号（装好后在终端运行一次 `agy` 登录）。Worker 要用 git 时，机器上需要装有 git。
+模型接入：Claude Code 内核读取 `ANTHROPIC_*` 环境变量或你已有的 Claude Code 登录；Oh My Pi 内核使用它自己目录里的 provider 配置；Antigravity 内核使用 `agy` 已登录的 Google 账号（装好后在终端运行一次 `agy` 登录）；Hermes Agent 内核使用 `~/.hermes` 里的模型与提供商配置（装好后运行 `hermes setup` 配置），Worker 启用跨会话记忆与技能演进。Worker 要用 git 时，机器上需要装有 git。
 
 ## 从源码运行
 
@@ -74,7 +74,7 @@ cd ../app && flutter analyze && flutter test
 | [docs/000-philosophy.md](docs/000-philosophy.md) | 理念 |
 | [docs/001-domain.md](docs/001-domain.md) | 领域概念 |
 | [docs/002-authorization.md](docs/002-authorization.md) | 谁可以让它做什么 |
-| [docs/003-execution.md](docs/003-execution.md) | 任务如何执行、后台任务与看护、两种内核 |
+| [docs/003-execution.md](docs/003-execution.md) | 任务如何执行、后台任务与看护、四种内核 |
 | [docs/004-prompts.md](docs/004-prompts.md) | 各会话的提示词与工具 |
 | [docs/005-sessions.md](docs/005-sessions.md) | 会话、对话与微信 |
 | [docs/006-deployment.md](docs/006-deployment.md) | 两种运行方式、单实例、数据目录、访问控制、排障 |

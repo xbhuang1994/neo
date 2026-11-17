@@ -31,7 +31,7 @@ Options for desktop-sidecar:
   --token-stdin           Read the access token from the first line of standard input.
 
 Environment:
-  NEO_CLAUDE_BIN, NEO_OMP_BIN, NEO_AGY_BIN
+  NEO_CLAUDE_BIN, NEO_OMP_BIN, NEO_AGY_BIN, NEO_HERMES_BIN
                               The runtime programs, when not on PATH or where their installers put them.
   NEO_DATA_DIR                  Same as --data-dir.
 ";

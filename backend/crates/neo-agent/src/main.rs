@@ -63,6 +63,7 @@ fn kernels(plan: &Plan) -> RealKernels {
             Kernel::Claude => "NEO_CLAUDE_BIN",
             Kernel::Omp => "NEO_OMP_BIN",
             Kernel::Antigravity => "NEO_AGY_BIN",
+            Kernel::Hermes => "NEO_HERMES_BIN",
         };
         let name = kernels::program_name(kernel);
         paths::find_runtime(name, env_path(variable), std::env::var_os("PATH").as_deref(), &paths::install_dirs(name))
@@ -120,7 +121,7 @@ async fn run(plan: Plan, sidecar: bool, ended: Option<tokio::sync::oneshot::Rece
         Refused::Failed(why) => fail(why),
     })?;
     let kernels = Arc::new(kernels(&plan));
-    for kernel in [Kernel::Claude, Kernel::Omp, Kernel::Antigravity] {
+    for kernel in [Kernel::Claude, Kernel::Omp, Kernel::Antigravity, Kernel::Hermes] {
         let name = kernels::display_name(kernel);
         match (kernels.program(kernel), kernels.unavailable(kernel)) {
             (Some(program), None) => log(&format!("{name}: {}", program.display())),
@@ -186,7 +187,7 @@ fn doctor(options: &Common) -> i32 {
     println!("Agent directory:  {}", plan.agent_dir.display());
     println!("Instance lock:    {}", paths::runtime_dir().display());
     let mut usable = 0;
-    for kernel in [Kernel::Claude, Kernel::Omp, Kernel::Antigravity] {
+    for kernel in [Kernel::Claude, Kernel::Omp, Kernel::Antigravity, Kernel::Hermes] {
         let name = format!("{}:", kernels::display_name(kernel));
         match (kernels.program(kernel), kernels.unavailable(kernel)) {
             (Some(program), None) => {
@@ -206,7 +207,7 @@ fn doctor(options: &Common) -> i32 {
         None => println!("Web app:          not found beside the program (serve --web-dir <dir> names it)"),
     }
     if usable == 0 {
-        println!("No kernel can run: install Claude Code, Oh My Pi or the Antigravity CLI (the app's settings can install them), or set NEO_CLAUDE_BIN / NEO_OMP_BIN / NEO_AGY_BIN.");
+        println!("No kernel can run: install Claude Code, Oh My Pi, the Antigravity CLI or Hermes Agent (the app's settings can install them), or set NEO_CLAUDE_BIN / NEO_OMP_BIN / NEO_AGY_BIN / NEO_HERMES_BIN.");
         return 1;
     }
     0

@@ -110,7 +110,7 @@ async fn serves_every_route_of_the_app() {
     assert_eq!((status, installed["kernels"][2]["id"].as_str(), installed["kernels"][2]["installing"].as_bool()), (200, Some("antigravity"), Some(false)));
     assert_eq!(
         api.call("PUT", "/api/settings/kernel", Some(json!({"kernel": "other"}))).await,
-        (400, json!({"error": "kernel is omp, claude or antigravity"}))
+        (400, json!({"error": "kernel is omp, claude, antigravity or hermes"}))
     );
     assert_eq!(api.call("PUT", "/api/settings/kernel", Some(json!({"kernel": "omp"}))).await.1["current"], chosen);
 

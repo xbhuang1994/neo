@@ -367,7 +367,7 @@ impl App {
         self.sync_blocked();
         self.report_kernels();
         // The settings page lists every kernel's models: ask for them now, so it need not wait.
-        for kernel in [Kernel::Omp, Kernel::Claude, Kernel::Antigravity] {
+        for kernel in [Kernel::Omp, Kernel::Claude, Kernel::Antigravity, Kernel::Hermes] {
             if self.kernels.unavailable(kernel).is_none() {
                 let _ = self.models_known(kernel);
             }

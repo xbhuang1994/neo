@@ -91,7 +91,8 @@ pub fn omp_agent_dir() -> PathBuf {
 }
 
 /// Where an agent's official installer puts its program: `~/.local/bin` on macOS and Linux; on Windows Claude Code's
-/// `%USERPROFILE%\.local\bin`, Oh My Pi's `%LOCALAPPDATA%\omp` and the Antigravity CLI's `%LOCALAPPDATA%\agy\bin`.
+/// `%USERPROFILE%\.local\bin`, Oh My Pi's `%LOCALAPPDATA%\omp`, the Antigravity CLI's `%LOCALAPPDATA%\agy\bin` and
+/// Hermes Agent's `%LOCALAPPDATA%\hermes\bin`.
 pub fn install_dirs(name: &str) -> Vec<PathBuf> {
     let local_bin = home().join(".local").join("bin");
     if !cfg!(windows) {
@@ -101,6 +102,7 @@ pub fn install_dirs(name: &str) -> Vec<PathBuf> {
     match name {
         "omp" => vec![app_data.join("omp"), local_bin],
         "agy" => vec![app_data.join("agy").join("bin"), local_bin],
+        "hermes" => vec![app_data.join("hermes").join("bin"), local_bin],
         _ => vec![local_bin],
     }
 }

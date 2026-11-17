@@ -411,6 +411,26 @@ void main() {
     await save();
     expect(backend.kernel, 'antigravity');
     expect(backend.models['antigravity']!['eval'], {'provider': 'antigravity', 'model': 'gemini-3.8-flash-low'});
+    // Hermes is the fourth kernel, with provider/model choices and minimal through max effort.
+    await show(tester, find.text('Hermes'));
+    await tester.tap(find.text('Hermes'));
+    await settle(tester);
+    await tester.tap(find.byKey(const ValueKey('model-评估与调度模型')));
+    await settle(tester);
+    await tester.tap(find.textContaining('Claude Sonnet 4.6'));
+    await settle(tester);
+    expect(find.text('openrouter/anthropic/claude-sonnet-4.6'), findsOneWidget);
+    await tester.tap(find.text('  思考档位'));
+    await settle(tester);
+    await tester.tap(find.text('minimal'));
+    await settle(tester);
+    await save();
+    expect(backend.kernel, 'hermes');
+    expect(backend.models['hermes']!['eval'], {
+      'provider': 'openrouter',
+      'model': 'anthropic/claude-sonnet-4.6',
+      'thinkingLevel': 'minimal',
+    });
     // A kernel whose program is missing can be installed from here, and then chosen.
     final install = find.byKey(const ValueKey('install-claude'));
     await show(tester, install);

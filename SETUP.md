@@ -36,7 +36,7 @@ The package holds the backend and the web app, and runs from wherever it is unpa
 
 ## 2. Give it a model
 
-Open Settings → Kernel and models and choose the kernel the main session runs on and, if it is to be another one, the workers' kernel; nothing changes until you press Save. No kernel comes with Neo: it finds the `claude`, `omp` and `agy` programs already on the machine, on `PATH` or where their installers put them (`~/.local/bin`; on Windows also `%LOCALAPPDATA%\omp` and `%LOCALAPPDATA%\agy\bin`). A kernel that is missing shows an **Install** button, which runs the vendor's official installer (`curl -fsSL <script> | bash`, or `irm <script> | iex` on Windows) on the machine the backend runs on; the kernel can be chosen as soon as it finishes, without a restart. `NEO_CLAUDE_BIN`, `NEO_OMP_BIN` and `NEO_AGY_BIN` name a program elsewhere.
+Open Settings → Kernel and models and choose the kernel the main session runs on and, if it is to be another one, the workers' kernel; nothing changes until you press Save. No kernel comes with Neo: it finds the `claude`, `omp`, `agy` and `hermes` programs already on the machine, on `PATH` or where their installers put them (`~/.local/bin`; on Windows also `%LOCALAPPDATA%\omp`, `%LOCALAPPDATA%\agy\bin` and `%LOCALAPPDATA%\hermes\bin`). A kernel that is missing shows an **Install** button, which runs the vendor's official installer (`curl -fsSL <script> | bash`, or `irm <script> | iex` on Windows) on the machine the backend runs on; the kernel can be chosen as soon as it finishes, without a restart. `NEO_CLAUDE_BIN`, `NEO_OMP_BIN`, `NEO_AGY_BIN` and `NEO_HERMES_BIN` name a program elsewhere.
 
 Each kernel needs model access of its own:
 
@@ -52,6 +52,8 @@ A desktop app started from the Dock or the Start menu does not see variables set
 **Oh My Pi.** It uses the providers, models and sign-in of your own `omp`: the agent directory `~/.omp/agent` (or `PI_CODING_AGENT_DIR`), unless `--agent-dir` names another. Configure `omp` as usual and Neo offers the same models.
 
 **Antigravity CLI.** After installing it, run `agy` once in a terminal to sign in with Google. The backend offers the models `agy models` lists, and leaves the thinking effort to the model you choose. While a Session runs, a folder named after its working directory with `.neo-` and an id sits beside it, and goes when the Session ends.
+
+**Hermes Agent.** After installing it, run `hermes setup` once in a terminal to configure a model provider (such as OpenRouter, Nous Portal, Anthropic or a custom endpoint). It reads `~/.hermes` (or `HERMES_HOME`), offers the models configured there, and gives worker Sessions Hermes's persistent memory (`MEMORY.md`, `USER.md`) and learned skills.
 
 The settings page lists the models each role's kernel offers; leave a role on "kernel default" to use the runtime's own choice. A missing runtime or a failing model request is shown in the app in the runtime's own words.
 

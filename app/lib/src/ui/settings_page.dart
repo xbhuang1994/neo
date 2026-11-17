@@ -531,6 +531,7 @@ class _ModelsSettingsState extends LoadingState<ModelsSettings, ModelSettings> {
   String _name(String kernel) => switch (kernel) {
     'claude' => 'Claude Code',
     'antigravity' => 'Antigravity',
+    'hermes' => 'Hermes',
     _ => 'Oh My Pi',
   };
 
@@ -552,7 +553,7 @@ class _ModelsSettingsState extends LoadingState<ModelsSettings, ModelSettings> {
       title: strings.workerKernel,
       options: [
         (null, strings.sameAsOrchestrator),
-        for (final kernel in const ['omp', 'claude', 'antigravity']) (kernel, _name(kernel)),
+        for (final kernel in const ['omp', 'claude', 'antigravity', 'hermes']) (kernel, _name(kernel)),
       ],
       current: _workerKernel,
     );
@@ -585,7 +586,11 @@ class _ModelsSettingsState extends LoadingState<ModelsSettings, ModelSettings> {
   Future<void> _install(String kernel) async {
     final strings = Strings.read(context);
     final name = _name(kernel);
-    final done = kernel == 'antigravity' ? '${strings.installed(name)} ${strings.antigravitySignIn}' : strings.installed(name);
+    final done = switch (kernel) {
+      'antigravity' => '${strings.installed(name)} ${strings.antigravitySignIn}',
+      'hermes' => '${strings.installed(name)} ${strings.hermesSetup}',
+      _ => strings.installed(name),
+    };
     setState(() => _installing = kernel);
     // Installing keeps the draft: only what may be chosen changes.
     final draft = (_kernel, _workerKernel, _eval, _executor);
@@ -671,6 +676,7 @@ class _ModelsSettingsState extends LoadingState<ModelsSettings, ModelSettings> {
               '${switch (_kernel) {
                 'claude' => strings.kernelHintClaude,
                 'antigravity' => strings.kernelHintAntigravity,
+                'hermes' => strings.kernelHintHermes,
                 _ => strings.kernelHintOmp,
               }} ${strings.kernelSwitchHint}',
           children: [
@@ -687,8 +693,11 @@ class _ModelsSettingsState extends LoadingState<ModelsSettings, ModelSettings> {
                     key: const ValueKey('orchestrator-kernel'),
                     groupValue: _kernel,
                     children: {
-                      for (final kernel in const ['omp', 'claude', 'antigravity'])
-                        kernel: Padding(padding: const EdgeInsets.symmetric(horizontal: 8), child: Text(_name(kernel))),
+                      for (final kernel in const ['omp', 'claude', 'antigravity', 'hermes'])
+                        kernel: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 6),
+                          child: FittedBox(fit: BoxFit.scaleDown, child: Text(_name(kernel), maxLines: 1)),
+                        ),
                     },
                     onValueChanged: (kernel) {
                       if (kernel == null || kernel == _kernel || busy) return;

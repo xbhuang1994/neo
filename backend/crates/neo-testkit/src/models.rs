@@ -138,6 +138,9 @@ pub async fn openai(script: impl Fn(&Value, usize) -> Reply + Send + Sync + 'sta
     let requests = Arc::new(Mutex::new(Vec::new()));
     let seen = requests.clone();
     let server = serve(move |request: Request| {
+        if request.method == "GET" && request.path.ends_with("/models") {
+            return Response::json(200, &json!({"object": "list", "data": [{"id": "fixture", "object": "model"}]}));
+        }
         if request.method != "POST" || !request.path.ends_with("/chat/completions") {
             return Response::json(404, &json!({"error": "not found"}));
         }
@@ -148,6 +151,26 @@ pub async fn openai(script: impl Fn(&Value, usize) -> Reply + Send + Sync + 'sta
             seen.len() - 1
         };
         let reply = script(&body, number);
+        if body.get("stream") == Some(&Value::Bool(false)) {
+            let calls: Vec<Value> = reply
+                .tool_calls
+                .iter()
+                .enumerate()
+                .map(|(index, (name, arguments))| {
+                    json!({"id": format!("fixture-call-{number}-{index}"), "type": "function", "function": {"name": name, "arguments": arguments.to_string()}})
+                })
+                .collect();
+            let mut msg = json!({"role": "assistant", "content": reply.text});
+            if !calls.is_empty() {
+                msg["tool_calls"] = Value::Array(calls);
+            }
+            return Response::json(
+                200,
+                &json!({"id": format!("chatcmpl-fixture-{number}"), "object": "chat.completion", "created": 0, "model": "fixture",
+                    "choices": [{"index": 0, "message": msg, "finish_reason": if reply.tool_calls.is_empty() { "stop" } else { "tool_calls" }}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}),
+            );
+        }
         let delta = if reply.tool_calls.is_empty() {
             json!({"role": "assistant", "content": reply.text.clone().unwrap_or_default()})
         } else {

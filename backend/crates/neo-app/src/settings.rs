@@ -36,8 +36,10 @@ pub enum Kernel {
     Omp,
     /// Claude Code, driven over its stream-json protocol.
     Claude,
-    /// The Antigravity CLI, driven over the Agent Client Protocol.
+    /// The Antigravity CLI, driven in print mode with stream-json input and output.
     Antigravity,
+    /// Hermes Agent, driven over a Python JSON-RPC bridge in its own runtime.
+    Hermes,
 }
 
 impl Kernel {
@@ -47,6 +49,7 @@ impl Kernel {
             Kernel::Omp => "omp",
             Kernel::Claude => "claude",
             Kernel::Antigravity => "antigravity",
+            Kernel::Hermes => "hermes",
         }
     }
 }

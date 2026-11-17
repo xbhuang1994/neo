@@ -46,6 +46,7 @@ class FakeBackend {
     'omp': {'eval': null, 'executor': null},
     'claude': {'eval': null, 'executor': null},
     'antigravity': {'eval': null, 'executor': null},
+    'hermes': {'eval': null, 'executor': null},
   };
   Map<String, dynamic> general = {
     'paused': false,
@@ -106,7 +107,7 @@ class FakeBackend {
   }
 
   List<String> _levels(String kernel) => switch (kernel) {
-    'omp' => ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+    'omp' || 'hermes' => ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
     'antigravity' => <String>[],
     _ => ['auto', 'off', 'low', 'medium', 'high', 'xhigh', 'max'],
   };
@@ -122,6 +123,9 @@ class FakeBackend {
           : [
               {'id': 'gemini-3.8-flash-low', 'provider': 'antigravity', 'name': 'Gemini 3.8 Flash (Low)'},
             ],
+    'hermes' => [
+      {'id': 'anthropic/claude-sonnet-4.6', 'provider': 'openrouter', 'name': 'Claude Sonnet 4.6'},
+    ],
     _ => [
       {'id': 'opus', 'provider': 'anthropic', 'name': 'Opus'},
     ],
@@ -135,7 +139,7 @@ class FakeBackend {
       'workerKernelFollows': workerKernel == null,
       'loading': antigravityListing,
       'kernels': [
-        for (final id in const ['omp', 'claude', 'antigravity'])
+        for (final id in const ['omp', 'claude', 'antigravity', 'hermes'])
           {
             'id': id,
             'problem': id == 'claude' ? claudeProblem : null,

@@ -1,8 +1,9 @@
-//! The whole product with a real kernel: the program as a process, the real `claude` or `omp` runtime under it, and a
-//! local fake model endpoint — a chat message over HTTP becomes a ticket, a worker does it, and the result comes back.
-//! No network and no account. These start real runtime processes, so they run only with `NEO_REAL_KERNELS=1` (the
-//! runtimes on `PATH`) or `NEO_CLAUDE_BIN` / `NEO_OMP_BIN`; otherwise each test notes that it was skipped. The
-//! Antigravity test is the exception: its runtime signs in to Google, so it uses real models and is opted into apart.
+//! The whole product with a real kernel: the program as a process, the real `claude`, `omp` or `hermes` runtime under
+//! it, and a local fake model endpoint — a chat message over HTTP becomes a ticket, a worker does it, and the result
+//! comes back. No network and no account. These start real runtime processes, so they run only with `NEO_REAL_KERNELS=1`
+//! (the runtimes on `PATH`) or `NEO_CLAUDE_BIN` / `NEO_OMP_BIN` / `NEO_HERMES_BIN`; otherwise each test notes that it
+//! was skipped. The Antigravity test is the exception: its runtime signs in to Google, so it uses real models and is
+//! opted into apart.
 
 use neo_app::http::{send, Request};
 use neo_testkit::models::{anthropic, conversation, openai, ticket_flow, FakeModel};
@@ -55,7 +56,12 @@ impl Product {
             .env("NEO_RUNTIME_DIR", dir.join("run"))
             .env("HOME", dir.join("home"))
             .env("NEO_CLAUDE_BIN", dir.join("none"))
-            .env("NEO_OMP_BIN", dir.join("none"));
+            .env("NEO_OMP_BIN", dir.join("none"))
+            .env("NEO_AGY_BIN", dir.join("none"))
+            .env("NEO_HERMES_BIN", dir.join("none"))
+            .env_remove("NEO_TOKEN")
+            .env_remove("NEO_DATA_DIR")
+            .env_remove("NEO_ALLOW_MULTIPLE");
         for (name, value) in env {
             command.env(name, value);
         }
@@ -207,6 +213,30 @@ async fn does_a_request_end_to_end_on_oh_my_pi() {
     product.does_a_request(&model, "omp").await;
     let models = product.models_ready().await;
     assert!(models["available"].as_array().unwrap().iter().any(|option| option["provider"] == "fixture" && option["id"] == "fixture"), "{models}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn does_a_request_end_to_end_on_hermes() {
+    let Some(hermes) = runtime("hermes", "NEO_HERMES_BIN") else {
+        eprintln!("skipped: set NEO_REAL_KERNELS=1 or NEO_HERMES_BIN=<program> to run against the real hermes program");
+        return;
+    };
+    let model = openai(|request, _| ticket_flow(request, |name| name.to_string(), "terminal")).await;
+    let dir = TempDir::new("real-hermes");
+    for sub in ["home", "hermes-home"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    std::fs::write(dir.join("hermes-home/config.yaml"), format!("model:\n  provider: custom\n  base_url: {}/v1\n  default: fixture\n", model.url())).unwrap();
+    let settings = json!({"kernel": "hermes", "models": {"hermes": {"eval": {"provider": "custom", "model": "fixture"}, "executor": {"provider": "custom", "model": "fixture"}}}});
+    let env = [
+        ("NEO_HERMES_BIN", hermes.display().to_string()),
+        ("HERMES_HOME", dir.join("hermes-home").display().to_string()),
+        ("OPENAI_API_KEY", "fixture-key".to_string()),
+    ];
+    let product = Product::start(dir, settings, &env);
+    product.does_a_request(&model, "hermes").await;
+    let models = product.models_ready().await;
+    assert!(models["available"].as_array().unwrap().iter().any(|option| option["provider"] == "custom" && option["id"] == "fixture"), "{models}");
 }
 
 /// The whole product on the Antigravity CLI and its real models, with this program relaying the runtime's hooks. It

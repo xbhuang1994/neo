@@ -20,6 +20,7 @@ fn program(dir: &TempDir) -> Command {
         .env("NEO_CLAUDE_BIN", dir.join("no-claude"))
         .env("NEO_OMP_BIN", dir.join("no-omp"))
         .env("NEO_AGY_BIN", dir.join("no-agy"))
+        .env("NEO_HERMES_BIN", dir.join("no-hermes"))
         .env_remove("NEO_TOKEN")
         .env_remove("NEO_DATA_DIR")
         .env_remove("NEO_ALLOW_MULTIPLE")
