@@ -182,7 +182,8 @@ struct Shared {
     commands: HashMap<String, oneshot::Sender<Result<Value, String>>>,
     /// Shim requests awaiting their status frame.
     shim: HashMap<String, oneshot::Sender<Result<Value, String>>>,
-    ready: Option<oneshot::Sender<()>>,
+    /// Told when the runtime is ready, or why it ended before.
+    ready: Option<oneshot::Sender<Result<(), String>>>,
     /// The last turn ended with background jobs running.
     awaiting_async: bool,
     model: Option<String>,
@@ -236,7 +237,7 @@ impl OmpDriver {
         };
         tokio::spawn(self.clone().read(lines, generation));
         let started = async {
-            is_ready.await.map_err(|_| "Oh My Pi ended before it was ready".to_string())?;
+            is_ready.await.map_err(|_| "Oh My Pi ended before it was ready".to_string())??;
             let tools: Vec<Value> = self
                 .host
                 .specs()
@@ -327,7 +328,10 @@ impl OmpDriver {
                     let awaited = {
                         let mut shared = lock(&self.shared);
                         shared.process = None;
-                        shared.ready = None;
+                        // Whoever waits for it to start hears why it could not, in the runtime's own words.
+                        if let Some(ready) = shared.ready.take() {
+                            let _ = ready.send(Err(error.clone().unwrap_or_else(|| "Oh My Pi ended before it was ready".into())));
+                        }
                         let waiting: Vec<_> = shared.commands.drain().map(|(_, answer)| answer).collect();
                         for answer in waiting.into_iter().chain(std::mem::take(&mut shared.shim).into_values()) {
                             let _ = answer.send(Err("Oh My Pi ended before answering".into()));
@@ -354,7 +358,7 @@ impl OmpDriver {
         match frame["type"].as_str().unwrap_or("") {
             "ready" => {
                 if let Some(ready) = lock(&self.shared).ready.take() {
-                    let _ = ready.send(());
+                    let _ = ready.send(Ok(()));
                 }
             }
             "response" => {
