@@ -70,7 +70,9 @@ fn kernels(plan: &Plan) -> RealKernels {
     let shim = paths::find_shim(env_path("NEO_SHIM"), program_dir.as_deref());
     // Every Session meets the blocked commands first on its path.
     let env = [("PATH".to_string(), blocked::path_with(&plan.data_dir).to_string_lossy().to_string())].into_iter().collect();
-    RealKernels { state_dir: plan.data_dir.clone(), agent_dir: plan.agent_dir.clone(), find, installing: Default::default(), shim, env }
+    // Antigravity's hooks come back to this program.
+    let hook_relay = std::env::current_exe().map(|exe| vec![exe.display().to_string(), "agy-hook".into()]).unwrap_or_default();
+    RealKernels { state_dir: plan.data_dir.clone(), agent_dir: plan.agent_dir.clone(), find, installing: Default::default(), shim, env, hook_relay }
 }
 
 /// Waits until the process is asked to end: by a signal, or by `ended` (the desktop app going away).
@@ -272,6 +274,17 @@ fn main() {
         std::process::exit(blocked::REFUSED_STATUS);
     }
     let args: Vec<String> = args.collect();
+    // Antigravity runs this program as a hook's command: the hook goes to the Session's driver, its answer comes back.
+    if args.first().is_some_and(|first| first == "agy-hook") {
+        let url = args.get(1).map(String::as_str).unwrap_or("");
+        match neo_kernel::antigravity::relay_hook(url, &mut std::io::stdin().lock(), &mut std::io::stdout().lock()) {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
     let command = match cli::parse(&args) {
         Ok(command) => command,
         Err(error) => {

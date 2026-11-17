@@ -51,7 +51,7 @@ A desktop app started from the Dock or the Start menu does not see variables set
 
 **Oh My Pi.** It uses the providers, models and sign-in of your own `omp`: the agent directory `~/.omp/agent` (or `PI_CODING_AGENT_DIR`), unless `--agent-dir` names another. Configure `omp` as usual and Neo offers the same models.
 
-**Antigravity CLI.** After installing it, run `agy` once in a terminal to sign in with Google. The backend offers the models `agy models` lists, and leaves the thinking effort to the runtime. Its workers run without background jobs or subagents.
+**Antigravity CLI.** After installing it, run `agy` once in a terminal to sign in with Google. The backend offers the models `agy models` lists, and leaves the thinking effort to the model you choose. While a Session runs, a folder named after its working directory with `.neo-` and an id sits beside it, and goes when the Session ends.
 
 The settings page lists the models the chosen kernel offers; leave a role on "kernel default" to use the runtime's own choice. A missing runtime or a failing model request is shown in the app in the runtime's own words.
 

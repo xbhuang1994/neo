@@ -1,12 +1,13 @@
-//! The Antigravity kernel against the real `agy` program and its real models: it needs a signed-in Antigravity CLI and
-//! the network, and asks a small model to follow plain instructions. It runs only with `NEO_AGY_BIN=<program>`, or
-//! `NEO_REAL_ANTIGRAVITY=1` for the `agy` on `PATH`; otherwise each test notes that it was skipped. The model is
-//! `NEO_AGY_MODEL`, by default `gemini-3.8-flash-low`.
+//! The Antigravity kernel against the real `agy` program and its real models: it needs a signed-in Antigravity CLI,
+//! the network and `python3`, which stands in for `neo-agent agy-hook` as the hooks' relay, and asks a small model to
+//! follow plain instructions. It runs only with `NEO_AGY_BIN=<program>`, or `NEO_REAL_ANTIGRAVITY=1` for the `agy` on
+//! `PATH`; otherwise each test notes that it was skipped. The model is `NEO_AGY_MODEL`, by default
+//! `gemini-3.8-flash-low`.
 
 use neo_kernel::antigravity::{Antigravity, AntigravityDriver, AntigravityOptions};
 use neo_kernel::journal::{Entry, Journal};
 use neo_kernel::session::{Mode, Presentation, Session};
-use neo_kernel::types::{Block, BoxFut, Guard, KernelEvent, Role, ToolHost, ToolSpec};
+use neo_kernel::types::{Block, BoxFut, Guard, JobKind, KernelEvent, Role, ToolHost, ToolSpec};
 use neo_testkit::TempDir;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -58,14 +59,20 @@ struct Fixture {
     events: broadcast::Receiver<KernelEvent>,
 }
 
+/// The hooks' relay: what `neo-agent agy-hook` does, in Python.
+const RELAY: &str = "import sys, urllib.request\nreq = urllib.request.Request(sys.argv[1], data=sys.stdin.buffer.read(), method='POST')\nsys.stdout.write(urllib.request.urlopen(req, timeout=600).read().decode())\n";
+
 fn open(dir: TempDir, journal: Journal) -> Fixture {
     let host = Arc::new(Host::default());
+    let relay = dir.join("relay.py");
+    std::fs::write(&relay, RELAY).unwrap();
     let options = AntigravityOptions {
         program: program().expect("checked by the test"),
         cwd: dir.join("work"),
         system_prompt: "You are a fixture worker. Do exactly what you are asked, nothing more, and answer in one short line.".into(),
         tools: vec!["read".into(), "bash".into()],
         model: Some(std::env::var("NEO_AGY_MODEL").unwrap_or_else(|_| "gemini-3.8-flash-low".into())),
+        hook_relay: vec!["python3".into(), relay.display().to_string()],
         ..Default::default()
     };
     let (reports, runtime) = mpsc::unbounded_channel();
@@ -131,12 +138,13 @@ async fn runs_host_tools_guards_commands_and_resumes_its_conversation() {
     let said = f.messages();
     assert!(said.iter().any(|(role, text)| *role == Role::Assistant && text.contains("KIWI-42")), "{said:?}");
 
-    f.send("r2", "Run the shell command `echo forbidden-step` once. If it is denied, do not retry; reply with the single word DENIED.").await;
+    f.send("r2", "Run the shell command `echo forbidden-step` once. If it is denied, do not retry; reply with DENIED and the reason you were given.").await;
     f.turn().await;
     let guarded = f.host.guarded.lock().unwrap().clone();
     assert!(guarded.iter().any(|(tool, input)| tool == "bash" && input["command"].as_str().is_some_and(|c| c.contains("forbidden"))), "{guarded:?}");
     let said = f.messages();
     assert!(said.iter().rev().any(|(role, text)| *role == Role::Assistant && text.to_uppercase().contains("DENIED")), "{said:?}");
+    assert!(said.iter().any(|(_, text)| text.contains("Ticket ended")), "the guard's reason reaches the model: {said:?}");
 
     // A new process continues the same conversation.
     let journal = Arc::clone(f.session.journal());
@@ -150,5 +158,29 @@ async fn runs_host_tools_guards_commands_and_resumes_its_conversation() {
     assert_eq!(f.session.journal().kernel_session("antigravity"), Some(resumed_from));
     let said = f.messages();
     assert!(said.last().is_some_and(|(_, text)| text.contains("KIWI-42")), "{said:?}");
+    f.session.dispose().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ends_a_turn_while_a_background_command_runs_and_wakes_when_it_ends() {
+    if program().is_none() {
+        eprintln!("skipped: set NEO_AGY_BIN or NEO_REAL_ANTIGRAVITY=1 to run against the real Antigravity CLI");
+        return;
+    }
+    let mut f = fixture();
+    f.send(
+        "r1",
+        "Run the shell command `sleep 25 && echo BG-FINISHED` with WaitMsBeforeAsync set to 500 so that it moves to the background. Do not wait for it or check on it: reply STARTED and end your turn at once. When it finishes, reply with its output.",
+    )
+    .await;
+    let events = f.turn().await;
+    assert_eq!(events.last(), Some(&KernelEvent::AgentEnd { terminal: false, awaiting_async: true }), "{events:?}");
+    let jobs = f.session.driver().jobs().await;
+    assert!(jobs.iter().any(|job| job.kind == JobKind::Bash && job.own && job.command.as_deref().is_some_and(|c| c.contains("sleep 25"))), "{jobs:?}");
+    let events = f.turn().await;
+    assert_eq!(events.last(), Some(&KernelEvent::AgentEnd { terminal: true, awaiting_async: false }), "{events:?}");
+    assert!(f.session.driver().jobs().await.is_empty());
+    let said = f.messages();
+    assert!(said.iter().any(|(role, text)| *role == Role::Assistant && text.contains("BG-FINISHED")), "{said:?}");
     f.session.dispose().await;
 }

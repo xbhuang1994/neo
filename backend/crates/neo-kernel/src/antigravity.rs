@@ -1,43 +1,72 @@
-//! The Antigravity kernel: one `agy acp` process per Session, driven over the Agent Client Protocol (JSON-RPC 2.0 on
-//! its standard input and output).
+//! The Antigravity kernel: one `agy` process per Session in its headless print mode, driven by stream-json lines on
+//! its standard input and output.
+//!
+//! The runtime takes the Session's system prompt, built-in tools and extensions from a custom agent. The driver writes
+//! that agent, with a plugin carrying the host's MCP server and its hooks, into a bridge folder beside the Session's
+//! working directory and adds the folder to the runtime's workspace. Antigravity orders its workspace folders by path
+//! and works in the first, and the bridge's path extends the working directory's, so it always comes second.
 //!
 //! The host's tools reach the model through an MCP server on the loopback interface, which answers only the bearer
-//! token this driver hands its runtime; the tool-call guard answers the runtime's permission requests for its own
-//! tools and judges every call of the host's tools before it runs. The runtime keeps its conversations itself, and
-//! `session/resume` continues one in a new process without replaying it.
+//! token written into the plugin. Every tool call, the main conversation's and its subagents', runs a `PreToolUse`
+//! hook first: a relay program posts it to the same server, the guard judges it, and a refusal reaches the model with
+//! its reason. A hook that fails refuses the call. `Stop` hooks tell whether background commands or subagents still
+//! run, which the stream only shows once they end. The runtime keeps its conversations itself, and
+//! `--conversation` continues one in a new process.
 
 use crate::process::{Launch, Line, Proc};
 use crate::session::{Driver, DriverEvent};
-use crate::types::{uuid, Block, BoxFut, Deliver, Guard, KernelJob, Message, Role, ToolHost, ToolSpec};
+use crate::types::{uuid, Block, BoxFut, Deliver, Guard, JobKind, KernelJob, Message, Role, ToolHost, ToolSpec};
+use neo_core::time::now_ms;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
-/// The name of the MCP server that carries the host's tools.
+/// The plugin that carries the host's MCP server and hooks.
+pub const PLUGIN: &str = "neo";
+
+/// The MCP server, inside the plugin, that carries the host's tools.
 pub const MCP_SERVER: &str = "neo";
 
-/// The name Antigravity gives a host tool.
-pub fn mcp_tool_name(name: &str) -> String {
-    format!("mcp_{MCP_SERVER}_{name}")
+/// The custom agent a Session runs as.
+pub const AGENT: &str = "neo-session";
+
+/// The name the model gives the host's MCP server when it calls `call_mcp_tool`: the plugin's, then the server's.
+pub fn mcp_server_name() -> String {
+    format!("{PLUGIN}_{MCP_SERVER}")
 }
 
-/// A thinking level as Antigravity's `thought_level`: `None` keeps the model's own level.
-pub fn thought_level(level: Option<&str>) -> Option<&'static str> {
+/// A thinking level as Antigravity's `--effort`: `None` keeps the model's own.
+pub fn effort_of(level: Option<&str>) -> Option<&'static str> {
     match level? {
         "off" | "minimal" | "low" => Some("low"),
         "medium" => Some("medium"),
-        "high" | "xhigh" | "max" => Some("high"),
+        "high" => Some("high"),
+        "xhigh" => Some("xhigh"),
+        "max" => Some("max"),
         _ => None,
     }
 }
 
 /// The kinds of built-in tool a Session may be allowed, in the host's words.
 pub const TOOL_KINDS: &[&str] = &["read", "bash", "edit", "write", "task"];
+
+/// The runtime's tools for each kind. Tools of no kind, such as fetching a web page, come with `bash`.
+fn runtime_tools(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "read" => &["view_file", "list_dir", "grep_search", "find_by_name"],
+        "bash" => &["run_command", "command_status", "send_command_input", "manage_task", "wait", "read_url_content", "search_web"],
+        "edit" => &["replace_file_content", "multi_replace_file_content"],
+        "write" => &["write_to_file"],
+        "task" => &["invoke_subagent", "manage_subagents"],
+        _ => &[],
+    }
+}
 
 /// How an Antigravity Session runs.
 #[derive(Clone, Default)]
@@ -48,8 +77,7 @@ pub struct AntigravityOptions {
     pub cwd: PathBuf,
     /// What the Session adds to the runtime's own system prompt.
     pub system_prompt: String,
-    /// The built-in tool kinds the model may use: of [`TOOL_KINDS`]. Tools of no kind, such as fetching a web page,
-    /// are allowed only to a Session that may use `bash`.
+    /// The built-in tool kinds the model may use: of [`TOOL_KINDS`].
     pub tools: Vec<String>,
     /// The model, or the runtime's default.
     pub model: Option<String>,
@@ -57,44 +85,106 @@ pub struct AntigravityOptions {
     pub thinking: Option<String>,
     /// Variables to set for the runtime.
     pub env: BTreeMap<String, String>,
+    /// The program, and its first arguments, that relays a hook to this driver: the hook's URL follows them. It is
+    /// `neo-agent agy-hook` in the application, which runs [`relay_hook`].
+    pub hook_relay: Vec<String>,
+}
+
+/// The folder beside `cwd` that carries a Session's agent and plugin. Its path extends `cwd`'s, so it sorts after it.
+pub fn bridge_dir(cwd: &Path, id: &str) -> PathBuf {
+    let mut path = cwd.as_os_str().to_owned();
+    path.push(format!(".neo-{id}"));
+    PathBuf::from(path)
+}
+
+/// The file that marks a bridge folder as the driver's, with the host's process id.
+const BRIDGE_MARKER: &str = ".neo-bridge";
+
+/// A command line for `sh -c`, or `cmd /c` on Windows.
+fn shell_command(words: &[String]) -> String {
+    words
+        .iter()
+        .map(|word| if cfg!(windows) { format!("\"{}\"", word.replace('"', "\"\"")) } else { format!("'{}'", word.replace('\'', "'\\''")) })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The custom agent's file: its plugin, its built-in tools, and the Session's prompt.
+pub fn agent_file(options: &AntigravityOptions) -> String {
+    let mut tools: Vec<&str> = Vec::new();
+    for kind in &options.tools {
+        for tool in runtime_tools(kind) {
+            if !tools.contains(tool) {
+                tools.push(tool);
+            }
+        }
+    }
+    format!(
+        "---\nname: {AGENT}\ndescription: A Neo Session.\nplugins:\n  - {PLUGIN}\ntools: [{}]\n---\n{}\n",
+        tools.join(", "),
+        options.system_prompt.trim_end()
+    )
+}
+
+/// The plugin's hooks: every tool call is judged before it runs; ends of tool calls, model calls and turns are reported.
+pub fn hooks_file(command: &str) -> Value {
+    let handler = |timeout: u64| json!([{"type": "command", "command": command, "timeout": timeout}]);
+    json!({
+        PLUGIN: {
+            "PreToolUse": [{"matcher": "*", "hooks": handler(600)}],
+            "PostToolUse": [{"matcher": "*", "hooks": handler(30)}],
+            "PreInvocation": handler(30),
+            "Stop": handler(30),
+        }
+    })
 }
 
 /// The command line and environment of an Antigravity process.
-pub fn launch(options: &AntigravityOptions) -> Launch {
+pub fn launch(options: &AntigravityOptions, bridge: &Path, resume: Option<&str>) -> Launch {
+    let mut args: Vec<String> = ["--input-format", "stream-json", "--output-format", "stream-json", "--disable-slash-commands"].map(String::from).to_vec();
+    args.extend(["--add-dir".into(), bridge.display().to_string(), "--agent".into(), AGENT.into()]);
+    let settings = json!({"permissions": {"allow": [format!("mcp({}/*)", mcp_server_name())]}});
+    args.extend(["--settings".into(), settings.to_string()]);
+    if let Some(model) = options.model.as_deref().filter(|model| !model.is_empty()) {
+        args.extend(["--model".into(), model.into()]);
+    }
+    if let Some(effort) = effort_of(options.thinking.as_deref()) {
+        args.extend(["--effort".into(), effort.into()]);
+    }
+    if let Some(id) = resume {
+        args.extend(["--conversation".into(), id.into()]);
+    }
+    // Print mode, its prompts coming as stream-json lines.
+    args.push("-p=".into());
     Launch {
         program: options.program.clone(),
-        args: vec!["acp".into()],
+        args,
         cwd: options.cwd.clone(),
         env: options.env.clone(),
         env_remove: crate::claude::SESSION_VARIABLES.iter().map(|name| name.to_string()).collect(),
     }
 }
 
-/// A runtime tool call in the host's words: the kind or host tool it is, and the input the guard judges. The ACP
-/// `kind` the runtime reports decides first; the tool's name decides when the kind says nothing.
-pub fn host_view(tool: &str, kind: Option<&str>, input: &Value) -> (String, Value) {
+/// A runtime tool call in the host's words: the kind or host tool it is, and the input the guard judges.
+pub fn host_view(tool: &str, input: &Value) -> (String, Value) {
     let path = || {
-        let path = ["Path", "TargetFile", "AbsolutePath"].iter().find_map(|field| input[*field].as_str()).unwrap_or("");
+        let path = ["Path", "TargetFile", "AbsolutePath", "File"].iter().find_map(|field| input[*field].as_str()).unwrap_or("");
         json!({ "path": path })
     };
-    if let Some(bare) = tool.strip_prefix(&format!("mcp_{MCP_SERVER}_")) {
-        return (bare.to_string(), input.clone());
-    }
-    match (tool, kind.unwrap_or("")) {
-        ("run_command", _) => ("bash".into(), json!({"command": input["CommandLine"].as_str().unwrap_or("")})),
-        ("send_command_input", _) => ("bash".into(), json!({"command": input["Input"].as_str().unwrap_or("")})),
-        ("write_file" | "write_to_file", _) => ("write".into(), path()),
-        ("invoke_subagent" | "define_subagent" | "manage_subagents" | "browser_subagent", _) => ("task".into(), input.clone()),
-        (_, "execute") => ("bash".into(), json!({"command": input["CommandLine"].as_str().or(input["command"].as_str()).unwrap_or("")})),
-        (_, "edit" | "delete" | "move") => ("edit".into(), path()),
-        (_, "read" | "search") => ("read".into(), input.clone()),
-        ("edit_file" | "replace_file_content" | "multi_replace_file_content" | "sed_file" | "notebook_edit", _) => ("edit".into(), path()),
-        ("read_file" | "view_file" | "list_dir" | "grep_search" | "find_by_name", _) => ("read".into(), input.clone()),
+    match tool {
+        "run_command" => ("bash".into(), json!({"command": input["CommandLine"].as_str().unwrap_or("")})),
+        "send_command_input" => ("bash".into(), json!({"command": input["Input"].as_str().unwrap_or("")})),
+        "write_file" | "write_to_file" => ("write".into(), path()),
+        "edit_file" | "replace_file_content" | "multi_replace_file_content" | "sed_file" | "notebook_edit" | "delete_file" | "move_file" => {
+            ("edit".into(), path())
+        }
+        "read_file" | "view_file" | "list_dir" | "grep_search" | "find_by_name" => ("read".into(), input.clone()),
+        "invoke_subagent" | "define_subagent" | "manage_subagents" | "browser_subagent" => ("task".into(), input.clone()),
         _ => (tool.to_string(), input.clone()),
     }
 }
 
-/// Arguments Antigravity adds to every MCP tool call for its own display; a tool that does not declare one never sees it.
+/// Arguments Antigravity adds to every tool call for its own display; a tool that does not declare one never sees it.
 const INJECTED_ARGUMENTS: &[&str] = &["toolSummary", "explanation", "toolAction", "waitForPreviousTools"];
 
 fn strip_injected(spec: Option<&ToolSpec>, mut arguments: Value) -> Value {
@@ -105,46 +195,8 @@ fn strip_injected(spec: Option<&ToolSpec>, mut arguments: Value) -> Value {
     arguments
 }
 
-/// Kernel content as ACP prompt content blocks.
-fn prompt_content(content: &[Block]) -> Value {
-    content
-        .iter()
-        .map(|block| match block {
-            Block::Text { text } => json!({"type": "text", "text": text}),
-            Block::Image { mime_type, data } => json!({"type": "image", "mimeType": mime_type, "data": data}),
-            Block::ToolCall { name, .. } => json!({"type": "text", "text": format!("[tool call {name}]")}),
-        })
-        .collect()
-}
-
-/// Why a prompt ended, as a transcript stop reason.
-fn stop_reason(reason: &str) -> &'static str {
-    match reason {
-        "max_tokens" | "max_turn_requests" => "length",
-        "cancelled" => "aborted",
-        "refusal" => "error",
-        _ => "stop",
-    }
-}
-
-/// The text a finished tool call reports.
-fn tool_output(update: &Value) -> String {
-    let content: Vec<&str> = update["content"]
-        .as_array()
-        .map(|blocks| blocks.iter().filter_map(|block| block["content"]["text"].as_str().or(block["text"].as_str())).collect())
-        .unwrap_or_default();
-    if !content.is_empty() {
-        return content.join("\n");
-    }
-    match &update["rawOutput"] {
-        Value::Null => update["status"].as_str().unwrap_or("").to_string(),
-        Value::String(text) => text.clone(),
-        output => output["output"].as_str().map(str::to_string).unwrap_or_else(|| output.to_string()),
-    }
-}
-
 /// The models `agy models` lists: id and display name.
-pub async fn list_models(program: &std::path::Path, env: &BTreeMap<String, String>) -> Result<Vec<(String, String)>, String> {
+pub async fn list_models(program: &Path, env: &BTreeMap<String, String>) -> Result<Vec<(String, String)>, String> {
     let mut command = tokio::process::Command::new(program);
     command.arg("models").envs(env).stdin(std::process::Stdio::null()).kill_on_drop(true);
     let output = tokio::time::timeout(Duration::from_secs(60), command.output())
@@ -168,48 +220,91 @@ fn parse_models(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The host's tools as an MCP server on the loopback interface.
-struct McpServer {
-    url: String,
+/// Relay one hook: the hook's input, read from `input`, is posted to `url`, and the answer written to `output`.
+/// Antigravity runs this as the hook's command; an error makes the command fail, which refuses a tool call.
+pub fn relay_hook(url: &str, input: &mut impl Read, output: &mut impl Write) -> Result<(), String> {
+    let rest = url.strip_prefix("http://").ok_or("The hook URL is not http")?;
+    let (address, path) = rest.split_once('/').map(|(address, path)| (address, format!("/{path}"))).unwrap_or((rest, "/".into()));
+    let mut body = Vec::new();
+    input.read_to_end(&mut body).map_err(|error| format!("Cannot read the hook's input: {error}"))?;
+    let mut stream = std::net::TcpStream::connect(address).map_err(|error| format!("Cannot reach Neo at {address}: {error}"))?;
+    // The guard may take its time; Antigravity's own limit on the hook ends it first.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(900)));
+    let head =
+        format!("POST {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+    stream.write_all(head.as_bytes()).and_then(|_| stream.write_all(&body)).map_err(|error| format!("Cannot send the hook to Neo: {error}"))?;
+    let mut reply = Vec::new();
+    stream.read_to_end(&mut reply).map_err(|error| format!("Neo did not answer the hook: {error}"))?;
+    let split = reply.windows(4).position(|window| window == b"\r\n\r\n").ok_or("Neo's answer to the hook is malformed")?;
+    let status = String::from_utf8_lossy(&reply[..split]).split_whitespace().nth(1).unwrap_or("").to_string();
+    if status != "200" {
+        return Err(format!("Neo answered the hook with status {status}"));
+    }
+    output.write_all(&reply[split + 4..]).and_then(|_| output.flush()).map_err(|error| format!("Cannot write the hook's answer: {error}"))
+}
+
+type HookHandler = Arc<dyn Fn(Value) -> BoxFut<'static, Value> + Send + Sync>;
+
+/// The host's tools as an MCP server, and the hooks' endpoint, on the loopback interface.
+struct HostServer {
+    port: u16,
     token: String,
     task: tokio::task::JoinHandle<()>,
 }
 
-impl Drop for McpServer {
+impl HostServer {
+    fn mcp_url(&self) -> String {
+        format!("http://127.0.0.1:{}/mcp", self.port)
+    }
+    fn hook_url(&self) -> String {
+        format!("http://127.0.0.1:{}/hook/{}", self.port, self.token)
+    }
+}
+
+impl Drop for HostServer {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
 
-/// The most notes of refused tool calls sent in a row, without a submission between them.
-const MAX_NOTES: u32 = 3;
+/// The largest request body the server reads.
+const BODY_LIMIT: usize = 16 << 20;
 
-/// The largest request body the tool server reads.
-const MCP_BODY_LIMIT: usize = 16 << 20;
+#[derive(Clone)]
+struct Routes {
+    host: Arc<dyn ToolHost>,
+    token: String,
+    on_tool_call: Option<Arc<dyn Fn() + Send + Sync>>,
+    on_hook: Option<HookHandler>,
+}
 
-async fn start_mcp(host: Arc<dyn ToolHost>, on_tool_call: Option<Arc<dyn Fn() + Send + Sync>>) -> Result<McpServer, String> {
+async fn start_server(host: Arc<dyn ToolHost>, on_tool_call: Option<Arc<dyn Fn() + Send + Sync>>, on_hook: Option<HookHandler>) -> Result<HostServer, String> {
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|error| format!("Cannot open the tool server: {error}"))?;
     let port = listener.local_addr().map_err(|error| format!("Cannot open the tool server: {error}"))?.port();
     let token = format!("{}{}", uuid().replace('-', ""), uuid().replace('-', ""));
-    let expected = format!("Bearer {token}");
+    let routes = Routes { host, token: token.clone(), on_tool_call, on_hook };
     let task = tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
-            tokio::spawn(serve_connection(stream, host.clone(), expected.clone(), on_tool_call.clone()));
+            tokio::spawn(serve_connection(stream, routes.clone()));
         }
     });
-    Ok(McpServer { url: format!("http://127.0.0.1:{port}/mcp"), token, task })
+    Ok(HostServer { port, token, task })
 }
 
-async fn serve_connection(stream: TcpStream, host: Arc<dyn ToolHost>, expected: String, on_tool_call: Option<Arc<dyn Fn() + Send + Sync>>) {
+async fn serve_connection(stream: TcpStream, routes: Routes) {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
+    let bearer = format!("Bearer {}", routes.token);
+    let hook_path = format!("/hook/{}", routes.token);
     loop {
         let mut start = String::new();
         if reader.read_line(&mut start).await.unwrap_or(0) == 0 {
             return;
         }
         let mut parts = start.split_whitespace();
-        let (method, http11) = (parts.next().unwrap_or("").to_string(), parts.nth(1).is_some_and(|version| version == "HTTP/1.1"));
+        let method = parts.next().unwrap_or("").to_string();
+        let path = parts.next().unwrap_or("").to_string();
+        let http11 = parts.next().is_some_and(|version| version == "HTTP/1.1");
         let (mut length, mut authorized, mut close) = (0usize, false, !http11);
         loop {
             let mut line = String::new();
@@ -224,13 +319,13 @@ async fn serve_connection(stream: TcpStream, host: Arc<dyn ToolHost>, expected: 
             let value = value.trim();
             match name.trim().to_ascii_lowercase().as_str() {
                 "content-length" => length = value.parse().unwrap_or(usize::MAX),
-                "authorization" => authorized = value == expected,
+                "authorization" => authorized = value == bearer,
                 "connection" => close = value.eq_ignore_ascii_case("close"),
                 "transfer-encoding" => length = usize::MAX,
                 _ => {}
             }
         }
-        if length > MCP_BODY_LIMIT {
+        if length > BODY_LIMIT {
             let _ = respond(&mut writer, 413, None).await;
             return;
         }
@@ -238,13 +333,18 @@ async fn serve_connection(stream: TcpStream, host: Arc<dyn ToolHost>, expected: 
         if reader.read_exact(&mut body).await.is_err() {
             return;
         }
-        let (status, answer) = if !authorized {
+        let hook = path == hook_path;
+        let (status, answer) = if !(authorized || hook) {
             (401, None)
         } else if method != "POST" {
             (405, None)
         } else {
             match serde_json::from_slice::<Value>(&body) {
-                Ok(message) => match mcp_answer(host.as_ref(), &message, on_tool_call.as_deref()).await {
+                Ok(message) if hook => match &routes.on_hook {
+                    Some(on_hook) => (200, Some(on_hook(message).await)),
+                    None => (200, Some(json!({}))),
+                },
+                Ok(message) => match mcp_answer(routes.host.as_ref(), &message, routes.on_tool_call.as_deref()).await {
                     Some(answer) => (200, Some(answer)),
                     None => (202, None),
                 },
@@ -313,37 +413,130 @@ async fn mcp_answer(host: &dyn ToolHost, message: &Value, on_tool_call: Option<&
     Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
 }
 
+/// The bridge folder of a running process: removed when the process ends.
+struct Bridge {
+    dir: PathBuf,
+}
+
+impl Bridge {
+    /// Write the bridge for one process of a Session.
+    fn create(options: &AntigravityOptions, server: &HostServer, has_tools: bool) -> Result<Bridge, String> {
+        let dir = bridge_dir(&options.cwd, &uuid()[..8]);
+        sweep_bridges(&options.cwd);
+        let plugin = dir.join(".agents").join("plugins").join(PLUGIN);
+        let failed = |error: std::io::Error| format!("Cannot write Antigravity's bridge at {}: {error}", dir.display());
+        std::fs::create_dir_all(dir.join(".agents").join("agents")).map_err(failed)?;
+        std::fs::create_dir_all(&plugin).map_err(failed)?;
+        let bridge = Bridge { dir: dir.clone() };
+        std::fs::write(dir.join(BRIDGE_MARKER), std::process::id().to_string()).map_err(failed)?;
+        std::fs::write(dir.join(".agents").join("agents").join(format!("{AGENT}.md")), agent_file(options)).map_err(failed)?;
+        let manifest = json!({"name": PLUGIN, "description": "Neo's tools and tool-call guard", "version": env!("CARGO_PKG_VERSION")});
+        std::fs::write(plugin.join("plugin.json"), manifest.to_string()).map_err(failed)?;
+        let mut relay = options.hook_relay.clone();
+        relay.push(server.hook_url());
+        std::fs::write(plugin.join("hooks.json"), hooks_file(&shell_command(&relay)).to_string()).map_err(failed)?;
+        let servers = if has_tools {
+            json!({MCP_SERVER: {"url": server.mcp_url(), "headers": {"Authorization": format!("Bearer {}", server.token)}}})
+        } else {
+            json!({})
+        };
+        std::fs::write(plugin.join("mcp_config.json"), json!({"mcpServers": servers}).to_string()).map_err(failed)?;
+        Ok(bridge)
+    }
+
+    /// The folder holds `path`.
+    fn holds(&self, path: &str) -> bool {
+        !path.is_empty() && Path::new(path).starts_with(&self.dir)
+    }
+}
+
+impl Drop for Bridge {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Remove bridges beside `cwd` that a host process which no longer runs left behind.
+fn sweep_bridges(cwd: &Path) {
+    #[cfg(unix)]
+    {
+        let (Some(parent), Some(name)) = (cwd.parent(), cwd.file_name()) else { return };
+        let prefix = format!("{}.neo-", name.to_string_lossy());
+        let Ok(entries) = std::fs::read_dir(parent) else { return };
+        for entry in entries.flatten() {
+            if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+                continue;
+            }
+            let Ok(owner) = std::fs::read_to_string(entry.path().join(BRIDGE_MARKER)) else { continue };
+            let Ok(pid) = owner.trim().parse::<i32>() else { continue };
+            // SAFETY: signal 0 only checks whether the process exists.
+            let alive = pid > 0 && (unsafe { libc::kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM));
+            if !alive {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = cwd;
+}
+
+/// A message the runtime was handed, until its turn ends.
+struct Turn {
+    /// The submission's id.
+    id: String,
+    taken: bool,
+}
+
+/// A command the model runs, from its `PreToolUse` hook to its `PostToolUse` hook.
+struct Command {
+    conversation: String,
+    command: String,
+    start_time: i64,
+}
+
 #[derive(Default)]
 struct Shared {
     process: Option<Arc<Proc>>,
-    /// The runtime's id of the conversation the process serves.
-    session_id: Option<String>,
-    /// Grows with every process, so a late line or answer from one that ended is ignored.
+    bridge: Option<Bridge>,
+    server: Option<Arc<HostServer>>,
+    /// Grows with every process, so a late line from one that ended is ignored.
     generation: u64,
-    next_request: u64,
-    requests: HashMap<u64, oneshot::Sender<Result<Value, String>>>,
-    /// Prompts sent whose answer has not come; the runtime is busy while there are any.
-    in_flight: usize,
-    /// Follow-ups waiting for the running turn to end: their submission id and content.
-    queued: VecDeque<(String, Value)>,
-    /// Prompts sent that the runtime has not confirmed taking into a step yet, oldest first: the request id and a
-    /// submission's id, or `None` for a note of the driver's own.
-    unechoed: VecDeque<(u64, Option<String>)>,
-    /// Why the guard refused tool calls of the running turn. The runtime ends a turn on a refusal without telling
-    /// the model why, so the reasons follow as a note of their own.
-    refused: Vec<String>,
-    /// Notes sent since the last submission, so a model that keeps trying is not told forever.
-    notes: u32,
-    /// The last update was part of a user message the runtime took.
-    echoing: bool,
-    /// What the model has said since its last message was recorded.
+    /// The model and thinking level the running process was started with.
+    started_with: (Option<String>, Option<String>),
+    /// The runtime's id of the main conversation.
+    conversation: Option<String>,
+    /// Messages handed to the runtime whose turn has not ended, oldest first. It runs one turn per message.
+    turns: VecDeque<Turn>,
+    /// The model said its turn is over while background work still runs; the stream holds what follows until it ends.
+    awaiting: bool,
+    /// What the model says in the step being streamed, and that step.
     text: String,
-    /// Tool calls already recorded, and those whose result was.
-    calls: HashSet<String>,
-    results: HashSet<String>,
+    text_step: Option<i64>,
+    /// Tool steps already recorded, and those whose result was.
+    calls: HashSet<i64>,
+    results: HashSet<i64>,
+    /// Commands running, by tool call id.
+    commands: BTreeMap<String, Command>,
+    /// Subagents' conversations that have not stopped, with when they started.
+    subagents: BTreeMap<String, i64>,
     model: Option<String>,
     thinking: Option<String>,
-    mcp: Option<Arc<McpServer>>,
+}
+
+impl Shared {
+    /// Forget the process: what it ran is gone with it.
+    fn reset(&mut self) -> (Option<Arc<Proc>>, Option<Bridge>) {
+        self.generation += 1;
+        self.turns.clear();
+        self.awaiting = false;
+        self.text.clear();
+        self.text_step = None;
+        self.calls.clear();
+        self.results.clear();
+        self.commands.clear();
+        self.subagents.clear();
+        (self.process.take(), self.bridge.take())
+    }
 }
 
 /// One Antigravity Session's runtime.
@@ -353,31 +546,45 @@ pub struct AntigravityDriver {
     events: mpsc::UnboundedSender<DriverEvent>,
     shared: Arc<Mutex<Shared>>,
     starting: tokio::sync::Mutex<()>,
+    weak: Weak<AntigravityDriver>,
 }
 
 fn lock(shared: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
     shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn clip(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
 impl AntigravityDriver {
     /// A driver that reports to `events` and serves the model's tool calls from `host`.
     pub fn new(options: AntigravityOptions, host: Arc<dyn ToolHost>, events: mpsc::UnboundedSender<DriverEvent>) -> Arc<AntigravityDriver> {
         let shared = Shared { model: options.model.clone(), thinking: options.thinking.clone(), ..Default::default() };
-        Arc::new(AntigravityDriver { options, host, events, shared: Arc::new(Mutex::new(shared)), starting: tokio::sync::Mutex::new(()) })
+        Arc::new_cyclic(|weak| AntigravityDriver {
+            options,
+            host,
+            events,
+            shared: Arc::new(Mutex::new(shared)),
+            starting: tokio::sync::Mutex::new(()),
+            weak: weak.clone(),
+        })
     }
 
     fn emit(&self, event: DriverEvent) {
         let _ = self.events.send(event);
     }
 
-    /// Mark the prompt that started the running turn taken once the runtime acts on it without echoing the user message.
+    /// The runtime acts on the message whose turn runs: report it taken once.
     fn take_started(&self) {
         let taken = {
             let mut shared = lock(&self.shared);
-            if shared.in_flight > 0 && shared.unechoed.len() >= shared.in_flight {
-                shared.unechoed.pop_front().and_then(|(_, submission)| submission)
-            } else {
-                None
+            match shared.turns.front_mut() {
+                Some(turn) if !turn.taken => {
+                    turn.taken = true;
+                    Some(turn.id.clone())
+                }
+                _ => None,
             }
         };
         if let Some(id) = taken {
@@ -385,275 +592,69 @@ impl AntigravityDriver {
         }
     }
 
-    /// Reset a broken runtime process and report its exit so un-taken submissions stay pending without wedging the turn.
-    async fn reset_broken(&self, error: String) {
-        let process = {
-            let mut shared = lock(&self.shared);
-            shared.generation += 1;
-            shared.session_id = None;
-            shared.in_flight = 0;
-            shared.queued.clear();
-            shared.unechoed.clear();
-            shared.refused.clear();
-            shared.text.clear();
-            for (_, answer) in shared.requests.drain() {
-                let _ = answer.send(Err("Antigravity ended before answering".into()));
-            }
-            shared.process.take()
-        };
-        if let Some(process) = process {
-            process.close(Duration::from_secs(3)).await;
+    /// The host's server, started once per driver.
+    async fn server(&self) -> Result<Arc<HostServer>, String> {
+        if let Some(server) = lock(&self.shared).server.clone() {
+            return Ok(server);
         }
-        self.emit(DriverEvent::Exited { error: Some(error), awaited: false });
+        let weak = self.weak.clone();
+        let on_call: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if let Some(driver) = weak.upgrade() {
+                driver.take_started();
+            }
+        });
+        let weak = self.weak.clone();
+        let on_hook: HookHandler = Arc::new(move |payload| {
+            let weak = weak.clone();
+            Box::pin(async move {
+                match weak.upgrade() {
+                    Some(driver) => driver.hook(payload).await,
+                    None => json!({"decision": "deny", "reason": "The Session has ended"}),
+                }
+            })
+        });
+        let server = Arc::new(start_server(self.host.clone(), Some(on_call), Some(on_hook)).await?);
+        lock(&self.shared).server = Some(server.clone());
+        Ok(server)
     }
 
-    /// The running process and its conversation, starting one that resumes `resume` when none runs.
-    async fn process(self: &Arc<Self>, resume: Option<String>) -> Result<(Arc<Proc>, String), String> {
+    /// The running process, starting one that continues `resume` when none runs. A process started with another model
+    /// is replaced once it has no turn.
+    async fn process(self: &Arc<Self>, resume: Option<String>) -> Result<Arc<Proc>, String> {
         let _one = self.starting.lock().await;
-        {
-            let shared = lock(&self.shared);
-            if let (Some(process), Some(id)) = (&shared.process, &shared.session_id) {
-                return Ok((process.clone(), id.clone()));
-            }
-        }
-        let known = lock(&self.shared).mcp.clone();
-        let mcp = match (self.host.specs().is_empty(), known) {
-            (true, _) => None,
-            (false, Some(server)) => Some(server),
-            (false, None) => {
-                let weak = Arc::downgrade(self);
-                let on_call: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                    if let Some(driver) = weak.upgrade() {
-                        driver.take_started();
-                    }
-                });
-                let server = Arc::new(start_mcp(self.host.clone(), Some(on_call)).await?);
-                lock(&self.shared).mcp = Some(server.clone());
-                Some(server)
+        let stale = {
+            let mut shared = lock(&self.shared);
+            let wanted = (shared.model.clone(), shared.thinking.clone());
+            match shared.process.clone() {
+                Some(process) if shared.started_with == wanted || !shared.turns.is_empty() => return Ok(process),
+                Some(_) => Some(shared.reset()),
+                None => None,
             }
         };
-        let (process, lines) = Proc::spawn(&launch(&self.options))?;
+        if let Some((Some(process), bridge)) = stale {
+            process.close(Duration::from_secs(5)).await;
+            drop(bridge);
+        }
+        let server = self.server().await?;
+        let mut options = self.options.clone();
+        let resume = {
+            let shared = lock(&self.shared);
+            options.model = shared.model.clone();
+            options.thinking = shared.thinking.clone();
+            shared.conversation.clone().or(resume)
+        };
+        let bridge = Bridge::create(&options, &server, !self.host.specs().is_empty())?;
+        let (process, lines) = Proc::spawn(&launch(&options, &bridge.dir, resume.as_deref()))?;
         let generation = {
             let mut shared = lock(&self.shared);
             shared.generation += 1;
             shared.process = Some(process.clone());
-            shared.session_id = None;
+            shared.bridge = Some(bridge);
+            shared.started_with = (options.model.clone(), options.thinking.clone());
             shared.generation
         };
         tokio::spawn(self.clone().read(lines, generation));
-        match tokio::time::timeout(Duration::from_secs(90), self.open(&process, mcp.as_deref(), resume)).await {
-            Ok(Ok(id)) => {
-                lock(&self.shared).session_id = Some(id.clone());
-                self.emit(DriverEvent::SessionId(id.clone()));
-                Ok((process, id))
-            }
-            failed => {
-                {
-                    let mut shared = lock(&self.shared);
-                    shared.generation += 1;
-                    shared.process = None;
-                }
-                process.close(Duration::from_secs(3)).await;
-                Err(match failed {
-                    Ok(Err(error)) => format!("Antigravity refused to start: {error}"),
-                    _ => "Antigravity did not answer within 90 seconds".into(),
-                })
-            }
-        }
-    }
-
-    /// Initialize the protocol and open the conversation: resume `resume`, else a new one.
-    async fn open(&self, process: &Proc, mcp: Option<&McpServer>, resume: Option<String>) -> Result<String, String> {
-        self.request(process, "initialize", json!({"protocolVersion": 1, "clientCapabilities": {}})).await?;
-        let servers: Vec<Value> = mcp
-            .map(|server| {
-                json!({"type": "http", "name": MCP_SERVER, "url": server.url, "headers": [{"name": "Authorization", "value": format!("Bearer {}", server.token)}]})
-            })
-            .into_iter()
-            .collect();
-        let mut params = json!({"cwd": self.options.cwd, "mcpServers": servers});
-        if !self.options.system_prompt.is_empty() {
-            params["_meta"] = json!({"antigravity": {"systemPrompt": {"append": self.options.system_prompt}}});
-        }
-        let resumed = match resume {
-            Some(id) => {
-                let mut params = params.clone();
-                params["sessionId"] = json!(id);
-                self.request(process, "session/resume", params).await.ok().map(|_| id)
-            }
-            None => None,
-        };
-        let id = match resumed {
-            Some(id) => id,
-            None => {
-                let opened = self.request(process, "session/new", params).await?;
-                opened["sessionId"].as_str().ok_or("session/new returned no session id")?.to_string()
-            }
-        };
-        let (model, thinking) = {
-            let shared = lock(&self.shared);
-            (shared.model.clone(), shared.thinking.clone())
-        };
-        self.configure(process, &id, model.as_deref(), thinking.as_deref()).await;
-        Ok(id)
-    }
-
-    /// Choose the conversation's model and thinking level; what the runtime refuses keeps its default.
-    async fn configure(&self, process: &Proc, id: &str, model: Option<&str>, thinking: Option<&str>) {
-        if let Some(model) = model.filter(|model| !model.is_empty()) {
-            let _ = self.request(process, "session/set_model", json!({"sessionId": id, "modelId": model})).await;
-        }
-        if let Some(level) = thought_level(thinking) {
-            let _ = self.request(process, "session/set_config_option", json!({"sessionId": id, "configId": "thought_level", "value": level})).await;
-        }
-    }
-
-    /// Send a request to the runtime and wait for its answer.
-    async fn request(&self, process: &Proc, method: &str, params: Value) -> Result<Value, String> {
-        let (id, answered) = self.register();
-        if let Err(error) = process.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})).await {
-            lock(&self.shared).requests.remove(&id);
-            return Err(error);
-        }
-        answered.await.unwrap_or_else(|_| Err("Antigravity ended before answering".into()))
-    }
-
-    fn register(&self) -> (u64, oneshot::Receiver<Result<Value, String>>) {
-        let (answer, answered) = oneshot::channel();
-        let mut shared = lock(&self.shared);
-        shared.next_request += 1;
-        let id = shared.next_request;
-        shared.requests.insert(id, answer);
-        (id, answered)
-    }
-
-    /// Send a prompt; its answer, which comes when the turn it joined ends, is handled off this call.
-    /// Boxed with its `Send` bound spelled out: an answer may send the next prompt, which makes the future recursive.
-    fn prompt(self: &Arc<Self>, process: Arc<Proc>, session: String, submission: Option<String>, content: Value) -> BoxFut<'static, Result<(), String>> {
-        let driver = self.clone();
-        Box::pin(async move { driver.send_prompt(process, &session, submission, content).await })
-    }
-
-    async fn send_prompt(self: &Arc<Self>, process: Arc<Proc>, session: &str, submission: Option<String>, content: Value) -> Result<(), String> {
-        let (id, answered) = self.register();
-        let generation = {
-            let mut shared = lock(&self.shared);
-            shared.in_flight += 1;
-            if submission.is_some() {
-                shared.notes = 0;
-            }
-            shared.unechoed.push_back((id, submission));
-            shared.generation
-        };
-        self.emit(DriverEvent::Running);
-        let sent = process.send(&json!({"jsonrpc": "2.0", "id": id, "method": "session/prompt", "params": {"sessionId": session, "prompt": content}})).await;
-        if let Err(error) = sent {
-            let mut shared = lock(&self.shared);
-            shared.requests.remove(&id);
-            shared.in_flight -= 1;
-            shared.unechoed.retain(|(known, _)| *known != id);
-            return Err(error);
-        }
-        let driver = self.clone();
-        tokio::spawn(async move {
-            let answer = answered.await.unwrap_or_else(|_| Err("Antigravity ended before answering".into()));
-            driver.answered(generation, id, answer).await;
-        });
-        Ok(())
-    }
-
-    /// A prompt's answer came: record what the model said, then run the next follow-up or report the runtime idle.
-    async fn answered(self: &Arc<Self>, generation: u64, request_id: u64, answer: Result<Value, String>) {
-        let (taken, broken, said, next) = {
-            let mut shared = lock(&self.shared);
-            if shared.generation != generation {
-                return;
-            }
-            shared.in_flight = shared.in_flight.saturating_sub(1);
-            let untaken = shared
-                .unechoed
-                .iter()
-                .position(|(known, _)| *known == request_id)
-                .and_then(|index| shared.unechoed.remove(index))
-                .and_then(|(_, submission)| submission);
-            let text = std::mem::take(&mut shared.text);
-            if let Err(error) = &answer {
-                if untaken.is_some() {
-                    let detail = format!("{text}{error}").trim().to_string();
-                    (None, Some(detail), None, None)
-                } else {
-                    let said = Some(Message {
-                        role: Role::Assistant,
-                        content: vec![Block::text(format!("{text}{error}").trim().to_string())],
-                        stop_reason: Some("error".into()),
-                    });
-                    let next = if shared.in_flight > 0 {
-                        None
-                    } else {
-                        shared.refused.clear();
-                        shared.queued.pop_front().map(|(id, content)| (Some(id), content))
-                    };
-                    (None, None, said, next.map(|next| (next, shared.process.clone(), shared.session_id.clone())))
-                }
-            } else {
-                let result = answer.as_ref().expect("checked Ok");
-                let taken = untaken;
-                let said = (!text.trim().is_empty()).then(|| Message {
-                    role: Role::Assistant,
-                    content: vec![Block::text(text)],
-                    stop_reason: Some(stop_reason(result["stopReason"].as_str().unwrap_or("end_turn")).into()),
-                });
-                if result["stopReason"] == "cancelled" {
-                    shared.refused.clear();
-                }
-                let next = if shared.in_flight > 0 {
-                    None
-                } else if !shared.refused.is_empty() && shared.notes < MAX_NOTES {
-                    shared.notes += 1;
-                    let reasons = std::mem::take(&mut shared.refused).join("\n");
-                    Some((
-                        None,
-                        json!([{"type": "text", "text": format!("[Neo] These tool calls were refused and did not run:\n{reasons}\nContinue without them.")}]),
-                    ))
-                } else {
-                    shared.refused.clear();
-                    shared.queued.pop_front().map(|(id, content)| (Some(id), content))
-                };
-                (taken, None, said, next.map(|next| (next, shared.process.clone(), shared.session_id.clone())))
-            }
-        };
-        if let Some(detail) = broken {
-            self.reset_broken(detail).await;
-            return;
-        }
-        if let Some(id) = taken {
-            self.emit(DriverEvent::Taken(id));
-        }
-        if let Some(message) = said {
-            self.emit(DriverEvent::Message(message));
-        }
-        match next {
-            Some(((submission, content), Some(process), Some(session))) => {
-                if let Err(error) = self.prompt(process, session, submission.clone(), content).await {
-                    if submission.is_some() {
-                        self.reset_broken(error).await;
-                    } else {
-                        self.emit(DriverEvent::Message(Message {
-                            role: Role::Assistant,
-                            content: vec![Block::text(error)],
-                            stop_reason: Some("error".into()),
-                        }));
-                        self.emit(DriverEvent::Idle { awaiting_async: false });
-                    }
-                }
-            }
-            Some(_) => {}
-            None => {
-                if lock(&self.shared).in_flight == 0 {
-                    self.emit(DriverEvent::Idle { awaiting_async: false });
-                }
-            }
-        }
+        Ok(process)
     }
 
     async fn read(self: Arc<Self>, mut lines: mpsc::UnboundedReceiver<Line>, generation: u64) {
@@ -662,160 +663,281 @@ impl AntigravityDriver {
                 return;
             }
             match line {
-                Line::Json(value) => self.handle(value).await,
+                Line::Json(value) => self.handle(&value),
                 Line::Exited(error) => {
-                    {
+                    let (awaited, _process, bridge) = {
                         let mut shared = lock(&self.shared);
-                        shared.generation += 1;
-                        shared.process = None;
-                        shared.session_id = None;
-                        shared.in_flight = 0;
-                        shared.queued.clear();
-                        shared.unechoed.clear();
-                        shared.refused.clear();
-                        shared.text.clear();
-                        for (_, answer) in shared.requests.drain() {
-                            let _ = answer.send(Err("Antigravity ended before answering".into()));
-                        }
-                    }
-                    self.emit(DriverEvent::Exited { error, awaited: false });
+                        let awaited = shared.awaiting || !shared.subagents.is_empty();
+                        let (process, bridge) = shared.reset();
+                        (awaited, process, bridge)
+                    };
+                    drop(bridge);
+                    self.emit(DriverEvent::Exited { error, awaited });
                     return;
                 }
             }
         }
     }
 
-    async fn handle(self: &Arc<Self>, line: Value) {
-        let method = line["method"].as_str();
-        match (method, line.get("id").filter(|id| !id.is_null())) {
-            // An answer to one of our requests.
-            (None, Some(id)) => {
-                let Some(answer) = id.as_u64().and_then(|id| lock(&self.shared).requests.remove(&id)) else { return };
-                let _ = answer.send(match line.get("error") {
-                    Some(error) => Err(error["message"].as_str().map(str::to_string).unwrap_or_else(|| error.to_string())),
-                    None => Ok(line["result"].clone()),
-                });
+    fn handle(&self, line: &Value) {
+        match line["event"].as_str().unwrap_or("") {
+            "init" => {
+                let Some(id) = line["conversation_id"].as_str().or(line["init"]["conversation_id"].as_str()) else { return };
+                let changed = {
+                    let mut shared = lock(&self.shared);
+                    shared.conversation.as_deref() != Some(id) && {
+                        shared.conversation = Some(id.to_string());
+                        true
+                    }
+                };
+                if changed {
+                    self.emit(DriverEvent::SessionId(id.to_string()));
+                }
             }
-            // A request of the runtime, answered off the reading task so a slow guard does not hold up the stream.
-            (Some(_), Some(_)) => {
-                let driver = self.clone();
-                tokio::spawn(async move { driver.serve(line).await });
-            }
-            (Some("session/update"), None) => self.update(&line["params"]["update"]),
+            "step_update" => self.step(&line["step_update"]),
+            "result" => self.result(&line["result"]),
             _ => {}
         }
     }
 
-    fn update(&self, update: &Value) {
-        let kind = update["sessionUpdate"].as_str().unwrap_or("");
+    /// One step of the main conversation, begun or done.
+    fn step(&self, step: &Value) {
+        let index = step["step_index"].as_i64().unwrap_or(-1);
+        let state = step["state"].as_str().unwrap_or("");
+        let done = matches!(state, "DONE" | "ERROR" | "CANCELED" | "CANCELLED");
+        let kind = step["step_type"].as_str().unwrap_or("");
+        if matches!(kind, "user_input" | "agent_response" | "tool" | "subagent") {
+            self.take_started();
+        }
         let mut emitted = Vec::new();
         {
             let mut shared = lock(&self.shared);
-            // Outside a prompt nothing would end the turn the update starts.
-            if shared.in_flight == 0 {
-                return;
-            }
-            let echoing = std::mem::replace(&mut shared.echoing, kind == "user_message_chunk");
-            if matches!(kind, "agent_thought_chunk" | "thought_chunk" | "agent_message_chunk" | "tool_call" | "tool_call_update" | "plan")
-                && shared.unechoed.len() >= shared.in_flight
-            {
-                // Antigravity 1.5.10+ begins the model's step without echoing `user_message_chunk`.
-                if let Some((_, Some(id))) = shared.unechoed.pop_front() {
-                    emitted.push(DriverEvent::Taken(id));
-                }
-            }
             match kind {
-                "user_message_chunk" if !echoing => {
-                    // The runtime echoed a submission it took into a step; its blocks arrive as consecutive chunks.
-                    if let Some((_, Some(id))) = shared.unechoed.pop_front() {
-                        emitted.push(DriverEvent::Taken(id));
-                    }
-                }
-                "agent_message_chunk" => {
-                    if let Some(text) = update["content"]["text"].as_str().filter(|_| update["content"]["type"] == "text") {
-                        shared.text.push_str(text);
-                    }
-                }
-                "tool_call" | "tool_call_update" => {
-                    let Some(id) = update["toolCallId"].as_str() else { return };
-                    if shared.calls.insert(id.to_string()) {
-                        let name = update["name"].as_str().or(update["title"].as_str()).unwrap_or("tool").to_string();
-                        let arguments = update.get("rawInput").or(update.get("args")).cloned().unwrap_or_else(|| json!({}));
-                        let mut content = Vec::new();
-                        let text = std::mem::take(&mut shared.text);
-                        if !text.trim().is_empty() {
-                            content.push(Block::text(text));
+                "agent_response" => {
+                    if shared.text_step != Some(index) {
+                        let said = std::mem::take(&mut shared.text);
+                        if !said.trim().is_empty() {
+                            emitted.push(Message { role: Role::Assistant, content: vec![Block::text(said.trim())], stop_reason: Some("stop".into()) });
                         }
-                        content.push(Block::ToolCall { id: id.to_string(), name, arguments });
-                        emitted.push(DriverEvent::Message(Message { role: Role::Assistant, content, stop_reason: Some("toolUse".into()) }));
+                        shared.text_step = Some(index);
                     }
-                    let finished = matches!(update["status"].as_str(), Some("completed" | "failed"));
-                    if finished && shared.results.insert(id.to_string()) {
-                        let text: String = tool_output(update).chars().take(2000).collect();
-                        emitted.push(DriverEvent::Message(Message { role: Role::ToolResult, content: vec![Block::text(text)], stop_reason: None }));
+                    if let Some(delta) = step["text_delta"].as_str() {
+                        shared.text.push_str(delta);
+                    }
+                    if done {
+                        let said = std::mem::take(&mut shared.text);
+                        shared.text_step = None;
+                        if !said.trim().is_empty() {
+                            emitted.push(Message { role: Role::Assistant, content: vec![Block::text(said.trim())], stop_reason: Some("stop".into()) });
+                        }
+                    }
+                }
+                "tool" | "subagent" => {
+                    let info = if kind == "tool" { &step["tool_info"] } else { &step["subagent_info"] };
+                    if shared.calls.insert(index) {
+                        let name = step["tool_name"].as_str().or(info["name"].as_str()).unwrap_or(kind).to_string();
+                        let arguments = if kind == "tool" { info["parameters"].clone() } else { info.clone() };
+                        emitted.push(Message {
+                            role: Role::Assistant,
+                            content: vec![Block::ToolCall { id: format!("step-{index}"), name, arguments }],
+                            stop_reason: Some("toolUse".into()),
+                        });
+                    }
+                    if done && shared.results.insert(index) {
+                        let text = info["output"]
+                            .as_str()
+                            .map(str::to_string)
+                            .or_else(|| info["error"]["message"].as_str().map(str::to_string))
+                            .unwrap_or_else(|| if kind == "subagent" { format!("subagent {}", state.to_lowercase()) } else { state.to_lowercase() });
+                        emitted.push(Message { role: Role::ToolResult, content: vec![Block::text(clip(&text, 2000))], stop_reason: None });
                     }
                 }
                 _ => {}
             }
         }
-        for event in emitted {
-            self.emit(event);
+        for message in emitted {
+            self.emit(DriverEvent::Message(message));
         }
     }
 
-    /// Answer a request of the runtime: a permission request goes to the guard; nothing else is offered.
-    async fn serve(&self, line: Value) {
-        let id = line["id"].clone();
-        let answer = match line["method"].as_str().unwrap_or("") {
-            "session/request_permission" => {
-                self.take_started();
-                let params = &line["params"];
-                let call = &params["toolCall"];
-                let tool = call["name"].as_str().unwrap_or("");
-                let input = call.get("rawInput").or(call.get("args")).cloned().unwrap_or_else(|| json!({}));
-                let refusal = match self.permitted(tool, call["kind"].as_str(), &input) {
-                    Ok((name, input)) => match self.host.guard(&name, &input).await {
-                        Guard::Allow => None,
-                        Guard::Block(reason) => Some(reason),
-                    },
-                    Err(()) => Some("This Session cannot use that tool".to_string()),
-                };
-                let allowed = refusal.is_none();
-                if let Some(reason) = refusal {
-                    let what = call["title"].as_str().filter(|title| !title.is_empty()).unwrap_or(tool);
-                    lock(&self.shared).refused.push(format!("- {tool} `{what}`: {reason}"));
-                }
-                let wanted: &[&str] = if allowed { &["allow_once", "allow_always"] } else { &["reject_once", "reject_always"] };
-                let options = params["options"].as_array().cloned().unwrap_or_default();
-                let chosen =
-                    wanted.iter().find_map(|kind| options.iter().find(|option| option["kind"] == *kind)).and_then(|option| option["optionId"].as_str());
-                let outcome = match chosen {
-                    Some(option) => json!({"outcome": "selected", "optionId": option}),
-                    None => json!({"outcome": "cancelled"}),
-                };
-                json!({"jsonrpc": "2.0", "id": id, "result": {"outcome": outcome}})
-            }
-            method => json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": format!("Method not found: {method}")}}),
+    /// A turn ended: the oldest message's.
+    fn result(&self, result: &Value) {
+        let failed = result["status"] != "SUCCESS";
+        let error = result["error"].as_str().filter(|error| !error.is_empty()).unwrap_or("Antigravity failed").to_string();
+        let interrupted = result["finished_reason"] == "interrupted";
+        let (turn, said, idle) = {
+            let mut shared = lock(&self.shared);
+            let said = std::mem::take(&mut shared.text);
+            shared.text_step = None;
+            shared.awaiting = false;
+            // The turn ran to its end, background work included.
+            let main = shared.conversation.clone();
+            shared.commands.retain(|_, command| Some(&command.conversation) != main.as_ref());
+            shared.subagents.clear();
+            let turn = shared.turns.pop_front();
+            (turn, said, shared.turns.is_empty())
         };
-        let Some(process) = lock(&self.shared).process.clone() else { return };
-        let _ = process.send(&answer).await;
-    }
-
-    /// Whether this Session may use a runtime tool at all, and if so what the guard judges.
-    fn permitted(&self, tool: &str, kind: Option<&str>, input: &Value) -> Result<(String, Value), ()> {
-        let (name, input) = host_view(tool, kind, input);
-        let allowed = |kind: &str| self.options.tools.iter().any(|known| known == kind);
-        let ok = if TOOL_KINDS.contains(&name.as_str()) { allowed(&name) } else { self.host.specs().iter().any(|spec| spec.name == name) || allowed("bash") };
-        if ok {
-            Ok((name, input))
-        } else {
-            Err(())
+        let Some(turn) = turn else { return };
+        if failed && !turn.taken {
+            // The runtime refused the message before acting on it: it stays pending, and a new process tries again.
+            let driver = self.weak.upgrade();
+            tokio::spawn(async move {
+                if let Some(driver) = driver {
+                    driver.reset_broken(error).await;
+                }
+            });
+            return;
+        }
+        if !turn.taken {
+            self.emit(DriverEvent::Taken(turn.id.clone()));
+        }
+        if !said.trim().is_empty() {
+            self.emit(DriverEvent::Message(Message { role: Role::Assistant, content: vec![Block::text(said.trim())], stop_reason: Some("stop".into()) }));
+        }
+        if failed {
+            let stop = if interrupted { "aborted" } else { "error" };
+            self.emit(DriverEvent::Message(Message { role: Role::Assistant, content: vec![Block::text(error)], stop_reason: Some(stop.into()) }));
+        }
+        if idle {
+            self.emit(DriverEvent::Idle { awaiting_async: false });
         }
     }
 
-    fn current(&self) -> Option<(Arc<Proc>, String)> {
-        let shared = lock(&self.shared);
-        Some((shared.process.clone()?, shared.session_id.clone()?))
+    /// End a process that refused a message, and report its exit so the message stays pending.
+    async fn reset_broken(&self, error: String) {
+        let (process, bridge) = lock(&self.shared).reset();
+        if let Some(process) = process {
+            process.close(Duration::from_secs(3)).await;
+        }
+        drop(bridge);
+        self.emit(DriverEvent::Exited { error: Some(error), awaited: false });
+    }
+
+    /// Answer a hook of the runtime.
+    async fn hook(&self, payload: Value) -> Value {
+        let conversation = payload["conversationId"].as_str().unwrap_or("").to_string();
+        let main = {
+            let mut shared = lock(&self.shared);
+            if shared.conversation.is_none() && !conversation.is_empty() {
+                shared.conversation = Some(conversation.clone());
+            }
+            shared.conversation.as_deref() == Some(conversation.as_str())
+        };
+        match payload["hookEventName"].as_str().unwrap_or("") {
+            "PreInvocation" => {
+                if main {
+                    self.take_started();
+                }
+                json!({})
+            }
+            "PreToolUse" => {
+                if main {
+                    self.take_started();
+                }
+                let call = &payload["toolCall"];
+                let tool = call["name"].as_str().unwrap_or("");
+                let input = call.get("args").cloned().unwrap_or_else(|| json!({}));
+                match self.judge(tool, &input).await {
+                    Guard::Allow => {
+                        let mut shared = lock(&self.shared);
+                        if !main {
+                            shared.subagents.entry(conversation.clone()).or_insert_with(now_ms);
+                        }
+                        if tool == "run_command" {
+                            if let Some(id) = call["id"].as_str() {
+                                let command = input["CommandLine"].as_str().unwrap_or("").to_string();
+                                shared.commands.insert(id.to_string(), Command { conversation, command, start_time: now_ms() });
+                            }
+                        }
+                        json!({"decision": "allow"})
+                    }
+                    Guard::Block(reason) => json!({"decision": "deny", "reason": reason}),
+                }
+            }
+            "PostToolUse" => {
+                if let Some(id) = payload["toolCall"]["id"].as_str() {
+                    lock(&self.shared).commands.remove(id);
+                }
+                json!({})
+            }
+            "Stop" => {
+                let backgrounded = {
+                    let mut shared = lock(&self.shared);
+                    if main {
+                        let waiting = payload["fullyIdle"] == false && !shared.turns.is_empty();
+                        let first = waiting && !shared.awaiting;
+                        shared.awaiting = waiting;
+                        first
+                    } else {
+                        shared.subagents.remove(&conversation);
+                        false
+                    }
+                };
+                // The stream shows nothing more until the background work ends, so the turn is reported over now.
+                if backgrounded {
+                    self.emit(DriverEvent::Idle { awaiting_async: true });
+                }
+                json!({})
+            }
+            _ => json!({}),
+        }
+    }
+
+    /// Whether a tool call may run: the Session's tools, Neo's bridge left alone, then the guard.
+    async fn judge(&self, tool: &str, input: &Value) -> Guard {
+        if tool == "call_mcp_tool" {
+            // The host's tools are judged by name where they run, in the MCP server.
+            return if input["ServerName"].as_str() == Some(mcp_server_name().as_str()) {
+                Guard::Allow
+            } else {
+                Guard::Block("Only Neo's application tools are available here".into())
+            };
+        }
+        let (name, input) = host_view(tool, input);
+        let allowed = |kind: &str| self.options.tools.iter().any(|known| known == kind);
+        let permitted =
+            if TOOL_KINDS.contains(&name.as_str()) { allowed(&name) } else { self.host.specs().iter().any(|spec| spec.name == name) || allowed("bash") };
+        if !permitted {
+            return Guard::Block("This Session cannot use that tool".into());
+        }
+        if matches!(name.as_str(), "edit" | "write") {
+            let path = input["path"].as_str().unwrap_or("");
+            if lock(&self.shared).bridge.as_ref().is_some_and(|bridge| bridge.holds(path)) {
+                return Guard::Block("That folder is Neo's link to this runtime; leave it alone".into());
+            }
+        }
+        self.host.guard(&name, &input).await
+    }
+
+    /// The message's text; images are saved in the bridge for the model to view.
+    fn message_text(&self, content: &[Block]) -> String {
+        let dir = lock(&self.shared).bridge.as_ref().map(|bridge| bridge.dir.join("images"));
+        let mut parts = Vec::new();
+        for block in content {
+            match block {
+                Block::Text { text } => parts.push(text.clone()),
+                Block::Image { mime_type, data } => {
+                    let extension = mime_type.rsplit('/').next().unwrap_or("png").replace("jpeg", "jpg");
+                    let saved = dir.as_ref().and_then(|dir| {
+                        let path = dir.join(format!("{}.{extension}", uuid()));
+                        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data).ok()?;
+                        std::fs::create_dir_all(dir).ok()?;
+                        std::fs::write(&path, bytes).ok()?;
+                        Some(path)
+                    });
+                    parts.push(match saved {
+                        Some(path) => format!("[Image attached at {}; look at it with view_file]", path.display()),
+                        None => "[An image was attached but could not be saved]".into(),
+                    });
+                }
+                Block::ToolCall { name, .. } => parts.push(format!("[tool call {name}]")),
+            }
+        }
+        parts.join("\n\n")
+    }
+
+    fn current(&self) -> Option<Arc<Proc>> {
+        lock(&self.shared).process.clone()
     }
 }
 
@@ -826,69 +948,110 @@ impl Driver for Antigravity {
     fn kernel(&self) -> &'static str {
         "antigravity"
     }
-    fn submit<'a>(&'a self, id: &'a str, content: &'a [Block], deliver: Deliver, resume: Option<String>) -> BoxFut<'a, Result<(), String>> {
+    fn submit<'a>(&'a self, id: &'a str, content: &'a [Block], _deliver: Deliver, resume: Option<String>) -> BoxFut<'a, Result<(), String>> {
         Box::pin(async move {
-            let (process, session) = self.0.process(resume).await?;
-            let content = prompt_content(content);
-            // A steered message joins the running turn at its next tool boundary; a follow-up waits for the turn to end.
-            {
-                let mut shared = lock(&self.0.shared);
-                if deliver == Deliver::FollowUp && (shared.in_flight > 0 || !shared.queued.is_empty()) {
-                    shared.queued.push_back((id.to_string(), content));
-                    return Ok(());
-                }
+            let process = self.0.process(resume).await?;
+            let text = self.0.message_text(content);
+            // The runtime runs one turn per message, in order: a message sent during a turn waits for it to end.
+            lock(&self.0.shared).turns.push_back(Turn { id: id.to_string(), taken: false });
+            self.0.emit(DriverEvent::Running);
+            let sent = process.send(&json!({"event": "user", "message": {"content": text}})).await;
+            if sent.is_err() {
+                lock(&self.0.shared).turns.retain(|turn| turn.id != id);
             }
-            self.0.prompt(process, session, Some(id.to_string()), content).await
+            sent
         })
     }
     fn interrupt(&self) -> BoxFut<'_, ()> {
+        // The runtime has no way to cancel a turn but ending its process; the next message continues the conversation.
         Box::pin(async move {
-            if let Some((process, session)) = self.0.current() {
-                let _ = process.send(&json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": session}})).await;
+            let (process, bridge, untaken, busy) = {
+                let mut shared = lock(&self.0.shared);
+                let untaken = shared.turns.iter().any(|turn| !turn.taken);
+                let busy = !shared.turns.is_empty();
+                let (process, bridge) = shared.reset();
+                (process, bridge, untaken, busy)
+            };
+            if let Some(process) = process {
+                process.close(Duration::from_secs(3)).await;
+            }
+            drop(bridge);
+            if untaken {
+                self.0.emit(DriverEvent::Exited { error: None, awaited: false });
+            } else if busy {
+                self.0.emit(DriverEvent::Message(Message {
+                    role: Role::Assistant,
+                    content: vec![Block::text("Interrupted")],
+                    stop_reason: Some("aborted".into()),
+                }));
+                self.0.emit(DriverEvent::Idle { awaiting_async: false });
             }
         })
     }
     fn jobs(&self) -> BoxFut<'_, Vec<KernelJob>> {
-        // The runtime does not report its background commands over the protocol.
-        Box::pin(async { Vec::new() })
+        Box::pin(async move {
+            let shared = lock(&self.0.shared);
+            let main = shared.conversation.clone();
+            let mut jobs: Vec<KernelJob> = shared
+                .subagents
+                .iter()
+                .map(|(id, start)| KernelJob {
+                    id: id.clone(),
+                    kind: JobKind::Task,
+                    label: "subagent".into(),
+                    start_time: *start,
+                    progress: None,
+                    command: None,
+                    own: true,
+                    pids: Vec::new(),
+                })
+                .collect();
+            // A command of the main conversation is a background job once the model ended its turn while it runs.
+            jobs.extend(shared.commands.iter().filter(|(_, command)| Some(&command.conversation) != main.as_ref() || shared.awaiting).map(|(id, command)| {
+                KernelJob {
+                    id: id.clone(),
+                    kind: JobKind::Bash,
+                    label: command.command.clone(),
+                    start_time: command.start_time,
+                    progress: None,
+                    command: Some(command.command.clone()),
+                    own: Some(&command.conversation) == main.as_ref(),
+                    pids: Vec::new(),
+                }
+            }));
+            jobs
+        })
     }
     fn acknowledge<'a>(&'a self, _ids: &'a [String]) -> BoxFut<'a, ()> {
+        // The runtime wakes the model when its background work ends; nothing outside it can stop that.
         Box::pin(async {})
     }
     fn cancel<'a>(&'a self, _id: &'a str) -> BoxFut<'a, bool> {
+        // Nor can one job be stopped from outside.
         Box::pin(async { false })
     }
     fn set_model<'a>(&'a self, model: Option<&'a str>, thinking: Option<&'a str>) -> BoxFut<'a, ()> {
+        // The process takes them at its start; the next message starts one with them once no turn runs.
         Box::pin(async move {
-            {
-                let mut shared = lock(&self.0.shared);
-                shared.model = model.map(str::to_string);
-                shared.thinking = thinking.map(str::to_string);
-            }
-            if let Some((process, session)) = self.0.current() {
-                let _ = tokio::time::timeout(Duration::from_secs(20), self.0.configure(&process, &session, model, thinking)).await;
-            }
+            let mut shared = lock(&self.0.shared);
+            shared.model = model.map(str::to_string);
+            shared.thinking = thinking.map(str::to_string);
         })
     }
     fn pid(&self) -> Option<u32> {
-        lock(&self.0.shared).process.as_ref().map(|process| process.pid())
+        self.0.current().map(|process| process.pid())
     }
     fn close(&self) -> BoxFut<'_, ()> {
         Box::pin(async move {
-            let (process, _server) = {
+            let (process, bridge, _server) = {
                 let mut shared = lock(&self.0.shared);
-                // Lines of the closed process are ignored from here on.
-                shared.generation += 1;
-                shared.session_id = None;
-                shared.in_flight = 0;
-                shared.queued.clear();
-                shared.unechoed.clear();
-                shared.refused.clear();
-                (shared.process.take(), shared.mcp.take())
+                let (process, bridge) = shared.reset();
+                (process, bridge, shared.server.take())
             };
             if let Some(process) = process {
                 process.close(Duration::from_secs(5)).await;
             }
+            drop(bridge);
         })
     }
 }
@@ -898,28 +1061,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn maps_thinking_levels_to_the_three_antigravity_levels() {
-        assert_eq!(thought_level(None), None);
-        assert_eq!(thought_level(Some("auto")), None);
-        assert_eq!(thought_level(Some("off")), Some("low"));
-        assert_eq!(thought_level(Some("medium")), Some("medium"));
-        assert_eq!(thought_level(Some("max")), Some("high"));
+    fn maps_thinking_levels_to_efforts() {
+        assert_eq!(effort_of(None), None);
+        assert_eq!(effort_of(Some("auto")), None);
+        assert_eq!(effort_of(Some("off")), Some("low"));
+        assert_eq!(effort_of(Some("medium")), Some("medium"));
+        assert_eq!(effort_of(Some("max")), Some("max"));
     }
 
     #[test]
     fn sees_runtime_tools_as_the_host_names_them() {
-        assert_eq!(
-            host_view("run_command", Some("execute"), &json!({"CommandLine": "ls", "WaitMsBeforeAsync": 5000})),
-            ("bash".into(), json!({"command": "ls"}))
-        );
-        assert_eq!(host_view("write_file", Some("edit"), &json!({"Path": "/w/a.txt", "Content": "x"})), ("write".into(), json!({"path": "/w/a.txt"})));
-        assert_eq!(host_view("edit_file", Some("edit"), &json!({"Path": "/w/a", "Target": "x"})), ("edit".into(), json!({"path": "/w/a"})));
-        assert_eq!(host_view("multi_replace_file_content", None, &json!({"TargetFile": "/w/a"})).0, "edit");
-        assert_eq!(host_view("some_new_tool", Some("delete"), &json!({"Path": "/w/a"})).0, "edit");
-        assert_eq!(host_view("read_file", Some("read"), &json!({})).0, "read");
-        assert_eq!(host_view("invoke_subagent", Some("other"), &json!({})).0, "task");
-        assert_eq!(host_view("mcp_neo_ticket_report", Some("other"), &json!({"a": 1})), ("ticket_report".into(), json!({"a": 1})));
-        assert_eq!(host_view("read_url_content", Some("fetch"), &json!({})).0, "read_url_content");
+        assert_eq!(host_view("run_command", &json!({"CommandLine": "ls", "WaitMsBeforeAsync": 5000})), ("bash".into(), json!({"command": "ls"})));
+        assert_eq!(host_view("write_file", &json!({"Path": "/w/a.txt", "Content": "x"})), ("write".into(), json!({"path": "/w/a.txt"})));
+        assert_eq!(host_view("replace_file_content", &json!({"TargetFile": "/w/a"})), ("edit".into(), json!({"path": "/w/a"})));
+        assert_eq!(host_view("read_file", &json!({})).0, "read");
+        assert_eq!(host_view("invoke_subagent", &json!({})).0, "task");
+        assert_eq!(host_view("read_url_content", &json!({})).0, "read_url_content");
     }
 
     #[test]
@@ -941,21 +1098,58 @@ mod tests {
     }
 
     #[test]
-    fn reads_tool_output_from_content_or_raw_output() {
-        let content = json!({"status": "completed", "content": [{"type": "content", "content": {"type": "text", "text": "done"}}]});
-        assert_eq!(tool_output(&content), "done");
-        assert_eq!(tool_output(&json!({"status": "completed", "rawOutput": {"output": "out"}})), "out");
-        assert_eq!(tool_output(&json!({"status": "failed"})), "failed");
-        assert_eq!(stop_reason("cancelled"), "aborted");
-        assert_eq!(stop_reason("end_turn"), "stop");
+    fn puts_the_bridge_after_the_working_directory_in_path_order() {
+        for cwd in ["/w/ticket", "/w/a", "/w/zzz", "/"] {
+            let cwd = Path::new(cwd);
+            let bridge = bridge_dir(cwd, "abcd1234");
+            assert!(cwd.as_os_str() < bridge.as_os_str(), "{bridge:?}");
+            assert!(bridge.to_string_lossy().starts_with(&*cwd.to_string_lossy()));
+        }
+        assert_eq!(bridge_dir(Path::new("/w/ticket"), "x"), PathBuf::from("/w/ticket.neo-x"));
     }
 
     #[test]
-    fn sends_images_as_acp_image_blocks() {
-        assert_eq!(
-            prompt_content(&[Block::text("see"), Block::Image { mime_type: "image/png".into(), data: "AAAA".into() }]),
-            json!([{"type": "text", "text": "see"}, {"type": "image", "mimeType": "image/png", "data": "AAAA"}])
-        );
+    fn writes_the_agent_with_the_tools_of_its_kinds_and_its_prompt() {
+        let options =
+            AntigravityOptions { system_prompt: "Be brief.\n".into(), tools: vec!["read".into(), "bash".into(), "read".into()], ..Default::default() };
+        let agent = agent_file(&options);
+        assert!(agent.starts_with(&format!("---\nname: {AGENT}\n")), "{agent}");
+        assert!(agent.contains("plugins:\n  - neo\n"), "{agent}");
+        assert!(agent.contains("tools: [view_file, list_dir, grep_search, find_by_name, run_command,"), "{agent}");
+        assert!(!agent.contains("write_to_file"));
+        assert!(agent.ends_with("---\nBe brief.\n"), "{agent}");
+    }
+
+    #[test]
+    fn hooks_every_tool_call_and_the_ends_of_turns() {
+        let hooks = hooks_file("relay");
+        assert_eq!(hooks["neo"]["PreToolUse"][0]["matcher"], "*");
+        assert_eq!(hooks["neo"]["PreToolUse"][0]["hooks"][0]["command"], "relay");
+        assert_eq!(hooks["neo"]["Stop"][0]["command"], "relay");
+        assert_eq!(hooks["neo"]["PreInvocation"][0]["command"], "relay");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quotes_the_relay_for_the_shell() {
+        assert_eq!(shell_command(&["/a b/neo-agent".into(), "agy-hook".into(), "it's".into()]), "'/a b/neo-agent' 'agy-hook' 'it'\\''s'");
+    }
+
+    #[test]
+    fn builds_the_command_line() {
+        let options =
+            AntigravityOptions { program: "agy".into(), cwd: "/w".into(), model: Some("gemini-x".into()), thinking: Some("high".into()), ..Default::default() };
+        let args = launch(&options, Path::new("/w.neo-1"), Some("c-1")).args;
+        let after = |flag: &str| args.iter().position(|arg| arg == flag).map(|index| args[index + 1].clone());
+        assert_eq!(after("--add-dir").as_deref(), Some("/w.neo-1"));
+        assert_eq!(after("--agent").as_deref(), Some(AGENT));
+        assert_eq!(after("--model").as_deref(), Some("gemini-x"));
+        assert_eq!(after("--effort").as_deref(), Some("high"));
+        assert_eq!(after("--conversation").as_deref(), Some("c-1"));
+        assert_eq!(after("--settings").as_deref(), Some(r#"{"permissions":{"allow":["mcp(neo_neo/*)"]}}"#));
+        assert_eq!(args.last().map(String::as_str), Some("-p="));
+        assert!(args.contains(&"--disable-slash-commands".to_string()));
+        assert!(!launch(&AntigravityOptions::default(), Path::new("/b"), None).args.iter().any(|arg| arg == "--conversation" || arg == "--model"));
     }
 
     struct Echo;
@@ -968,7 +1162,7 @@ mod tests {
         }
         fn guard<'a>(&'a self, _tool: &'a str, input: &'a Value) -> BoxFut<'a, Guard> {
             Box::pin(async move {
-                if input["text"] == "no" {
+                if input["text"] == "no" || input["command"].as_str().is_some_and(|command| command.contains("forbidden")) {
                     Guard::Block("refused".into())
                 } else {
                     Guard::Allow
@@ -977,11 +1171,13 @@ mod tests {
         }
     }
 
-    async fn post(url: &str, token: &str, body: &Value) -> (u16, Option<Value>) {
-        let address = url.trim_start_matches("http://").split('/').next().unwrap().to_string();
+    async fn post(url: &str, token: Option<&str>, body: &Value) -> (u16, Option<Value>) {
+        let rest = url.trim_start_matches("http://");
+        let (address, path) = rest.split_once('/').map(|(address, path)| (address.to_string(), format!("/{path}"))).unwrap();
         let mut stream = TcpStream::connect(address).await.unwrap();
         let body = serde_json::to_vec(body).unwrap();
-        let head = format!("POST /mcp HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+        let auth = token.map(|token| format!("Authorization: Bearer {token}\r\n")).unwrap_or_default();
+        let head = format!("POST {path} HTTP/1.1\r\nHost: x\r\n{auth}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len());
         stream.write_all(head.as_bytes()).await.unwrap();
         stream.write_all(&body).await.unwrap();
         let mut reply = String::new();
@@ -993,19 +1189,41 @@ mod tests {
 
     #[tokio::test]
     async fn serves_the_host_tools_over_mcp_to_the_token_holder_only() {
-        let server = start_mcp(Arc::new(Echo), None).await.unwrap();
-        let (status, _) = post(&server.url, "wrong", &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).await;
+        let server = start_server(Arc::new(Echo), None, None).await.unwrap();
+        let url = server.mcp_url();
+        let (status, _) = post(&url, Some("wrong"), &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).await;
         assert_eq!(status, 401);
-        let (_, listed) = post(&server.url, &server.token, &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).await;
+        let (_, listed) = post(&url, Some(&server.token), &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).await;
         assert_eq!(listed.unwrap()["result"]["tools"][0]["name"], "echo");
-        assert_eq!(post(&server.url, &server.token, &json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await, (202, None));
+        assert_eq!(post(&url, Some(&server.token), &json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await, (202, None));
         let call = |text: &str| json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "echo", "arguments": {"text": text, "toolSummary": "s"}}});
-        let (_, called) = post(&server.url, &server.token, &call("hi")).await;
+        let (_, called) = post(&url, Some(&server.token), &call("hi")).await;
         assert_eq!(called.unwrap()["result"]["content"][0]["text"], json!({"text": "hi"}).to_string());
-        let (_, blocked) = post(&server.url, &server.token, &call("no")).await;
+        let (_, blocked) = post(&url, Some(&server.token), &call("no")).await;
         assert_eq!(blocked.unwrap()["result"], json!({"isError": true, "content": [{"type": "text", "text": "refused"}]}));
-        let (_, unknown) = post(&server.url, &server.token, &json!({"jsonrpc": "2.0", "id": 3, "method": "server/discover"})).await;
-        assert_eq!(unknown.unwrap()["error"]["code"], -32601);
+        // The hooks' endpoint is the token's own path.
+        let (status, _) = post(&format!("http://127.0.0.1:{}/hook/wrong", server.port), None, &json!({})).await;
+        assert_eq!(status, 401);
+    }
+
+    #[tokio::test]
+    async fn relays_a_hook_and_fails_when_the_host_is_gone() {
+        let on_hook: HookHandler = Arc::new(|payload| Box::pin(async move { json!({"decision": "deny", "reason": payload["toolCall"]["name"]}) }));
+        let server = start_server(Arc::new(Echo), None, Some(on_hook)).await.unwrap();
+        let url = server.hook_url();
+        let relayed = tokio::task::spawn_blocking(move || {
+            let mut output = Vec::new();
+            relay_hook(&url, &mut &br#"{"toolCall": {"name": "run_command"}}"#[..], &mut output).map(|_| output)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&relayed).unwrap(), json!({"decision": "deny", "reason": "run_command"}));
+        let wrong = format!("http://127.0.0.1:{}/hook/wrong", server.port);
+        let refused = tokio::task::spawn_blocking(move || relay_hook(&wrong, &mut &b"{}"[..], &mut Vec::new())).await.unwrap();
+        assert!(refused.unwrap_err().contains("401"));
+        drop(server);
+        assert!(relay_hook("http://127.0.0.1:1/hook/x", &mut &b"{}"[..], &mut Vec::new()).is_err());
     }
 
     #[cfg(unix)]
@@ -1016,95 +1234,119 @@ mod tests {
         use crate::types::KernelEvent;
         use std::os::unix::fs::PermissionsExt;
 
-        fn fake_acp(dir: &std::path::Path, script_body: &str) -> PathBuf {
-            let path = dir.join("fake-agy.py");
-            let script = format!("#!/usr/bin/env python3\nimport json, sys, time, urllib.request\n{script_body}\n");
-            std::fs::write(&path, script).unwrap();
+        /// A stand-in for `agy`: it reads the bridge the driver wrote, calls hooks and the MCP server as the runtime
+        /// would, and writes stream-json lines.
+        const FAKE_AGY: &str = r#"#!/usr/bin/env python3
+import json, sys, os, subprocess, urllib.request, glob, re
+args = sys.argv[1:]
+bridge = args[args.index("--add-dir") + 1]
+conv = args[args.index("--conversation") + 1] if "--conversation" in args else "conv-1"
+plugin = os.path.join(bridge, ".agents", "plugins", "neo")
+hooks = json.load(open(os.path.join(plugin, "hooks.json")))["neo"]
+mcp = json.load(open(os.path.join(plugin, "mcp_config.json")))["mcpServers"].get("neo")
+agent = open(os.path.join(bridge, ".agents", "agents", "neo-session.md")).read()
+def out(event, body):
+    sys.stdout.write(json.dumps({"event": event, event: dict(body, conversation_id=conv)}) + "\n"); sys.stdout.flush()
+def hook(name, payload):
+    handler = hooks[name][0]["hooks"][0] if name in ("PreToolUse", "PostToolUse") else hooks[name][0]
+    payload = dict(payload, hookEventName=name, conversationId=payload.get("conversationId", conv))
+    done = subprocess.run(handler["command"], shell=True, input=json.dumps(payload).encode(), capture_output=True)
+    if done.returncode != 0: return {"decision": "deny", "reason": "hook failed"}
+    return json.loads(done.stdout or b"{}")
+def mcp_call(name, arguments):
+    req = urllib.request.Request(mcp["url"], data=json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": name, "arguments": arguments}}).encode(), headers=mcp["headers"], method="POST")
+    return json.loads(urllib.request.urlopen(req, timeout=5).read())["result"]["content"][0]["text"]
+sys.stdout.write(json.dumps({"event": "init", "conversation_id": conv, "init": {"agent": "neo-session"}}) + "\n"); sys.stdout.flush()
+step = 0
+def next_step():
+    global step
+    step += 1
+    return step
+for raw in sys.stdin:
+    text = json.loads(raw)["message"]["content"]
+    if "refuse" in text:
+        out("result", {"status": "ERROR", "error": "agent refused to start", "num_turns": 0})
+        continue
+    out("step_update", {"step_index": next_step(), "state": "DONE", "step_type": "user_input"})
+    if "prompt?" in text:
+        out("step_update", {"step_index": next_step(), "state": "DONE", "step_type": "agent_response", "text_delta": "prompt says: " + agent.split("---\n")[-1].strip()})
+    if "tool" in text:
+        hook("PreInvocation", {})
+        decision = hook("PreToolUse", {"toolCall": {"id": "c1", "name": "call_mcp_tool", "args": {"ServerName": "neo_neo", "ToolName": "echo", "Arguments": {"text": "ok"}}}})
+        i = next_step()
+        out("step_update", {"step_index": i, "state": "ACTIVE", "step_type": "tool", "tool_name": "call_mcp_tool", "tool_info": {"name": "call_mcp_tool", "parameters": {"ToolName": "echo"}}})
+        result = mcp_call("echo", {"text": "ok", "toolSummary": "x"}) if decision.get("decision") == "allow" else decision.get("reason")
+        out("step_update", {"step_index": i, "state": "DONE", "step_type": "tool", "tool_name": "call_mcp_tool", "tool_info": {"name": "call_mcp_tool", "parameters": {"ToolName": "echo"}, "output": result}})
+        hook("PostToolUse", {"toolCall": {"id": "c1", "name": "call_mcp_tool"}})
+    if "forbidden" in text:
+        decision = hook("PreToolUse", {"toolCall": {"id": "c2", "name": "run_command", "args": {"CommandLine": "forbidden"}}})
+        i = next_step()
+        out("step_update", {"step_index": i, "state": "ERROR", "step_type": "tool", "tool_name": "run_command", "tool_info": {"name": "run_command", "parameters": {"CommandLine": "forbidden"}, "error": {"message": "denied: " + decision.get("reason", "")}}})
+    if "bridge" in text:
+        decision = hook("PreToolUse", {"toolCall": {"id": "c3", "name": "write_to_file", "args": {"TargetFile": os.path.join(bridge, "x")}}})
+        out("step_update", {"step_index": next_step(), "state": "DONE", "step_type": "agent_response", "text_delta": decision["decision"] + ": " + decision.get("reason", "")})
+    if "background" in text:
+        hook("PreToolUse", {"toolCall": {"id": "bg1", "name": "run_command", "args": {"CommandLine": "sleep 1"}}})
+        hook("Stop", {"fullyIdle": False})
+        open(os.path.join(bridge, "..", "bg-waiting"), "w").write("1")
+        import time
+        while not os.path.exists(os.path.join(bridge, "..", "bg-release")): time.sleep(0.05)
+        hook("PostToolUse", {"toolCall": {"id": "bg1", "name": "run_command"}})
+        hook("Stop", {"fullyIdle": True})
+        out("step_update", {"step_index": next_step(), "state": "DONE", "step_type": "agent_response", "text_delta": "background done"})
+    out("step_update", {"step_index": next_step(), "state": "ACTIVE", "step_type": "agent_response", "text_delta": "Done "})
+    out("step_update", {"step_index": step, "state": "DONE", "step_type": "agent_response", "text_delta": text[:12]})
+    out("result", {"status": "SUCCESS", "response": "", "num_turns": 1})
+"#;
+
+        /// A hook relay in Python, standing in for `neo-agent agy-hook`.
+        const RELAY: &str = r#"#!/usr/bin/env python3
+import sys, urllib.request
+req = urllib.request.Request(sys.argv[1], data=sys.stdin.buffer.read(), headers={"Content-Type": "application/json"}, method="POST")
+sys.stdout.write(urllib.request.urlopen(req, timeout=30).read().decode())
+"#;
+
+        fn script(dir: &Path, name: &str, text: &str) -> PathBuf {
+            let path = dir.join(name);
+            std::fs::write(&path, text).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             path
         }
 
-        #[tokio::test]
-        async fn marks_prompts_taken_and_ends_turns_without_user_message_chunks_or_on_steered_prompts() {
+        struct Fixture {
+            dir: PathBuf,
+            session: Arc<Session>,
+            events: tokio::sync::broadcast::Receiver<KernelEvent>,
+            driver: Arc<AntigravityDriver>,
+        }
+
+        fn fixture() -> Fixture {
             let dir = std::env::temp_dir().join(format!("neo-agy-test-{}-{}", std::process::id(), uuid()));
-            std::fs::create_dir_all(&dir).unwrap();
-            let program = fake_acp(
-                &dir,
-                r#"
-mcp_url = None
-mcp_auth = None
-held = []
-for raw in sys.stdin:
-    msg = json.loads(raw)
-    mid = msg.get("id")
-    method = msg.get("method")
-    if method == "initialize":
-        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1}}) + "\n")
-        sys.stdout.flush()
-    elif method == "session/new":
-        servers = msg["params"].get("mcpServers") or []
-        if servers:
-            mcp_url = servers[0]["url"]
-            mcp_auth = servers[0]["headers"][0]["value"]
-        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "s-1"}}) + "\n")
-        sys.stdout.flush()
-    elif method == "session/prompt":
-        text = msg["params"]["prompt"][0]["text"]
-        if "turn1" in text:
-            # Antigravity 1.5.10+: no user_message_chunk; call MCP tool directly then emit agent_message_chunk.
-            req = urllib.request.Request(
-                mcp_url,
-                data=json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "echo", "arguments": {"text": "ok"}}}).encode(),
-                headers={"Authorization": mcp_auth, "Content-Type": "application/json"},
-                method="POST",
-            )
-            urllib.request.urlopen(req, timeout=5).read()
-            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Done 1"}}}}) + "\n")
-            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}}) + "\n")
-            sys.stdout.flush()
-        elif "hold" in text:
-            held.append(mid)
-        elif "release" in text:
-            held.append(mid)
-            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Done steered"}}}}) + "\n")
-            for hid in held:
-                sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": hid, "result": {"stopReason": "end_turn"}}) + "\n")
-            held.clear()
-            sys.stdout.flush()
-        elif "fail_rpc" in text:
-            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": "rpc failed"}}) + "\n")
-            sys.stdout.flush()
-"#,
-            );
-
-            struct RecordingHost {
-                pending_on_call: Mutex<Vec<usize>>,
-                journal: Arc<Journal>,
-            }
-            impl ToolHost for RecordingHost {
-                fn specs(&self) -> Vec<ToolSpec> {
-                    Echo.specs()
-                }
-                fn call<'a>(&'a self, _name: &'a str, arguments: Value) -> BoxFut<'a, Result<Value, String>> {
-                    Box::pin(async move {
-                        self.pending_on_call.lock().unwrap().push(self.journal.pending().len());
-                        Ok(arguments)
-                    })
-                }
-            }
-
-            let journal = Arc::new(Journal::create(&dir, &dir).unwrap());
-            let host = Arc::new(RecordingHost { pending_on_call: Mutex::new(Vec::new()), journal: journal.clone() });
-            let options = AntigravityOptions { program, cwd: dir.clone(), tools: vec!["read".into()], ..Default::default() };
+            let cwd = dir.join("work");
+            std::fs::create_dir_all(&cwd).unwrap();
+            let program = script(&dir, "fake-agy.py", FAKE_AGY);
+            let relay = script(&dir, "relay.py", RELAY);
+            let journal = Arc::new(Journal::create(&dir, &cwd).unwrap());
+            let options = AntigravityOptions {
+                program,
+                cwd,
+                system_prompt: "You are the fixture.".into(),
+                tools: vec!["read".into(), "bash".into(), "write".into()],
+                hook_relay: vec![relay.display().to_string()],
+                ..Default::default()
+            };
             let (reports, runtime) = mpsc::unbounded_channel();
-            let driver = AntigravityDriver::new(options, host.clone(), reports);
-            let session = Session::new(journal.clone(), Arc::new(Antigravity(driver)), runtime);
-            let mut events = session.subscribe();
+            let driver = AntigravityDriver::new(options, Arc::new(Echo), reports);
+            let session = Session::new(journal, Arc::new(Antigravity(driver.clone())), runtime);
+            let events = session.subscribe();
+            Fixture { dir, session, events, driver }
+        }
 
-            async fn wait_turn(events: &mut tokio::sync::broadcast::Receiver<KernelEvent>) -> Vec<KernelEvent> {
+        impl Fixture {
+            async fn turn(&mut self) -> Vec<KernelEvent> {
                 let mut seen = Vec::new();
                 loop {
-                    let event = tokio::time::timeout(Duration::from_secs(10), events.recv()).await.expect("turn finishes").unwrap();
+                    let event = tokio::time::timeout(Duration::from_secs(20), self.events.recv()).await.expect("the turn ends").unwrap();
                     let done = matches!(event, KernelEvent::AgentEnd { .. });
                     seen.push(event);
                     if done {
@@ -1112,38 +1354,92 @@ for raw in sys.stdin:
                     }
                 }
             }
-
-            // 1. Single prompt without user_message_chunk: Taken fires before MCP tool call and turn ends cleanly.
-            session.send("r1", vec![Block::text("turn1")], Mode::Steer, &Presentation::default(), &[]).await.unwrap();
-            let seen = wait_turn(&mut events).await;
-            assert!(seen.contains(&KernelEvent::Taken { request_ids: vec!["r1".into()] }), "{seen:?}");
-            assert!(!session.is_streaming() && !session.has_admitted_submission());
-            assert!(journal.pending().is_empty());
-            assert_eq!(*host.pending_on_call.lock().unwrap(), vec![0], "submission is already marked taken when MCP tool executes");
-
-            // 2. Concurrent Mode::Steer prompts answered together without user_message_chunk: all are taken and turn ends.
-            session.send("r2", vec![Block::text("hold-1")], Mode::Steer, &Presentation::default(), &[]).await.unwrap();
-            session.send("r3", vec![Block::text("hold-2")], Mode::Steer, &Presentation::default(), &[]).await.unwrap();
-            session.send("r4", vec![Block::text("release")], Mode::Steer, &Presentation::default(), &[]).await.unwrap();
-            let seen = wait_turn(&mut events).await;
-            for req in ["r2", "r3", "r4"] {
-                assert!(
-                    seen.iter().any(|e| matches!(e, KernelEvent::Taken { request_ids } if request_ids.contains(&req.to_string()))),
-                    "missing {req}: {seen:?}"
-                );
+            async fn send(&self, id: &str, text: &str) {
+                self.session.send(id, vec![Block::text(text)], Mode::Queue, &Presentation::default(), &[]).await.unwrap();
             }
-            assert!(!session.is_streaming() && !session.has_admitted_submission());
-            assert!(journal.pending().is_empty());
+            fn said(&self) -> Vec<String> {
+                self.session
+                    .journal()
+                    .entries()
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        crate::journal::Entry::Message { message, .. } => Some(crate::types::text_of(&message.content)),
+                        _ => None,
+                    })
+                    .collect()
+            }
+        }
 
-            // 3. Un-taken prompt rejected with JSON-RPC error: turn ends cleanly while entry stays pending for retry.
-            session.send("r5", vec![Block::text("fail_rpc")], Mode::Steer, &Presentation::default(), &[]).await.unwrap();
-            let _ = wait_turn(&mut events).await;
-            assert!(!session.is_streaming() && !session.has_admitted_submission());
-            assert_eq!(journal.last_stop_reason().as_deref(), Some("error"));
-            assert_eq!(journal.pending().len(), 1);
+        #[tokio::test]
+        async fn runs_turns_with_host_tools_hooks_and_the_agent_prompt() {
+            let mut f = fixture();
+            f.send("r1", "prompt? and tool").await;
+            let seen = f.turn().await;
+            assert!(seen.contains(&KernelEvent::Taken { request_ids: vec!["r1".into()] }), "{seen:?}");
+            assert_eq!(seen.last(), Some(&KernelEvent::AgentEnd { terminal: true, awaiting_async: false }));
+            assert!(f.session.journal().pending().is_empty());
+            assert_eq!(f.session.journal().kernel_session("antigravity").as_deref(), Some("conv-1"));
+            let said = f.said();
+            assert!(said.iter().any(|text| text == "prompt says: You are the fixture."), "{said:?}");
+            assert!(said.iter().any(|text| text == r#"{"text":"ok"}"#), "the host tool ran without display arguments: {said:?}");
+            assert!(said.iter().any(|text| text == "Done prompt? and"), "{said:?}");
 
-            session.dispose().await;
-            let _ = std::fs::remove_dir_all(&dir);
+            // A refused command reaches the model with the guard's reason, and the turn goes on.
+            f.send("r2", "forbidden").await;
+            f.turn().await;
+            assert!(f.said().iter().any(|text| text == "denied: refused"), "{:?}", f.said());
+
+            // Neo's bridge is not the model's to change.
+            f.send("r3", "bridge").await;
+            f.turn().await;
+            assert!(f.said().iter().any(|text| text.starts_with("deny: That folder is Neo's link")), "{:?}", f.said());
+
+            // Two messages sent together run as two turns, in order.
+            f.send("r4", "first").await;
+            f.send("r5", "second").await;
+            let mut seen = f.turn().await;
+            if !seen.iter().any(|event| matches!(event, KernelEvent::Taken { request_ids } if request_ids == &["r5".to_string()])) {
+                seen.extend(f.turn().await);
+            }
+            assert!(seen.iter().any(|event| matches!(event, KernelEvent::Taken { request_ids } if request_ids == &["r5".to_string()])), "{seen:?}");
+            assert!(f.said().iter().any(|text| text == "Done second"), "{:?}", f.said());
+            assert!(f.session.journal().pending().is_empty());
+
+            let bridge = lock(&f.driver.shared).bridge.as_ref().map(|bridge| bridge.dir.clone()).unwrap();
+            assert!(bridge.join(".agents/plugins/neo/hooks.json").is_file());
+            f.session.dispose().await;
+            assert!(!bridge.exists(), "the bridge goes with the process");
+            let _ = std::fs::remove_dir_all(&f.dir);
+        }
+
+        #[tokio::test]
+        async fn ends_the_turn_while_background_work_runs_and_lists_it() {
+            let mut f = fixture();
+            f.send("r1", "background").await;
+            let seen = f.turn().await;
+            assert_eq!(seen.last(), Some(&KernelEvent::AgentEnd { terminal: false, awaiting_async: true }), "{seen:?}");
+            let jobs = f.session.driver().jobs().await;
+            assert_eq!(jobs.len(), 1, "{jobs:?}");
+            assert_eq!((jobs[0].kind, jobs[0].command.as_deref(), jobs[0].own), (JobKind::Bash, Some("sleep 1"), true));
+            std::fs::write(f.dir.join("bg-release"), "1").unwrap();
+            let seen = f.turn().await;
+            assert_eq!(seen.last(), Some(&KernelEvent::AgentEnd { terminal: true, awaiting_async: false }), "{seen:?}");
+            assert!(f.session.driver().jobs().await.is_empty());
+            assert!(f.said().iter().any(|text| text == "background done"), "{:?}", f.said());
+            f.session.dispose().await;
+            let _ = std::fs::remove_dir_all(&f.dir);
+        }
+
+        #[tokio::test]
+        async fn keeps_a_message_the_runtime_refused_pending() {
+            let mut f = fixture();
+            f.send("r1", "refuse").await;
+            let seen = f.turn().await;
+            assert!(!seen.iter().any(|event| matches!(event, KernelEvent::Taken { .. })), "{seen:?}");
+            assert_eq!(f.session.journal().pending().len(), 1);
+            assert!(f.said().iter().any(|text| text.contains("agent refused to start")), "{:?}", f.said());
+            f.session.dispose().await;
+            let _ = std::fs::remove_dir_all(&f.dir);
         }
     }
 }

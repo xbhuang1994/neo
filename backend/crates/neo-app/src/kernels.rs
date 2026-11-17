@@ -153,6 +153,8 @@ pub struct RealKernels {
     pub shim: PathBuf,
     /// Variables to set for every runtime, on top of the host's environment.
     pub env: BTreeMap<String, String>,
+    /// The program, with its first arguments, that relays Antigravity's hooks: `neo-agent agy-hook`.
+    pub hook_relay: Vec<String>,
 }
 
 const OVERLAY_COMMON: &str = "launch:\n  enabled: false\nretry:\n  enabled: true\ncompaction:\n  enabled: true\n";
@@ -347,28 +349,38 @@ impl RealKernels {
 
     fn open_antigravity(&self, spec: &SessionSpec, host: Arc<dyn ToolHost>, events: mpsc::UnboundedSender<DriverEvent>) -> Result<Arc<dyn Driver>, String> {
         let program = self.require(Kernel::Antigravity)?;
-        let names: Vec<String> = host.specs().into_iter().map(|tool| tool.name).collect();
-        let worker = spec.role == SessionRole::Worker;
-        let note = if worker {
-            "Runtime note: you run in the Antigravity CLI. Tool names above map to `read_file`, `run_command`, `write_file` and `edit_file`; application tools are exposed as `mcp_neo_<name>`. There is no `task` or `wait` tool here, and no subagents: do the work yourself. Run commands in the foreground and wait for each to finish (check a long one with `command_status`) before you end your turn, because nothing wakes you after it. Do not use browser, image, scheduling or web-search tools unless the ticket asks for them."
+        let server = antigravity::mcp_server_name();
+        let application = if host.specs().is_empty() {
+            String::new()
         } else {
-            "Runtime note: you run in the Antigravity CLI. Tool names above map to `read_file` and `run_command`; application tools are exposed as `mcp_neo_<name>`. Do not use browser, image, scheduling or web-search tools."
+            format!(
+                " Application tools are on the MCP server `{server}`: call one with `call_mcp_tool`, `ServerName` `{server}` and `ToolName` its name above."
+            )
+        };
+        let note = match spec.role {
+            SessionRole::Worker => format!(
+                "Runtime note: you run in the Antigravity CLI. Tool names above map to `view_file`, `run_command`, `write_to_file`, `replace_file_content`, and `invoke_subagent` for subagents.{application} A command still running after a few seconds moves to the background, and its end wakes you, as does a subagent's reply. Do not use browser, image, scheduling or web-search tools unless the ticket asks for them."
+            ),
+            _ => format!(
+                "Runtime note: you run in the Antigravity CLI. Tool names above map to `view_file` and `run_command`.{application} Do not use browser, image, scheduling or web-search tools."
+            ),
         };
         let tools: &[&str] = match spec.role {
-            SessionRole::Worker => &["read", "bash", "edit", "write"],
+            SessionRole::Worker => &["read", "bash", "edit", "write", "task"],
             SessionRole::Sidecar => &["read"],
             SessionRole::Orchestrator | SessionRole::Watchdog => &["read", "bash"],
         };
-        // The runtime picks its own effort; only an inspection turn, which decides from evidence it is handed, asks for low.
+        // The model id names its effort; only an inspection turn, which decides from evidence it is handed, asks for low.
         let thinking = (spec.role == SessionRole::Watchdog).then(|| "low".to_string());
         let options = AntigravityOptions {
             program,
             cwd: spec.cwd.clone(),
-            system_prompt: format!("{}\n\n{note}", claude::rename_tools(&spec.system_prompt, &names, antigravity::mcp_tool_name)),
+            system_prompt: format!("{}\n\n{note}", spec.system_prompt),
             tools: tools.iter().map(|name| name.to_string()).collect(),
             model: spec.model.as_ref().map(|model| model.model.clone()),
             thinking,
             env: self.env.clone(),
+            hook_relay: self.hook_relay.clone(),
         };
         Ok(Arc::new(Antigravity(AntigravityDriver::new(options, host, events))))
     }
@@ -521,6 +533,7 @@ mod tests {
             installing: Default::default(),
             shim: "/missing/shim.ts".into(),
             env: BTreeMap::new(),
+            hook_relay: Vec::new(),
         };
         assert!(kernels.unavailable(Kernel::Claude).unwrap().contains("claude"));
         assert!(kernels.unavailable(Kernel::Antigravity).unwrap().contains("agy"));

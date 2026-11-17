@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 neo-app = { path = "../neo-app" }
+neo-kernel = { path = "../neo-kernel" }
 neo-http = { path = "../neo-http" }
 tokio.workspace = true
 serde.workspace = true

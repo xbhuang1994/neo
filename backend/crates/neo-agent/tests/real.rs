@@ -1,7 +1,8 @@
 //! The whole product with a real kernel: the program as a process, the real `claude` or `omp` runtime under it, and a
 //! local fake model endpoint — a chat message over HTTP becomes a ticket, a worker does it, and the result comes back.
 //! No network and no account. These start real runtime processes, so they run only with `NEO_REAL_KERNELS=1` (the
-//! runtimes on `PATH`) or `NEO_CLAUDE_BIN` / `NEO_OMP_BIN`; otherwise each test notes that it was skipped.
+//! runtimes on `PATH`) or `NEO_CLAUDE_BIN` / `NEO_OMP_BIN`; otherwise each test notes that it was skipped. The
+//! Antigravity test is the exception: its runtime signs in to Google, so it uses real models and is opted into apart.
 
 use neo_app::http::{send, Request};
 use neo_testkit::models::{anthropic, conversation, openai, ticket_flow, FakeModel};
@@ -25,6 +26,13 @@ struct Product {
 
 impl Drop for Product {
     fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl Product {
+    /// End the program as a service manager would, waiting for it to leave.
+    fn stop(&mut self) {
         let _ = Command::new("kill").args(["-TERM", &self.child.id().to_string()]).status();
         let began = Instant::now();
         while began.elapsed() < Duration::from_secs(15) && self.child.try_wait().ok().flatten().is_none() {
@@ -182,4 +190,65 @@ async fn does_a_request_end_to_end_on_oh_my_pi() {
     product.does_a_request(&model, "omp").await;
     let (_, models) = product.call("GET", "/api/settings/models", None).await;
     assert!(models["available"].as_array().unwrap().iter().any(|option| option["provider"] == "fixture" && option["id"] == "fixture"), "{models}");
+}
+
+/// The whole product on the Antigravity CLI and its real models, with this program relaying the runtime's hooks. It
+/// needs a signed-in `agy` and the network, so it runs only with `NEO_REAL_ANTIGRAVITY=1` or `NEO_AGY_BIN`; the model
+/// is `NEO_AGY_MODEL`, by default `gemini-3.8-flash-low`. A real model words its replies itself, so this checks what
+/// the product did rather than what was said.
+#[tokio::test(flavor = "multi_thread")]
+async fn does_a_request_end_to_end_on_antigravity() {
+    let enabled = std::env::var("NEO_REAL_ANTIGRAVITY").is_ok_and(|value| value == "1");
+    let Some(agy) = std::env::var_os("NEO_AGY_BIN").map(PathBuf::from).or_else(|| enabled.then(|| neo_testkit::find_program("agy")).flatten()) else {
+        eprintln!("skipped: set NEO_REAL_ANTIGRAVITY=1 or NEO_AGY_BIN=<program> to run against the real Antigravity CLI");
+        return;
+    };
+    let model = std::env::var("NEO_AGY_MODEL").unwrap_or_else(|_| "gemini-3.8-flash-low".into());
+    let dir = TempDir::new("real-agy");
+    // Antigravity keeps its sign-in in the person's home.
+    let home = std::env::var("HOME").unwrap_or_default();
+    let settings = json!({"kernel": "antigravity", "models": {"antigravity": {"eval": {"provider": "antigravity", "model": model}, "executor": {"provider": "antigravity", "model": model}}}});
+    let mut product = Product::start(dir, settings, &[("NEO_AGY_BIN", agy.display().to_string()), ("HOME", home)]);
+    let (status, health) = product.call("GET", "/api/health", None).await;
+    assert_eq!((status, health["kernel"].as_str(), health["components"]["kernel"]["state"].as_str()), (200, Some("antigravity"), Some("ready")), "{health}");
+    let request = "Please do this as a task: create a file named result.txt in the task's directory whose whole content is the line `done by the worker`, using the shell, then report the task done.";
+    let (status, receipt) = product.call("POST", "/api/chat", Some(json!({"text": request, "messageId": "web:real-agy-1"}))).await;
+    assert_eq!((status, receipt["result"].as_str()), (202, Some("stored")));
+    let began = Instant::now();
+    let worker = loop {
+        let (_, workers) = product.call("GET", "/api/workers", None).await;
+        let done = workers["workers"].as_array().and_then(|workers| workers.iter().find(|worker| worker["outcome"] == "completed").cloned());
+        if let Some(worker) = done {
+            break worker;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(600),
+            "no completed ticket in time; workers: {workers}; messages: {:?}; log: {}",
+            product.messages().await,
+            std::fs::read_to_string(product.dir.join("log.txt")).unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+    // The worker ran its shell in the ticket's own directory, and the bridge beside it is not left in it.
+    let directory = PathBuf::from(worker["directory"].as_str().unwrap());
+    assert!(directory.starts_with(product.dir.join("data").join("work")), "{worker}");
+    assert_eq!(std::fs::read_to_string(directory.join("result.txt")).unwrap().trim(), "done by the worker");
+    assert!(!directory.join(".agents").exists());
+    // The person hears back: their message, an acknowledgement or the result, all from the main Session.
+    let began = Instant::now();
+    loop {
+        let messages = product.messages().await;
+        if messages.iter().filter(|(role, _)| role == "assistant").count() >= 1
+            && messages.first().is_some_and(|(role, text)| role == "user" && text == request)
+        {
+            break;
+        }
+        assert!(began.elapsed() < Duration::from_secs(120), "no reply: {messages:?}");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let work = product.dir.join("data").join("work");
+    product.stop();
+    let left: Vec<_> =
+        std::fs::read_dir(&work).unwrap().flatten().map(|entry| entry.file_name()).filter(|name| name.to_string_lossy().contains(".neo-")).collect();
+    assert!(left.is_empty(), "bridges left after shutdown: {left:?}");
 }

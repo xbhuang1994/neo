@@ -13,7 +13,7 @@ A Session's system prompt is composed from the texts in `assets/prompts`, which 
 | Sidecar | `sidecar` |
 | Watchdog | `watchdog`, and the execution environment |
 
-Every worker's prompt is the same text, so a model provider caches it once for all of them. The team sections are `team/communication`, `team/scope` and `team/delivery`. The texts name tools by their bare names; the Claude Code and Antigravity kernels rewrite them to the names those runtimes give them and adds a note on how its built-in tools map.
+Every worker's prompt is the same text, so a model provider caches it once for all of them. The team sections are `team/communication`, `team/scope` and `team/delivery`. The texts name tools by their bare names; the Claude Code kernel rewrites them to the names that runtime gives them, and the Claude Code and Antigravity kernels add a note on how their built-in tools map and, for Antigravity, how to call the application's tools through `call_mcp_tool`.
 
 A worker's first message is its assignment card, with the Mandate's instructions: for a Ticket accepted under rules, the names and instructions of those rules.
 

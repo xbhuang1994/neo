@@ -365,6 +365,7 @@ version = "0.3.1"
 dependencies = [
  "neo-app",
  "neo-http",
+ "neo-kernel",
  "neo-testkit",
  "serde",
  "serde_json",
@@ -415,6 +416,7 @@ dependencies = [
 name = "neo-kernel"
 version = "0.3.1"
 dependencies = [
+ "base64",
  "getrandom",
  "libc",
  "neo-core",

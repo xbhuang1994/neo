@@ -128,7 +128,7 @@ fn says_nothing_of_what_was_removed() {
     let mut texts: Vec<(String, String)> = documents().into_iter().map(|(_, name, text)| (name, text)).collect();
     texts.push(("SETUP.md".into(), read(&root.join("SETUP.md"))));
     for (name, text) in &texts {
-        for removed in ["bun run", "config.json", "stateDir", "pull request", "gh api", "omp-superagent"] {
+        for removed in ["bun run", "config.json", "stateDir", "pull request", "gh api", "omp-superagent", "agy acp", "mcp_neo_"] {
             assert!(!text.contains(removed), "{name} still mentions {removed}");
         }
         // The earlier releases are named only where a person is told that their state cannot be opened.
