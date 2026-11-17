@@ -1,7 +1,7 @@
 ; The Windows installer of Neo (Inno Setup 6): the app and its backend, installed for
 ; the current user without administrator rights.
 ;
-; Build: iscc /DAppVersion=0.3.0 /DStage=<folder> packaging\windows\neo-agent.iss
+; Build: iscc /DAppVersion=0.3.1 /DStage=<folder> packaging\windows\neo-agent.iss
 ; <folder> holds what packaging\windows\stage.ps1 put together: the Flutter app (neo_agent.exe, its DLLs and data),
 ; neo-agent.exe and shim\. The agent runtimes are not bundled; the app installs them.
 
