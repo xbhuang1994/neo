@@ -415,7 +415,15 @@ impl Protocol {
     }
 
     /// Upload a file encrypted and send it as an image, a video or a file, after its caption.
-    pub async fn send_media(&self, account: &Account, plain: &[u8], name: &str, media_type: &str, caption: &str) -> Result<(), Error> {
+    pub async fn send_media(
+        &self,
+        account: &Account,
+        plain: &[u8],
+        name: &str,
+        media_type: &str,
+        caption: &str,
+        message_id: Option<&str>,
+    ) -> Result<(), Error> {
         if plain.len() > MAX_MEDIA_BYTES {
             return Err(Error::Other("微信媒体不能超过 100 MiB".into()));
         }
@@ -463,7 +471,8 @@ impl Protocol {
             }
         }
         if !caption.is_empty() {
-            self.send_text(account, caption, None).await?;
+            let caption_id = message_id.map(|id| format!("{id}:caption"));
+            self.send_text(account, caption, caption_id.as_deref()).await?;
         }
         let media = json!({"encrypt_query_param": download, "aes_key": STANDARD.encode(hex(&key)), "encrypt_type": 1});
         let item = match kind {
@@ -471,7 +480,7 @@ impl Protocol {
             2 => json!({"type": 5, "video_item": {"media": media, "video_size": cipher_size}}),
             _ => json!({"type": 4, "file_item": {"media": media, "file_name": safe_name(Some(name), "file.bin"), "len": plain.len().to_string()}}),
         };
-        self.send_item(account, item, None).await
+        self.send_item(account, item, message_id).await
     }
 
     async fn download(&self, media: &Value, hex_key: Option<&str>) -> Result<Vec<u8>, String> {

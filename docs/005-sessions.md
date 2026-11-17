@@ -50,6 +50,6 @@ One WeChat user, bound by scanning a QR code in the settings, talks to the main 
 - Binding adds `wechat:<user id>` to the chat Source's allowed list, and unbinding removes it.
 - The poll's cursor advances only after its messages were taken in. Text, voice transcripts, images, files and videos are received; an attachment that cannot be fetched is said so in the message and holds nothing back.
 - A reply carries the reply's id as the message's client id, so a retry is the same message to WeChat.
-- `wechat_send_file` sends a local file to the bound user: an image, a video, or any file up to 100 MiB.
+- `wechat_send_file` sends a local file to the bound user: an image, a video, or any file up to 100 MiB, recording a reply receipt for the Ticket it delivers so Watchdog does not re-relay the report and a duplicate call does not send the file twice.
 - While the main Session is in a turn or has one coming, or any worker is in a turn, starting, or has background work that will wake it, "typing" blinks in the bound user's chat: shown for 2 seconds, away for 1, and again, so the person sees the work is alive. A local loop beside the poll, with no model in it, checks four times a second and takes it away once nothing is at work or the bridge stops. Its failures are logged once and retried; they never touch the bridge's status.
 - The account's credential, the bound user and the cursor are kept in the store and never leave through the API. The app is given only what the QR code encodes, and draws the code itself.

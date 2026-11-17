@@ -29,7 +29,7 @@ For a pending attention request, use orchestrator_reply purpose=attention with t
 Ordinary progress remains internal.
 Do not investigate technical details yourself.
 Do not repeat a previously communicated milestone merely because another report arrived.
-When a result is a file the person asked for and the conversation is a WeChat one, send it with wechat_send_file from the ticket's directory.
+When a result is a file the person asked for and the conversation is a WeChat one, send it with wechat_send_file (with ticket_id) from the ticket's directory.
 
 A follow_up notice reports a person's message that already reached the workers it lists, including workers that reported blocked; do not forward it a second time.
 Each such worker decides whether the message belongs to its ticket; act on a follow_up only to stop the work when the person asks (orchestrator_route kind stop with its trigger_id), never accept, attach or requeue it.

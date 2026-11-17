@@ -507,6 +507,10 @@ fn tells_whether_a_ticket_was_replied_to_since_a_time() {
     assert!(store.replied_since("t1", "2000-01-01T00:00:00.000Z"));
     assert!(!store.replied_since("t1", "2999-01-01T00:00:00.000Z"));
     assert!(!store.replied_since("t2", "2000-01-01T00:00:00.000Z"));
+    store.record_sent_receipt(&message("file-1", Some("t2"), "c1"), "2999-01-01T00:00:00.000Z");
+    assert_eq!(store.reply_status("file-1"), Some(ReplyStatus::Sent));
+    assert!(store.waiting_receipts().iter().all(|receipt| receipt.message.id != "file-1"));
+    assert!(store.replied_since("t2", "2999-01-01T00:00:00.000Z"));
 }
 
 // effect rows

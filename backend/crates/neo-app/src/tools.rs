@@ -152,8 +152,9 @@ pub fn main_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "wechat_send_file",
-            "Send a local image, video, or other file to the bound WeChat user. Use an absolute path produced or verified during this conversation; an optional caption is sent first. Requires an active binding.",
-            json!({"path": {"type": "string", "description": "Absolute local file path."}, "caption": {"type": "string"}}),
+            "Send a local image, video, or other file to the bound WeChat user. Use an absolute path produced or verified during this conversation; an optional caption is sent first, and ticket_id records the delivery for that ticket's report so it is not sent twice. Requires an active binding.",
+            json!({"path": {"type": "string", "description": "Absolute local file path."}, "caption": {"type": "string"},
+                "ticket_id": {"type": "string", "description": "The ticket whose report this file delivers, when it delivers one."}}),
             &["path"],
         ),
     ]
@@ -530,13 +531,13 @@ impl App {
                 Ok(json!({"removed": self.quietly(|| self.engine.unsubscribe(thread)).map_err(user)?, "thread": thread}))
             }
             "wechat_send_file" => {
-                let args = Args::of(arguments, &["path", "caption"])?;
+                let args = Args::of(arguments, &["path", "caption", "ticket_id"])?;
                 let path = args.required("path")?.trim().to_string();
                 let caption = args.text("caption").map(str::to_string);
                 if caption.as_ref().is_some_and(|caption| caption.chars().count() > 8000) {
                     return Err("caption has at most 8000 characters".into());
                 }
-                self.wechat_send_file(&path, caption.as_deref()).await
+                self.wechat_send_ticket_file(&path, caption.as_deref(), args.text("ticket_id")).await
             }
             _ => Err(format!("Unknown tool {name}")),
         }

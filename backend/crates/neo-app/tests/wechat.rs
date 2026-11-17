@@ -533,3 +533,133 @@ async fn blinks_typing_while_the_orchestrator_works_and_takes_it_away_after() {
     assert_eq!(wechat.seen.lock().unwrap().typing.len(), count, "nothing more once idle");
     f.app.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn records_a_file_result_receipt_so_watchdog_and_restarts_do_not_resend_it() {
+    let (wechat, f) = quietly_bound(Duration::ZERO, Duration::from_secs(10)).await;
+    let version = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let worker_version = version.clone();
+    let script = move || {
+        let worker_version = worker_version.clone();
+        model(move |turn| {
+            let worker_version = worker_version.clone();
+            Box::pin(async move {
+                match turn.role {
+                    SessionRole::Worker => {
+                        let rev = worker_version.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        std::fs::write(turn.cwd.join("report.docx"), format!("report-v{rev}").into_bytes()).map_err(|error| error.to_string())?;
+                        std::fs::write(turn.cwd.join("chart.png"), STANDARD.decode(PIXEL).unwrap()).map_err(|error| error.to_string())?;
+                        let trigger_id = messages(&turn.text)
+                            .iter()
+                            .rev()
+                            .find_map(|card| card["trigger"]["trigger_id"].as_str().or_else(|| card["trigger_id"].as_str()).map(str::to_string))
+                            .expect("the human trigger");
+                        turn.call(
+                            "orchestrator_report",
+                            json!({"state": "ready", "reply_to_trigger_id": trigger_id, "summary": format!("Send report.docx (v{rev}).")}),
+                        )
+                        .await?;
+                        Ok("Ready.".into())
+                    }
+                    SessionRole::Watchdog => {
+                        let patrol = turn.card("kind").expect("the patrol");
+                        for suspect in patrol["suspects"].as_array().into_iter().flatten() {
+                            turn.call("watchdog_intervene", json!({"action": "relay_report", "ticket_id": suspect["ticket_id"], "message": "Missing reply."}))
+                                .await?;
+                        }
+                        Ok("Patrolled.".into())
+                    }
+                    _ => {
+                        for message in messages(&turn.text) {
+                            match message["kind"].as_str() {
+                                Some("candidate") if message["text"] == "给我一份市场调研报告" => {
+                                    turn.call(
+                                        "orchestrator_route",
+                                        json!({"decisions": [{"kind": "accept", "trigger_id": message["trigger_id"], "title": "市场调研报告", "worktree_name": "market-report", "acknowledgement": "收到：准备市场调研报告。"}]}),
+                                    )
+                                    .await?;
+                                }
+                                Some("candidate") => {
+                                    let ticket_id = message["related_tickets"][0]["ticket_id"].clone();
+                                    turn.call(
+                                        "orchestrator_route",
+                                        json!({"decisions": [{"kind": "attach", "trigger_id": message["trigger_id"], "ticket_id": ticket_id, "acknowledgement": "收到：补充后重发报告。"}]}),
+                                    )
+                                    .await?;
+                                }
+                                Some("worker_report") if message["state"] == "ready" => {
+                                    let ticket_id = message["ticket"]["ticket_id"].as_str().unwrap();
+                                    let card = turn.call("orchestrator_read", json!({"resource": format!("ticket/{ticket_id}")})).await?;
+                                    let path = format!("{}/report.docx", card["directory"].as_str().unwrap());
+                                    // Omit ticket_id: the ticket is resolved from its directory.
+                                    turn.call("wechat_send_file", json!({"path": path, "caption": "这是最新版报告。"})).await?;
+                                }
+                                _ => {}
+                            }
+                        }
+                        Ok("Done.".into())
+                    }
+                }
+            })
+        })
+    };
+    f.script(script());
+    let ready_relays = |f: &Fixture| {
+        f.ran(SessionRole::Orchestrator)
+            .iter()
+            .filter(|ran| messages(&ran.text).iter().any(|message| message["kind"] == "worker_report" && message["state"] == "ready"))
+            .count()
+    };
+
+    wechat.seen.lock().unwrap().batches.push_back(json!([from_bound("ask-1", json!([{"type": 1, "text_item": {"text": "给我一份市场调研报告"}}]))]));
+    f.until("the file was uploaded", || wechat.seen.lock().unwrap().uploads.len() == 1).await;
+    f.settle().await;
+    assert_eq!(wechat.seen.lock().unwrap().uploads, vec![b"report-v1".to_vec()]);
+    assert_eq!(ready_relays(&f), 1);
+
+    // Watchdog sees the file receipt as the report's reply: neither auto-nudges nor patrols re-relay it.
+    for _ in 0..3 {
+        f.app.watchdog_tick().await;
+        f.settle().await;
+    }
+    assert_eq!(ready_relays(&f), 1);
+    assert!(f.ran(SessionRole::Watchdog).is_empty());
+    assert_eq!(wechat.seen.lock().unwrap().uploads.len(), 1);
+
+    // Across a server restart and a fresh orchestrator session, Watchdog stays quiet and a duplicate file send is a no-op.
+    let f = f.restart().await;
+    f.script(script());
+    f.app.reset_orchestrator().await.unwrap();
+    f.app.watchdog_tick().await;
+    f.settle().await;
+    assert!(f.ran(SessionRole::Watchdog).is_empty());
+    let ticket = f.ticket(0);
+    let dir = ticket.execution.as_ref().unwrap().directory.clone();
+    let report_path = format!("{dir}/report.docx");
+    assert_eq!(
+        f.app.wechat_send_file(&report_path, Some("这是最新版《市场调研报告》。")).await.unwrap(),
+        json!({"sent": true, "reused": true, "name": "report.docx"})
+    );
+    assert_eq!(
+        f.app.wechat_send_ticket_file(&report_path, Some("又发一次"), Some(&ticket.id)).await.unwrap(),
+        json!({"sent": true, "reused": true, "name": "report.docx"})
+    );
+    assert_eq!(f.app.wechat_send_ticket_file(&report_path, None, Some("missing")).await.unwrap_err(), "Unknown ticket: missing");
+    assert_eq!(wechat.seen.lock().unwrap().uploads.len(), 1, "neither the file nor the paraphrased caption was resent");
+
+    // A companion file for the same report still goes out once.
+    let chart_path = format!("{dir}/chart.png");
+    assert_eq!(f.app.wechat_send_ticket_file(&chart_path, None, Some(&ticket.id)).await.unwrap(), json!({"sent": true, "name": "chart.png"}));
+    assert_eq!(f.app.wechat_send_ticket_file(&chart_path, None, Some(&ticket.id)).await.unwrap(), json!({"sent": true, "reused": true, "name": "chart.png"}));
+    assert_eq!(wechat.seen.lock().unwrap().uploads.len(), 2);
+
+    // A human follow-up that produces a newer ready report sends the updated file of the same name.
+    wechat.seen.lock().unwrap().batches.push_back(json!([from_bound("ask-2", json!([{"type": 1, "text_item": {"text": "补充第 5.3 节后再发我"}}]))]));
+    f.until("the updated file was uploaded", || wechat.seen.lock().unwrap().uploads.len() == 3).await;
+    f.settle().await;
+    assert_eq!(wechat.seen.lock().unwrap().uploads[2], b"report-v2".to_vec());
+    f.app.watchdog_tick().await;
+    f.settle().await;
+    assert!(f.ran(SessionRole::Watchdog).is_empty());
+    f.app.stop().await;
+}

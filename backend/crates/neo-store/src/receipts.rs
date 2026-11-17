@@ -84,6 +84,14 @@ impl Store {
         let json = serde_json::to_string(&receipt).expect("receipts serialize");
         self.with(|db| db.prepare_cached("INSERT OR IGNORE INTO outbox (id, value) VALUES (?1, ?2)")?.execute(params![message.id, json])) > 0
     }
+    /// Record a message that already went out directly (such as a media upload), queued at least as recently as `since`.
+    pub fn record_sent_receipt(&self, message: &OutboundMessage, since: &str) {
+        let now = now_iso();
+        let queued_at = if now.as_str() >= since { now } else { since.to_string() };
+        let receipt = Receipt { message: message.clone(), status: ReplyStatus::Sent, queued_at: Some(queued_at), dropped: None };
+        let json = serde_json::to_string(&receipt).expect("receipts serialize");
+        self.with(|db| db.prepare_cached("INSERT OR IGNORE INTO outbox (id, value) VALUES (?1, ?2)")?.execute(params![message.id, json]));
+    }
     /// True when a reply for `ticket_id` was queued at or after `since`.
     pub fn replied_since(&self, ticket_id: &str, since: &str) -> bool {
         self.with(|db| {

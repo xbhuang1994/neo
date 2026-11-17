@@ -722,11 +722,39 @@ impl App {
         Ok(Sent::Sent)
     }
 
+    /// The ticket whose directory holds `file`, choosing the deepest match when directories nest.
+    fn ticket_for_path(&self, file: &Path) -> Option<neo_core::model::Ticket> {
+        use neo_core::ports::Repositories;
+        self.store
+            .tickets()
+            .into_iter()
+            .filter_map(|ticket| {
+                let dir = Path::new(&ticket.execution.as_ref()?.directory);
+                if dir.as_os_str().is_empty() {
+                    return None;
+                }
+                let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+                file.starts_with(&dir).then(|| (dir.as_os_str().len(), ticket))
+            })
+            .max_by_key(|(depth, _)| *depth)
+            .map(|(_, ticket)| ticket)
+    }
+
     /// Send a local file to the bound user, after its caption.
     pub async fn wechat_send_file(&self, path: &str, caption: Option<&str>) -> Result<Value, String> {
+        self.wechat_send_ticket_file(path, caption, None).await
+    }
+
+    /// Send a local file to the bound user, recording a reply receipt when it delivers a ticket's report so Watchdog
+    /// does not re-relay that report and a duplicate call does not send the file twice.
+    pub async fn wechat_send_ticket_file(&self, path: &str, caption: Option<&str>, ticket_id: Option<&str>) -> Result<Value, String> {
         let account = self.wechat_account().ok_or("请先在应用中连接微信")?;
+        let explicit = match ticket_id.map(str::trim).filter(|id| !id.is_empty()) {
+            Some(id) => Some(self.store_ticket(id).ok_or_else(|| format!("Unknown ticket: {id}"))?),
+            None => None,
+        };
         let file = Path::new(path).to_path_buf();
-        let read = tokio::task::spawn_blocking(move || {
+        let canonical = tokio::task::spawn_blocking(move || {
             let info = std::fs::metadata(&file).map_err(|error| format!("无法读取微信附件：{error}"))?;
             if !info.is_file() {
                 return Err("微信附件路径必须是文件".to_string());
@@ -734,11 +762,52 @@ impl App {
             if info.len() as usize > MAX_MEDIA_BYTES {
                 return Err("微信附件不能超过 100 MiB".to_string());
             }
-            std::fs::read(&file).map_err(|error| format!("无法读取微信附件：{error}"))
-        });
-        let data = read.await.map_err(|error| error.to_string())??;
+            Ok::<_, String>(std::fs::canonicalize(&file).unwrap_or(file))
+        })
+        .await
+        .map_err(|error| error.to_string())??;
         let name = Path::new(path).file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_else(|| "file.bin".into());
-        self.wechat.protocol.send_media(&account, &data, &name, mime_of(&name), caption.unwrap_or("")).await.map_err(|error| error.to_string())?;
+        let ticket = explicit.or_else(|| self.ticket_for_path(&canonical)).or_else(|| self.ticket_for_path(Path::new(path)));
+        let receipt = ticket.and_then(|ticket| {
+            let report = ticket.latest_report()?;
+            let id = neo_core::ids::key(&["wechat-file", &ticket.id, &report.at, &canonical.to_string_lossy()]);
+            Some((ticket.id.clone(), report.at.clone(), id))
+        });
+        if let Some((_, _, id)) = &receipt {
+            if self.store.reply_status(id) == Some(neo_core::ports::ReplyStatus::Sent) {
+                return Ok(json!({"sent": true, "reused": true, "name": name}));
+            }
+        }
+        let read_path = canonical.clone();
+        let data = tokio::task::spawn_blocking(move || {
+            let data = std::fs::read(&read_path).map_err(|error| format!("无法读取微信附件：{error}"))?;
+            if data.len() > MAX_MEDIA_BYTES {
+                return Err("微信附件不能超过 100 MiB".to_string());
+            }
+            Ok::<_, String>(data)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        let message_id = receipt.as_ref().map(|(_, _, id)| id.as_str());
+        self.wechat.protocol.send_media(&account, &data, &name, mime_of(&name), caption.unwrap_or(""), message_id).await.map_err(|error| error.to_string())?;
+        if let Some((ticket_id, report_at, id)) = receipt {
+            let party = format!("wechat:{}", account.user_id);
+            let address = [("surface", "wechat"), ("conversation", party.as_str()), ("sender", party.as_str())]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let text = caption.map(str::trim).filter(|text| !text.is_empty()).map(str::to_string).unwrap_or_else(|| name.clone());
+            self.store.record_sent_receipt(
+                &neo_core::ports::OutboundMessage {
+                    id,
+                    channel: neo_core::model::ChannelRef { source: crate::settings::CHAT_SOURCE.into(), thread: party, address },
+                    text,
+                    kind: neo_core::ports::MessageKind::Reply,
+                    ticket_id: Some(ticket_id),
+                },
+                &report_at,
+            );
+        }
         Ok(json!({"sent": true, "name": name}))
     }
 }
