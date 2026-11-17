@@ -118,14 +118,17 @@ class ApiClient {
 
   Future<ModelSettings> models() async => ModelSettings.fromJson(await _object('GET', '/api/settings/models', timeout: const Duration(seconds: 30)));
 
-  Future<ModelSettings> saveModels({RoleModel? eval, RoleModel? executor}) async => ModelSettings.fromJson(
-    await _object(
-      'PUT',
-      '/api/settings/models',
-      body: {'eval': eval?.toJson(), 'executor': executor?.toJson()},
-      timeout: const Duration(seconds: 60),
-    ),
-  );
+  /// Save the kernels and models as one: the main session's kernel and model, and the workers' kernel (`null` follows
+  /// the main session's) and model. A new main kernel reopens the main session on it.
+  Future<ModelSettings> saveModels({required String kernel, required String? workerKernel, RoleModel? eval, RoleModel? executor}) async =>
+      ModelSettings.fromJson(
+        await _object(
+          'PUT',
+          '/api/settings/models',
+          body: {'kernel': kernel, 'workerKernel': workerKernel, 'eval': eval?.toJson(), 'executor': executor?.toJson()},
+          timeout: const Duration(seconds: 90),
+        ),
+      );
 
   Future<ModelSettings> setKernel(String kernel) async =>
       ModelSettings.fromJson(await _object('PUT', '/api/settings/kernel', body: {'kernel': kernel}, timeout: const Duration(seconds: 60)));

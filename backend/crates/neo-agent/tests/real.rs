@@ -33,6 +33,9 @@ impl Drop for Product {
 impl Product {
     /// End the program as a service manager would, waiting for it to leave.
     fn stop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_some() {
+            return;
+        }
         let _ = Command::new("kill").args(["-TERM", &self.child.id().to_string()]).status();
         let began = Instant::now();
         while began.elapsed() < Duration::from_secs(15) && self.child.try_wait().ok().flatten().is_none() {
@@ -86,6 +89,18 @@ impl Product {
             .map(|message| (message["role"].as_str().unwrap_or("").to_string(), message["text"].as_str().unwrap_or("").to_string()))
             .collect()
     }
+    /// The kernel and model settings once the kernels have listed their models, which they do in the background.
+    async fn models_ready(&self) -> Value {
+        let began = Instant::now();
+        loop {
+            let (_, models) = self.call("GET", "/api/settings/models", None).await;
+            if models["loading"] != true || began.elapsed() > Duration::from_secs(90) {
+                return models;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
     /// From a chat message to its result, as the app would see it.
     async fn does_a_request(&self, model: &FakeModel, kernel: &str) {
         let (status, health) = self.call("GET", "/api/health", None).await;
@@ -162,7 +177,7 @@ async fn does_a_request_end_to_end_on_claude_code() {
     let settings = json!({"kernel": "claude", "models": {"claude": {"eval": {"provider": "anthropic", "model": "fixture"}, "executor": {"provider": "anthropic", "model": "fixture"}}}});
     let product = Product::start(dir, settings, &env);
     product.does_a_request(&model, "claude").await;
-    let (_, models) = product.call("GET", "/api/settings/models", None).await;
+    let models = product.models_ready().await;
     assert_eq!((models["kernel"].as_str(), models["available"][0]["id"].as_str()), (Some("claude"), Some("fixture")), "{models}");
 }
 
@@ -186,9 +201,11 @@ async fn does_a_request_end_to_end_on_oh_my_pi() {
     )
     .unwrap();
     let settings = json!({"kernel": "omp", "models": {"omp": {"eval": {"provider": "fixture", "model": "fixture"}, "executor": {"provider": "fixture", "model": "fixture"}}}});
-    let product = Product::start(dir, settings, &[("NEO_OMP_BIN", omp.display().to_string())]);
+    // Oh My Pi reads its models from its agent directory, which the person's environment names.
+    let agent_dir = dir.join("data/omp").display().to_string();
+    let product = Product::start(dir, settings, &[("NEO_OMP_BIN", omp.display().to_string()), ("PI_CODING_AGENT_DIR", agent_dir)]);
     product.does_a_request(&model, "omp").await;
-    let (_, models) = product.call("GET", "/api/settings/models", None).await;
+    let models = product.models_ready().await;
     assert!(models["available"].as_array().unwrap().iter().any(|option| option["provider"] == "fixture" && option["id"] == "fixture"), "{models}");
 }
 

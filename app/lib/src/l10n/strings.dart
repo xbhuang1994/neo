@@ -116,6 +116,11 @@ abstract class Strings {
   String get switchingKernel;
   String get orchestratorModel;
   String get workerModel;
+  String get orchestratorKernel;
+  String get workerKernel;
+  String get sameAsOrchestrator;
+  String get listingModels;
+  String get savingKernel;
   String get install;
   String get installing;
   String installed(String kernel);
@@ -371,13 +376,23 @@ class ZhStrings extends Strings {
   @override
   String get kernelHintAntigravity => '运行 Antigravity CLI（agy）：使用它已登录的 Google 账号与 agy models 列出的模型；后台任务与子代理结束时会唤醒 worker，但不能单独取消。';
   @override
-  String get kernelSwitchHint => '切换立即生效并保留；每个内核有自己的一套模型配置。主会话在新内核上重开（对话记录保留），运行中的 Worker 在原内核上完成。';
+  String get kernelSwitchHint => '选好内核与模型后点「保存」才生效；每个内核有自己的一套模型配置。调度换内核时主会话在新内核上重开（对话记录保留），运行中的 Worker 在原内核上完成。';
   @override
   String get switchingKernel => '正在切换内核…';
   @override
   String get orchestratorModel => '评估与调度模型';
   @override
   String get workerModel => 'Worker 模型';
+  @override
+  String get orchestratorKernel => '调度内核';
+  @override
+  String get workerKernel => 'Worker 内核';
+  @override
+  String get sameAsOrchestrator => '同调度内核';
+  @override
+  String get listingModels => '正在读取模型列表…';
+  @override
+  String get savingKernel => '正在保存并切换…';
   @override
   String get install => '安装';
   @override
@@ -702,13 +717,23 @@ class EnStrings extends Strings {
   String get kernelHintAntigravity => 'Runs the Antigravity CLI (agy): it uses the Google account agy is signed in to and the models agy models lists; background jobs and subagents wake the worker when they end but cannot be cancelled one by one.';
   @override
   String get kernelSwitchHint =>
-      'A switch applies at once and is kept; each kernel has its own model choices. The main session reopens on the new kernel with its transcript; running workers finish on theirs.';
+      'Kernels and models apply when you save; each kernel has its own model choices. A new main kernel reopens the main session on it with its transcript; running workers finish on theirs.';
   @override
   String get switchingKernel => 'Switching the kernel…';
   @override
   String get orchestratorModel => 'Assessment and routing model';
   @override
   String get workerModel => 'Worker model';
+  @override
+  String get orchestratorKernel => 'Main session kernel';
+  @override
+  String get workerKernel => 'Worker kernel';
+  @override
+  String get sameAsOrchestrator => 'Same as the main session';
+  @override
+  String get listingModels => 'Listing models…';
+  @override
+  String get savingKernel => 'Saving and switching…';
   @override
   String get install => 'Install';
   @override

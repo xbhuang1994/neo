@@ -483,35 +483,101 @@ class ModelsSettings extends StatefulWidget {
 }
 
 class _ModelsSettingsState extends LoadingState<ModelsSettings, ModelSettings> {
+  // What the page shows is a draft: nothing changes on the backend until it is saved.
+  String _kernel = 'omp';
+  String? _workerKernel;
   RoleModel? _eval;
   RoleModel? _executor;
   String? _installing;
+  Timer? _poll;
 
   @override
   Future<ModelSettings> load() async => _take(await widget.api.models());
 
+  @override
+  void dispose() {
+    _poll?.cancel();
+    super.dispose();
+  }
+
+  /// Keep what the backend answered as the draft's starting point.
   ModelSettings _take(ModelSettings settings) {
+    _kernel = settings.kernel;
+    _workerKernel = settings.workerKernelFollows ? null : settings.workerKernel;
     _eval = settings.eval;
     _executor = settings.executor;
+    _watch(settings);
     return settings;
   }
 
-  String _name(String kernel) => switch (kernel) {
-        'claude' => 'Claude Code',
-        'antigravity' => 'Antigravity',
-        _ => 'Oh My Pi',
-      };
+  /// While a kernel is still listing its models, ask again shortly, keeping the draft as it is.
+  void _watch(ModelSettings settings) {
+    _poll?.cancel();
+    if (!settings.loading) return;
+    _poll = Timer(const Duration(milliseconds: 1500), () async {
+      try {
+        final fresh = await widget.api.models();
+        if (!mounted) return;
+        setState(() => data = fresh);
+        _watch(fresh);
+      } on ApiException {
+        // The next look at the page asks again.
+      }
+    });
+  }
 
-  Future<void> _pickModel(String title, RoleModel? current, String fallback, ValueChanged<RoleModel?> set) async {
+  String get _workers => _workerKernel ?? _kernel;
+
+  String _name(String kernel) => switch (kernel) {
+    'claude' => 'Claude Code',
+    'antigravity' => 'Antigravity',
+    _ => 'Oh My Pi',
+  };
+
+  /// Choose the main session's kernel in the draft; its model becomes the one kept for that kernel.
+  void _chooseKernel(String kernel) {
     final settings = data!;
+    final workersBefore = _workers;
+    setState(() {
+      _kernel = kernel;
+      _eval = settings.info(kernel).eval;
+      if (_workers != workersBefore) _executor = settings.info(_workers).executor;
+    });
+  }
+
+  Future<void> _pickWorkerKernel() async {
     final strings = Strings.read(context);
-    final known = settings.available.any((option) => option.provider == current?.provider && option.id == current?.model);
+    final picked = await pickOption<String?>(
+      context,
+      title: strings.workerKernel,
+      options: [
+        (null, strings.sameAsOrchestrator),
+        for (final kernel in const ['omp', 'claude', 'antigravity']) (kernel, _name(kernel)),
+      ],
+      current: _workerKernel,
+    );
+    if (picked == null || !mounted) return;
+    final workersBefore = _workers;
+    setState(() {
+      _workerKernel = picked.$1;
+      if (_workers != workersBefore) _executor = data!.info(_workers).executor;
+    });
+  }
+
+  Future<void> _pickModel(KernelInfo kernel, String title, RoleModel? current, String fallback, ValueChanged<RoleModel?> set) async {
+    final strings = Strings.read(context);
+    final known = kernel.available.any((option) => option.provider == current?.provider && option.id == current?.model);
     final options = <(RoleModel?, String)>[
       (null, fallback),
-      for (final option in settings.available) (RoleModel(option.provider, option.id, current?.thinkingLevel), '${option.name} · ${option.provider}/${option.id}'),
+      for (final option in kernel.available)
+        (RoleModel(option.provider, option.id, current?.thinkingLevel), '${option.name} · ${option.provider}/${option.id}'),
       if (current != null && !known) (current, '${current.provider}/${current.model} (${strings.current})'),
     ];
-    final currentKey = current == null ? null : options.map((option) => option.$1).firstWhere((option) => option?.provider == current.provider && option?.model == current.model, orElse: () => current);
+    final currentKey = current == null
+        ? null
+        : options
+              .map((option) => option.$1)
+              .firstWhere((option) => option?.provider == current.provider && option?.model == current.model, orElse: () => current);
     final picked = await pickOption<RoleModel?>(context, title: title, options: options, current: currentKey);
     if (picked != null && mounted) setState(() => set(picked.$1));
   }
@@ -521,29 +587,62 @@ class _ModelsSettingsState extends LoadingState<ModelsSettings, ModelSettings> {
     final name = _name(kernel);
     final done = kernel == 'antigravity' ? '${strings.installed(name)} ${strings.antigravitySignIn}' : strings.installed(name);
     setState(() => _installing = kernel);
-    await run(() async => _take(await widget.api.installKernel(kernel)), done: done);
-    if (mounted) setState(() => _installing = null);
+    // Installing keeps the draft: only what may be chosen changes.
+    final draft = (_kernel, _workerKernel, _eval, _executor);
+    await run(() async {
+      final settings = await widget.api.installKernel(kernel);
+      _watch(settings);
+      return settings;
+    }, done: done);
+    if (!mounted) return;
+    setState(() {
+      _kernel = draft.$1;
+      _workerKernel = draft.$2;
+      _eval = draft.$3;
+      _executor = draft.$4;
+      _installing = null;
+    });
   }
 
-  Future<void> _pickThinking(RoleModel model, ValueChanged<RoleModel?> set) async {
+  Future<void> _pickThinking(KernelInfo kernel, RoleModel model, ValueChanged<RoleModel?> set) async {
     final strings = Strings.read(context);
-    final levels = data!.thinkingLevels;
-    final picked = await pickOption<String>(context, title: strings.thinking, options: [for (final level in levels) (level, level)], current: model.thinkingLevel ?? 'auto');
+    final picked = await pickOption<String>(
+      context,
+      title: strings.thinking,
+      options: [for (final level in kernel.thinkingLevels) (level, level)],
+      current: model.thinkingLevel ?? 'auto',
+    );
     if (picked != null && mounted) setState(() => set(model.withThinking(picked.$1 == 'auto' ? null : picked.$1)));
   }
 
-  List<Widget> _role(String title, RoleModel? model, String fallback, ValueChanged<RoleModel?> set) {
+  List<Widget> _role(KernelInfo kernel, String title, RoleModel? model, String fallback, ValueChanged<RoleModel?> set) {
     final strings = Strings.read(context);
+    final typo = Typo.of(context);
+    final palette = Palette.of(context);
     return [
       Field(
         key: ValueKey('model-$title'),
         label: title,
         trailing: Choice(model == null ? fallback : '${model.provider}/${model.model}'),
-        onTap: busy ? null : () => unawaited(_pickModel(title, model, fallback, set)),
+        onTap: busy ? null : () => unawaited(_pickModel(kernel, title, model, fallback, set)),
       ),
+      if (kernel.loading)
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+          child: Text(strings.listingModels, style: typo.footnote.copyWith(color: palette.secondary)),
+        )
+      else if (kernel.listProblem != null && kernel.problem == null)
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+          child: Text(kernel.listProblem!, style: typo.footnote.copyWith(color: palette.orange)),
+        ),
       // A kernel with no levels, such as Antigravity, picks its own effort.
-      if (model != null && data!.thinkingLevels.isNotEmpty)
-        Field(label: '  ${strings.thinking}', trailing: Choice(model.thinkingLevel ?? 'auto'), onTap: busy ? null : () => unawaited(_pickThinking(model, set))),
+      if (model != null && kernel.thinkingLevels.isNotEmpty)
+        Field(
+          label: '  ${strings.thinking}',
+          trailing: Choice(model.thinkingLevel ?? 'auto'),
+          onTap: busy ? null : () => unawaited(_pickThinking(kernel, model, set)),
+        ),
     ];
   }
 
@@ -554,30 +653,46 @@ class _ModelsSettingsState extends LoadingState<ModelsSettings, ModelSettings> {
     if (settings == null) return placeholder(context, strings.kernelAndModels);
     final palette = Palette.of(context);
     final typo = Typo.of(context);
-    final changed = _eval != settings.eval || _executor != settings.executor;
-    final missing = [for (final kernel in settings.kernels) if (kernel.problem != null) kernel];
+    final changed =
+        _kernel != settings.kernel ||
+        _workerKernel != (settings.workerKernelFollows ? null : settings.workerKernel) ||
+        _eval != settings.eval ||
+        _executor != settings.executor;
+    final missing = [
+      for (final kernel in settings.kernels)
+        if (kernel.problem != null) kernel,
+    ];
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Group(
           title: strings.kernelAndModels,
-          footer: '${switch (settings.kernel) {
-            'claude' => strings.kernelHintClaude,
-            'antigravity' => strings.kernelHintAntigravity,
-            _ => strings.kernelHintOmp,
-          }} ${strings.kernelSwitchHint}',
+          footer:
+              '${switch (_kernel) {
+                'claude' => strings.kernelHintClaude,
+                'antigravity' => strings.kernelHintAntigravity,
+                _ => strings.kernelHintOmp,
+              }} ${strings.kernelSwitchHint}',
           children: [
             Padding(
               padding: const EdgeInsets.all(12),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: Text(strings.orchestratorKernel, style: typo.footnote.copyWith(color: palette.secondary)),
+                  ),
                   CupertinoSlidingSegmentedControl<String>(
-                    groupValue: settings.kernel,
-                    children: {for (final kernel in const ['omp', 'claude', 'antigravity']) kernel: Padding(padding: const EdgeInsets.symmetric(horizontal: 8), child: Text(_name(kernel)))},
+                    key: const ValueKey('orchestrator-kernel'),
+                    groupValue: _kernel,
+                    children: {
+                      for (final kernel in const ['omp', 'claude', 'antigravity'])
+                        kernel: Padding(padding: const EdgeInsets.symmetric(horizontal: 8), child: Text(_name(kernel))),
+                    },
                     onValueChanged: (kernel) {
-                      if (kernel == null || kernel == settings.kernel || busy) return;
-                      unawaited(run(() async => _take(await widget.api.setKernel(kernel)), done: _name(kernel)));
+                      if (kernel == null || kernel == _kernel || busy) return;
+                      _chooseKernel(kernel);
                     },
                   ),
                   for (final kernel in missing)
@@ -586,7 +701,9 @@ class _ModelsSettingsState extends LoadingState<ModelsSettings, ModelSettings> {
                       padding: const EdgeInsets.only(top: 8),
                       child: Row(
                         children: [
-                          Expanded(child: Text('${_name(kernel.id)}: ${kernel.problem}', style: typo.footnote.copyWith(color: palette.orange))),
+                          Expanded(
+                            child: Text('${_name(kernel.id)}: ${kernel.problem}', style: typo.footnote.copyWith(color: palette.orange)),
+                          ),
                           if (!kernel.installed)
                             Padding(
                               padding: const EdgeInsets.only(left: 8),
@@ -601,21 +718,40 @@ class _ModelsSettingsState extends LoadingState<ModelsSettings, ModelSettings> {
                         ],
                       ),
                     ),
-                  if (settings.problem != null && missing.isEmpty) Padding(padding: const EdgeInsets.only(top: 8), child: Text(settings.problem!, style: typo.footnote.copyWith(color: palette.orange))),
                 ],
               ),
             ),
-            ..._role(strings.orchestratorModel, _eval, strings.followKernelDefault, (model) => _eval = model),
-            ..._role(strings.workerModel, _executor, strings.followKernelDefault, (model) => _executor = model),
+            ..._role(settings.info(_kernel), strings.orchestratorModel, _eval, strings.followKernelDefault, (model) => _eval = model),
+            Field(
+              key: const ValueKey('worker-kernel'),
+              label: strings.workerKernel,
+              trailing: Choice(_workerKernel == null ? '${strings.sameAsOrchestrator} · ${_name(_kernel)}' : _name(_workerKernel!)),
+              onTap: busy ? null : () => unawaited(_pickWorkerKernel()),
+            ),
+            ..._role(settings.info(_workers), strings.workerModel, _executor, strings.followKernelDefault, (model) => _executor = model),
             Padding(
               padding: const EdgeInsets.all(12),
               child: Row(
                 children: [
-                  Expanded(child: notice == null ? const SizedBox.shrink() : Text(notice!, style: typo.footnote.copyWith(color: noticeGood ? palette.green : palette.red))),
+                  Expanded(
+                    child: busy
+                        ? Text(strings.savingKernel, style: typo.footnote.copyWith(color: palette.secondary))
+                        : notice == null
+                        ? const SizedBox.shrink()
+                        : Text(notice!, style: typo.footnote.copyWith(color: noticeGood ? palette.green : palette.red)),
+                  ),
                   ActionButton(
+                    key: const ValueKey('save-models'),
                     label: strings.save,
                     busy: busy,
-                    onPressed: changed ? () => unawaited(run(() async => _take(await widget.api.saveModels(eval: _eval, executor: _executor)), done: strings.saved)) : null,
+                    onPressed: changed && !busy
+                        ? () => unawaited(
+                            run(
+                              () async => _take(await widget.api.saveModels(kernel: _kernel, workerKernel: _workerKernel, eval: _eval, executor: _executor)),
+                              done: strings.saved,
+                            ),
+                          )
+                        : null,
                   ),
                 ],
               ),

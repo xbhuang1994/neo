@@ -346,12 +346,18 @@ void main() {
     await app.close();
   });
 
-  testWidgets('chooses the kernel and its models', (tester) async {
+  testWidgets('chooses the kernels and their models, applying them only when saved', (tester) async {
     final backend = FakeBackend();
     final app = await open(tester, backend);
     await tester.tap(nav(2));
     await settle(tester);
     expect(find.text('跟随内核默认'), findsNWidgets(2));
+    Future<void> save() async {
+      final saving = find.byKey(const ValueKey('save-models'));
+      await show(tester, saving);
+      await tester.tap(saving);
+      await settle(tester);
+    }
 
     await tester.tap(find.byKey(const ValueKey('model-评估与调度模型')));
     await settle(tester);
@@ -363,40 +369,48 @@ void main() {
     await settle(tester);
     await tester.tap(find.text('high'));
     await settle(tester);
-    await show(tester, find.widgetWithText(CupertinoButton, '保存').first);
-    await tester.tap(find.widgetWithText(CupertinoButton, '保存').first);
-    await settle(tester);
+    await save();
     expect(backend.models['omp'], {
       'eval': {'provider': 'fixture', 'model': 'big', 'thinkingLevel': 'high'},
       'executor': null,
     });
     expect(find.text('已保存'), findsOneWidget);
 
-    // The other kernel has its own choices.
+    // Choosing another kernel only prepares the switch: nothing is asked of the backend until it is saved.
+    final reads = backend.modelReads;
     await show(tester, find.text('Claude Code'));
     await tester.tap(find.text('Claude Code'));
     await settle(tester);
-    expect(backend.kernel, 'claude');
+    expect((backend.kernel, backend.modelReads), ('omp', reads));
+    // The other kernel has its own choices, and the workers follow the main session's kernel.
     expect(find.text('fixture/big'), findsNothing);
-    // A kernel that cannot run says why, and nothing changes.
+    expect(find.text('同调度内核 · Claude Code'), findsOneWidget);
+    await save();
+    expect(backend.kernel, 'claude');
+    // A kernel that cannot run says why when saved, and nothing changes.
     backend.claudeProblem = 'The Claude Code program (claude) was not found.';
     await tester.tap(find.text('Oh My Pi'));
     await settle(tester);
+    await save();
+    expect(backend.kernel, 'omp');
     await tester.tap(find.text('Claude Code'));
     await settle(tester);
+    await save();
     expect(backend.kernel, 'omp');
-    expect(find.text('The Claude Code program (claude) was not found.'), findsOneWidget);
+    expect(find.text('The Claude Code program (claude) was not found.'), findsWidgets);
     // Antigravity is the third kernel, with its own models and no thinking level to choose.
     await show(tester, find.text('Antigravity'));
     await tester.tap(find.text('Antigravity'));
     await settle(tester);
-    expect(backend.kernel, 'antigravity');
-    await tester.tap(find.text('跟随内核默认').first);
+    await tester.tap(find.byKey(const ValueKey('model-评估与调度模型')));
     await settle(tester);
     await tester.tap(find.textContaining('Gemini 3.8 Flash (Low)'));
     await settle(tester);
     expect(find.text('antigravity/gemini-3.8-flash-low'), findsOneWidget);
     expect(find.text('  思考档位'), findsNothing);
+    await save();
+    expect(backend.kernel, 'antigravity');
+    expect(backend.models['antigravity']!['eval'], {'provider': 'antigravity', 'model': 'gemini-3.8-flash-low'});
     // A kernel whose program is missing can be installed from here, and then chosen.
     final install = find.byKey(const ValueKey('install-claude'));
     await show(tester, install);
@@ -409,7 +423,42 @@ void main() {
     expect(install, findsNothing);
     await tester.tap(find.text('Claude Code'));
     await settle(tester);
+    await save();
     expect(backend.kernel, 'claude');
+    await app.close();
+  });
+
+  testWidgets('runs workers on a kernel of their own, once its models are listed', (tester) async {
+    final backend = FakeBackend()..antigravityListing = true;
+    final app = await open(tester, backend);
+    await tester.tap(nav(2));
+    await settle(tester);
+    final workerKernel = find.byKey(const ValueKey('worker-kernel'));
+    await show(tester, workerKernel);
+    await tester.tap(workerKernel);
+    await settle(tester);
+    await tester.tap(find.text('Antigravity').last);
+    await settle(tester);
+    expect(find.descendant(of: workerKernel, matching: find.text('Antigravity')), findsOneWidget);
+    expect(find.text('正在读取模型列表…'), findsOneWidget);
+    // The page asks again until the kernel has listed its models, and keeps the draft meanwhile.
+    backend.antigravityListing = false;
+    await tester.pump(const Duration(seconds: 2));
+    await settle(tester);
+    expect(find.text('正在读取模型列表…'), findsNothing);
+    final workerModel = find.byKey(const ValueKey('model-Worker 模型'));
+    await show(tester, workerModel);
+    await tester.tap(workerModel);
+    await settle(tester);
+    await tester.tap(find.textContaining('Gemini 3.8 Flash (Low)'));
+    await settle(tester);
+    final saving = find.byKey(const ValueKey('save-models'));
+    await show(tester, saving);
+    await tester.tap(saving);
+    await settle(tester);
+    expect((backend.kernel, backend.workerKernel), ('omp', 'antigravity'));
+    expect(backend.models['antigravity']!['executor'], {'provider': 'antigravity', 'model': 'gemini-3.8-flash-low'});
+    expect(backend.models['omp']!['executor'], null);
     await app.close();
   });
 

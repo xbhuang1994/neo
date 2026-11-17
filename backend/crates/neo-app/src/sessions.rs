@@ -180,16 +180,25 @@ impl App {
         self.sessions.loaded.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(session_id).cloned()
     }
 
+    /// The kernel a Session of a role runs on: workers on theirs, everything else on the main Session's.
+    pub(crate) fn role_kernel(settings: &Settings, role: SessionRole) -> Kernel {
+        match role {
+            SessionRole::Worker => settings.worker_kernel(),
+            SessionRole::Orchestrator | SessionRole::Sidecar | SessionRole::Watchdog => settings.kernel,
+        }
+    }
+
     fn role_model(settings: &Settings, role: SessionRole) -> Option<RoleModel> {
-        let models = settings.role_models();
+        let kernel = Self::role_kernel(settings, role);
+        let models = settings.models_of(kernel);
         let model = match role {
             SessionRole::Worker => models.executor,
             SessionRole::Orchestrator => models.eval,
-            // One-off turns run on the orchestrator's model, else the workers'.
+            // One-off turns run on the main Session's kernel, with its model, else that kernel's workers' model.
             SessionRole::Sidecar | SessionRole::Watchdog => models.eval.or(models.executor),
         };
         // A level saved before the kernel stopped taking one is not passed on.
-        let levels = crate::kernels::support(settings.kernel).thinking_levels;
+        let levels = crate::kernels::support(kernel).thinking_levels;
         model.map(|model| RoleModel { thinking_level: model.thinking_level.filter(|_| !levels.is_empty()), ..model })
     }
 
@@ -213,7 +222,7 @@ impl App {
             return Err("neo-agent is stopping".into());
         }
         let settings = self.settings();
-        let kernel = settings.kernel;
+        let kernel = Self::role_kernel(&settings, role);
         if let Some(problem) = self.kernels.unavailable(kernel) {
             return Err(problem);
         }
@@ -301,11 +310,11 @@ impl App {
         self.ensure_orchestrator().await.map(|_| ())
     }
 
-    /// Apply the settings' model choices to the open Sessions of the current kernel, from their next turn.
+    /// Apply the settings' model choices to the open Sessions on the kernel of their role, from their next turn.
     pub async fn apply_models(&self) {
         let settings = self.settings();
         let all: Vec<Arc<Loaded>> = self.sessions.loaded.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).values().cloned().collect();
-        for loaded in all.into_iter().filter(|loaded| loaded.kernel == settings.kernel && !loaded.session.is_disposed()) {
+        for loaded in all.into_iter().filter(|loaded| loaded.kernel == Self::role_kernel(&settings, loaded.role) && !loaded.session.is_disposed()) {
             let Some(model) = Self::role_model(&settings, loaded.role) else { continue };
             let name = match loaded.kernel {
                 Kernel::Claude | Kernel::Antigravity => model.model.clone(),
@@ -436,7 +445,7 @@ impl App {
             return Err("neo-agent is stopping".into());
         }
         let settings = self.settings();
-        let kernel = settings.kernel;
+        let kernel = Self::role_kernel(&settings, role);
         if let Some(problem) = self.kernels.unavailable(kernel) {
             return Err(problem);
         }

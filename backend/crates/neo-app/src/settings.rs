@@ -264,6 +264,9 @@ pub struct Settings {
     /// Each kernel's own model choices.
     #[serde(default)]
     pub models: BTreeMap<Kernel, RoleModels>,
+    /// The runtime workers run on; `None` follows `kernel`, which the main Session runs on.
+    #[serde(default, rename = "workerKernel", skip_serializing_if = "Option::is_none")]
+    pub worker_kernel: Option<Kernel>,
 }
 
 fn id_like(text: &str, max: usize) -> bool {
@@ -376,9 +379,19 @@ impl Settings {
         Ok(())
     }
 
-    /// The current kernel's model choices.
+    /// The runtime workers run on.
+    pub fn worker_kernel(&self) -> Kernel {
+        self.worker_kernel.unwrap_or(self.kernel)
+    }
+
+    /// A kernel's model choices.
+    pub fn models_of(&self, kernel: Kernel) -> RoleModels {
+        self.models.get(&kernel).cloned().unwrap_or_default()
+    }
+
+    /// The model choices in use: the main Session's on its kernel, the workers' on theirs.
     pub fn role_models(&self) -> RoleModels {
-        self.models.get(&self.kernel).cloned().unwrap_or_default()
+        RoleModels { eval: self.models_of(self.kernel).eval, executor: self.models_of(self.worker_kernel()).executor }
     }
 
     /// The listed sender an actor is, compared without case.

@@ -29,6 +29,16 @@ class FakeBackend {
   final List<String> calls = [];
   int resets = 0;
   String kernel = 'omp';
+
+  /// The workers' kernel; null follows [kernel].
+  String? workerKernel;
+
+  /// Antigravity is still listing its models; the page asks again until it is done.
+  bool antigravityListing = false;
+
+  /// How many times the models were asked for.
+  int modelReads = 0;
+
   /// Why Claude Code cannot run; set, its program is not installed until the app installs it.
   String? claudeProblem;
   final List<String> installed = [];
@@ -95,35 +105,56 @@ class FakeBackend {
     details[id] = {...card, 'inputs': <dynamic>[], 'recent': recent};
   }
 
-  Map<String, dynamic> _modelsView() => {
-    'kernel': kernel,
-    'kernels': [
-      {'id': 'omp', 'problem': null, 'installed': true, 'installing': false},
-      {'id': 'claude', 'problem': claudeProblem, 'installed': claudeProblem == null, 'installing': false},
-      {'id': 'antigravity', 'problem': null, 'installed': true, 'installing': false},
-    ],
-    'supports': {
-      'thinkingLevels': switch (kernel) {
-        'omp' => ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
-        'antigravity' => <String>[],
-        _ => ['auto', 'off', 'low', 'medium', 'high', 'xhigh', 'max'],
-      },
-    },
-    'current': models[kernel],
-    'available': kernel == 'omp'
-        ? [
-            {'id': 'big', 'provider': 'fixture', 'name': 'Big'},
-            {'id': 'small', 'provider': 'fixture', 'name': 'Small'},
-          ]
-        : kernel == 'antigravity'
-            ? [
-                {'id': 'gemini-3.8-flash-low', 'provider': 'antigravity', 'name': 'Gemini 3.8 Flash (Low)'},
-              ]
-            : [
-                {'id': 'opus', 'provider': 'anthropic', 'name': 'Opus'},
-              ],
-    'problem': null,
+  List<String> _levels(String kernel) => switch (kernel) {
+    'omp' => ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+    'antigravity' => <String>[],
+    _ => ['auto', 'off', 'low', 'medium', 'high', 'xhigh', 'max'],
   };
+
+  List<Map<String, dynamic>> _available(String kernel) => switch (kernel) {
+    'omp' => [
+      {'id': 'big', 'provider': 'fixture', 'name': 'Big'},
+      {'id': 'small', 'provider': 'fixture', 'name': 'Small'},
+    ],
+    'antigravity' =>
+      antigravityListing
+          ? <Map<String, dynamic>>[]
+          : [
+              {'id': 'gemini-3.8-flash-low', 'provider': 'antigravity', 'name': 'Gemini 3.8 Flash (Low)'},
+            ],
+    _ => [
+      {'id': 'opus', 'provider': 'anthropic', 'name': 'Opus'},
+    ],
+  };
+
+  Map<String, dynamic> _modelsView() {
+    final workers = workerKernel ?? kernel;
+    return {
+      'kernel': kernel,
+      'workerKernel': workers,
+      'workerKernelFollows': workerKernel == null,
+      'loading': antigravityListing,
+      'kernels': [
+        for (final id in const ['omp', 'claude', 'antigravity'])
+          {
+            'id': id,
+            'problem': id == 'claude' ? claudeProblem : null,
+            'installed': id != 'claude' || claudeProblem == null,
+            'installing': false,
+            'supports': {'thinkingLevels': _levels(id)},
+            'available': _available(id),
+            'listProblem': id == 'claude' ? claudeProblem : null,
+            'loading': id == 'antigravity' && antigravityListing,
+            'models': models[id],
+          },
+      ],
+      'supports': {'thinkingLevels': _levels(kernel)},
+      'workerSupports': {'thinkingLevels': _levels(workers)},
+      'current': {'eval': models[kernel]!['eval'], 'executor': models[workers]!['executor']},
+      'available': _available(kernel),
+      'problem': null,
+    };
+  }
 
   Map<String, dynamic> _generalView() => {
     ...general,
@@ -182,11 +213,20 @@ class FakeBackend {
         messages.clear();
         return _json(200, {'reset': true});
       case ('GET', '/api/settings/models'):
+        modelReads++;
         return _json(200, _modelsView());
       case ('PUT', '/api/settings/models'):
         final chosen = (body as Map).cast<String, dynamic>();
         if ((chosen['eval'] as Map?)?['model'] == 'broken') return _json(400, {'error': 'Unknown OMP model: fixture/broken'});
-        models[kernel] = chosen;
+        final main = chosen['kernel'] as String? ?? kernel;
+        final workers = chosen.containsKey('workerKernel') ? chosen['workerKernel'] as String? : workerKernel;
+        for (final each in [main, workers]) {
+          if (each == 'claude' && claudeProblem != null) return _json(400, {'error': claudeProblem});
+        }
+        kernel = main;
+        workerKernel = workers;
+        models[main]!['eval'] = chosen['eval'];
+        models[workers ?? main]!['executor'] = chosen['executor'];
         return _json(200, _modelsView());
       case ('PUT', '/api/settings/kernel'):
         final next = (body as Map)['kernel'] as String;

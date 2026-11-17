@@ -79,6 +79,8 @@ pub struct Scripted {
     pub model: Mutex<Option<Model>>,
     pub ran: Mutex<Vec<Ran>>,
     pub opened: Mutex<Vec<SessionSpec>>,
+    /// The kernel each opened Session runs on, by role.
+    pub opened_on: Mutex<Vec<(SessionRole, Kernel)>>,
     pub unavailable: Mutex<Option<String>>,
     /// The kernels installed through the application; installing one makes every kernel available.
     pub installed: Mutex<Vec<Kernel>>,
@@ -161,15 +163,10 @@ impl Driver for ScriptedDriver {
 pub struct ScriptedKernels(pub Arc<Scripted>);
 
 impl Kernels for ScriptedKernels {
-    fn open(
-        &self,
-        _kernel: Kernel,
-        spec: &SessionSpec,
-        host: Arc<dyn ToolHost>,
-        events: mpsc::UnboundedSender<DriverEvent>,
-    ) -> Result<Arc<dyn Driver>, String> {
+    fn open(&self, kernel: Kernel, spec: &SessionSpec, host: Arc<dyn ToolHost>, events: mpsc::UnboundedSender<DriverEvent>) -> Result<Arc<dyn Driver>, String> {
         let kernels = &self.0;
         kernels.opened.lock().unwrap().push(spec.clone());
+        kernels.opened_on.lock().unwrap().push((spec.role, kernel));
         let (queue, mut turns) = mpsc::unbounded_channel::<(String, String, Deliver, Option<String>)>();
         let driver = Arc::new(ScriptedDriver {
             kernels: kernels.clone(),
@@ -435,4 +432,16 @@ impl Once {
         *count += 1;
         *count == 1
     }
+}
+
+/// The kernel and model settings once every kernel has listed its models.
+pub async fn models_ready(app: &std::sync::Arc<neo_app::app::App>) -> serde_json::Value {
+    for _ in 0..200 {
+        let view = app.models_view().await;
+        if view["loading"] != true {
+            return view;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the kernels never listed their models");
 }

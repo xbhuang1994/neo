@@ -156,13 +156,22 @@ async fn chooses_models_per_kernel_and_switches_the_kernel() {
     let f = fixture().await;
     *f.kernels.models.lock().unwrap() = vec![option("fixture", "big"), option("fixture", "small")];
     f.app.start().await.unwrap();
-    let view = f.app.models_view().await;
+    let view = models_ready(&f.app).await;
     assert_eq!((view["kernel"].as_str(), view["problem"].is_null()), (Some("omp"), true));
     assert_eq!(view["current"], json!({"eval": null, "executor": null}));
     assert!(view["supports"]["thinkingLevels"].as_array().unwrap().contains(&json!("minimal")));
     assert_eq!(view["available"][0], json!({"id": "big", "provider": "fixture", "name": "fixture big"}));
     let idle = |id: &str| json!({"id": id, "problem": null, "installed": true, "installing": false});
-    assert_eq!(view["kernels"], json!([idle("omp"), idle("claude"), idle("antigravity")]));
+    let state: Vec<Value> = view["kernels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|kernel| json!({"id": kernel["id"], "problem": kernel["problem"], "installed": kernel["installed"], "installing": kernel["installing"]}))
+        .collect();
+    assert_eq!(state, vec![idle("omp"), idle("claude"), idle("antigravity")]);
+    // Every kernel's models and kept choices come along, so a page can prepare a switch without asking again.
+    assert_eq!(view["kernels"][2]["available"], view["available"]);
+    assert_eq!(view["kernels"][1]["models"], json!({"eval": null, "executor": null}));
 
     // Refusals change nothing.
     let refused = |value: Value| {
@@ -239,6 +248,81 @@ async fn chooses_models_per_kernel_and_switches_the_kernel() {
     let f = f.restart().await;
     assert_eq!(f.app.models_view().await["current"], chosen);
     assert_eq!(f.kernels.opened.lock().unwrap().last().and_then(|spec| spec.model.clone()).map(|model| model.model), Some("big".into()));
+    f.app.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chooses_the_workers_kernel_and_model_apart_from_the_main_sessions() {
+    let f = fixture().await;
+    *f.kernels.models.lock().unwrap() = vec![option("fixture", "big"), option("fixture", "small")];
+    f.app.start().await.unwrap();
+    let view = models_ready(&f.app).await;
+    assert_eq!((view["workerKernel"].as_str(), view["workerKernelFollows"].as_bool()), (Some("omp"), Some(true)));
+    assert_eq!(view["workerAvailable"], view["available"]);
+    assert_eq!(f.app.health_view()["workerKernel"], "omp");
+
+    let opened = f.kernels.opened.lock().unwrap().len();
+    let view = f.app.set_kernel(json!({"workerKernel": "antigravity"})).await.unwrap();
+    assert_eq!(f.kernels.opened.lock().unwrap().len(), opened, "the main Session stays where it is");
+    assert_eq!((view["kernel"].as_str(), view["workerKernel"].as_str()), (Some("omp"), Some("antigravity")));
+    assert_eq!((view["supports"]["thinkingLevels"].as_array().map(Vec::len), view["workerSupports"]["thinkingLevels"].clone()), (Some(8), json!([])));
+    // Each role is checked against its own kernel, and saved under it.
+    let view = f
+        .app
+        .update_models(json!({"eval": {"provider": "fixture", "model": "big", "thinkingLevel": "low"}, "executor": {"provider": "antigravity", "model": "gemini", "thinkingLevel": "high"}}))
+        .await
+        .unwrap();
+    assert_eq!(
+        view["current"],
+        json!({"eval": {"provider": "fixture", "model": "big", "thinkingLevel": "low"}, "executor": {"provider": "antigravity", "model": "gemini"}})
+    );
+    let settings = f.app.settings();
+    assert_eq!(settings.models[&Kernel::Omp].eval.as_ref().map(|model| model.model.as_str()), Some("big"));
+    assert_eq!(settings.models[&Kernel::Omp].executor, None);
+    assert_eq!(settings.models[&Kernel::Antigravity].executor.as_ref().map(|model| model.model.as_str()), Some("gemini"));
+    // Switching the main Session's kernel leaves the workers' where it was.
+    let view = f.app.set_kernel(json!({"kernel": "claude"})).await.unwrap();
+    assert_eq!(
+        (view["kernel"].as_str(), view["workerKernel"].as_str(), view["current"]["executor"]["model"].as_str()),
+        (Some("claude"), Some("antigravity"), Some("gemini"))
+    );
+    assert_eq!(f.app.board.get("kernel").map(|health| health.detail), Some("Main Session on claude, workers on antigravity".to_string()));
+    // Both at once, and the refusals.
+    let view = f.app.set_kernel(json!({"kernel": "omp", "workerKernel": null})).await.unwrap();
+    assert_eq!((view["kernel"].as_str(), view["workerKernel"].as_str()), (Some("omp"), Some("omp")));
+    assert_eq!(f.app.set_kernel(json!({})).await.unwrap_err(), "kernel or workerKernel is required");
+    assert_eq!(f.app.set_kernel(json!({"workerKernel": "pi"})).await.unwrap_err(), "workerKernel is omp, claude, antigravity or null");
+    *f.kernels.unavailable.lock().unwrap() = Some("The Claude Code program (claude) was not found.".into());
+    assert_eq!(f.app.set_kernel(json!({"workerKernel": "claude"})).await.unwrap_err(), "The Claude Code program (claude) was not found.");
+    assert_eq!(f.app.settings().worker_kernel, None);
+    f.app.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn saves_a_kernel_switch_and_its_models_as_one() {
+    let f = fixture().await;
+    *f.kernels.models.lock().unwrap() = vec![option("fixture", "big")];
+    f.app.start().await.unwrap();
+    let opened = f.kernels.opened.lock().unwrap().len();
+    // A model the new kernel refuses changes nothing, the kernel included.
+    let refused = f
+        .app
+        .update_models(json!({"kernel": "claude", "eval": {"provider": "anthropic", "model": "opus", "thinkingLevel": "minimal"}, "executor": null}))
+        .await;
+    assert_eq!(refused.unwrap_err(), "Thinking level minimal is not supported by the claude kernel");
+    assert_eq!((f.app.settings().kernel, f.kernels.opened.lock().unwrap().len()), (Kernel::Omp, opened));
+    let view = f
+        .app
+        .update_models(json!({"kernel": "claude", "workerKernel": "omp", "eval": {"provider": "anthropic", "model": "opus"}, "executor": {"provider": "fixture", "model": "big"}}))
+        .await
+        .unwrap();
+    assert_eq!((view["kernel"].as_str(), view["workerKernel"].as_str(), view["workerKernelFollows"].as_bool()), (Some("claude"), Some("omp"), Some(false)));
+    assert_eq!(view["current"], json!({"eval": {"provider": "anthropic", "model": "opus"}, "executor": {"provider": "fixture", "model": "big"}}));
+    assert_eq!(f.app.session(&f.app.master_id).map(|main| main.kernel), Some(Kernel::Claude));
+    assert_eq!(f.kernels.opened.lock().unwrap().len(), opened + 1, "the main Session reopened once");
+    // Saving again as it is reopens nothing.
+    f.app.update_models(json!({"eval": {"provider": "anthropic", "model": "opus"}, "executor": {"provider": "fixture", "model": "big"}})).await.unwrap();
+    assert_eq!(f.kernels.opened.lock().unwrap().len(), opened + 1);
     f.app.stop().await;
 }
 

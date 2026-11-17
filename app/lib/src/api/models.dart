@@ -223,24 +223,44 @@ class RoleModel {
   int get hashCode => Object.hash(provider, model, thinkingLevel);
 }
 
-/// A kernel, whether its program is installed on the backend's machine, and whether it can run there.
+/// A kernel, whether its program is installed on the backend's machine and can run there, the models it offers,
+/// and the model choices kept for it.
 class KernelInfo {
   KernelInfo.fromJson(Map<String, dynamic> json)
     : id = json['id'] as String? ?? '',
       problem = _text(json['problem']),
       installed = json['installed'] != false,
-      installing = json['installing'] == true;
+      installing = json['installing'] == true,
+      thinkingLevels = _list(_map(json['supports'])['thinkingLevels']).cast<String>(),
+      available = [for (final option in _list(json['available'])) ModelOption.fromJson(_map(option))],
+      listProblem = _text(json['listProblem']),
+      loading = json['loading'] == true,
+      eval = RoleModel.fromJson(_map(json['models'])['eval']),
+      executor = RoleModel.fromJson(_map(json['models'])['executor']);
 
   final String id;
   final String? problem;
   final bool installed;
   final bool installing;
+  final List<String> thinkingLevels;
+  final List<ModelOption> available;
+
+  /// Why it lists no models, when it cannot run or listing them failed.
+  final String? listProblem;
+
+  /// It is still listing its models.
+  final bool loading;
+  final RoleModel? eval;
+  final RoleModel? executor;
 }
 
 /// The kernel and model settings, with what may be chosen.
 class ModelSettings {
   ModelSettings.fromJson(Map<String, dynamic> json)
     : kernel = json['kernel'] as String? ?? 'omp',
+      workerKernel = _text(json['workerKernel']) ?? json['kernel'] as String? ?? 'omp',
+      workerKernelFollows = json['workerKernelFollows'] != false,
+      loading = json['loading'] == true,
       kernels = [for (final kernel in _list(json['kernels'])) KernelInfo.fromJson(_map(kernel))],
       thinkingLevels = _list(_map(json['supports'])['thinkingLevels']).cast<String>(),
       eval = RoleModel.fromJson(_map(json['current'])['eval']),
@@ -248,13 +268,24 @@ class ModelSettings {
       available = [for (final option in _list(json['available'])) ModelOption.fromJson(_map(option))],
       problem = _text(json['problem']);
 
+  /// The kernel the main session runs on.
   final String kernel;
+
+  /// The kernel workers run on, and whether it follows the main session's.
+  final String workerKernel;
+  final bool workerKernelFollows;
+
+  /// A kernel is still listing its models.
+  final bool loading;
   final List<KernelInfo> kernels;
   final List<String> thinkingLevels;
   final RoleModel? eval;
   final RoleModel? executor;
   final List<ModelOption> available;
   final String? problem;
+
+  /// What is known of a kernel; an empty one when the backend did not list it.
+  KernelInfo info(String id) => kernels.firstWhere((kernel) => kernel.id == id, orElse: () => KernelInfo.fromJson({'id': id}));
 }
 
 /// A rule of the Policy.

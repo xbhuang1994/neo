@@ -10,7 +10,7 @@ use crate::outbox::{Channels, Outbox, Sent};
 use crate::passes::Passes;
 use crate::policy::{policy_effects, policy_version, SettingsPolicy, Sources};
 use crate::sessions::SessionsState;
-use crate::settings::{Settings, SettingsStore, CHAT_SOURCE};
+use crate::settings::{Kernel, Settings, SettingsStore, CHAT_SOURCE};
 use neo_core::engine::{Engine, EngineOptions};
 use neo_core::ids::key;
 use neo_core::model::{Assignment, ChannelRef, Ticket};
@@ -87,6 +87,8 @@ pub struct App {
     pub(crate) sessions: SessionsState,
     pub(crate) executor: ExecutorState,
     pub(crate) wechat: crate::wechat::WeChatState,
+    /// What each kernel offered when last asked for its models, and when; listing them can take seconds.
+    pub(crate) model_lists: std::sync::Mutex<std::collections::BTreeMap<crate::settings::Kernel, crate::views::ModelList>>,
 }
 
 struct ExecutorPort(Weak<App>);
@@ -209,6 +211,7 @@ impl App {
                 sessions: SessionsState::default(),
                 executor: ExecutorState::default(),
                 wechat: crate::wechat::WeChatState::new(wechat),
+                model_lists: Default::default(),
             }
         }))
     }
@@ -362,13 +365,15 @@ impl App {
         );
 
         self.sync_blocked();
-        let kernel = self.settings().kernel;
-        match self.kernels.unavailable(kernel) {
-            Some(problem) => self.board.set("kernel", Health::error(problem)),
-            None => {
-                self.board.set("kernel", Health::ready(format!("Running on {}", kernel.as_str())));
-                self.ensure_orchestrator().await?;
+        self.report_kernels();
+        // The settings page lists every kernel's models: ask for them now, so it need not wait.
+        for kernel in [Kernel::Omp, Kernel::Claude, Kernel::Antigravity] {
+            if self.kernels.unavailable(kernel).is_none() {
+                let _ = self.models_known(kernel);
             }
+        }
+        if self.kernels.unavailable(self.settings().kernel).is_none() {
+            self.ensure_orchestrator().await?;
         }
         if self.closing() {
             return Ok(());

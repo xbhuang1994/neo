@@ -44,9 +44,10 @@ Stored in the database; changed in the app or through the API. As JSON:
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `paused` | `false` | While true nothing is assessed, launched or sent; messages are still received |
-| `kernel` | `omp` | `omp`, `claude` or `antigravity` |
-| `models.<kernel>.eval` | `null` | The main Session's model: `{provider, model, thinkingLevel?}`, or `null` for the kernel's default |
-| `models.<kernel>.executor` | `null` | The workers' model, likewise |
+| `kernel` | `omp` | The kernel the main Session, the Sidecar and the Watchdog run on: `omp`, `claude` or `antigravity` |
+| `workerKernel` | unset | The kernel workers run on; unset follows `kernel` |
+| `models.<kernel>.eval` | `null` | The main Session's model when it runs on that kernel: `{provider, model, thinkingLevel?}`, or `null` for the kernel's default |
+| `models.<kernel>.executor` | `null` | The workers' model when they run on that kernel, likewise |
 | `eval.mode` | `observe` | Proactive assessment: `off`, `observe` or `auto`, as [002 Authorization](002-authorization.md) says |
 | `eval.timeoutSeconds` | 120 | An assessment's time limit, 30 to 600 |
 | `executor.maxWorkers` | 3 | Workers at once, 1 to 16 |
@@ -67,16 +68,16 @@ JSON over HTTP, as [006 Deployment](006-deployment.md) says who may call. Errors
 
 | Route | Does |
 | --- | --- |
-| `GET /api/health` | `{ready, version, kernel, paused, activeWorkers, components}`; each component has `state` (`ready`, `waiting`, `error`), `detail` and `at` |
+| `GET /api/health` | `{ready, version, kernel, workerKernel, paused, activeWorkers, components}`; each component has `state` (`ready`, `waiting`, `error`), `detail` and `at` |
 | `GET /api/messages` | `{messages}`: the visible conversation, each `{id, role: user\|assistant, text, at, source, images?, files?}` |
 | `GET /api/workers` | `{workers}`: every Ticket with its worker: `{ticketId, title, stage, outcome, updatedAt, directory, digest, session, background, assignment, progress, attention, pendingInputs, delivery}` |
 | `GET /api/workers/{ticketId}` | The same with `inputs` and `recent`, the worker's latest thirty transcript entries |
 | `GET /api/activity` | `{router, workers}`: whether the main Session is thinking, and for each busy worker `{ticketId, title, doing}`, a line on what it does now: its latest tool call or line while in a turn, else its background job, else its latest report. The app's ticker polls it |
 | `POST /api/chat` | `{text, attachments?, messageId?}` → 202 `{requestId, triggerId, result: stored\|duplicate\|filtered}`. At most 8000 characters and 3 attachments of 5 MiB, each `{name, mediaType, data}` with base64 data. The same `messageId` is the same message |
 | `POST /api/session/reset` | Empties the conversation; Tickets and workers stay |
-| `GET /api/settings/models` | `{kernel, kernels, supports, current, available, problem}`; each of `kernels` is `{id, problem, installed, installing}` |
-| `PUT /api/settings/models` | `{eval, executor}`, each a model or `null` |
-| `PUT /api/settings/kernel` | `{kernel}` |
+| `GET /api/settings/models` | `{kernel, workerKernel, workerKernelFollows, loading, kernels, supports, workerSupports, current, available, problem, workerAvailable, workerProblem}`; each of `kernels` is `{id, problem, installed, installing, supports, available, listProblem, loading, models: {eval, executor}}`. It never waits for a kernel to list its models: the last list is answered and renewed in the background once a minute old, and `loading` is true while a kernel lists them the first time |
+| `PUT /api/settings/models` | `{eval, executor, kernel?, workerKernel?}`: the models, each a model or `null`, and optionally the kernels (`workerKernel` `null` follows `kernel`), checked together and saved as one; a new `kernel` reopens the main Session on it |
+| `PUT /api/settings/kernel` | `{kernel?, workerKernel?}`: switch the kernels only |
 | `POST /api/settings/kernel/install` | `{kernel}`: runs that kernel's official installer on the backend's machine and answers when it ends, with the models view; nothing is run when the program is there already |
 | `GET /api/settings/general` | `{paused, eval, executor, policy, defaults, limits}` |
 | `PUT /api/settings/general` | Any of `paused`, `eval`, `executor`, `policy`; each block sent replaces that block whole |

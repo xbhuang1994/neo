@@ -6,6 +6,7 @@ mod common;
 use common::*;
 use neo_app::kernels::SessionRole;
 use neo_app::sessions::ChatAttachment;
+use neo_app::settings::Kernel;
 use neo_core::model::{AssignmentState, ReportState, TicketEndBy, TicketOutcome};
 use neo_core::stage::{ticket_stage, PersonAction, TicketStage};
 use neo_kernel::types::JobKind;
@@ -620,5 +621,41 @@ async fn sends_a_result_once_when_the_worker_replied_directly_and_the_orchestrat
     let said = replies(&f);
     assert_eq!(said.iter().filter(|text| text.contains("ring buffer")).count(), 1, "{said:#?}");
     assert_eq!(said[1], "Done: the ring buffer is in src/lib.rs.");
+    f.app.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn runs_workers_on_their_own_kernel_and_model_beside_the_main_sessions() {
+    let f = started().await;
+    // The main Session stays on Oh My Pi; workers go to Claude Code, each with its kernel's model.
+    let view = f.app.set_kernel(json!({"workerKernel": "claude"})).await.unwrap();
+    assert_eq!((view["kernel"].as_str(), view["workerKernel"].as_str(), view["workerKernelFollows"].as_bool()), (Some("omp"), Some("claude"), Some(false)));
+    f.app.update_models(json!({"eval": null, "executor": {"provider": "anthropic", "model": "opus"}})).await.unwrap();
+    assert_eq!(f.app.board.get("kernel").map(|health| health.detail), Some("Main Session on omp, workers on claude".to_string()));
+    f.script(model(|turn| {
+        Box::pin(async move {
+            match turn.role {
+                SessionRole::Worker => {
+                    turn.call("orchestrator_report", json!({"state": "ready", "summary": "Painted."})).await?;
+                    Ok("Reported.".into())
+                }
+                _ => orchestrate(&turn).await,
+            }
+        })
+    }));
+    f.app.receive_web("Paint the settings button.", vec![], None).await.unwrap();
+    f.until("the result is delivered", || replies(&f).len() == 2).await;
+    f.settle().await;
+    let opened = f.kernels.opened_on.lock().unwrap().clone();
+    assert!(opened.contains(&(SessionRole::Orchestrator, Kernel::Omp)), "{opened:?}");
+    assert!(opened.contains(&(SessionRole::Worker, Kernel::Claude)), "{opened:?}");
+    assert!(!opened.contains(&(SessionRole::Worker, Kernel::Omp)), "{opened:?}");
+    let worker = f.kernels.opened.lock().unwrap().iter().find(|spec| spec.role == SessionRole::Worker).cloned().unwrap();
+    assert_eq!(worker.model.map(|model| model.model), Some("opus".into()));
+
+    // Following the main Session again, the next worker opens on its kernel.
+    let view = f.app.set_kernel(json!({"workerKernel": null})).await.unwrap();
+    assert_eq!((view["workerKernel"].as_str(), view["workerKernelFollows"].as_bool()), (Some("omp"), Some(true)));
+    assert_eq!(f.app.settings().worker_kernel, None);
     f.app.stop().await;
 }

@@ -3,10 +3,22 @@
 
 use crate::app::App;
 use crate::health::Health;
-use crate::kernels::support;
+use crate::kernels::{support, ModelOption};
 use crate::sessions::worker_session_id;
-use crate::settings::{limits, Kernel, RoleModel, RoleModels, Settings};
+use crate::settings::{limits, Kernel, RoleModel, Settings};
 use crate::text::clip;
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
+
+/// How old a kernel's model list may be before it is listed again in the background.
+const MODEL_LIST_STALE: Duration = Duration::from_secs(60);
+
+/// What a kernel said when last asked for its models.
+pub(crate) struct ModelList {
+    at: Instant,
+    /// `None` while the first listing runs.
+    listed: Option<Result<Vec<ModelOption>, String>>,
+}
 use neo_core::model::Ticket;
 use neo_core::ports::Repositories;
 use neo_core::stage::{ticket_stage, TicketStage};
@@ -135,6 +147,7 @@ impl App {
             "ready": self.board.get("runtime").is_some_and(|health| health.state == "ready"),
             "version": env!("CARGO_PKG_VERSION"),
             "kernel": settings.kernel.as_str(),
+            "workerKernel": settings.worker_kernel().as_str(),
             "paused": settings.paused,
             "activeWorkers": self.active_workers(),
             "components": self.board.all(),
@@ -291,114 +304,258 @@ impl App {
         Some(card)
     }
 
-    /// The kernel and model settings, with what may be chosen.
-    pub async fn models_view(&self) -> Value {
+    /// Say in the health board whether the main Session's kernel and the workers' can run.
+    pub(crate) fn report_kernels(&self) {
         let settings = self.settings();
-        let kernel = settings.kernel;
-        let chosen = settings.role_models();
-        let (available, problem) = match self.kernels.unavailable(kernel) {
-            Some(problem) => (Vec::new(), Some(problem)),
-            None => match self.kernels.models(kernel).await {
-                Ok(models) => (models, None),
-                Err(error) => (Vec::new(), Some(error)),
-            },
+        let (main, workers) = (settings.kernel, settings.worker_kernel());
+        let problem = self
+            .kernels
+            .unavailable(main)
+            .or_else(|| (workers != main).then(|| self.kernels.unavailable(workers)).flatten().map(|problem| format!("Workers: {problem}")));
+        let health = match problem {
+            Some(problem) => Health::error(problem),
+            None if workers == main => Health::ready(format!("Running on {}", main.as_str())),
+            None => Health::ready(format!("Main Session on {}, workers on {}", main.as_str(), workers.as_str())),
         };
+        self.board.set("kernel", health);
+    }
+
+    /// What a kernel offers now, without waiting: its models or why it has none, or `None` while they are first
+    /// listed. A list a minute old is listed again in the background.
+    pub(crate) fn models_known(self: &Arc<Self>, kernel: Kernel) -> Option<Result<Vec<ModelOption>, String>> {
+        let mut lists = self.model_lists.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (known, refresh) = match lists.get_mut(&kernel) {
+            Some(list) if list.listed.is_none() => (None, false),
+            Some(list) => {
+                let stale = list.at.elapsed() > MODEL_LIST_STALE;
+                if stale {
+                    // Marked new now, so one refresh runs at a time.
+                    list.at = Instant::now();
+                }
+                (list.listed.clone(), stale)
+            }
+            None => {
+                lists.insert(kernel, ModelList { at: Instant::now(), listed: None });
+                (None, true)
+            }
+        };
+        drop(lists);
+        if refresh {
+            let app = self.clone();
+            self.rt.spawn(async move {
+                let _ = app.list_models_now(kernel).await;
+            });
+        }
+        known
+    }
+
+    /// A kernel's models, waiting for them when they are not known or `fresh` asks for a new list.
+    pub(crate) async fn listed_models(self: &Arc<Self>, kernel: Kernel, fresh: bool) -> Result<Vec<ModelOption>, String> {
+        match self.models_known(kernel) {
+            Some(Ok(models)) if !fresh => Ok(models),
+            _ => self.list_models_now(kernel).await,
+        }
+    }
+
+    /// Ask the kernel for its models, and keep what it said.
+    async fn list_models_now(&self, kernel: Kernel) -> Result<Vec<ModelOption>, String> {
+        let listed = self.kernels.models(kernel).await;
+        self.model_lists.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(kernel, ModelList { at: Instant::now(), listed: Some(listed.clone()) });
+        listed
+    }
+
+    /// The models a kernel offers, or why it offers none, and whether they are still being listed.
+    fn offered(self: &Arc<Self>, kernel: Kernel) -> (Vec<ModelOption>, Option<String>, bool) {
+        if let Some(problem) = self.kernels.unavailable(kernel) {
+            return (Vec::new(), Some(problem), false);
+        }
+        match self.models_known(kernel) {
+            Some(Ok(models)) => (models, None, false),
+            Some(Err(error)) => (Vec::new(), Some(error), false),
+            None => (Vec::new(), None, true),
+        }
+    }
+
+    /// The kernel and model settings, with what may be chosen: the main Session's kernel and model, the workers', and
+    /// for every kernel its models and the choices kept for it, so a page can prepare a switch before saving it. It
+    /// never waits for a kernel to list its models: `loading` says one is still at it.
+    pub async fn models_view(self: &Arc<Self>) -> Value {
+        let settings = self.settings();
+        let (kernel, workers) = (settings.kernel, settings.worker_kernel());
+        let chosen = settings.role_models();
+        let mut loading = false;
+        let mut offers = BTreeMap::new();
         let kernels: Vec<Value> = [Kernel::Omp, Kernel::Claude, Kernel::Antigravity]
             .into_iter()
-            .map(|kernel| {
+            .map(|each| {
+                let (available, problem, listing) = self.offered(each);
+                loading |= listing;
+                offers.insert(each, (available.clone(), problem.clone()));
+                let kept = settings.models_of(each);
                 json!({
-                    "id": kernel.as_str(),
-                    "problem": self.kernels.unavailable(kernel),
-                    "installed": self.kernels.installed(kernel),
-                    "installing": self.kernels.installing(kernel),
+                    "id": each.as_str(),
+                    "problem": self.kernels.unavailable(each),
+                    "installed": self.kernels.installed(each),
+                    "installing": self.kernels.installing(each),
+                    "supports": support(each),
+                    "available": available,
+                    "listProblem": problem,
+                    "loading": listing,
+                    "models": {"eval": kept.eval, "executor": kept.executor},
                 })
             })
             .collect();
+        let (available, problem) = offers.get(&kernel).cloned().unwrap_or_default();
+        let (worker_available, worker_problem) = offers.get(&workers).cloned().unwrap_or_default();
         json!({
             "kernel": kernel.as_str(),
+            "workerKernel": workers.as_str(),
+            "workerKernelFollows": settings.worker_kernel.is_none(),
             "kernels": kernels,
+            "loading": loading,
             "supports": support(kernel),
+            "workerSupports": support(workers),
             "current": {"eval": chosen.eval, "executor": chosen.executor},
             "available": available,
             "problem": problem,
+            "workerAvailable": worker_available,
+            "workerProblem": worker_problem,
         })
     }
 
-    /// Choose the models of the current kernel's roles; `null` follows the kernel's default. They apply to open
-    /// Sessions from their next turn.
-    pub async fn update_models(self: &Arc<Self>, value: Value) -> Result<Value, String> {
-        let fields = object(value, &["eval", "executor"])?;
-        let settings = self.settings();
-        let kernel = settings.kernel;
+    /// Check a role's model against its kernel: a level it does not take is dropped or refused, and Oh My Pi knows its
+    /// models by provider and id.
+    async fn checked(self: &Arc<Self>, kernel: Kernel, model: Option<RoleModel>) -> Result<Option<RoleModel>, String> {
+        let Some(mut model) = model else { return Ok(None) };
         let supports = support(kernel);
-        let mut chosen = RoleModels { eval: selection(fields.get("eval"), "eval")?, executor: selection(fields.get("executor"), "executor")? };
         if supports.thinking_levels.is_empty() {
             // The runtime picks its own effort: a level sent along is dropped.
-            for model in [&mut chosen.eval, &mut chosen.executor].into_iter().flatten() {
-                model.thinking_level = None;
+            model.thinking_level = None;
+        }
+        if let Some(level) = model.thinking_level.as_deref().filter(|level| !supports.thinking_levels.contains(level)) {
+            return Err(format!("Thinking level {level} is not supported by the {} kernel", kernel.as_str()));
+        }
+        if kernel == Kernel::Omp {
+            let listed = |known: &[ModelOption]| known.iter().any(|option| option.provider == model.provider && option.id == model.model);
+            // A model added since the last list is looked for in a new one.
+            if !listed(&self.listed_models(kernel, false).await?) && !listed(&self.listed_models(kernel, true).await?) {
+                return Err(format!("Unknown OMP model: {}/{}", model.provider, model.model));
             }
         }
-        let all: Vec<&RoleModel> = [&chosen.eval, &chosen.executor].into_iter().flatten().collect();
-        for model in &all {
-            if let Some(level) = model.thinking_level.as_deref().filter(|level| !supports.thinking_levels.contains(level)) {
-                return Err(format!("Thinking level {level} is not supported by the {} kernel", kernel.as_str()));
+        Ok(Some(model))
+    }
+
+    /// Save the kernel and model settings as one: the main Session's kernel (`kernel`, else as it is) and model
+    /// (`eval`), the workers' kernel (`workerKernel`, `null` to follow the main Session's, else as it is) and model
+    /// (`executor`); a model `null` follows its kernel's default. Everything is checked before anything is saved. A
+    /// new main kernel reopens the main Session on it from its transcript; a worker stays on the kernel it started on
+    /// until its ticket ends. Models apply to open Sessions from their next turn.
+    pub async fn update_models(self: &Arc<Self>, value: Value) -> Result<Value, String> {
+        let fields = object(value, &["eval", "executor", "kernel", "workerKernel"])?;
+        let before = self.settings();
+        let kernel = match fields.get("kernel") {
+            Some(value) => kernel_named(Some(value))?,
+            None => before.kernel,
+        };
+        let worker_kernel = match fields.get("workerKernel") {
+            None => before.worker_kernel,
+            Some(Value::Null) => None,
+            Some(value) => Some(kernel_named(Some(value)).map_err(|_| "workerKernel is omp, claude, antigravity or null".to_string())?),
+        };
+        let workers = worker_kernel.unwrap_or(kernel);
+        for each in [kernel, workers] {
+            if each != before.kernel && each != before.worker_kernel() {
+                if let Some(problem) = self.kernels.unavailable(each) {
+                    return Err(problem);
+                }
             }
         }
-        // Oh My Pi knows its models by provider and id: an unknown one is refused before anything is saved.
-        if kernel == Kernel::Omp && !all.is_empty() {
-            let known = self.kernels.models(kernel).await?;
-            if let Some(unknown) = all.iter().find(|model| !known.iter().any(|option| option.provider == model.provider && option.id == model.model)) {
-                return Err(format!("Unknown OMP model: {}/{}", unknown.provider, unknown.model));
-            }
-        }
-        let mut next = (*settings).clone();
-        next.models.insert(kernel, chosen);
+        let eval = self.checked(kernel, selection(fields.get("eval"), "eval")?).await?;
+        let executor = self.checked(workers, selection(fields.get("executor"), "executor")?).await?;
+        let mut next = (*before).clone();
+        next.kernel = kernel;
+        next.worker_kernel = worker_kernel;
+        next.models.entry(kernel).or_default().eval = eval;
+        next.models.entry(workers).or_default().executor = executor;
         self.save_settings(next, "app", "models")?;
+        if kernel != before.kernel {
+            if let Err(error) = self.reopen_orchestrator().await {
+                // The main Session could not open on the new kernel: everything stays as it was.
+                self.save_settings((*before).clone(), "internal", "models")?;
+                let _ = self.reopen_orchestrator().await;
+                self.report_kernels();
+                return Err(error);
+            }
+        }
         self.apply_models().await;
+        self.report_kernels();
+        self.passes.pump();
         Ok(self.models_view().await)
     }
 
-    /// Install a kernel's program with its official installer. When it is the kernel in use, the main Session opens on
-    /// it at once.
+    /// Install a kernel's program with its official installer. When the main Session runs on it, the main Session
+    /// opens on it at once.
     pub async fn install_kernel(self: &Arc<Self>, value: Value) -> Result<Value, String> {
         let fields = object(value, &["kernel"])?;
         let kernel = kernel_named(fields.get("kernel"))?;
         if !self.kernels.installed(kernel) {
             self.kernels.install(kernel).await?;
+            self.model_lists.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&kernel);
+            let _ = self.models_known(kernel);
         }
-        if self.settings().kernel == kernel {
+        let settings = self.settings();
+        if settings.kernel == kernel {
             if let Some(problem) = self.kernels.unavailable(kernel) {
                 return Err(problem);
             }
             self.ensure_orchestrator().await?;
-            self.board.set("kernel", Health::ready(format!("Running on {}", kernel.as_str())));
+        }
+        if settings.kernel == kernel || settings.worker_kernel() == kernel {
+            self.report_kernels();
             self.passes.pump();
         }
         Ok(self.models_view().await)
     }
 
-    /// Switch the kernel new Sessions run on. The main Session reopens on it from its transcript; a worker stays on
-    /// the kernel it started on until its ticket ends. Each kernel keeps its own model choices.
+    /// Switch the kernel the main Session runs on (`kernel`), the workers' (`workerKernel`, `null` to follow the
+    /// main Session's), or both. The main Session reopens on its kernel from its transcript; a worker stays on the
+    /// kernel it started on until its ticket ends. Each kernel keeps its own model choices.
     pub async fn set_kernel(self: &Arc<Self>, value: Value) -> Result<Value, String> {
-        let fields = object(value, &["kernel"])?;
-        let kernel = kernel_named(fields.get("kernel"))?;
+        let fields = object(value, &["kernel", "workerKernel"])?;
+        if fields.is_empty() {
+            return Err("kernel or workerKernel is required".into());
+        }
+        let main = fields.get("kernel").map(|value| kernel_named(Some(value))).transpose()?;
+        let workers = match fields.get("workerKernel") {
+            None => None,
+            Some(Value::Null) => Some(None),
+            Some(value) => Some(Some(kernel_named(Some(value)).map_err(|_| "workerKernel is omp, claude, antigravity or null".to_string())?)),
+        };
+        for kernel in [main, workers.flatten()].into_iter().flatten() {
+            if let Some(problem) = self.kernels.unavailable(kernel) {
+                return Err(problem);
+            }
+        }
         let before = self.settings();
-        if before.kernel == kernel {
-            return Ok(self.models_view().await);
+        if let Some(choice) = workers.filter(|choice| *choice != before.worker_kernel) {
+            let mut next = (*before).clone();
+            next.worker_kernel = choice;
+            self.save_settings(next, "app", "kernel")?;
         }
-        if let Some(problem) = self.kernels.unavailable(kernel) {
-            return Err(problem);
+        if let Some(kernel) = main.filter(|kernel| *kernel != before.kernel) {
+            let kept = self.settings();
+            let mut next = (*kept).clone();
+            next.kernel = kernel;
+            self.save_settings(next, "app", "kernel")?;
+            if let Err(error) = self.reopen_orchestrator().await {
+                // The main Session could not open on the new kernel: stay on the old one.
+                self.save_settings((*kept).clone(), "internal", "kernel")?;
+                let _ = self.reopen_orchestrator().await;
+                self.report_kernels();
+                return Err(error);
+            }
         }
-        let mut next = (*before).clone();
-        next.kernel = kernel;
-        self.save_settings(next, "app", "kernel")?;
-        if let Err(error) = self.reopen_orchestrator().await {
-            // The main Session could not open on the new kernel: stay on the old one.
-            self.save_settings((*before).clone(), "internal", "kernel")?;
-            let _ = self.reopen_orchestrator().await;
-            return Err(error);
-        }
-        self.board.set("kernel", Health::ready(format!("Running on {}", kernel.as_str())));
+        self.report_kernels();
         self.passes.pump();
         Ok(self.models_view().await)
     }
