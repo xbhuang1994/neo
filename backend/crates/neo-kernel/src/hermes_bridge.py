@@ -38,6 +38,7 @@ else:
         hermes_bootstrap.harden_import_path()
 
 import contextlib
+import inspect
 import json
 import queue
 import threading
@@ -414,8 +415,13 @@ class SessionBridge:
         if not self.persist:
             return
         try:
-            from persistence.conversation.messages import ConversationRequest
-            from persistence_assembly import open_persistence, profile_scope
+            try:
+                from persistence.conversation.messages import ConversationRequest
+                from persistence_assembly import open_persistence, profile_scope
+            except ImportError:
+                # Released Hermes (v0.23 and before) keeps sessions in the older SessionDB.
+                self._init_session_db(resume_id)
+                return
 
             self.db = open_persistence(profile_scope(home=self.home), eager=True)
             self.persistence = self.db
@@ -434,6 +440,18 @@ class SessionBridge:
         except Exception:
             self.db = None
             self.persistence = None
+
+    def _init_session_db(self, resume_id: str | None) -> None:
+        from hermes_state_registry import acquire
+
+        self.db = acquire(Path(self.home) / "state.db")
+        if resume_id:
+            row = self.db.get_session(resume_id)
+            if row is not None:
+                if row.get("ended_at") is not None:
+                    with contextlib.suppress(Exception):
+                        self.db.reopen_session(resume_id)
+                self.history = self.db.get_messages_as_conversation(resume_id, repair_alternation=True)
 
     def _build_agent(self) -> Any:
         from hermes_cli.config import load_config
@@ -496,6 +514,10 @@ class SessionBridge:
                 if runtime.get("request_overrides"):
                     kwargs["request_overrides"] = runtime["request_overrides"]
 
+        # Hermes's releases trail its main branch: hand over only what this one's AIAgent takes.
+        params = inspect.signature(AIAgent.__init__).parameters
+        if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            kwargs = {k: v for k, v in kwargs.items() if k in params}
         agent = AIAgent(**kwargs)
         agent._print_fn = lambda *a, **kw: print(*a, **{**kw, "file": sys.stderr})
         agent._auto_recovery_cycles = 0
@@ -821,6 +843,9 @@ class SessionBridge:
         if self.persistence is not None:
             with contextlib.suppress(Exception):
                 self.persistence.sessions.end(self.session_id, "neo_session_close")
+        elif self.db is not None:
+            with contextlib.suppress(Exception):
+                self.db.end_session(self.session_id, "neo_session_close")
 
     def serve(self) -> int:
         emit({"type": "ready", "session_id": self.session_id})
