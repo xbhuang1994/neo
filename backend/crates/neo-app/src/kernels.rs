@@ -1,6 +1,8 @@
 //! The agent runtimes behind Sessions: what a Session of each role needs, and how each kernel provides it.
 
+use crate::accounts::{KernelAccounts, LoginCommand};
 use crate::http;
+use crate::providers::{self, Provider, ResolvedProvider};
 use crate::settings::{Kernel, RoleModel};
 use neo_core::ids::key;
 use neo_kernel::antigravity::{self, Antigravity, AntigravityDriver, AntigravityOptions};
@@ -286,6 +288,28 @@ pub trait Kernels: Send + Sync {
     fn install_progress(&self, _kernel: Kernel) -> Option<String> {
         None
     }
+    /// Use these custom providers from now on: Sessions opened later and model lists reach them.
+    fn set_providers(&self, _providers: Vec<ResolvedProvider>) {}
+    /// The custom providers to start from when none are set: Oh My Pi's own, each with the key it names.
+    fn imported_providers(&self) -> Vec<(Provider, Option<String>)> {
+        Vec::new()
+    }
+    /// Who the kernel is logged in as, and what it can log in to.
+    fn accounts(&self, kernel: Kernel) -> BoxFut<'_, Result<KernelAccounts, String>> {
+        Box::pin(async move { Err(format!("{} accounts cannot be managed from here", display_name(kernel))) })
+    }
+    /// The command that logs the kernel in to a provider.
+    fn login(&self, kernel: Kernel, _provider: &str) -> Result<LoginCommand, String> {
+        Err(format!("{} cannot log in from here", display_name(kernel)))
+    }
+    /// Log the kernel out of one of its accounts.
+    fn logout<'a>(&'a self, kernel: Kernel, _account: &'a str) -> BoxFut<'a, Result<(), String>> {
+        Box::pin(async move { Err(format!("{} cannot log out from here", display_name(kernel))) })
+    }
+    /// Give the kernel an API key for a provider, in its own credential store.
+    fn api_key<'a>(&'a self, kernel: Kernel, _provider: &'a str, _key: &'a str) -> BoxFut<'a, Result<(), String>> {
+        Box::pin(async move { Err(format!("{} takes no API key from here", display_name(kernel))) })
+    }
 }
 
 /// Finds a kernel's program on this machine.
@@ -308,6 +332,8 @@ pub struct RealKernels {
     pub env: BTreeMap<String, String>,
     /// The program, with its first arguments, that relays Antigravity's hooks: `neo-agent agy-hook`.
     pub hook_relay: Vec<String>,
+    /// The custom providers in use, with their keys.
+    pub providers: std::sync::RwLock<Vec<ResolvedProvider>>,
 }
 
 const OVERLAY_COMMON: &str = "launch:\n  enabled: false\nretry:\n  enabled: true\ncompaction:\n  enabled: true\n";
@@ -360,7 +386,7 @@ impl RealKernels {
         (self.find)(kernel)
     }
 
-    fn require(&self, kernel: Kernel) -> Result<PathBuf, String> {
+    pub(crate) fn require(&self, kernel: Kernel) -> Result<PathBuf, String> {
         self.program(kernel).ok_or_else(|| self.unavailable(kernel).unwrap_or_default())
     }
 
@@ -444,7 +470,41 @@ impl RealKernels {
             .ok_or_else(|| format!("The {name} installer finished, but its program ({}) was not found where it installs itself", program_name(kernel)))
     }
 
-    fn claude_env(&self) -> BTreeMap<String, String> {
+    /// The variables every runtime of a kernel gets: the common ones and the custom providers it uses.
+    fn runtime_env(&self, kernel: Kernel) -> BTreeMap<String, String> {
+        let mut env = self.env.clone();
+        env.extend(providers::runtime_env(kernel, &self.providers.read().unwrap_or_else(|poisoned| poisoned.into_inner())));
+        env
+    }
+
+    /// The custom provider of a name that a kernel uses.
+    fn provider_for(&self, kernel: Kernel, name: &str) -> Option<ResolvedProvider> {
+        self.providers.read().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().find(|resolved| resolved.provider.name == name && resolved.provider.used_by(kernel)).cloned()
+    }
+
+    /// The models of the custom providers a kernel uses, in place of any the runtime lists under the same name.
+    fn with_custom_models(&self, kernel: Kernel, mut models: Vec<ModelOption>) -> Vec<ModelOption> {
+        let custom: Vec<ModelOption> = self
+            .providers
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|resolved| resolved.provider.used_by(kernel))
+            .flat_map(|resolved| {
+                resolved.provider.models.iter().map(|model| ModelOption {
+                    id: model.id.clone(),
+                    provider: resolved.provider.name.clone(),
+                    name: if model.name.is_empty() { model.id.clone() } else { model.name.clone() },
+                })
+            })
+            .collect();
+        models.retain(|model| !custom.iter().any(|ours| ours.provider == model.provider));
+        models.extend(custom);
+        models.sort_by(|a, b| (&a.provider, &a.id).cmp(&(&b.provider, &b.id)));
+        models
+    }
+
+    pub(crate) fn claude_env(&self) -> BTreeMap<String, String> {
         // The user's Claude Code settings fill in what the process environment does not say.
         let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_default();
         let mut env: BTreeMap<String, String> =
@@ -463,6 +523,15 @@ impl RealKernels {
             "Runtime note: you run in Claude Code. Tool names above map to `Read` and `Bash`; application tools are exposed as `mcp__neo__<name>`."
         };
         let mut env = self.claude_env();
+        let mut env_remove = Vec::new();
+        if let Some((resolved, model)) = spec.model.as_ref().and_then(|model| Some((self.provider_for(Kernel::Claude, &model.provider)?, &model.model))) {
+            let (custom, removed) = providers::claude_env(&resolved, model);
+            for name in &removed {
+                env.remove(name);
+            }
+            env.extend(custom);
+            env_remove = removed;
+        }
         // The same compaction thresholds as on Oh My Pi, and its move of a long command to the background after a minute.
         env.insert("CLAUDE_CODE_AUTO_COMPACT_WINDOW".into(), if worker { "100000" } else { "60000" }.into());
         if worker {
@@ -501,6 +570,7 @@ impl RealKernels {
             agents,
             project_settings: worker,
             env,
+            env_remove,
             max_turns: match spec.role {
                 SessionRole::Sidecar => Some(20),
                 SessionRole::Watchdog => Some(30),
@@ -556,7 +626,7 @@ impl RealKernels {
                 SessionRole::Watchdog => Some(format!("watchdog-{}", key(&[&self.state_dir.display().to_string()]))),
                 _ => None,
             },
-            env: self.env.clone(),
+            env: self.runtime_env(Kernel::Omp),
         };
         Ok(Arc::new(Omp(OmpDriver::new(options, host, events))))
     }
@@ -639,7 +709,7 @@ impl RealKernels {
                 SessionRole::Watchdog => Some(30),
                 _ => None,
             },
-            env: self.env.clone(),
+            env: self.runtime_env(Kernel::Hermes),
         };
         Ok(Arc::new(Hermes(HermesDriver::new(options, host, events))))
     }
@@ -696,16 +766,24 @@ impl Kernels for RealKernels {
     fn models(&self, kernel: Kernel) -> BoxFut<'_, Result<Vec<ModelOption>, String>> {
         Box::pin(async move {
             match kernel {
-                Kernel::Claude => self.claude_models().await,
+                Kernel::Claude => {
+                    let listed = self.claude_models().await;
+                    let custom = self.with_custom_models(kernel, Vec::new());
+                    // A failed Anthropic list does not hide the custom providers' models.
+                    match listed {
+                        Ok(models) => Ok(self.with_custom_models(kernel, models)),
+                        Err(_) if !custom.is_empty() => Ok(custom),
+                        Err(error) => Err(error),
+                    }
+                }
                 Kernel::Omp => {
                     let program = self.require(Kernel::Omp)?;
-                    let mut models: Vec<ModelOption> = omp::list_models(&program, &self.agent_dir, &self.state_dir)
+                    let models: Vec<ModelOption> = omp::list_models(&program, &self.agent_dir, &self.state_dir)
                         .await?
                         .into_iter()
                         .map(|model| ModelOption { id: model.id, provider: model.provider, name: model.name })
                         .collect();
-                    models.sort_by(|a, b| (&a.provider, &a.id).cmp(&(&b.provider, &b.id)));
-                    Ok(models)
+                    Ok(self.with_custom_models(kernel, models))
                 }
                 Kernel::Antigravity => {
                     let program = self.require(Kernel::Antigravity)?;
@@ -718,13 +796,12 @@ impl Kernels for RealKernels {
                 Kernel::Hermes => {
                     let program = self.require(Kernel::Hermes)?;
                     let bridge = self.hermes_bridge_file();
-                    let mut models: Vec<ModelOption> = hermes::list_models(&program, &bridge, &self.state_dir, &self.env)
+                    let models: Vec<ModelOption> = hermes::list_models(&program, &bridge, &self.state_dir, &self.env)
                         .await?
                         .into_iter()
                         .map(|model| ModelOption { id: model.id, provider: model.provider, name: model.name })
                         .collect();
-                    models.sort_by(|a, b| (&a.provider, &a.id).cmp(&(&b.provider, &b.id)));
-                    Ok(models)
+                    Ok(self.with_custom_models(kernel, models))
                 }
             }
         })
@@ -764,6 +841,24 @@ impl Kernels for RealKernels {
     }
     fn install_progress(&self, kernel: Kernel) -> Option<String> {
         self.installing.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(&kernel).filter(|line| !line.is_empty()).cloned()
+    }
+    fn set_providers(&self, providers: Vec<ResolvedProvider>) {
+        *self.providers.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = providers;
+    }
+    fn imported_providers(&self) -> Vec<(Provider, Option<String>)> {
+        providers::import_omp(&self.agent_dir.join("models.yml"))
+    }
+    fn accounts(&self, kernel: Kernel) -> BoxFut<'_, Result<KernelAccounts, String>> {
+        Box::pin(self.kernel_accounts(kernel))
+    }
+    fn login(&self, kernel: Kernel, provider: &str) -> Result<LoginCommand, String> {
+        self.kernel_login(kernel, provider)
+    }
+    fn logout<'a>(&'a self, kernel: Kernel, account: &'a str) -> BoxFut<'a, Result<(), String>> {
+        Box::pin(self.kernel_logout(kernel, account))
+    }
+    fn api_key<'a>(&'a self, kernel: Kernel, provider: &'a str, key: &'a str) -> BoxFut<'a, Result<(), String>> {
+        Box::pin(self.kernel_api_key(kernel, provider, key))
     }
 }
 
@@ -844,6 +939,7 @@ mod tests {
                 shim: dir.join("shim.ts"),
                 env: BTreeMap::new(),
                 hook_relay: Vec::new(),
+                providers: Default::default(),
             },
         );
         std::fs::create_dir_all(&real).unwrap();
@@ -951,6 +1047,7 @@ mod tests {
             shim: "/missing/shim.ts".into(),
             env: BTreeMap::new(),
             hook_relay: Vec::new(),
+            providers: Default::default(),
         };
         assert!(kernels.unavailable(Kernel::Claude).unwrap().contains("claude"));
         assert!(kernels.unavailable(Kernel::Antigravity).unwrap().contains("agy"));

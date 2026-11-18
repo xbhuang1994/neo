@@ -187,6 +187,50 @@ abstract class Strings {
 
   /// A component's name, in words.
   String component(String name);
+
+  // Providers and accounts
+  String get customProviders;
+  String get providersFooter;
+  String get noProviders;
+  String get addProvider;
+  String get importFromOmp;
+  String importedProviders(int count);
+  String get editProvider;
+  String get providerName;
+  String get providerApi;
+  String get baseUrl;
+  String get apiKey;
+  String get apiKeyPlaceholder;
+  String apiKeyKeep(String hint);
+  String get removeKey;
+  String get headers;
+  String get headersHint;
+  String get providerModels;
+  String get providerModelsHint;
+  String get usedBy;
+  String get unsupportedApi;
+  String get delete;
+  String get kernelAccounts;
+  String get accountsFooter;
+  String get notLoggedIn;
+  String get logIn;
+  String get logOut;
+  String get addApiKey;
+  String get providerId;
+  String get otherProvider;
+  String loginRunning(String kernel);
+  String get loginDone;
+  String get loginFailed;
+  String get pasteCode;
+  String get submit;
+  String get copyLink;
+  String get copied;
+  String get notInstalledShort;
+  String get loggedOut;
+  String get keyAdded;
+  String get refreshModels;
+  String get modelsListed;
+  String get modelsAfterSave;
 }
 
 /// Gives the widgets below it their words.
@@ -541,6 +585,92 @@ class ZhStrings extends Strings {
     'wechat' => '微信',
     _ => name,
   };
+
+  // Providers and accounts
+  @override
+  String get customProviders => '自定义供应商';
+  @override
+  String get providersFooter => '多个内核共享同一份供应商配置，模型列表自动从供应商接口获取：Oh My Pi 支持任意 API，Hermes 支持 OpenAI 与 Anthropic API，Claude Code 只支持 Anthropic API，Antigravity 不支持自定义供应商。首次启动时导入 Oh My Pi 的 models.yml。密钥单独保存，不进入设置历史；修改对之后打开的会话生效。';
+  @override
+  String get noProviders => '还没有自定义供应商';
+  @override
+  String get addProvider => '添加供应商';
+  @override
+  String get importFromOmp => '从 Oh My Pi 导入';
+  @override
+  String importedProviders(int count) => '导入了 $count 个供应商';
+  @override
+  String get editProvider => '编辑供应商';
+  @override
+  String get providerName => '名称';
+  @override
+  String get providerApi => 'API';
+  @override
+  String get baseUrl => 'Base URL';
+  @override
+  String get apiKey => 'API 密钥';
+  @override
+  String get apiKeyPlaceholder => '密钥或环境变量名';
+  @override
+  String apiKeyKeep(String hint) => '已保存 $hint，留空则保留';
+  @override
+  String get removeKey => '不使用密钥';
+  @override
+  String get headers => '请求头';
+  @override
+  String get headersHint => '每行一个：Name: value';
+  @override
+  String get providerModels => '模型';
+  @override
+  String get providerModelsHint => '每行一个：模型 ID，可加 | 显示名';
+  @override
+  String get usedBy => '使用的内核';
+  @override
+  String get unsupportedApi => '不支持此 API';
+  @override
+  String get delete => '删除';
+  @override
+  String get kernelAccounts => '内核账号';
+  @override
+  String get accountsFooter => '登录在后端所在机器上进行：打开链接完成授权，再把页面给出的代码粘贴回来；若浏览器跳到 localhost 打不开，把地址栏的完整网址粘贴回来即可。设备码登录在网页上确认后会自动完成。';
+  @override
+  String get notLoggedIn => '未登录';
+  @override
+  String get logIn => '登录';
+  @override
+  String get logOut => '登出';
+  @override
+  String get addApiKey => '添加 API 密钥';
+  @override
+  String get providerId => '供应商 ID';
+  @override
+  String get otherProvider => '其他…';
+  @override
+  String loginRunning(String kernel) => '正在登录 $kernel';
+  @override
+  String get loginDone => '登录成功';
+  @override
+  String get loginFailed => '登录失败';
+  @override
+  String get pasteCode => '粘贴代码或跳转后的网址';
+  @override
+  String get submit => '提交';
+  @override
+  String get copyLink => '复制链接';
+  @override
+  String get copied => '已复制';
+  @override
+  String get notInstalledShort => '未安装';
+  @override
+  String get loggedOut => '已登出';
+  @override
+  String get keyAdded => '密钥已添加';
+  @override
+  String get refreshModels => '刷新模型';
+  @override
+  String get modelsListed => '模型由供应商接口自动获取';
+  @override
+  String get modelsAfterSave => '保存后自动从供应商接口获取模型';
 }
 
 /// English.
@@ -886,4 +1016,90 @@ class EnStrings extends Strings {
     'wechat' => 'WeChat',
     _ => name,
   };
+
+  // Providers and accounts
+  @override
+  String get customProviders => 'Custom providers';
+  @override
+  String get providersFooter => 'One provider configuration shared by the kernels, its models listed by the provider\'s own API: Oh My Pi takes any API, Hermes the OpenAI and Anthropic APIs, Claude Code only the Anthropic API, and Antigravity none. Oh My Pi\'s models.yml is imported on first start. Keys are kept apart from the settings history; changes apply to sessions opened afterwards.';
+  @override
+  String get noProviders => 'No custom providers yet';
+  @override
+  String get addProvider => 'Add provider';
+  @override
+  String get importFromOmp => 'Import from Oh My Pi';
+  @override
+  String importedProviders(int count) => 'Imported $count providers';
+  @override
+  String get editProvider => 'Edit provider';
+  @override
+  String get providerName => 'Name';
+  @override
+  String get providerApi => 'API';
+  @override
+  String get baseUrl => 'Base URL';
+  @override
+  String get apiKey => 'API key';
+  @override
+  String get apiKeyPlaceholder => 'A key or a variable\'s name';
+  @override
+  String apiKeyKeep(String hint) => 'Saved $hint; leave empty to keep it';
+  @override
+  String get removeKey => 'Use no key';
+  @override
+  String get headers => 'Headers';
+  @override
+  String get headersHint => 'One per line: Name: value';
+  @override
+  String get providerModels => 'Models';
+  @override
+  String get providerModelsHint => 'One per line: the model id, optionally | a display name';
+  @override
+  String get usedBy => 'Used by';
+  @override
+  String get unsupportedApi => 'Does not speak this API';
+  @override
+  String get delete => 'Delete';
+  @override
+  String get kernelAccounts => 'Kernel accounts';
+  @override
+  String get accountsFooter => 'Logging in runs on the backend\'s machine: open the link, authorize, and paste back the code the page shows. If the browser lands on a localhost address that does not open, paste that whole address. A device-code login finishes by itself once approved.';
+  @override
+  String get notLoggedIn => 'Not logged in';
+  @override
+  String get logIn => 'Log in';
+  @override
+  String get logOut => 'Log out';
+  @override
+  String get addApiKey => 'Add API key';
+  @override
+  String get providerId => 'Provider id';
+  @override
+  String get otherProvider => 'Other…';
+  @override
+  String loginRunning(String kernel) => 'Logging in to $kernel';
+  @override
+  String get loginDone => 'Logged in';
+  @override
+  String get loginFailed => 'Login failed';
+  @override
+  String get pasteCode => 'Paste the code or the address you landed on';
+  @override
+  String get submit => 'Submit';
+  @override
+  String get copyLink => 'Copy link';
+  @override
+  String get copied => 'Copied';
+  @override
+  String get notInstalledShort => 'Not installed';
+  @override
+  String get loggedOut => 'Logged out';
+  @override
+  String get keyAdded => 'Key added';
+  @override
+  String get refreshModels => 'Refresh models';
+  @override
+  String get modelsListed => 'Models are listed by the provider\'s API';
+  @override
+  String get modelsAfterSave => 'Models are fetched from the provider\'s API once saved';
 }

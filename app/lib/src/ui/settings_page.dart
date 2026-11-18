@@ -10,6 +10,7 @@ import '../api/models.dart';
 import '../l10n/strings.dart';
 import '../qr/qr_view.dart';
 import '../state/app_state.dart';
+import 'accounts_settings.dart';
 import 'scope.dart';
 import 'theme.dart';
 import 'widgets.dart';
@@ -293,6 +294,8 @@ class SettingsPage extends StatelessWidget {
                           if (online) ...[
                             // A new backend is new settings: each section starts over with its client.
                             ModelsSettings(key: ValueKey(('models', state.client)), api: state.client!),
+                            ProvidersSettings(key: ValueKey(('providers', state.client)), api: state.client!),
+                            AccountsSettings(key: ValueKey(('accounts', state.client)), api: state.client!),
                             GeneralSettingsSection(key: ValueKey(('general', state.client)), api: state.client!),
                             WeChatSettings(key: ValueKey(('wechat', state.client)), api: state.client!),
                             const AboutSection(),

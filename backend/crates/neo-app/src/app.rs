@@ -88,6 +88,9 @@ pub struct App {
     pub(crate) executor: ExecutorState,
     pub(crate) wechat: crate::wechat::WeChatState,
     /// What each kernel offered when last asked for its models, and when; listing them can take seconds.
+    pub(crate) logins: crate::accounts::Logins,
+    /// Why each custom provider could not list its models the last time it was asked.
+    pub(crate) provider_problems: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
     pub(crate) model_lists: std::sync::Mutex<std::collections::BTreeMap<crate::settings::Kernel, crate::views::ModelList>>,
 }
 
@@ -211,6 +214,8 @@ impl App {
                 sessions: SessionsState::default(),
                 executor: ExecutorState::default(),
                 wechat: crate::wechat::WeChatState::new(wechat),
+                logins: Default::default(),
+                provider_problems: Default::default(),
                 model_lists: Default::default(),
             }
         }))
@@ -257,7 +262,10 @@ impl App {
                 if from != to {
                     self.engine.policy_changed(&from, &to, &effects);
                 }
-                self.notify(crate::notices::settings_notice(block, &changed));
+                // Custom providers are the kernels' plumbing, not something the main Session acts on.
+                if changed.iter().any(|path| path != "providers" && !path.starts_with("providers.") && !path.starts_with("providers[")) {
+                    self.notify(crate::notices::settings_notice(block, &changed));
+                }
                 Ok::<(), String>(())
             })
             .inspect_err(|_| {
@@ -318,6 +326,7 @@ impl App {
 
     /// Start everything: the main Session, interrupted work, the effect queue and the passes.
     pub async fn start(self: &Arc<Self>) -> Result<(), String> {
+        self.start_providers()?;
         let handler = |run: fn(Arc<App>, serde_json::Value, String) -> effects::Running| -> effects::Handler {
             let weak = self.weak.clone();
             Arc::new(move |payload, key| match weak.upgrade() {

@@ -73,7 +73,7 @@ fn kernels(plan: &Plan) -> RealKernels {
     let env = [("PATH".to_string(), blocked::path_with(&plan.data_dir).to_string_lossy().to_string())].into_iter().collect();
     // Antigravity's hooks come back to this program.
     let hook_relay = std::env::current_exe().map(|exe| vec![exe.display().to_string(), "agy-hook".into()]).unwrap_or_default();
-    RealKernels { state_dir: plan.data_dir.clone(), agent_dir: plan.agent_dir.clone(), find, installing: Default::default(), shim, env, hook_relay }
+    RealKernels { state_dir: plan.data_dir.clone(), agent_dir: plan.agent_dir.clone(), find, installing: Default::default(), shim, env, hook_relay, providers: Default::default() }
 }
 
 /// Waits until the process is asked to end: by a signal, or by `ended` (the desktop app going away).

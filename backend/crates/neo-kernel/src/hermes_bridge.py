@@ -193,6 +193,24 @@ def _allowed_builtin_tools(kinds: list[str], with_memory: bool) -> tuple[list[st
     return toolsets, allowed
 
 
+_NEO_API_MODES = {
+    "openai-completions": "chat_completions",
+    "openai-responses": "codex_responses",
+    "anthropic-messages": "anthropic_messages",
+}
+
+
+def _neo_provider(name: str | None) -> dict[str, Any] | None:
+    """The custom provider of a name that Neo hands over in NEO_PROVIDERS, if any."""
+    if not name:
+        return None
+    with contextlib.suppress(Exception):
+        for provider in json.loads(os.environ.get("NEO_PROVIDERS") or "[]"):
+            if isinstance(provider, dict) and provider.get("name") == name:
+                return provider
+    return None
+
+
 def _split_model(raw: str | None) -> tuple[str | None, str | None]:
     text = (raw or "").strip()
     if not text:
@@ -454,19 +472,29 @@ class SessionBridge:
         if isinstance(self.max_turns, int) and self.max_turns > 0:
             kwargs["max_iterations"] = self.max_turns
 
-        with contextlib.suppress(Exception):
-            runtime = resolve_runtime_provider(requested=requested, target_model=target_model or None)
+        custom = _neo_provider(req_provider)
+        if custom is not None:
+            # A custom provider Neo hands over: its endpoint and key as given, past Hermes's own provider ladder.
             kwargs.update({
-                "provider": runtime.get("provider"),
-                "api_mode": runtime.get("api_mode"),
-                "base_url": runtime.get("base_url"),
-                "api_key": runtime.get("api_key"),
-                "credential_pool": runtime.get("credential_pool"),
-                "command": runtime.get("command"),
-                "args": list(runtime.get("args") or []),
+                "provider": "custom",
+                "api_mode": _NEO_API_MODES.get(str(custom.get("api") or ""), "chat_completions"),
+                "base_url": str(custom.get("baseUrl") or ""),
+                "api_key": os.environ.get(str(custom.get("apiKeyEnv") or ""), "") or "neo-no-key",
             })
-            if runtime.get("request_overrides"):
-                kwargs["request_overrides"] = runtime["request_overrides"]
+        else:
+            with contextlib.suppress(Exception):
+                runtime = resolve_runtime_provider(requested=requested, target_model=target_model or None)
+                kwargs.update({
+                    "provider": runtime.get("provider"),
+                    "api_mode": runtime.get("api_mode"),
+                    "base_url": runtime.get("base_url"),
+                    "api_key": runtime.get("api_key"),
+                    "credential_pool": runtime.get("credential_pool"),
+                    "command": runtime.get("command"),
+                    "args": list(runtime.get("args") or []),
+                })
+                if runtime.get("request_overrides"):
+                    kwargs["request_overrides"] = runtime["request_overrides"]
 
         agent = AIAgent(**kwargs)
         agent._print_fn = lambda *a, **kw: print(*a, **{**kw, "file": sys.stderr})

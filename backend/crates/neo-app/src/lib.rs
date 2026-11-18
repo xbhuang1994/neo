@@ -1,6 +1,7 @@
 //! Neo application layer: settings and policy, the effect queue, sessions, the executor, sources and tools.
 #![deny(missing_docs)]
 
+pub mod accounts;
 pub mod app;
 mod assess;
 pub mod blocked;
@@ -17,6 +18,8 @@ pub mod passes;
 pub mod policy;
 pub mod procinfo;
 pub mod prompts;
+pub mod providers;
+mod provider_views;
 pub mod resources;
 pub mod sessions;
 pub mod settings;

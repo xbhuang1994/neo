@@ -13,6 +13,9 @@
  * `extension_ui_request` of method `input` whose title starts with GUARD_TITLE, which the host answers with
  * `ok` or `block:<reason>`.
  *
+ * It also registers the custom providers the host hands it in NEO_PROVIDERS: a JSON list in OMP's `models.yml` shape,
+ * each naming in `apiKeyEnv` the variable that holds its key.
+ *
  * This is the only TypeScript in the project. It has no imports of its own beyond OMP's job manager.
  */
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
@@ -24,7 +27,20 @@ const GUARD_TITLE = "neo-guard:";
 interface Call { id: string; op: "ping" | "jobs" | "ack" | "cancel"; ids?: string[]; job?: string }
 interface Job { id: string; type: string; label?: string; startTime?: number; ownerId?: string; progressText?: string; process?: { command?: string; pids?: () => readonly number[] } }
 interface Context { ui: { setStatus(key: string, text: string): void; input(title: string): Promise<string | undefined> } }
-interface Extensions { on(event: string, handler: (event: never, context: Context) => unknown): void }
+interface Extensions {
+  on(event: string, handler: (event: never, context: Context) => unknown): void;
+  registerProvider(name: string, config: Record<string, unknown>): void;
+}
+interface CustomProvider { name: string; apiKeyEnv?: string; [field: string]: unknown }
+
+function registerProviders(pi: Extensions): void {
+  const text = process.env.NEO_PROVIDERS;
+  if (!text) return;
+  for (const { name, apiKeyEnv, ...config } of JSON.parse(text) as CustomProvider[]) {
+    // OMP takes a variable's name as a key; an endpoint that takes none still needs one at registration.
+    pi.registerProvider(name, { ...config, apiKey: apiKeyEnv ?? "neo-no-key" });
+  }
+}
 
 function jobs(): unknown[] {
   const running = (AsyncJobManager.instance()?.getRunningJobs() ?? []) as Job[];
@@ -45,6 +61,7 @@ function run(call: Call): unknown {
 }
 
 export default function neoShim(pi: Extensions): void {
+  registerProviders(pi);
   pi.on("input", ((event: { text: string }, context: Context) => {
     if (!event.text.startsWith(SENTINEL)) return undefined;
     let id = "";

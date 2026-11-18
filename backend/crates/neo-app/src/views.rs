@@ -132,7 +132,7 @@ fn selection(value: Option<&Value>, name: &str) -> Result<Option<RoleModel>, Str
     }
 }
 
-fn object(value: Value, allowed: &[&str]) -> Result<Map<String, Value>, String> {
+pub(crate) fn object(value: Value, allowed: &[&str]) -> Result<Map<String, Value>, String> {
     let Value::Object(map) = value else { return Err("Expected a JSON object".into()) };
     if let Some(unknown) = map.keys().find(|name| !allowed.contains(&name.as_str())) {
         return Err(format!("Unknown field {unknown}; the fields are {}", allowed.join(", ")));

@@ -65,6 +65,7 @@ The app depends on: `cupertino_ui` (Flutter's Cupertino widgets), `cupertino_ico
 | `backend/crates/neo-app/src/lib.rs`, `app.rs`, `settings.rs`, `policy.rs`, `health.rs`, `text.rs`, `http.rs` | The application value and its wiring, settings, the Policy the settings make, component health, text limits, the outbound HTTP client |
 | `backend/crates/neo-app/src/effects.rs`, `passes.rs`, `outbox.rs`, `notices.rs` | The effect queue, orchestration passes, outbound messages, notices and relays to the main Session |
 | `backend/crates/neo-app/src/kernels.rs`, `sessions.rs`, `prompts.rs`, `tools.rs`, `resources.rs`, `cards.rs`, `assess.rs` | Launching runtimes per role, Sessions and the conversation, prompts, the tools of each role, readable resources, cards, candidate delivery and assessment |
+| `backend/crates/neo-app/src/providers.rs`, `provider_views.rs`, `accounts.rs` | Custom model providers the kernels share: their settings, kept-apart keys, the one-time import of Oh My Pi's models.yml, what each kernel is handed, and their API; each kernel's accounts, logging in through its own program, logging out and API keys |
 | `backend/crates/neo-app/src/executor.rs`, `blocked.rs`, `sidecar.rs`, `watchdog.rs`, `procinfo.rs` | The Executor, blocked commands, the Sidecar, the Watchdog and its process sampling |
 | `backend/crates/neo-app/src/chat.rs`, `wechat.rs`, `wechat_protocol.rs`, `wechat_typing.rs`, `views.rs` | The chat Source, the WeChat bridge, its protocol and its typing indicator (a model-free loop showing "typing" while the main Session or a worker is at work), what the API shows and changes |
 | `backend/crates/neo-http/src/lib.rs`, `server.rs`, `api.rs` | The HTTP server, the API's routes, access control, the web app's files |
@@ -75,7 +76,7 @@ The app depends on: `cupertino_ui` (Flutter's Cupertino widgets), `cupertino_ico
 | `app/lib/src/api/client.dart`, `models.dart` | The API client and what it carries |
 | `app/lib/src/state/app_state.dart` | Connection and polled state |
 | `app/lib/src/platform/host.dart`, `host_io.dart`, `host_web.dart`, `host_stub.dart` | Where the app runs: the desktop's backend process and single instance, the browser's origin and storage |
-| `app/lib/src/ui/shell.dart`, `chat_page.dart`, `workers_page.dart`, `settings_page.dart`, `activity_ticker.dart`, `scope.dart`, `widgets.dart`, `theme.dart`, `format.dart` | The frame and the three pages, the bottom-right ticker of what is at work, shared widgets, the look, message formatting |
+| `app/lib/src/ui/shell.dart`, `chat_page.dart`, `workers_page.dart`, `settings_page.dart`, `accounts_settings.dart`, `activity_ticker.dart`, `scope.dart`, `widgets.dart`, `theme.dart`, `format.dart` | The frame and the three pages (the settings with the shared custom providers and kernel accounts), the bottom-right ticker of what is at work, shared widgets, the look, message formatting |
 | `app/lib/src/qr/qr_code.dart`, `qr_view.dart` | The QR code encoder and its painter |
 | `app/lib/src/l10n/strings.dart` | The app's words in Chinese and English |
 

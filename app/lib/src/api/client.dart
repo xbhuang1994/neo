@@ -151,4 +151,36 @@ class ApiClient {
   Future<WeChatStatus> wechatDisconnect() async => WeChatStatus.fromJson(await _object('POST', '/api/wechat/disconnect', timeout: const Duration(seconds: 60)));
 
   Future<WeChatStatus> wechatVerify(String code) async => WeChatStatus.fromJson(await _object('POST', '/api/wechat/verify', body: {'code': code}));
+
+  Future<ProvidersView> providers() async => ProvidersView.fromJson(await _object('GET', '/api/settings/providers'));
+
+  /// Replace the custom providers. Each may carry `apiKey` (a key, a variable's name, or null for none; absent keeps
+  /// its key) and `previousName` when renamed.
+  Future<ProvidersView> saveProviders(List<Map<String, dynamic>> providers) async =>
+      ProvidersView.fromJson(await _object('PUT', '/api/settings/providers', body: {'providers': providers}, timeout: const Duration(seconds: 60)));
+
+  /// Ask every provider for its models again.
+  Future<ProvidersView> refreshProviders() async => ProvidersView.fromJson(await _object('POST', '/api/settings/providers/refresh', timeout: const Duration(seconds: 60)));
+
+  /// Add Oh My Pi's custom providers that are not listed yet.
+  Future<ProvidersView> importProviders() async => ProvidersView.fromJson(await _object('POST', '/api/settings/providers/import'));
+
+  Future<AccountsView> accounts() async => AccountsView.fromJson(await _object('GET', '/api/settings/accounts', timeout: const Duration(seconds: 90)));
+
+  /// Start logging a kernel in to a provider on the backend's machine.
+  Future<LoginRun?> startLogin(String kernel, String provider) async =>
+      LoginRun.maybe((await _object('POST', '/api/settings/accounts/login', body: {'kernel': kernel, 'provider': provider}, timeout: const Duration(seconds: 30)))['login']);
+
+  Future<LoginRun?> login() async => LoginRun.maybe((await _object('GET', '/api/settings/accounts/login'))['login']);
+
+  /// Pass one line, such as a code or the address the browser landed on, to the login.
+  Future<LoginRun?> loginInput(String text) async => LoginRun.maybe((await _object('POST', '/api/settings/accounts/login/input', body: {'text': text}))['login']);
+
+  Future<LoginRun?> cancelLogin() async => LoginRun.maybe((await _object('POST', '/api/settings/accounts/login/cancel'))['login']);
+
+  Future<AccountsView> logout(String kernel, String account) async =>
+      AccountsView.fromJson(await _object('POST', '/api/settings/accounts/logout', body: {'kernel': kernel, 'account': account}, timeout: const Duration(seconds: 90)));
+
+  Future<AccountsView> addApiKey(String kernel, String provider, String key) async =>
+      AccountsView.fromJson(await _object('POST', '/api/settings/accounts/key', body: {'kernel': kernel, 'provider': provider, 'key': key}, timeout: const Duration(seconds: 90)));
 }

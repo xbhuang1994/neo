@@ -130,6 +130,8 @@ pub struct ClaudeOptions {
     pub project_settings: bool,
     /// Variables to set for the runtime.
     pub env: BTreeMap<String, String>,
+    /// Variables to remove from what the runtime inherits, such as a login a custom provider must not send.
+    pub env_remove: Vec<String>,
     /// The most turns one run may take.
     pub max_turns: Option<u32>,
     /// Keep the runtime's own session on disk, so a later process resumes it.
@@ -172,7 +174,7 @@ pub fn launch(options: &ClaudeOptions, resume: Option<&str>, session_id: &str) -
         args,
         cwd: options.cwd.clone(),
         env,
-        env_remove: SESSION_VARIABLES.iter().map(|name| name.to_string()).collect(),
+        env_remove: SESSION_VARIABLES.iter().map(|name| name.to_string()).chain(options.env_remove.iter().cloned()).collect(),
     }
 }
 

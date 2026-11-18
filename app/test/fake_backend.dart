@@ -168,6 +168,41 @@ class FakeBackend {
     };
   }
 
+  /// The custom providers, as saved; keys only as hints.
+  List<Map<String, dynamic>> providers = [
+    {'name': 'magpie', 'api': 'openai-completions', 'baseUrl': 'http://127.0.0.1:3425/v1', 'models': [{'id': 'big', 'contextWindow': 1000}], 'kernels': ['omp', 'hermes'], 'key': null},
+  ];
+  final List<Object?> savedProviders = [];
+
+  /// The login in progress, and what was pasted into it.
+  Map<String, dynamic>? login;
+  final List<String> pasted = [];
+
+  Map<String, dynamic> _providersView() => {
+    'providers': providers,
+    'apis': ['openai-completions', 'openai-responses', 'anthropic-messages'],
+    'serves': {'omp': '*', 'claude': ['anthropic-messages'], 'antigravity': [], 'hermes': ['openai-completions', 'openai-responses', 'anthropic-messages']},
+  };
+
+  Map<String, dynamic> _accountsView() => {
+    'kernels': [
+      {
+        'id': 'omp',
+        'installed': true,
+        'accounts': {
+          'accounts': [{'id': '1', 'provider': 'openai-codex', 'kind': 'oauth', 'label': 'me@example.com', 'removable': true}],
+          'login': [{'id': 'anthropic', 'name': 'Anthropic'}],
+          'anyProvider': true,
+          'apiKeys': true,
+        },
+      },
+      {'id': 'claude', 'installed': false},
+      {'id': 'antigravity', 'installed': true, 'accounts': {'accounts': [], 'login': [{'id': 'google', 'name': 'Google'}]}},
+      {'id': 'hermes', 'installed': true, 'accounts': {'accounts': [], 'login': [], 'apiKeys': true}},
+    ],
+    'login': login,
+  };
+
   Map<String, dynamic> _generalView() => {
     ...general,
     'defaults': {'directory': '/data/work'},
@@ -264,6 +299,31 @@ class FakeBackend {
         if (((blocks['executor'] as Map?)?['blockedCommands'] as List?)?.contains('rm -rf') ?? false) return _json(400, {'error': '"rm -rf" is not a command name'});
         general = {...general, ...blocks};
         return _json(200, _generalView());
+      case ('GET', '/api/settings/providers'):
+        return _json(200, _providersView());
+      case ('PUT', '/api/settings/providers'):
+        final list = ((body as Map)['providers'] as List).cast<Map>();
+        savedProviders.add(body);
+        providers = [
+          for (final item in list)
+            {...(Map<String, dynamic>.of(item.cast<String, dynamic>())..remove('apiKey')..remove('previousName')), 'key': item.containsKey('apiKey') && item['apiKey'] != null ? '…abcd' : null},
+        ];
+        return _json(200, _providersView());
+      case ('POST', '/api/settings/providers/refresh'):
+        providers = [for (final provider in providers) {...provider, 'modelsProblem': '${provider['name']}: cannot list models: refused'}];
+        return _json(200, _providersView());
+      case ('GET', '/api/settings/accounts'):
+        return _json(200, _accountsView());
+      case ('POST', '/api/settings/accounts/login'):
+        final ask = (body as Map).cast<String, dynamic>();
+        login = {'id': 1, 'kernel': ask['kernel'], 'provider': ask['provider'], 'state': 'running', 'links': ['https://auth.example/authorize?x=1'], 'output': 'Open this URL in your browser:\nhttps://auth.example/authorize?x=1\nPaste the authorization code:'};
+        return _json(200, {'login': login});
+      case ('GET', '/api/settings/accounts/login'):
+        return _json(200, {'login': login});
+      case ('POST', '/api/settings/accounts/login/input'):
+        pasted.add((body as Map)['text'] as String);
+        login = {...login!, 'state': 'done', 'output': 'Logged in to Anthropic as me@example.com'};
+        return _json(200, {'login': login});
       case ('GET', '/api/wechat'):
         return _json(200, wechat);
       case ('POST', '/api/wechat/connect'):

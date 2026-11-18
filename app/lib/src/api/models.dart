@@ -443,3 +443,140 @@ class Activity {
 
   bool get busy => router || workers.isNotEmpty;
 }
+
+/// A custom model provider the kernels share, as the backend shows it: its key only as a hint.
+class CustomProvider {
+  CustomProvider.fromJson(Map<String, dynamic> json)
+    : raw = Map<String, dynamic>.of(json)
+        ..remove('key')
+        ..remove('listsModels')
+        ..remove('modelsProblem'),
+      listsModels = json['listsModels'] != false,
+      modelsProblem = _text(json['modelsProblem']),
+      name = json['name'] as String? ?? '',
+      api = json['api'] as String? ?? 'openai-completions',
+      baseUrl = json['baseUrl'] as String? ?? '',
+      headers = _map(json['headers']).map((name, value) => MapEntry(name, '$value')),
+      models = [for (final model in _list(json['models'])) _map(model)],
+      kernels = _list(json['kernels']).cast<String>(),
+      keyHint = _text(json['key']);
+
+  /// Everything the backend sent but the key hint, to send back as it was.
+  final Map<String, dynamic> raw;
+  final String name;
+  final String api;
+  final String baseUrl;
+  final Map<String, String> headers;
+
+  /// Each model as the backend has it: `id`, `name`, and fields the app does not edit, which go back unchanged.
+  final List<Map<String, dynamic>> models;
+  final List<String> kernels;
+  final String? keyHint;
+
+  /// Whether its models are listed over its API rather than typed.
+  final bool listsModels;
+
+  /// Why its models could not be listed the last time.
+  final String? modelsProblem;
+}
+
+/// The custom providers, with the APIs a provider may speak and the ones each kernel can use.
+class ProvidersView {
+  ProvidersView.fromJson(Map<String, dynamic> json)
+    : providers = [for (final provider in _list(json['providers'])) CustomProvider.fromJson(_map(provider))],
+      apis = _list(json['apis']).cast<String>(),
+      serves = _map(json['serves']),
+      imported = (json['imported'] as num?)?.toInt();
+
+  final List<CustomProvider> providers;
+  final List<String> apis;
+  final Map<String, dynamic> serves;
+
+  /// How many an import added, after one.
+  final int? imported;
+
+  /// Whether a provider of an API lists its models itself.
+  bool listsModels(String api) => apis.contains(api);
+
+  /// Whether a kernel can use a provider of an API.
+  bool kernelServes(String kernel, String api) {
+    final apis = serves[kernel];
+    return apis == '*' || (apis is List && apis.contains(api));
+  }
+}
+
+/// An account a kernel is logged in with.
+class KernelAccount {
+  KernelAccount.fromJson(Map<String, dynamic> json)
+    : id = json['id'] as String? ?? '',
+      provider = json['provider'] as String? ?? '',
+      kind = json['kind'] as String? ?? '',
+      label = json['label'] as String? ?? '',
+      removable = json['removable'] == true;
+
+  final String id;
+  final String provider;
+  final String kind;
+  final String label;
+  final bool removable;
+}
+
+/// One kernel's accounts and what can be done about them.
+class KernelAccounts {
+  KernelAccounts.fromJson(Map<String, dynamic> json)
+    : id = json['id'] as String? ?? '',
+      installed = json['installed'] == true,
+      problem = _text(json['problem']),
+      accounts = [for (final account in _list(_map(json['accounts'])['accounts'])) KernelAccount.fromJson(_map(account))],
+      login = [for (final option in _list(_map(json['accounts'])['login'])) (_map(option)['id'] as String? ?? '', _map(option)['name'] as String? ?? '')],
+      anyProvider = _map(json['accounts'])['anyProvider'] == true,
+      apiKeys = _map(json['accounts'])['apiKeys'] == true,
+      note = _text(_map(json['accounts'])['note']);
+
+  final String id;
+  final bool installed;
+  final String? problem;
+  final List<KernelAccount> accounts;
+
+  /// The providers it can log in to, as (id, name).
+  final List<(String, String)> login;
+  final bool anyProvider;
+  final bool apiKeys;
+  final String? note;
+}
+
+/// A login run by the backend: the links to open, and what the login program printed.
+class LoginRun {
+  LoginRun.fromJson(Map<String, dynamic> json)
+    : id = (json['id'] as num?)?.toInt() ?? 0,
+      kernel = json['kernel'] as String? ?? '',
+      provider = json['provider'] as String? ?? '',
+      state = json['state'] as String? ?? 'failed',
+      links = _list(json['links']).cast<String>(),
+      output = json['output'] as String? ?? '';
+
+  static LoginRun? maybe(Object? json) => json is Map ? LoginRun.fromJson(_map(json)) : null;
+
+  final int id;
+  final String kernel;
+  final String provider;
+
+  /// `running`, `done` or `failed`.
+  final String state;
+  final List<String> links;
+  final String output;
+
+  bool get running => state == 'running';
+}
+
+/// Every kernel's accounts, and the login in progress or the last one.
+class AccountsView {
+  AccountsView.fromJson(Map<String, dynamic> json)
+    : kernels = [for (final kernel in _list(json['kernels'])) KernelAccounts.fromJson(_map(kernel))],
+      login = LoginRun.maybe(json['login']);
+
+  AccountsView.withLogin(AccountsView view, this.login) : kernels = view.kernels;
+
+  final List<KernelAccounts> kernels;
+  final LoginRun? login;
+}

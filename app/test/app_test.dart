@@ -56,6 +56,9 @@ Future<void> show(WidgetTester tester, Finder finder) async {
 }
 
 Finder nav(int index) => find.byKey(ValueKey('nav-$index'));
+
+/// A kernel on the main session's kernel switch.
+Finder segment(String name) => find.descendant(of: find.byKey(const ValueKey('orchestrator-kernel')), matching: find.text(name));
 Finder button(String label) => find.bySemanticsLabel(label);
 
 void main() {
@@ -379,8 +382,8 @@ void main() {
 
     // Choosing another kernel only prepares the switch: nothing is asked of the backend until it is saved.
     final reads = backend.modelReads;
-    await show(tester, find.text('Claude Code'));
-    await tester.tap(find.text('Claude Code'));
+    await show(tester, segment('Claude Code'));
+    await tester.tap(segment('Claude Code'));
     await settle(tester);
     expect((backend.kernel, backend.modelReads), ('omp', reads));
     // The other kernel has its own choices, and the workers follow the main session's kernel.
@@ -390,18 +393,18 @@ void main() {
     expect(backend.kernel, 'claude');
     // A kernel that cannot run says why when saved, and nothing changes.
     backend.claudeProblem = 'The Claude Code program (claude) was not found.';
-    await tester.tap(find.text('Oh My Pi'));
+    await tester.tap(segment('Oh My Pi'));
     await settle(tester);
     await save();
     expect(backend.kernel, 'omp');
-    await tester.tap(find.text('Claude Code'));
+    await tester.tap(segment('Claude Code'));
     await settle(tester);
     await save();
     expect(backend.kernel, 'omp');
     expect(find.text('The Claude Code program (claude) was not found.'), findsWidgets);
     // Antigravity is the third kernel, with its own models and no thinking level to choose.
-    await show(tester, find.text('Antigravity'));
-    await tester.tap(find.text('Antigravity'));
+    await show(tester, segment('Antigravity'));
+    await tester.tap(segment('Antigravity'));
     await settle(tester);
     await tester.tap(find.byKey(const ValueKey('model-评估与调度模型')));
     await settle(tester);
@@ -413,8 +416,8 @@ void main() {
     expect(backend.kernel, 'antigravity');
     expect(backend.models['antigravity']!['eval'], {'provider': 'antigravity', 'model': 'gemini-3.8-flash-low'});
     // Hermes is the fourth kernel, with provider/model choices and minimal through max effort.
-    await show(tester, find.text('Hermes'));
-    await tester.tap(find.text('Hermes'));
+    await show(tester, segment('Hermes'));
+    await tester.tap(segment('Hermes'));
     await settle(tester);
     await tester.tap(find.byKey(const ValueKey('model-评估与调度模型')));
     await settle(tester);
@@ -451,7 +454,7 @@ void main() {
     expect(backend.installed, ['claude']);
     expect(find.text('Claude Code 已安装'), findsOneWidget);
     expect(install, findsNothing);
-    await tester.tap(find.text('Claude Code'));
+    await tester.tap(segment('Claude Code'));
     await settle(tester);
     await save();
     expect(backend.kernel, 'claude');
@@ -489,6 +492,56 @@ void main() {
     expect((backend.kernel, backend.workerKernel), ('omp', 'antigravity'));
     expect(backend.models['antigravity']!['executor'], {'provider': 'antigravity', 'model': 'gemini-3.8-flash-low'});
     expect(backend.models['omp']!['executor'], null);
+    await app.close();
+  });
+
+  testWidgets('edits the shared providers and logs a kernel in with a pasted code', (tester) async {
+    final backend = FakeBackend();
+    final app = await open(tester, backend);
+    await tester.tap(nav(2));
+    await settle(tester);
+    // A provider is edited on a sheet; what the app does not edit goes back as it was.
+    final magpie = find.byKey(const ValueKey('provider-magpie'));
+    await show(tester, magpie);
+    await tester.tap(magpie);
+    await settle(tester);
+    // Its models come from its API: shown, not typed, and sent back as they were.
+    expect(find.byKey(const ValueKey('provider-models')), findsNothing);
+    expect(find.byKey(const ValueKey('provider-listed-models')), findsOneWidget);
+    await show(tester, find.byKey(const ValueKey('provider-key')));
+    await tester.enterText(find.byKey(const ValueKey('provider-key')), 'sk-new');
+    await show(tester, find.byKey(const ValueKey('save-provider')));
+    await tester.tap(find.byKey(const ValueKey('save-provider')));
+    await settle(tester);
+    final saved = ((backend.savedProviders.single as Map)['providers'] as List).single as Map;
+    expect(saved['apiKey'], 'sk-new');
+    expect(saved['models'], [
+      {'id': 'big', 'contextWindow': 1000},
+    ]);
+    expect(saved['kernels'], ['omp', 'hermes']);
+    expect(saved.containsKey('previousName'), false);
+    // Asking again lists them anew, and says what went wrong.
+    final refresh = find.byKey(const ValueKey('refresh-providers'));
+    await show(tester, refresh);
+    await tester.tap(refresh);
+    await settle(tester);
+    expect(find.text('magpie: cannot list models: refused'), findsOneWidget);
+    expect(find.textContaining('…abcd'), findsOneWidget);
+
+    // Logging in shows the link and passes back the pasted code.
+    final login = find.byKey(const ValueKey('login-antigravity'));
+    await show(tester, login);
+    await tester.tap(login);
+    await settle(tester);
+    expect(find.text('https://auth.example/authorize?x=1'), findsOneWidget);
+    await tester.enterText(find.byKey(const ValueKey('login-code')), ' code#state ');
+    await tester.tap(find.byKey(const ValueKey('login-submit')));
+    await settle(tester);
+    await tester.pump(const Duration(seconds: 2));
+    await settle(tester);
+    expect(backend.pasted, ['code#state']);
+    expect(find.text('登录成功'), findsWidgets);
+    expect(find.text('openai-codex · me@example.com · oauth'), findsOneWidget);
     await app.close();
   });
 

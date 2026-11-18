@@ -270,6 +270,10 @@ pub struct Settings {
     /// The runtime workers run on; `None` follows `kernel`, which the main Session runs on.
     #[serde(default, rename = "workerKernel", skip_serializing_if = "Option::is_none")]
     pub worker_kernel: Option<Kernel>,
+    /// Custom model providers the kernels share; `None` until the list is first set, when Oh My Pi's own are
+    /// imported. Their keys are kept apart, in [`crate::providers::ProviderKeys`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub providers: Option<Vec<crate::providers::Provider>>,
 }
 
 fn id_like(text: &str, max: usize) -> bool {
@@ -313,6 +317,14 @@ impl Settings {
                 model.model = model.model.trim().to_string();
             }
         }
+        for provider in self.providers.iter_mut().flatten() {
+            provider.normalize();
+        }
+    }
+
+    /// The custom providers, none before the list is first set.
+    pub fn provider_list(&self) -> &[crate::providers::Provider] {
+        self.providers.as_deref().unwrap_or_default()
     }
 
     /// Check every bound; the first problem is returned in words.
@@ -379,7 +391,7 @@ impl Settings {
                 }
             }
         }
-        Ok(())
+        crate::providers::validate(self.provider_list())
     }
 
     /// The runtime workers run on.

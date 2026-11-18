@@ -246,3 +246,42 @@ async fn reports_a_model_failure_as_an_error_turn() {
     assert_eq!(f.session.journal().last_stop_reason().as_deref(), Some("error"));
     f.session.dispose().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn runs_on_a_custom_provider_neo_hands_over_past_its_own_configuration() {
+    require_hermes!();
+    let model = openai(|_, _| Reply::text("From the custom provider.")).await;
+    let dir = TempDir::new("hermes-real");
+    for sub in ["work", "hermes-home", "sessions", "bridge"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    // Hermes's own configuration points nowhere: only the provider Neo hands over can answer.
+    std::fs::write(dir.join("hermes-home/config.yaml"), "model:\n  provider: custom\n  base_url: http://127.0.0.1:9/v1\n  default: nothing\nagent:\n  api_max_retries: 1\n  auto_recovery_cycles: 0\n").unwrap();
+    let providers = json!([{"name": "neofix", "api": "openai-completions", "baseUrl": format!("{}/v1", model.url()), "apiKeyEnv": "NEO_PROVIDER_KEY_0", "models": [{"id": "fixture"}]}]);
+    let env: BTreeMap<String, String> = [
+        ("HERMES_HOME".to_string(), dir.join("hermes-home").display().to_string()),
+        ("NEO_PROVIDERS".to_string(), providers.to_string()),
+        ("NEO_PROVIDER_KEY_0".to_string(), "fixture-key".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    let options = HermesOptions {
+        program: program().expect("checked by the test"),
+        bridge_file: dir.join("bridge/neo-hermes-bridge.py"),
+        cwd: dir.join("work"),
+        system_prompt: "You are a fixture worker.\n".into(),
+        builtin_tools: vec!["read".into()],
+        model: Some("neofix/fixture".into()),
+        env,
+        ..Default::default()
+    };
+    let journal = Journal::create(&dir.join("sessions"), &dir.join("work")).unwrap();
+    let (reports, runtime) = mpsc::unbounded_channel();
+    let session = Session::new(Arc::new(journal), Arc::new(Hermes(HermesDriver::new(options, Arc::new(Host::default()), reports))), runtime);
+    let mut f = Fixture { dir, host: Arc::new(Host::default()), events: session.subscribe(), session };
+    f.send("r1", "Say hello.").await;
+    f.turn().await;
+    assert_eq!(f.said().last().map(String::as_str), Some("From the custom provider."));
+    assert_eq!(model.requests().len(), 1);
+    f.session.dispose().await;
+}

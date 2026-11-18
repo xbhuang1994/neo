@@ -139,6 +139,20 @@ async fn route(app: &Arc<App>, request: &Request) -> Result<Response, Response> 
         ("PUT", "/api/settings/models") => done(app.update_models(json_body(request)?).await),
         ("PUT", "/api/settings/kernel") => done(app.set_kernel(json_body(request)?).await),
         ("POST", "/api/settings/kernel/install") => done(app.install_kernel(json_body(request)?).await),
+        ("GET", "/api/settings/providers") => ok(app.providers_view()),
+        ("PUT", "/api/settings/providers") => done(app.update_providers(json_body(request)?).await),
+        ("POST", "/api/settings/providers/import") => done(app.import_providers().await),
+        ("POST", "/api/settings/providers/refresh") => done(app.refresh_providers().await),
+        ("GET", "/api/settings/accounts") => ok(app.accounts_view().await),
+        ("GET", "/api/settings/accounts/login") => ok(json!({"login": app.login_view()})),
+        ("POST", "/api/settings/accounts/login") => done(app.start_login(json_body(request)?).await),
+        ("POST", "/api/settings/accounts/login/input") => done(app.login_input(json_body(request)?).await),
+        ("POST", "/api/settings/accounts/login/cancel") => {
+            app.cancel_login();
+            ok(json!({"login": app.login_view()}))
+        }
+        ("POST", "/api/settings/accounts/logout") => done(app.logout(json_body(request)?).await),
+        ("POST", "/api/settings/accounts/key") => done(app.add_api_key(json_body(request)?).await),
         ("GET", "/api/settings/general") => ok(app.general_view()),
         ("PUT", "/api/settings/general") => done(app.update_general(json_body(request)?).await),
         ("POST", "/api/session/reset") => done(app.reset_orchestrator().await.map(|()| json!({"reset": true}))),
