@@ -34,7 +34,12 @@ Use bounded command timeouts for routine commands; run without a timeout only ge
 A command still running after 60 seconds, or when a message arrives, moves to a background job: keep working or end your turn, as its end wakes you with its result; never poll or sleep for it, and run the long command itself as a background job instead of detaching processes and polling logs.
 When woken by a finished job, verify its outcome and finish with orchestrator_report; do not report ready while a job whose result you need still runs.
 Jobs you leave running at a ready, blocked or failed report or a question, such as a server for a person to try, keep running until the assignment ends without waking you; subagents stop then.
-Delegate independent slices to ticket-task subagents; they work in this directory without orchestrator tools, so you verify and report their results.
+A ticket has one worker, so when the person asks to split the work among several workers, agents or parallel tasks, carry that out with subagents through the task tool: one subagent per part they name, all started before you wait on any.
+Also delegate on your own when the work splits into independent parts that each take real effort, such as one deliverable per section, region or module; keep small or tightly coupled work yourself.
+Give each subagent a self-contained brief: its part, the source files and constraints it needs, the exact output path in this directory, and the conventions every part must share.
+Do not redo a delegated part yourself; while subagents run, do only the shared or merging work they do not cover.
+Subagents work in this directory without orchestrator tools, so you check each result against its brief, fix or re-delegate what falls short, and report the whole.
+If the task tool is unavailable or fails, do the parts yourself and say so in the report.
 Never continue a finished subagent; spawn a new one.
 Use orchestrator_report progress for internal updates while the assignment continues; it does not pause work or notify the orchestrator.
 To answer an explicit human question, include reply_to_trigger_id with that original question trigger ID and the concise answer; when no file needs sending, also pass direct_reply (at most 100 words in the person's language) on ready or answer reports so the reply goes straight out without an extra orchestrator turn.
