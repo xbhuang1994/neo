@@ -88,6 +88,10 @@ pub struct AntigravityOptions {
     /// The program, and its first arguments, that relays a hook to this driver: the hook's URL follows them. It is
     /// `neo-agent agy-hook` in the application, which runs [`relay_hook`].
     pub hook_relay: Vec<String>,
+    /// A name for the Session's bridge folder that stays the same across its processes. The runtime keeps a
+    /// conversation's workspace folders from when it began, and its subagents load hooks from those, so a continued
+    /// conversation needs its bridge where it was. Without one, each process gets a folder of its own.
+    pub bridge_id: Option<String>,
 }
 
 /// The folder beside `cwd` that carries a Session's agent and plugin. Its path extends `cwd`'s, so it sorts after it.
@@ -97,7 +101,7 @@ pub fn bridge_dir(cwd: &Path, id: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// The file that marks a bridge folder as the driver's, with the host's process id.
+/// The file that marks a bridge folder as the driver's: the host's process id, then a stamp of the process it is for.
 const BRIDGE_MARKER: &str = ".neo-bridge";
 
 /// A command line for `sh -c`, or `cmd /c` on Windows.
@@ -421,22 +425,25 @@ async fn mcp_answer(host: &dyn ToolHost, message: &Value, on_tool_call: Option<&
     Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
 }
 
-/// The bridge folder of a running process: removed when the process ends.
+/// The bridge folder of a running process: removed when the process ends, unless a later process of the Session
+/// has taken it over.
 struct Bridge {
     dir: PathBuf,
+    /// What this process wrote to the folder's marker: the host's process id and a unique stamp.
+    stamp: String,
 }
 
 impl Bridge {
     /// Write the bridge for one process of a Session.
     fn create(options: &AntigravityOptions, server: &HostServer, has_tools: bool) -> Result<Bridge, String> {
-        let dir = bridge_dir(&options.cwd, &uuid()[..8]);
+        let dir = bridge_dir(&options.cwd, options.bridge_id.as_deref().unwrap_or(&uuid()[..8]));
         sweep_bridges(&options.cwd);
         let plugin = dir.join(".agents").join("plugins").join(PLUGIN);
         let failed = |error: std::io::Error| format!("Cannot write Antigravity's bridge at {}: {error}", dir.display());
         std::fs::create_dir_all(dir.join(".agents").join("agents")).map_err(failed)?;
         std::fs::create_dir_all(&plugin).map_err(failed)?;
-        let bridge = Bridge { dir: dir.clone() };
-        std::fs::write(dir.join(BRIDGE_MARKER), std::process::id().to_string()).map_err(failed)?;
+        let bridge = Bridge { dir: dir.clone(), stamp: format!("{} {}", std::process::id(), uuid()) };
+        std::fs::write(dir.join(BRIDGE_MARKER), &bridge.stamp).map_err(failed)?;
         std::fs::write(dir.join(".agents").join("agents").join(format!("{AGENT}.md")), agent_file(options)).map_err(failed)?;
         let manifest = json!({"name": PLUGIN, "description": "Neo's tools and tool-call guard", "version": env!("CARGO_PKG_VERSION")});
         std::fs::write(plugin.join("plugin.json"), manifest.to_string()).map_err(failed)?;
@@ -460,7 +467,9 @@ impl Bridge {
 
 impl Drop for Bridge {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if std::fs::read_to_string(self.dir.join(BRIDGE_MARKER)).is_ok_and(|owner| owner == self.stamp) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -476,7 +485,7 @@ fn sweep_bridges(cwd: &Path) {
                 continue;
             }
             let Ok(owner) = std::fs::read_to_string(entry.path().join(BRIDGE_MARKER)) else { continue };
-            let Ok(pid) = owner.trim().parse::<i32>() else { continue };
+            let Ok(pid) = owner.split_whitespace().next().unwrap_or("").parse::<i32>() else { continue };
             // SAFETY: signal 0 only checks whether the process exists.
             let alive = pid > 0 && (unsafe { libc::kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM));
             if !alive {
@@ -486,6 +495,35 @@ fn sweep_bridges(cwd: &Path) {
     }
     #[cfg(not(unix))]
     let _ = cwd;
+}
+
+/// A subagent's conversation, from its first hook until it stops.
+struct Subagent {
+    start_time: i64,
+    /// Its task, from the message that started it, once its transcript shows it.
+    label: Option<String>,
+    /// What it does now: its latest tool call.
+    activity: Option<String>,
+}
+
+/// A subagent's task: the start of the message that began its conversation, the first step of its transcript.
+fn subagent_task(transcript: &str) -> Option<String> {
+    use std::io::BufRead;
+    let path = transcript.strip_prefix("file://").unwrap_or(transcript);
+    let mut first = String::new();
+    std::io::BufReader::new(std::fs::File::open(path).ok()?).take(1 << 20).read_line(&mut first).ok()?;
+    let content = serde_json::from_str::<Value>(&first).ok()?["content"].as_str()?.to_string();
+    let text = content.split_once(" content=").map_or(content.as_str(), |(_, text)| text);
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty() && !line.starts_with('<'))?;
+    Some(clip(line, 160))
+}
+
+/// A tool call as a short line: the summary the model gave it, or its name.
+fn activity(tool: &str, input: &Value) -> String {
+    match input["toolSummary"].as_str().map(str::trim).filter(|summary| !summary.is_empty()) {
+        Some(summary) => clip(summary, 160),
+        None => tool.to_string(),
+    }
 }
 
 /// A message the runtime was handed, until its turn ends.
@@ -525,8 +563,8 @@ struct Shared {
     results: HashSet<i64>,
     /// Commands running, by tool call id.
     commands: BTreeMap<String, Command>,
-    /// Subagents' conversations that have not stopped, with when they started.
-    subagents: BTreeMap<String, i64>,
+    /// Subagents' conversations that have not stopped.
+    subagents: BTreeMap<String, Subagent>,
     model: Option<String>,
     thinking: Option<String>,
 }
@@ -835,6 +873,8 @@ impl AntigravityDriver {
             "PreInvocation" => {
                 if main {
                     self.take_started();
+                } else {
+                    self.subagent_seen(&conversation, &payload);
                 }
                 json!({})
             }
@@ -847,9 +887,12 @@ impl AntigravityDriver {
                 let input = call.get("args").cloned().unwrap_or_else(|| json!({}));
                 match self.judge(tool, &input).await {
                     Guard::Allow => {
-                        let mut shared = lock(&self.shared);
                         if !main {
-                            shared.subagents.entry(conversation.clone()).or_insert_with(now_ms);
+                            self.subagent_seen(&conversation, &payload);
+                        }
+                        let mut shared = lock(&self.shared);
+                        if let Some(subagent) = shared.subagents.get_mut(&conversation).filter(|_| !main) {
+                            subagent.activity = Some(activity(tool, &input));
                         }
                         if tool == "run_command" {
                             if let Some(id) = call["id"].as_str() {
@@ -889,6 +932,17 @@ impl AntigravityDriver {
             }
             _ => json!({}),
         }
+    }
+
+    /// A subagent's conversation is running: list it, and read its task until its transcript shows it.
+    fn subagent_seen(&self, conversation: &str, payload: &Value) {
+        if lock(&self.shared).subagents.get(conversation).is_some_and(|subagent| subagent.label.is_some()) {
+            return;
+        }
+        let label = payload["transcriptPath"].as_str().and_then(subagent_task);
+        let mut shared = lock(&self.shared);
+        let subagent = shared.subagents.entry(conversation.to_string()).or_insert(Subagent { start_time: now_ms(), label: None, activity: None });
+        subagent.label = subagent.label.take().or(label);
     }
 
     /// Whether a tool call may run: the Session's tools, Neo's bridge left alone, then the guard.
@@ -1003,12 +1057,12 @@ impl Driver for Antigravity {
             let mut jobs: Vec<KernelJob> = shared
                 .subagents
                 .iter()
-                .map(|(id, start)| KernelJob {
+                .map(|(id, subagent)| KernelJob {
                     id: id.clone(),
                     kind: JobKind::Task,
-                    label: "subagent".into(),
-                    start_time: *start,
-                    progress: None,
+                    label: subagent.label.clone().unwrap_or_else(|| "subagent".into()),
+                    start_time: subagent.start_time,
+                    progress: subagent.activity.clone(),
                     command: None,
                     own: true,
                     pids: Vec::new(),

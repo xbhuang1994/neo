@@ -63,6 +63,10 @@ struct Fixture {
 const RELAY: &str = "import sys, urllib.request\nreq = urllib.request.Request(sys.argv[1], data=sys.stdin.buffer.read(), method='POST')\nsys.stdout.write(urllib.request.urlopen(req, timeout=600).read().decode())\n";
 
 fn open(dir: TempDir, journal: Journal) -> Fixture {
+    open_with(dir, journal, &["read", "bash"])
+}
+
+fn open_with(dir: TempDir, journal: Journal, tools: &[&str]) -> Fixture {
     let host = Arc::new(Host::default());
     let relay = dir.join("relay.py");
     std::fs::write(&relay, RELAY).unwrap();
@@ -70,9 +74,11 @@ fn open(dir: TempDir, journal: Journal) -> Fixture {
         program: program().expect("checked by the test"),
         cwd: dir.join("work"),
         system_prompt: "You are a fixture worker. Do exactly what you are asked, nothing more, and answer in one short line.".into(),
-        tools: vec!["read".into(), "bash".into()],
+        tools: tools.iter().map(|tool| tool.to_string()).collect(),
         model: Some(std::env::var("NEO_AGY_MODEL").unwrap_or_else(|_| "gemini-3.8-flash-low".into())),
         hook_relay: vec!["python3".into(), relay.display().to_string()],
+        // As in the application: one bridge folder per Session, kept across its processes.
+        bridge_id: Some("fixture".into()),
         ..Default::default()
     };
     let (reports, runtime) = mpsc::unbounded_channel();
@@ -200,5 +206,48 @@ async fn runs_commands_on_this_machine_outside_any_sandbox() {
     let said = f.messages();
     let answer = said.iter().rev().find(|(role, _)| *role == Role::Assistant).map(|(_, text)| text.trim().to_string());
     assert_eq!(answer, Some(interfaces.to_string()), "{said:?}");
+    f.session.dispose().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lists_a_running_subagent_as_a_background_job() {
+    if program().is_none() {
+        eprintln!("skipped: set NEO_AGY_BIN or NEO_REAL_ANTIGRAVITY=1 to run against the real Antigravity CLI");
+        return;
+    }
+    let dir = TempDir::new("antigravity-real");
+    for sub in ["work", "sessions"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    let journal = Journal::create(&dir.join("sessions"), &dir.join("work")).unwrap();
+    let mut f = open_with(dir, journal, &["read", "bash", "task"]);
+    f.send("r0", "Reply OK.").await;
+    f.turn().await;
+    // Workers come back in a new process that continues their conversation.
+    let journal = Arc::clone(f.session.journal());
+    f.session.dispose().await;
+    let Fixture { dir, .. } = f;
+    let journal = Journal::open(journal.path()).unwrap();
+    let mut f = open_with(dir, journal, &["read", "bash", "task"]);
+    f.send(
+        "r1",
+        "Use invoke_subagent to start one subagent whose only job is to run the shell command `sleep 40 && echo SUB-FINISHED` and send back its output. Do not run anything yourself and do not wait: reply STARTED and end your turn at once. When the subagent reports, reply with its output.",
+    )
+    .await;
+    let events = f.turn().await;
+    assert_eq!(events.last(), Some(&KernelEvent::AgentEnd { terminal: false, awaiting_async: true }), "{events:?}");
+    let mut seen = Vec::new();
+    for _ in 0..40 {
+        seen = f.session.driver().jobs().await;
+        if seen.iter().any(|job| job.kind == JobKind::Task && job.label.contains("SUB-FINISHED")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    // Listed with its task, taken from the message that started it.
+    assert!(seen.iter().any(|job| job.kind == JobKind::Task && job.own && job.label.contains("SUB-FINISHED")), "{seen:?}");
+    let events = f.turn().await;
+    assert_eq!(events.last(), Some(&KernelEvent::AgentEnd { terminal: true, awaiting_async: false }), "{events:?}");
+    assert!(f.session.driver().jobs().await.is_empty());
     f.session.dispose().await;
 }

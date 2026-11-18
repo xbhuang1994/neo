@@ -236,7 +236,11 @@ impl App {
             .running_jobs(&ticket.id)
             .await
             .into_iter()
-            .map(|job| json!({"id": job.id, "type": job.kind, "label": clip(&job.label, 160), "startedAt": job.started_at, "elapsedSeconds": job.elapsed_seconds}))
+            .map(|job| {
+                // Its latest line of progress: a subagent's current step, or the end of a job's output.
+                let progress = job.progress.as_deref().and_then(|text| text.lines().rev().map(str::trim).find(|line| !line.is_empty())).map(|line| clip(line, 200));
+                json!({"id": job.id, "type": job.kind, "label": clip(&job.label, 160), "startedAt": job.started_at, "elapsedSeconds": job.elapsed_seconds, "progress": progress})
+            })
             .collect();
         let assignment = ticket.latest();
         json!({

@@ -210,8 +210,19 @@ class WorkerDetail extends StatelessWidget {
                     children: [
                       for (final (index, job) in worker.background.indexed) ...[
                         if (index > 0) const SizedBox(height: 10),
-                        Text('${job.type == 'task' ? strings.subagent : strings.shell}${job.startedAt == null ? '' : ' · ${clockTime(job.startedAt!)}'}', style: typo.caption),
-                        Text('${job.id} · ${job.label}', style: typo.mono.copyWith(color: palette.label)),
+                        Text(
+                          [
+                            job.type == 'task' ? strings.subagent : strings.shell,
+                            if (job.startedAt != null) clockTime(job.startedAt!),
+                            if (job.elapsedSeconds != null) strings.runningFor(Duration(seconds: job.elapsedSeconds!)),
+                          ].join(' · '),
+                          style: typo.caption,
+                        ),
+                        if (job.type == 'task')
+                          Text(job.label, style: typo.body.copyWith(color: palette.label))
+                        else
+                          Text('${job.id} · ${job.label}', style: typo.mono.copyWith(color: palette.label)),
+                        if (job.progress.isNotEmpty) Text('→ ${job.progress}', style: typo.footnote, maxLines: 2, overflow: TextOverflow.ellipsis),
                       ],
                     ],
                   ),

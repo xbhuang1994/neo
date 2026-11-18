@@ -92,12 +92,22 @@ class BackgroundJob {
     : id = json['id'] as String? ?? '',
       type = json['type'] as String? ?? 'bash',
       label = json['label'] as String? ?? '',
-      startedAt = _time(json['startedAt']);
+      startedAt = _time(json['startedAt']),
+      elapsedSeconds = (json['elapsedSeconds'] as num?)?.toInt(),
+      progress = json['progress'] as String? ?? '';
 
   final String id;
   final String type;
+
+  /// A shell job's command, or a subagent's task.
   final String label;
   final DateTime? startedAt;
+
+  /// How long it had run when the server answered.
+  final int? elapsedSeconds;
+
+  /// Its latest step: what a subagent does now, or a job's last line of output.
+  final String progress;
 }
 
 /// A worker's latest report.

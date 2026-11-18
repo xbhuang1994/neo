@@ -665,6 +665,7 @@ impl RealKernels {
             thinking,
             env: self.env.clone(),
             hook_relay: self.hook_relay.clone(),
+            bridge_id: Some(key(&[&spec.session_id])[..8].to_string()),
         };
         Ok(Arc::new(Antigravity(AntigravityDriver::new(options, host, events))))
     }

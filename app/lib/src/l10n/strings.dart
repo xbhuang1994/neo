@@ -94,6 +94,7 @@ abstract class Strings {
   String pendingCount(int count);
   String get inputsDelivered;
   String backgroundCount(int count);
+  String runningFor(Duration elapsed);
   String get notStarted;
 
   // Settings
@@ -388,6 +389,8 @@ class ZhStrings extends Strings {
   String get inputsDelivered => '输入已投递';
   @override
   String backgroundCount(int count) => '$count 个后台任务';
+  @override
+  String runningFor(Duration elapsed) => elapsed.inMinutes < 1 ? '刚开始' : elapsed.inHours < 1 ? '已运行 ${elapsed.inMinutes} 分钟' : '已运行 ${elapsed.inHours} 小时 ${elapsed.inMinutes % 60} 分钟';
   @override
   String get notStarted => '未启动';
 
@@ -818,6 +821,8 @@ class EnStrings extends Strings {
   String get inputsDelivered => 'Inputs delivered';
   @override
   String backgroundCount(int count) => '$count in background';
+  @override
+  String runningFor(Duration elapsed) => elapsed.inMinutes < 1 ? 'just started' : elapsed.inHours < 1 ? 'running ${elapsed.inMinutes} min' : 'running ${elapsed.inHours} h ${elapsed.inMinutes % 60} min';
   @override
   String get notStarted => 'Not started';
 
