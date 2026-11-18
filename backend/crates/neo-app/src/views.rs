@@ -3,7 +3,7 @@
 
 use crate::app::App;
 use crate::health::Health;
-use crate::kernels::{support, ModelOption};
+use crate::kernels::{display_name, support, ModelOption};
 use crate::sessions::worker_session_id;
 use crate::settings::{limits, Kernel, RoleModel, Settings};
 use crate::text::clip;
@@ -398,6 +398,7 @@ impl App {
                     "problem": self.kernels.unavailable(each),
                     "installed": self.kernels.installed(each),
                     "installing": self.kernels.installing(each),
+                    "installProgress": self.kernels.install_progress(each),
                     "supports": support(each),
                     "available": available,
                     "listProblem": problem,
@@ -500,9 +501,17 @@ impl App {
         let fields = object(value, &["kernel"])?;
         let kernel = kernel_named(fields.get("kernel"))?;
         if !self.kernels.installed(kernel) {
-            self.kernels.install(kernel).await?;
-            self.model_lists.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&kernel);
-            let _ = self.models_known(kernel);
+            // The installer runs on when whoever asked goes away, such as a page reloaded during a long download;
+            // the kernel settings show its progress meanwhile.
+            let app = Arc::clone(self);
+            tokio::spawn(async move {
+                app.kernels.install(kernel).await?;
+                app.model_lists.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&kernel);
+                let _ = app.models_known(kernel);
+                Ok::<_, String>(())
+            })
+            .await
+            .map_err(|error| format!("Installing {} stopped: {error}", display_name(kernel)))??;
         }
         let settings = self.settings();
         if settings.kernel == kernel {

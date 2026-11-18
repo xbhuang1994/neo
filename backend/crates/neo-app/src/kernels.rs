@@ -100,6 +100,60 @@ pub fn display_name(kernel: Kernel) -> &'static str {
     }
 }
 
+/// Fetches Hermes Agent's repository before its installer runs. The installer clones the whole history over one
+/// connection, which a slow link to GitHub drops long before it ends, and a clone cannot resume. Here the history
+/// comes one release at a time, oldest first, each part only what that release adds, and a part that broke off is
+/// tried again; the releases that came stay in `<install dir>.neo-download`, so the next install continues from
+/// there. Nothing is shallow: deepening a shallow history of many merges can cut off commits already fetched. The
+/// checkout ends on the first commit, with a clean tree: the installer then treats it as an earlier install and moves
+/// it to the latest release, as a fresh clone would be.
+const HERMES_PREFETCH: &str = r#"set -o pipefail
+url="${HERMES_REPO_URL:-https://github.com/NousResearch/hermes-agent.git}"
+home="${HERMES_HOME:-$HOME/.hermes}"
+dir="${HERMES_INSTALL_DIR:-$home/hermes-agent}"
+part="$dir.neo-download"
+pause="${NEO_RETRY_SECONDS:-5}"
+try() {
+    local n
+    for n in 1 2 3 4 5; do
+        "$@" && return 0
+        echo "Neo: that part broke off; trying it again ($n of 5)" >&2
+        sleep $((n * pause))
+    done
+    "$@"
+}
+fetch() {
+    git -C "$part" fetch --progress --no-tags --filter=blob:none origin "$@"
+}
+if [ ! -e "$dir" ]; then
+    # A shallow download, from an earlier version of this, starts over.
+    [ ! -f "$part/.git/shallow" ] || rm -rf "$part"
+    if [ ! -d "$part/.git" ]; then
+        mkdir -p "$(dirname "$part")" && git init -q "$part" && git -C "$part" remote add -t main origin "$url" || exit 1
+        git -C "$part" config remote.origin.promisor true && git -C "$part" config remote.origin.partialclonefilter blob:none || exit 1
+    fi
+    tags="$(try git ls-remote --tags --refs "$url" 'refs/tags/v*')" || exit 1
+    # Oldest first: releases were named by date (v2026.9.24) before they were by version (v0.21.6). Snapshots
+    # (v0.23.1+canary.…) are left out; one can point at the newest commit.
+    tags="$(printf '%s\n' "$tags" | sed -n 's|.*refs/tags/||p' | grep -v '+' | sort -V)"
+    tags="$(printf '%s\n' "$tags" | grep '^v20[0-9][0-9]\.'; printf '%s\n' "$tags" | grep -v '^v20[0-9][0-9]\.')"
+    total="$(printf '%s\n' "$tags" | grep -c .)"
+    n=0
+    for tag in $tags; do
+        n=$((n + 1))
+        git -C "$part" show-ref -q --verify "refs/tags/$tag" && continue
+        echo "Neo: fetching Hermes Agent's history up to $tag ($n of $total)"
+        try fetch "+refs/tags/$tag:refs/tags/$tag" || exit 1
+    done
+    echo "Neo: fetching Hermes Agent's latest history"
+    try fetch "+refs/heads/main:refs/remotes/origin/main" || exit 1
+    git -C "$part" update-ref refs/heads/main refs/remotes/origin/main && git -C "$part" symbolic-ref HEAD refs/heads/main || exit 1
+    root="$(git -C "$part" rev-list --max-parents=0 --first-parent main)" || exit 1
+    try git -C "$part" checkout -q --detach "$root" || exit 1
+    mv "$part" "$dir" || exit 1
+fi
+"#;
+
 /// The official installer of each kernel's program, as a shell command: a script fetched from the vendor that puts
 /// the program in the user's own folders, with no administrator rights.
 pub fn install_command(kernel: Kernel) -> (&'static str, Vec<String>) {
@@ -108,7 +162,8 @@ pub fn install_command(kernel: Kernel) -> (&'static str, Vec<String>) {
             let command = "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; & ([scriptblock]::Create((irm https://hermes-agent.nousresearch.com/install.ps1))) -NonInteractive";
             ("powershell", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command].map(String::from).to_vec())
         } else {
-            ("bash", vec!["-c".into(), "set -o pipefail; curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --non-interactive".into()])
+            let install = "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --non-interactive";
+            ("bash", vec!["-c".into(), format!("{HERMES_PREFETCH}{install}\n")])
         };
     }
     let (script, windows_script) = match kernel {
@@ -122,6 +177,88 @@ pub fn install_command(kernel: Kernel) -> (&'static str, Vec<String>) {
         ("powershell", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &command].map(String::from).to_vec())
     } else {
         ("bash", vec!["-c".into(), format!("set -o pipefail; curl -fsSL {script} | bash")])
+    }
+}
+
+/// How long a kernel's installer may run. Hermes Agent's fetches a repository with a long history, which takes far
+/// longer than the others on a slow link to GitHub; one stopped here continues where it was the next time.
+pub fn install_timeout(kernel: Kernel) -> Duration {
+    Duration::from_secs(if kernel == Kernel::Hermes { 2 * 60 * 60 } else { 10 * 60 })
+}
+
+/// Stands in for `git` while an installer runs: git prints its progress ("Receiving objects: 42%") into a pipe only
+/// when asked, and the settings page shows that progress.
+#[cfg(unix)]
+const GIT_PROGRESS_SHIM: &str = r#"#!/bin/sh
+# Written by neo-agent for kernel installers; edits are lost.
+here=$(dirname -- "$0")
+PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF -- "$here" | paste -s -d: -)
+export PATH
+case "$1" in
+    clone|fetch) sub=$1; shift; exec git "$sub" --progress "$@" ;;
+esac
+exec git "$@"
+"#;
+
+/// Splits an installer's output into lines, at `\n` and at the bare `\r` with which git and others redraw their
+/// progress, without terminal colour codes or blank lines. An unfinished line stays in `pending`.
+fn output_lines(pending: &mut Vec<u8>, chunk: &[u8]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for &byte in chunk {
+        if byte == b'\n' || byte == b'\r' {
+            let line = plain_text(&String::from_utf8_lossy(pending));
+            pending.clear();
+            if !line.is_empty() {
+                lines.push(line);
+            }
+        } else {
+            pending.push(byte);
+        }
+    }
+    lines
+}
+
+fn plain_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+        } else if !c.is_control() {
+            out.push(c);
+        }
+    }
+    out.trim().to_string()
+}
+
+/// The last lines an installer printed, a redrawn progress line kept once: the new line replaces the one before when
+/// both read the same up to their first digit.
+#[derive(Default)]
+struct OutputTail(std::collections::VecDeque<String>);
+
+impl OutputTail {
+    const KEEP: usize = 12;
+
+    fn push(&mut self, line: String) {
+        let head = |text: &str| text.split(|c: char| c.is_ascii_digit()).next().unwrap_or_default().to_string();
+        if self.0.back().is_some_and(|last| head(last) == head(&line)) {
+            self.0.pop_back();
+        }
+        self.0.push_back(line);
+        if self.0.len() > Self::KEEP {
+            self.0.pop_front();
+        }
+    }
+
+    fn text(&self) -> String {
+        Vec::from(self.0.clone()).join("\n")
     }
 }
 
@@ -145,6 +282,10 @@ pub trait Kernels: Send + Sync {
     fn installing(&self, _kernel: Kernel) -> bool {
         false
     }
+    /// The last line the kernel's installer printed while it runs, such as how far its download has come.
+    fn install_progress(&self, _kernel: Kernel) -> Option<String> {
+        None
+    }
 }
 
 /// Finds a kernel's program on this machine.
@@ -159,8 +300,8 @@ pub struct RealKernels {
     pub agent_dir: PathBuf,
     /// Finds each kernel's program.
     pub find: Finder,
-    /// The kernels whose programs are being installed.
-    pub installing: std::sync::Mutex<std::collections::BTreeSet<Kernel>>,
+    /// The kernels whose programs are being installed, each with the last line its installer printed.
+    pub installing: std::sync::Mutex<BTreeMap<Kernel, String>>,
     /// The shim extension file for Oh My Pi.
     pub shim: PathBuf,
     /// Variables to set for every runtime, on top of the host's environment.
@@ -223,20 +364,81 @@ impl RealKernels {
         self.program(kernel).ok_or_else(|| self.unavailable(kernel).unwrap_or_default())
     }
 
+    fn note_progress(&self, kernel: Kernel, line: &str) {
+        if let Some(progress) = self.installing.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get_mut(&kernel) {
+            line.clone_into(progress);
+        }
+    }
+
+    /// Where the installer finds the `git` that reports its progress, written now; `None` where there is none.
+    fn installer_bin(&self) -> Option<PathBuf> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = self.state_dir.join("installer-bin");
+            let git = dir.join("git");
+            write_if_changed(&git, GIT_PROGRESS_SHIM).ok()?;
+            std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).ok()?;
+            Some(dir)
+        }
+        #[cfg(not(unix))]
+        None
+    }
+
     async fn run_installer(&self, kernel: Kernel) -> Result<PathBuf, String> {
+        use tokio::io::AsyncReadExt;
         let name = display_name(kernel);
         let (program, args) = install_command(kernel);
         let mut command = tokio::process::Command::new(program);
-        command.args(&args).stdin(std::process::Stdio::null()).kill_on_drop(true);
-        let output = tokio::time::timeout(Duration::from_secs(600), command.output())
-            .await
-            .map_err(|_| format!("Installing {name} took longer than 10 minutes and was stopped"))?
-            .map_err(|error| format!("Cannot run {program} to install {name}: {error}"))?;
-        if !output.status.success() {
-            let text = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-            let lines: Vec<&str> = text.lines().map(str::trim_end).filter(|line| !line.trim().is_empty()).collect();
-            let tail = lines[lines.len().saturating_sub(12)..].join("\n");
-            return Err(format!("Installing {name} failed ({}):\n{tail}", output.status));
+        command.args(&args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
+        if let Some(bin) = self.installer_bin() {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            if let Ok(path) = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path))) {
+                command.env("PATH", path);
+            }
+        }
+        // Its own process group, so that stopping it stops the downloads it started too.
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command.spawn().map_err(|error| format!("Cannot run {program} to install {name}: {error}"))?;
+        let tail = std::sync::Mutex::new(OutputTail::default());
+        let pump = |mut stream: Box<dyn tokio::io::AsyncRead + Send + Unpin>| {
+            let tail = &tail;
+            async move {
+                let (mut pending, mut chunk) = (Vec::new(), [0u8; 4096]);
+                loop {
+                    let read = stream.read(&mut chunk).await.unwrap_or(0);
+                    let lines = if read == 0 { output_lines(&mut pending, b"\n") } else { output_lines(&mut pending, &chunk[..read]) };
+                    for line in lines {
+                        self.note_progress(kernel, &line);
+                        tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(line);
+                    }
+                    if read == 0 {
+                        break;
+                    }
+                }
+            }
+        };
+        let (stdout, stderr) = (child.stdout.take().expect("piped"), child.stderr.take().expect("piped"));
+        let pid = child.id();
+        let run = async {
+            let (_, _, status) = tokio::join!(pump(Box::new(stdout)), pump(Box::new(stderr)), child.wait());
+            status
+        };
+        let limit = install_timeout(kernel);
+        let Ok(status) = tokio::time::timeout(limit, run).await else {
+            #[cfg(unix)]
+            if let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) {
+                // SAFETY: signals the installer's own process group, which nothing else belongs to.
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+            }
+            let _ = pid;
+            return Err(format!("Installing {name} took longer than {} minutes and was stopped", limit.as_secs() / 60));
+        };
+        let status = status.map_err(|error| format!("Cannot run {program} to install {name}: {error}"))?;
+        if !status.success() {
+            let tail = tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).text();
+            return Err(format!("Installing {name} failed ({status}):\n{tail}"));
         }
         self.program(kernel)
             .ok_or_else(|| format!("The {name} installer finished, but its program ({}) was not found where it installs itself", program_name(kernel)))
@@ -542,8 +744,12 @@ impl Kernels for RealKernels {
     }
     fn install(&self, kernel: Kernel) -> BoxFut<'_, Result<PathBuf, String>> {
         Box::pin(async move {
-            if !self.installing.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(kernel) {
-                return Err(format!("{} is already being installed", display_name(kernel)));
+            {
+                let mut installing = self.installing.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if installing.contains_key(&kernel) {
+                    return Err(format!("{} is already being installed", display_name(kernel)));
+                }
+                installing.insert(kernel, String::new());
             }
             let result = self.run_installer(kernel).await;
             self.installing.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&kernel);
@@ -554,7 +760,10 @@ impl Kernels for RealKernels {
         self.program(kernel).is_some()
     }
     fn installing(&self, kernel: Kernel) -> bool {
-        self.installing.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).contains(&kernel)
+        self.installing.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).contains_key(&kernel)
+    }
+    fn install_progress(&self, kernel: Kernel) -> Option<String> {
+        self.installing.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(&kernel).filter(|line| !line.is_empty()).cloned()
     }
 }
 
@@ -598,6 +807,141 @@ mod tests {
     }
 
     #[test]
+    fn gives_hermes_two_hours_to_install_and_the_others_ten_minutes() {
+        assert_eq!(install_timeout(Kernel::Hermes), Duration::from_secs(7200));
+        assert_eq!(install_timeout(Kernel::Claude), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn reads_an_installers_redrawn_progress_as_lines_without_colours() {
+        let mut pending = Vec::new();
+        let lines = output_lines(
+            &mut pending,
+            "\u{1b}[2m  Cloning\u{1b}[0m\nReceiving objects:   3% (1/30), 8.04 MiB | 116.00 KiB/s\rReceiving objects:   4% (2/".as_bytes(),
+        );
+        assert_eq!(lines, ["Cloning", "Receiving objects:   3% (1/30), 8.04 MiB | 116.00 KiB/s"]);
+        assert_eq!(output_lines(&mut pending, b"30)\r\r\n"), ["Receiving objects:   4% (2/30)"]);
+        assert!(pending.is_empty());
+
+        let mut tail = OutputTail::default();
+        for line in ["==> Cloning", "Receiving objects:   3% (1/30)", "Receiving objects:   4% (2/30)", "fatal: early EOF"] {
+            tail.push(line.into());
+        }
+        assert_eq!(tail.text(), "==> Cloning\nReceiving objects:   4% (2/30)\nfatal: early EOF");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn asks_git_for_its_progress_while_an_installer_runs() {
+        let dir = std::env::temp_dir().join(format!("neo-git-shim-{}", std::process::id()));
+        let (real, kernels) = (
+            dir.join("real"),
+            RealKernels {
+                state_dir: dir.clone(),
+                agent_dir: dir.clone(),
+                find: Arc::new(|_| None),
+                installing: Default::default(),
+                shim: dir.join("shim.ts"),
+                env: BTreeMap::new(),
+                hook_relay: Vec::new(),
+            },
+        );
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("git"), "#!/bin/sh\necho \"$@\"\n").unwrap();
+        std::process::Command::new("chmod").arg("+x").arg(real.join("git")).status().unwrap();
+        let bin = kernels.installer_bin().unwrap();
+        let path = std::env::join_paths([bin.clone(), real, "/usr/bin".into(), "/bin".into()]).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new(bin.join("git")).args(args).env("PATH", &path).output().unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        assert_eq!(run(&["clone", "--filter=blob:none", "url", "dir"]), "clone --progress --filter=blob:none url dir\n");
+        assert_eq!(run(&["-C", "dir", "status"]), "-C dir status\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fetches_hermes_history_in_parts_continuing_a_broken_download_and_hands_over_a_clean_checkout() {
+        let dir = std::env::temp_dir().join(format!("neo-hermes-prefetch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (source, home) = (dir.join("source"), dir.join("home"));
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git").args(args).current_dir(cwd).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        // 2500 commits, each changing a file, a release every 100 (v0.1 to v0.25, and a tag that is not a release),
+        // with commits after the last release and a release branched off main.
+        std::fs::create_dir_all(&source).unwrap();
+        git(&source, &["init", "-q", "-b", "main"]);
+        git(&source, &["config", "uploadpack.allowFilter", "true"]);
+        let mut stream = String::new();
+        for n in 1..=2500 {
+            let from = if n == 1 { String::new() } else { format!("from :{}\n", n - 1) };
+            stream.push_str(&format!(
+                "commit refs/heads/main\nmark :{n}\ncommitter T <t@t> {n} +0000\ndata 2\nc\n{from}M 644 inline f{}.txt\ndata {}\n{n}\n",
+                n % 7,
+                n.to_string().len() + 1
+            ));
+            if n % 100 == 0 && n < 2500 {
+                stream.push_str(&format!("tag v0.{}\nfrom :{n}\ntagger T <t@t> {n} +0000\ndata 2\nr\n", n / 100));
+            }
+        }
+        stream.push_str("commit refs/heads/release/x\ncommitter T <t@t> 3000 +0000\ndata 2\nx\nfrom :1500\nM 644 inline x.txt\ndata 2\nx\n");
+        stream.push_str("tag v0.15.1\nfrom refs/heads/release/x\ntagger T <t@t> 3000 +0000\ndata 2\nr\n");
+        stream.push_str("tag rc-abandoned\nfrom :50\ntagger T <t@t> 50 +0000\ndata 2\nr\n");
+        stream.push_str("tag v2020.1.1\nfrom :50\ntagger T <t@t> 50 +0000\ndata 2\nr\n");
+        stream.push_str("tag v0.0.1+channel.1\nfrom :2500\ntagger T <t@t> 2500 +0000\ndata 2\nr\n");
+        let mut import =
+            std::process::Command::new("git").args(["fast-import", "--quiet"]).current_dir(&source).stdin(std::process::Stdio::piped()).spawn().unwrap();
+        std::io::Write::write_all(import.stdin.as_mut().unwrap(), stream.as_bytes()).unwrap();
+        assert!(import.wait().unwrap().success());
+        let url = format!("file://{}", source.display());
+        let part = home.join("hermes-agent.neo-download");
+        // A shallow download an earlier version left behind.
+        std::fs::create_dir_all(&home).unwrap();
+        git(&home, &["clone", "-q", "--filter=blob:none", "--depth=1", "--no-checkout", "--branch", "main", &url, part.to_str().unwrap()]);
+        // A link that always drops the part up to v0.10: the download stops there, keeping the releases before it.
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let real = String::from_utf8(std::process::Command::new("sh").args(["-c", "command -v git"]).output().unwrap().stdout).unwrap();
+        std::fs::write(bin.join("git"), format!("#!/bin/sh\ncase \"$*\" in *refs/tags/v0.10:*) exit 128;; esac\nexec {} \"$@\"\n", real.trim())).unwrap();
+        std::process::Command::new("chmod").arg("+x").arg(bin.join("git")).status().unwrap();
+        let broken = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap()))).unwrap();
+        let run = |path: &std::ffi::OsStr| {
+            let out = std::process::Command::new("bash")
+                .args(["-c", HERMES_PREFETCH])
+                .env("PATH", path)
+                .env("HERMES_REPO_URL", &url)
+                .env("HERMES_HOME", &home)
+                .env("NEO_RETRY_SECONDS", "0")
+                .env_remove("HERMES_INSTALL_DIR")
+                .output()
+                .unwrap();
+            (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
+        };
+        let (done, said, errors) = run(&broken);
+        assert!(!done && errors.contains("trying it again (5 of 5)"), "{said}{errors}");
+        assert!(!part.join(".git").join("shallow").exists());
+        assert_eq!(git(&part, &["tag", "--list"]).lines().count(), 10, "v2020.1.1, then v0.1 to v0.9");
+        // The next install continues from v0.10.
+        let (done, said, errors) = run(&std::env::var_os("PATH").unwrap());
+        assert!(done, "{said}{errors}");
+        assert!(said.starts_with("Neo: fetching Hermes Agent's history up to v0.10 (11 of 26)\n"), "{said}");
+        assert!(said.ends_with("Neo: fetching Hermes Agent's history up to v0.24 (26 of 26)\nNeo: fetching Hermes Agent's latest history\n"), "{said}");
+        let checkout = home.join("hermes-agent");
+        assert!(!part.exists() && !checkout.join(".git").join("shallow").exists());
+        assert_eq!(git(&checkout, &["rev-list", "--count", "origin/main"]), "2500");
+        assert_eq!(git(&checkout, &["rev-list", "--count", "main"]), "2500");
+        assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), git(&source, &["rev-list", "--max-parents=0", "main"]));
+        assert_eq!(git(&checkout, &["status", "--porcelain"]), "");
+        assert_eq!(git(&checkout, &["config", "remote.origin.partialclonefilter"]), "blob:none");
+        assert!(git(&checkout, &["tag", "--list", "rc-*"]).is_empty() && git(&checkout, &["tag", "--list", "*+*"]).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn says_why_a_kernel_cannot_run() {
         let kernels = RealKernels {
             state_dir: "/s".into(),
@@ -612,7 +956,7 @@ mod tests {
         assert!(kernels.unavailable(Kernel::Antigravity).unwrap().contains("agy"));
         assert!(kernels.unavailable(Kernel::Hermes).unwrap().contains("hermes"));
         assert!(kernels.unavailable(Kernel::Omp).unwrap().contains("/missing/shim.ts"));
-        kernels.installing.lock().unwrap().insert(Kernel::Claude);
+        kernels.installing.lock().unwrap().insert(Kernel::Claude, String::new());
         assert!(kernels.unavailable(Kernel::Claude).unwrap().contains("being installed"));
     }
 

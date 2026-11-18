@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:cupertino_ui/cupertino_ui.dart';
@@ -436,7 +437,16 @@ void main() {
     await show(tester, install);
     expect(find.textContaining('Claude Code: The Claude Code program'), findsOneWidget);
     expect(find.byKey(const ValueKey('install-omp')), findsNothing);
+    // While it installs, the page says how far it has come.
+    backend.installGate = Completer();
+    backend.installProgress = '接收对象中:   3% (19605/507062), 8.04 MiB | 116.00 KiB/s';
     await tester.tap(install);
+    await settle(tester);
+    await tester.pump(const Duration(seconds: 2));
+    await settle(tester);
+    expect(find.text(backend.installProgress!), findsOneWidget);
+    expect(find.descendant(of: install, matching: find.byType(CupertinoActivityIndicator)), findsOneWidget);
+    backend.installGate!.complete();
     await settle(tester);
     expect(backend.installed, ['claude']);
     expect(find.text('Claude Code 已安装'), findsOneWidget);

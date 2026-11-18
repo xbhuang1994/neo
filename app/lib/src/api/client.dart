@@ -133,9 +133,10 @@ class ApiClient {
   Future<ModelSettings> setKernel(String kernel) async =>
       ModelSettings.fromJson(await _object('PUT', '/api/settings/kernel', body: {'kernel': kernel}, timeout: const Duration(seconds: 60)));
 
-  /// Install a kernel's program on the backend's machine with its official installer; that can take minutes.
+  /// Install a kernel's program on the backend's machine with its official installer; that can take minutes, and
+  /// Hermes Agent's up to two hours on a slow link to GitHub. [models] says how far it has come meanwhile.
   Future<ModelSettings> installKernel(String kernel) async =>
-      ModelSettings.fromJson(await _object('POST', '/api/settings/kernel/install', body: {'kernel': kernel}, timeout: const Duration(minutes: 11)));
+      ModelSettings.fromJson(await _object('POST', '/api/settings/kernel/install', body: {'kernel': kernel}, timeout: const Duration(minutes: 121)));
 
   Future<GeneralSettings> general() async => GeneralSettings.fromJson(await _object('GET', '/api/settings/general'));
 

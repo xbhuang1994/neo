@@ -379,6 +379,7 @@ dependencies = [
  "aes",
  "base64",
  "getrandom",
+ "libc",
  "neo-core",
  "neo-kernel",
  "neo-store",

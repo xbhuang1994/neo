@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
@@ -42,6 +43,12 @@ class FakeBackend {
   /// Why Claude Code cannot run; set, its program is not installed until the app installs it.
   String? claudeProblem;
   final List<String> installed = [];
+
+  /// Set, an install answers only once it completes; meanwhile the kernel is being installed, as far as
+  /// [installProgress] says.
+  Completer<void>? installGate;
+  String? installProgress;
+  String? _installingNow;
   Map<String, Map<String, dynamic>> models = {
     'omp': {'eval': null, 'executor': null},
     'claude': {'eval': null, 'executor': null},
@@ -144,7 +151,8 @@ class FakeBackend {
             'id': id,
             'problem': id == 'claude' ? claudeProblem : null,
             'installed': id != 'claude' || claudeProblem == null,
-            'installing': false,
+            'installing': id == _installingNow,
+            'installProgress': id == _installingNow ? installProgress : null,
             'supports': {'thinkingLevels': _levels(id)},
             'available': _available(id),
             'listProblem': id == 'claude' ? claudeProblem : null,
@@ -239,6 +247,11 @@ class FakeBackend {
         return _json(200, _modelsView());
       case ('POST', '/api/settings/kernel/install'):
         final which = (body as Map)['kernel'] as String;
+        if (installGate case final gate?) {
+          _installingNow = which;
+          await gate.future;
+          _installingNow = null;
+        }
         installed.add(which);
         if (which == 'claude') {
           claudeProblem = null;

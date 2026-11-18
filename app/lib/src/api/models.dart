@@ -231,6 +231,7 @@ class KernelInfo {
       problem = _text(json['problem']),
       installed = json['installed'] != false,
       installing = json['installing'] == true,
+      installProgress = _text(json['installProgress']),
       thinkingLevels = _list(_map(json['supports'])['thinkingLevels']).cast<String>(),
       available = [for (final option in _list(json['available'])) ModelOption.fromJson(_map(option))],
       listProblem = _text(json['listProblem']),
@@ -242,6 +243,9 @@ class KernelInfo {
   final String? problem;
   final bool installed;
   final bool installing;
+
+  /// The last line its installer printed, while it is being installed: how far its download has come.
+  final String? installProgress;
   final List<String> thinkingLevels;
   final List<ModelOption> available;
 

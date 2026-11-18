@@ -510,10 +510,10 @@ class _ModelsSettingsState extends LoadingState<ModelsSettings, ModelSettings> {
     return settings;
   }
 
-  /// While a kernel is still listing its models, ask again shortly, keeping the draft as it is.
+  /// While a kernel is still listing its models or being installed, ask again shortly, keeping the draft as it is.
   void _watch(ModelSettings settings) {
     _poll?.cancel();
-    if (!settings.loading) return;
+    if (!settings.loading && _installing == null && !settings.kernels.any((kernel) => kernel.installing)) return;
     _poll = Timer(const Duration(milliseconds: 1500), () async {
       try {
         final fresh = await widget.api.models();
@@ -591,22 +591,33 @@ class _ModelsSettingsState extends LoadingState<ModelsSettings, ModelSettings> {
       'hermes' => '${strings.installed(name)} ${strings.hermesSetup}',
       _ => strings.installed(name),
     };
-    setState(() => _installing = kernel);
-    // Installing keeps the draft: only what may be chosen changes.
-    final draft = (_kernel, _workerKernel, _eval, _executor);
-    await run(() async {
-      final settings = await widget.api.installKernel(kernel);
-      _watch(settings);
-      return settings;
-    }, done: done);
-    if (!mounted) return;
+    // An install can take most of an hour, so the rest of the page stays usable meanwhile, and the draft is kept:
+    // only what may be chosen changes.
     setState(() {
-      _kernel = draft.$1;
-      _workerKernel = draft.$2;
-      _eval = draft.$3;
-      _executor = draft.$4;
-      _installing = null;
+      _installing = kernel;
+      notice = null;
     });
+    _watch(data!);
+    try {
+      final settings = await widget.api.installKernel(kernel);
+      if (!mounted) return;
+      setState(() {
+        data = settings;
+        notice = done;
+        noticeGood = true;
+      });
+    } on ApiException catch (error) {
+      if (!mounted) return;
+      setState(() {
+        notice = error.message;
+        noticeGood = false;
+      });
+    } finally {
+      if (mounted) {
+        setState(() => _installing = null);
+        _watch(data!);
+      }
+    }
   }
 
   Future<void> _pickThinking(KernelInfo kernel, RoleModel model, ValueChanged<RoleModel?> set) async {
@@ -711,7 +722,20 @@ class _ModelsSettingsState extends LoadingState<ModelsSettings, ModelSettings> {
                       child: Row(
                         children: [
                           Expanded(
-                            child: Text('${_name(kernel.id)}: ${kernel.problem}', style: typo.footnote.copyWith(color: palette.orange)),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text('${_name(kernel.id)}: ${kernel.problem}', style: typo.footnote.copyWith(color: palette.orange)),
+                                if (kernel.installing && kernel.installProgress != null)
+                                  Text(
+                                    kernel.installProgress!,
+                                    key: ValueKey('install-progress-${kernel.id}'),
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: typo.footnote.copyWith(color: palette.secondary),
+                                  ),
+                              ],
+                            ),
                           ),
                           if (!kernel.installed)
                             Padding(
