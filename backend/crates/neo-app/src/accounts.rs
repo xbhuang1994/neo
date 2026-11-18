@@ -95,7 +95,13 @@ fn scrubbed(env: BTreeMap<String, String>) -> (BTreeMap<String, String>, Vec<Str
 async fn run(program: &Path, args: &[&str], env: &BTreeMap<String, String>, input: Option<&str>) -> Result<(bool, String), String> {
     let (env, remove) = scrubbed(env.clone());
     let mut command = tokio::process::Command::new(program);
-    command.args(args).envs(&env).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
+    command
+        .args(args)
+        .envs(&env)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
     for name in &remove {
         command.env_remove(name);
     }
@@ -243,7 +249,13 @@ impl RealKernels {
                 } else {
                     note = Some("No login file found. A login kept in the system keyring does not show here.".into());
                 }
-                Ok(KernelAccounts { accounts, login: vec![LoginOption { id: "google".into(), name: "Google".into() }], any_provider: false, api_keys: false, note })
+                Ok(KernelAccounts {
+                    accounts,
+                    login: vec![LoginOption { id: "google".into(), name: "Google".into() }],
+                    any_provider: false,
+                    api_keys: false,
+                    note,
+                })
             }
         }
     }
@@ -260,7 +272,9 @@ impl RealKernels {
                 let flag = if provider == "console" { "--console" } else { "--claudeai" };
                 (vec!["auth".into(), "login".into(), flag.into()], self.claude_env(), None)
             }
-            Kernel::Omp => (vec!["login".into(), provider.into()], BTreeMap::from([("PI_CODING_AGENT_DIR".into(), self.agent_dir.display().to_string())]), None),
+            Kernel::Omp => {
+                (vec!["login".into(), provider.into()], BTreeMap::from([("PI_CODING_AGENT_DIR".into(), self.agent_dir.display().to_string())]), None)
+            }
             Kernel::Hermes => (vec!["auth".into(), "add".into(), provider.into(), "--no-browser".into()], self.env.clone(), None),
             Kernel::Antigravity => (vec!["acp".into(), "--login".into()], self.env.clone(), Some("couldn't log in")),
         };
@@ -274,13 +288,21 @@ impl RealKernels {
         match kernel {
             Kernel::Claude => {
                 let (done, text) = run(&program, &["auth", "logout"], &self.claude_env(), None).await?;
-                if done { Ok(()) } else { Err(text) }
+                if done {
+                    Ok(())
+                } else {
+                    Err(text)
+                }
             }
             Kernel::Omp => omp_logout(&self.agent_dir.join("agent.db"), account),
             Kernel::Hermes => {
                 let (provider, id) = account.split_once('/').ok_or("A Hermes account is <provider>/<credential id>")?;
                 let (done, text) = run(&program, &["auth", "remove", provider, id], &self.env, None).await?;
-                if done { Ok(()) } else { Err(text) }
+                if done {
+                    Ok(())
+                } else {
+                    Err(text)
+                }
             }
             Kernel::Antigravity => match std::fs::remove_file(agy_token_file()) {
                 Ok(()) => Ok(()),
@@ -303,10 +325,16 @@ impl RealKernels {
                 let env = BTreeMap::from([("PI_CODING_AGENT_DIR".into(), self.agent_dir.display().to_string())]);
                 run(&program, &["auth", "import", "-"], &env, Some(&document.to_string())).await?
             }
-            Kernel::Hermes => run(&program, &["auth", "add", provider, "--type", "api-key", "--api-key", key.trim(), "--label", "neo"], &self.env, None).await?,
+            Kernel::Hermes => {
+                run(&program, &["auth", "add", provider, "--type", "api-key", "--api-key", key.trim(), "--label", "neo"], &self.env, None).await?
+            }
             _ => return Err(format!("{} takes no API key from here", display_name(kernel))),
         };
-        if done { Ok(()) } else { Err(text.replace(key.trim(), "…")) }
+        if done {
+            Ok(())
+        } else {
+            Err(text.replace(key.trim(), "…"))
+        }
     }
 }
 
@@ -318,7 +346,8 @@ fn omp_accounts(db: &Path) -> Result<Vec<Account>, String> {
     }
     let unreadable = |error: rusqlite::Error| format!("Cannot read Oh My Pi's credentials in {}: {error}", db.display());
     let connection = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(unreadable)?;
-    let mut statement = connection.prepare("SELECT id, provider, credential_type, data FROM auth_credentials WHERE disabled_cause IS NULL").map_err(unreadable)?;
+    let mut statement =
+        connection.prepare("SELECT id, provider, credential_type, data FROM auth_credentials WHERE disabled_cause IS NULL").map_err(unreadable)?;
     let mut rows = statement.query([]).map_err(unreadable)?;
     let mut accounts = Vec::new();
     loop {
@@ -348,7 +377,10 @@ fn omp_logout(db: &Path, account: &str) -> Result<(), String> {
     let connection = rusqlite::Connection::open(db).map_err(|error| format!("Cannot open {}: {error}", db.display()))?;
     connection.busy_timeout(Duration::from_secs(5)).map_err(|error| error.to_string())?;
     let changed = connection
-        .execute("UPDATE auth_credentials SET disabled_cause = 'deleted by user', updated_at = strftime('%s', 'now') WHERE id = ?1 AND disabled_cause IS NULL", [id])
+        .execute(
+            "UPDATE auth_credentials SET disabled_cause = 'deleted by user', updated_at = strftime('%s', 'now') WHERE id = ?1 AND disabled_cause IS NULL",
+            [id],
+        )
         .map_err(|error| format!("Cannot log Oh My Pi out: {error}"))?;
     if changed == 0 {
         return Err("That Oh My Pi credential is gone already".into());
@@ -436,12 +468,22 @@ impl App {
 
     /// Start logging a kernel in to a provider (`{kernel, provider}`); a login still in progress is ended first.
     pub async fn start_login(self: &Arc<Self>, value: Value) -> Result<Value, String> {
-        let kernel = value.get("kernel").and_then(Value::as_str).and_then(|name| serde_json::from_value::<Kernel>(json!(name)).ok()).ok_or("kernel is omp, claude, antigravity or hermes")?;
+        let kernel = value
+            .get("kernel")
+            .and_then(Value::as_str)
+            .and_then(|name| serde_json::from_value::<Kernel>(json!(name)).ok())
+            .ok_or("kernel is omp, claude, antigravity or hermes")?;
         let provider = value.get("provider").and_then(Value::as_str).unwrap_or_default().trim().to_string();
         let command = self.kernels.login(kernel, &provider)?;
         self.cancel_login();
         let mut process = tokio::process::Command::new(&command.program);
-        process.args(&command.args).envs(&command.env).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
+        process
+            .args(&command.args)
+            .envs(&command.env)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
         for name in &command.env_remove {
             process.env_remove(name);
         }
@@ -451,7 +493,13 @@ impl App {
         let view = LoginView { id, kernel, provider: provider.clone(), state: "running", links: Vec::new(), output: String::new() };
         *self.logins.current.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(LoginRun { view, stdin: child.stdin.take(), stop: Some(stop) });
         let (text_out, mut out) = tokio::sync::mpsc::unbounded_channel::<String>();
-        for mut stream in [child.stdout.take().map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>), child.stderr.take().map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>)].into_iter().flatten() {
+        for mut stream in [
+            child.stdout.take().map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+            child.stderr.take().map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+        ]
+        .into_iter()
+        .flatten()
+        {
             let text_out = text_out.clone();
             tokio::spawn(async move {
                 let mut buffer = [0u8; 4096];
@@ -564,7 +612,11 @@ impl App {
 
     /// Log a kernel out of an account (`{kernel, account}`).
     pub async fn logout(self: &Arc<Self>, value: Value) -> Result<Value, String> {
-        let kernel = value.get("kernel").and_then(Value::as_str).and_then(|name| serde_json::from_value::<Kernel>(json!(name)).ok()).ok_or("kernel is omp, claude, antigravity or hermes")?;
+        let kernel = value
+            .get("kernel")
+            .and_then(Value::as_str)
+            .and_then(|name| serde_json::from_value::<Kernel>(json!(name)).ok())
+            .ok_or("kernel is omp, claude, antigravity or hermes")?;
         let account = value.get("account").and_then(Value::as_str).ok_or("account is required")?;
         self.kernels.logout(kernel, account).await?;
         self.model_lists.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&kernel);
@@ -573,7 +625,11 @@ impl App {
 
     /// Give a kernel an API key for a provider (`{kernel, provider, key}`).
     pub async fn add_api_key(self: &Arc<Self>, value: Value) -> Result<Value, String> {
-        let kernel = value.get("kernel").and_then(Value::as_str).and_then(|name| serde_json::from_value::<Kernel>(json!(name)).ok()).ok_or("kernel is omp, claude, antigravity or hermes")?;
+        let kernel = value
+            .get("kernel")
+            .and_then(Value::as_str)
+            .and_then(|name| serde_json::from_value::<Kernel>(json!(name)).ok())
+            .ok_or("kernel is omp, claude, antigravity or hermes")?;
         let provider = value.get("provider").and_then(Value::as_str).ok_or("provider is required")?.trim();
         let key = value.get("key").and_then(Value::as_str).ok_or("key is required")?;
         self.kernels.api_key(kernel, provider, key).await?;
@@ -612,10 +668,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("neo-accounts-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("auth.json");
-        std::fs::write(&file, r#"{"version":1,"credential_pool":{"openrouter":[{"id":"3ff907","label":"test","auth_type":"api_key","access_token":"secret"}]}}"#).unwrap();
+        std::fs::write(
+            &file,
+            r#"{"version":1,"credential_pool":{"openrouter":[{"id":"3ff907","label":"test","auth_type":"api_key","access_token":"secret"}]}}"#,
+        )
+        .unwrap();
         let accounts = hermes_accounts(&file);
         std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(accounts, vec![Account { id: "openrouter/3ff907".into(), provider: "openrouter".into(), kind: "api_key".into(), label: "test".into(), removable: true }]);
+        assert_eq!(
+            accounts,
+            vec![Account { id: "openrouter/3ff907".into(), provider: "openrouter".into(), kind: "api_key".into(), label: "test".into(), removable: true }]
+        );
     }
 
     #[test]
@@ -634,7 +697,10 @@ mod tests {
             .unwrap();
         drop(connection);
         let accounts = omp_accounts(&db).unwrap();
-        assert_eq!(accounts.iter().map(|account| (account.id.as_str(), account.provider.as_str(), account.label.as_str())).collect::<Vec<_>>(), vec![("2", "deepseek", ""), ("1", "openai-codex", "a@b.c")]);
+        assert_eq!(
+            accounts.iter().map(|account| (account.id.as_str(), account.provider.as_str(), account.label.as_str())).collect::<Vec<_>>(),
+            vec![("2", "deepseek", ""), ("1", "openai-codex", "a@b.c")]
+        );
         omp_logout(&db, "1").unwrap();
         assert!(omp_logout(&db, "1").is_err());
         assert_eq!(omp_accounts(&db).unwrap().len(), 1);

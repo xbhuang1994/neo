@@ -179,7 +179,8 @@ impl ProviderKeys<'_> {
 
 /// What a saved key stands for: the value of the environment variable it names, else itself.
 pub fn resolve_key(saved: &str) -> String {
-    let variable = saved.bytes().next().is_some_and(|b| b.is_ascii_uppercase()) && saved.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+    let variable =
+        saved.bytes().next().is_some_and(|b| b.is_ascii_uppercase()) && saved.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
     match variable.then(|| std::env::var(saved).ok()).flatten().filter(|value| !value.is_empty()) {
         Some(value) => value,
         None => saved.to_string(),
@@ -264,7 +265,14 @@ pub fn claude_env(resolved: &ResolvedProvider, model: &str) -> (BTreeMap<String,
     let key = resolved.key.clone().unwrap_or_else(|| "neo-no-key".into());
     let (set, unset) = if provider.bearer() { ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY") } else { ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN") };
     env.insert(set.into(), key);
-    for tier in ["ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"] {
+    for tier in [
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+    ] {
         env.insert(tier.into(), model.to_string());
     }
     if !provider.headers.is_empty() {
@@ -317,11 +325,15 @@ pub fn parse_models(body: &Value) -> (Vec<ProviderModel>, Option<String>) {
         .filter_map(|entry| {
             let id = entry.get("id").and_then(Value::as_str).map(str::trim).filter(|id| !id.is_empty() && !id.contains(char::is_whitespace))?.to_string();
             let name = ["/display_name", "/name"].iter().find_map(|field| entry.pointer(field).and_then(Value::as_str)).unwrap_or_default().trim().to_string();
-            let inputs = ["/modalities/input", "/architecture/input_modalities", "/input"].iter().find_map(|field| entry.pointer(field).and_then(Value::as_array));
+            let inputs =
+                ["/modalities/input", "/architecture/input_modalities", "/input"].iter().find_map(|field| entry.pointer(field).and_then(Value::as_array));
             let levels: Vec<Value> = entry.get("reasoning_levels").and_then(Value::as_array).cloned().unwrap_or_default();
             let reasoning = entry.get("reasoning").and_then(Value::as_bool).unwrap_or(false)
                 || !levels.is_empty()
-                || entry.get("supported_parameters").and_then(Value::as_array).is_some_and(|parameters| parameters.iter().any(|parameter| parameter == "reasoning"));
+                || entry
+                    .get("supported_parameters")
+                    .and_then(Value::as_array)
+                    .is_some_and(|parameters| parameters.iter().any(|parameter| parameter == "reasoning"));
             let mut extra = Map::new();
             if !levels.is_empty() {
                 extra.insert("thinking".into(), json!({"mode": "effort", "efforts": levels}));
@@ -374,7 +386,8 @@ pub async fn discover(resolved: &ResolvedProvider) -> Result<Vec<ProviderModel>,
     let mut found = Vec::new();
     let mut after: Option<String> = None;
     for _ in 0..20 {
-        let request = models_request(resolved, after.as_deref()).ok_or_else(|| format!("{name}: its API ({}) lists no models; enter them by hand", resolved.provider.api))?;
+        let request = models_request(resolved, after.as_deref())
+            .ok_or_else(|| format!("{name}: its API ({}) lists no models; enter them by hand", resolved.provider.api))?;
         let response = crate::http::send(request).await.map_err(|failure| format!("{name}: cannot list models: {failure}"))?;
         if response.status != 200 {
             let text = String::from_utf8_lossy(&response.body);
@@ -439,7 +452,8 @@ pub fn import_omp(models_yml: &Path) -> Vec<(Provider, Option<String>)> {
         for field in ["api", "auth", "baseUrl", "apiKey", "headers", "models"] {
             extra.remove(field);
         }
-        let key = (config.get("auth").and_then(Value::as_str) != Some("none")).then(|| config.get("apiKey").and_then(Value::as_str).map(str::to_string)).flatten();
+        let key =
+            (config.get("auth").and_then(Value::as_str) != Some("none")).then(|| config.get("apiKey").and_then(Value::as_str).map(str::to_string)).flatten();
         let mut provider = Provider { name: name.clone(), kernels: kernels_serving(&api), api, base_url: base_url.to_string(), headers, models, extra };
         provider.normalize();
         if validate(std::slice::from_ref(&provider)).is_ok() {
@@ -459,7 +473,15 @@ mod tests {
             api: api.into(),
             base_url: "http://127.0.0.1:9/v1".into(),
             headers: BTreeMap::new(),
-            models: vec![ProviderModel { id: "m".into(), name: String::new(), reasoning: false, images: false, context_window: None, max_tokens: None, extra: Map::new() }],
+            models: vec![ProviderModel {
+                id: "m".into(),
+                name: String::new(),
+                reasoning: false,
+                images: false,
+                context_window: None,
+                max_tokens: None,
+                extra: Map::new(),
+            }],
             kernels: kernels_serving(api),
             extra: Map::new(),
         }
@@ -500,7 +522,10 @@ mod tests {
         .unwrap();
         let imported = import_omp(&file);
         std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(imported.iter().map(|(provider, key)| (provider.name.as_str(), key.as_deref())).collect::<Vec<_>>(), vec![("keyed", Some("EXAMPLE_KEY")), ("local", None)]);
+        assert_eq!(
+            imported.iter().map(|(provider, key)| (provider.name.as_str(), key.as_deref())).collect::<Vec<_>>(),
+            vec![("keyed", Some("EXAMPLE_KEY")), ("local", None)]
+        );
         let local = &imported[1].0;
         assert_eq!(local.base_url, "http://127.0.0.1:8080/v1");
         assert_eq!(local.kernels, vec![Kernel::Omp, Kernel::Hermes]);
@@ -526,7 +551,10 @@ mod tests {
         assert_eq!(listed[0]["models"][0], json!({"id": "m", "name": "m", "reasoning": false, "input": ["text"]}));
         assert!(runtime_env(Kernel::Antigravity, &providers).is_empty());
         let (env, unset) = claude_env(&providers[1], "m");
-        assert_eq!((env["ANTHROPIC_BASE_URL"].as_str(), env["ANTHROPIC_API_KEY"].as_str(), env["ANTHROPIC_DEFAULT_HAIKU_MODEL"].as_str()), ("http://127.0.0.1:9", "neo-no-key", "m"));
+        assert_eq!(
+            (env["ANTHROPIC_BASE_URL"].as_str(), env["ANTHROPIC_API_KEY"].as_str(), env["ANTHROPIC_DEFAULT_HAIKU_MODEL"].as_str()),
+            ("http://127.0.0.1:9", "neo-no-key", "m")
+        );
         assert!(unset.contains(&"ANTHROPIC_AUTH_TOKEN".to_string()));
     }
 
@@ -541,7 +569,10 @@ mod tests {
         assert_eq!(next, None);
         assert_eq!(models.iter().map(|model| model.id.as_str()).collect::<Vec<_>>(), vec!["group/intent", "plain"]);
         let intent = &models[0];
-        assert_eq!((intent.name.as_str(), intent.context_window, intent.max_tokens, intent.images, intent.reasoning), ("Intent", Some(1000), Some(50), true, true));
+        assert_eq!(
+            (intent.name.as_str(), intent.context_window, intent.max_tokens, intent.images, intent.reasoning),
+            ("Intent", Some(1000), Some(50), true, true)
+        );
         assert_eq!(intent.extra["thinking"], json!({"mode": "effort", "efforts": ["low", "high"]}));
         let anthropic = json!({"data": [{"id": "claude-x", "display_name": "Claude X", "type": "model"}], "has_more": true, "last_id": "claude-x"});
         assert_eq!(parse_models(&anthropic).1.as_deref(), Some("claude-x"));

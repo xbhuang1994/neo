@@ -479,7 +479,12 @@ impl RealKernels {
 
     /// The custom provider of a name that a kernel uses.
     fn provider_for(&self, kernel: Kernel, name: &str) -> Option<ResolvedProvider> {
-        self.providers.read().unwrap_or_else(|poisoned| poisoned.into_inner()).iter().find(|resolved| resolved.provider.name == name && resolved.provider.used_by(kernel)).cloned()
+        self.providers
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|resolved| resolved.provider.name == name && resolved.provider.used_by(kernel))
+            .cloned()
     }
 
     /// The models of the custom providers a kernel uses, in place of any the runtime lists under the same name.

@@ -434,7 +434,11 @@ async fn imports_oh_my_pi_providers_once_and_keeps_keys_out_of_settings() {
     let settings = serde_json::to_string(&*f.app.settings()).unwrap();
     assert!(!settings.contains("sk-") && settings.contains("renamed"), "{settings}");
     // A provider that does not check out changes nothing.
-    assert!(f.app.update_providers(json!({"providers": [{"name": "x", "api": "openai-completions", "baseUrl": "ftp://x", "models": [], "apiKey": null}]})).await.is_err());
+    assert!(f
+        .app
+        .update_providers(json!({"providers": [{"name": "x", "api": "openai-completions", "baseUrl": "ftp://x", "models": [], "apiKey": null}]}))
+        .await
+        .is_err());
     assert_eq!(f.app.providers_view()["providers"].as_array().unwrap().len(), 2);
     // Clearing a key takes it away; importing again adds only what is missing.
     f.app.update_providers(json!({"providers": [{"name": "renamed", "api": "openai-completions", "baseUrl": "http://127.0.0.1:9/v1", "models": [{"id": "big"}], "apiKey": null}]})).await.unwrap();
@@ -451,25 +455,35 @@ async fn lists_each_providers_models_over_its_own_api() {
     let log = seen.clone();
     let server = neo_testkit::http::serve(move |request| {
         log.lock().unwrap().push((request.path.clone(), request.headers.get("authorization").cloned()));
-        neo_testkit::http::Response::json(200, &json!({"object": "list", "data": [{"id": "big", "display_name": "Big", "context_window": 1000}, {"id": "small"}]}))
+        neo_testkit::http::Response::json(
+            200,
+            &json!({"object": "list", "data": [{"id": "big", "display_name": "Big", "context_window": 1000}, {"id": "small"}]}),
+        )
     })
     .await;
     let f = started().await;
     // A new provider is asked for its models when saved; nobody types them.
     let view = f
         .app
-        .update_providers(json!({"providers": [{"name": "listed", "api": "openai-completions", "baseUrl": format!("{}/v1", server.url()), "apiKey": "sk-listed"}]}))
+        .update_providers(
+            json!({"providers": [{"name": "listed", "api": "openai-completions", "baseUrl": format!("{}/v1", server.url()), "apiKey": "sk-listed"}]}),
+        )
         .await
         .unwrap();
     let models = &view["providers"][0]["models"];
-    assert_eq!(models, &json!([{"id": "big", "name": "Big", "reasoning": false, "images": false, "contextWindow": 1000}, {"id": "small", "reasoning": false, "images": false}]));
+    assert_eq!(
+        models,
+        &json!([{"id": "big", "name": "Big", "reasoning": false, "images": false, "contextWindow": 1000}, {"id": "small", "reasoning": false, "images": false}])
+    );
     assert_eq!(view["providers"][0]["listsModels"], true);
     assert_eq!(seen.lock().unwrap()[0], ("/v1/models".to_string(), Some("Bearer sk-listed".to_string())));
     assert_eq!(f.kernels.providers.lock().unwrap()[0].provider.models.len(), 2);
     // One that cannot be reached keeps its models and says why.
     let view = f
         .app
-        .update_providers(json!({"providers": [{"name": "listed", "api": "openai-completions", "baseUrl": "http://127.0.0.1:9/v1", "models": [{"id": "kept"}]}]}))
+        .update_providers(
+            json!({"providers": [{"name": "listed", "api": "openai-completions", "baseUrl": "http://127.0.0.1:9/v1", "models": [{"id": "kept"}]}]}),
+        )
         .await
         .unwrap();
     assert_eq!(view["providers"][0]["models"][0]["id"], "kept");

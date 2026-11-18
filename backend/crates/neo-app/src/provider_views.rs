@@ -2,10 +2,10 @@
 
 use crate::app::App;
 use crate::providers::{self, key_hint, resolve_key, Provider, ProviderKeys, ResolvedProvider, APIS};
-use std::collections::BTreeMap;
 use crate::settings::Kernel;
 use crate::views::object;
 use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 impl App {
@@ -161,7 +161,9 @@ impl App {
             .filter(|provider| {
                 items_with_key.contains(&provider.name)
                     || provider.models.is_empty()
-                    || !before.iter().any(|known| known.name == provider.name && known.api == provider.api && known.base_url == provider.base_url && known.headers == provider.headers)
+                    || !before.iter().any(|known| {
+                        known.name == provider.name && known.api == provider.api && known.base_url == provider.base_url && known.headers == provider.headers
+                    })
             })
             .map(|provider| provider.name.clone())
             .collect();

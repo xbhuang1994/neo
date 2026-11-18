@@ -256,7 +256,11 @@ async fn runs_on_a_custom_provider_neo_hands_over_past_its_own_configuration() {
         std::fs::create_dir_all(dir.join(sub)).unwrap();
     }
     // Hermes's own configuration points nowhere: only the provider Neo hands over can answer.
-    std::fs::write(dir.join("hermes-home/config.yaml"), "model:\n  provider: custom\n  base_url: http://127.0.0.1:9/v1\n  default: nothing\nagent:\n  api_max_retries: 1\n  auto_recovery_cycles: 0\n").unwrap();
+    std::fs::write(
+        dir.join("hermes-home/config.yaml"),
+        "model:\n  provider: custom\n  base_url: http://127.0.0.1:9/v1\n  default: nothing\nagent:\n  api_max_retries: 1\n  auto_recovery_cycles: 0\n",
+    )
+    .unwrap();
     let providers = json!([{"name": "neofix", "api": "openai-completions", "baseUrl": format!("{}/v1", model.url()), "apiKeyEnv": "NEO_PROVIDER_KEY_0", "models": [{"id": "fixture"}]}]);
     let env: BTreeMap<String, String> = [
         ("HERMES_HOME".to_string(), dir.join("hermes-home").display().to_string()),
