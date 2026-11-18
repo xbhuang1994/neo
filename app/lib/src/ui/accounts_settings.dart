@@ -29,33 +29,36 @@ Future<List<String>?> askText(BuildContext context, {required String title, requ
   final controllers = [for (final _ in fields) TextEditingController()];
   return showCupertinoDialog<List<String>>(
     context: context,
-    builder: (dialog) => CupertinoAlertDialog(
-      title: Text(title),
-      content: Column(
-        children: [
-          for (final (index, (placeholder, obscure)) in fields.indexed)
-            Padding(
-              padding: const EdgeInsets.only(top: 8),
-              child: CupertinoTextField(
-                controller: controllers[index],
-                placeholder: placeholder,
-                obscureText: obscure,
-                autocorrect: false,
-                enableSuggestions: false,
-                autofocus: index == 0,
+    builder: (dialog) {
+      final fonts = fallbackFonts(dialog);
+      return CupertinoAlertDialog(
+        title: Text(title, style: fonts),
+        content: Column(
+          children: [
+            for (final (index, (placeholder, obscure)) in fields.indexed)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: CupertinoTextField(
+                  controller: controllers[index],
+                  placeholder: placeholder,
+                  obscureText: obscure,
+                  autocorrect: false,
+                  enableSuggestions: false,
+                  autofocus: index == 0,
+                ),
               ),
-            ),
-        ],
-      ),
-      actions: [
-        CupertinoDialogAction(onPressed: () => Navigator.of(dialog).pop(), child: Text(strings.cancel)),
-        CupertinoDialogAction(
-          isDefaultAction: true,
-          onPressed: () => Navigator.of(dialog).pop([for (final controller in controllers) controller.text.trim()]),
-          child: Text(strings.ok),
+          ],
         ),
-      ],
-    ),
+        actions: [
+          CupertinoDialogAction(onPressed: () => Navigator.of(dialog).pop(), child: Text(strings.cancel, style: fonts)),
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () => Navigator.of(dialog).pop([for (final controller in controllers) controller.text.trim()]),
+            child: Text(strings.ok, style: fonts),
+          ),
+        ],
+      );
+    },
   ).whenComplete(() {
     for (final controller in controllers) {
       controller.dispose();
