@@ -383,7 +383,7 @@ dependencies = [
 
 [[package]]
 name = "neo-agent"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "neo-app",
  "neo-http",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "neo-app"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aes",
  "base64",
@@ -417,7 +417,7 @@ dependencies = [
 
 [[package]]
 name = "neo-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -426,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "neo-http"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64",
  "neo-app",
@@ -439,7 +439,7 @@ dependencies = [
 
 [[package]]
 name = "neo-kernel"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64",
  "getrandom",
@@ -453,7 +453,7 @@ dependencies = [
 
 [[package]]
 name = "neo-store"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "neo-core",
  "rusqlite",
@@ -463,7 +463,7 @@ dependencies = [
 
 [[package]]
 name = "neo-testkit"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde_json",
  "tokio",
