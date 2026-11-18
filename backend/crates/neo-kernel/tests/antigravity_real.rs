@@ -184,3 +184,21 @@ async fn ends_a_turn_while_a_background_command_runs_and_wakes_when_it_ends() {
     assert!(said.iter().any(|(role, text)| *role == Role::Assistant && text.contains("BG-FINISHED")), "{said:?}");
     f.session.dispose().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn runs_commands_on_this_machine_outside_any_sandbox() {
+    if program().is_none() {
+        eprintln!("skipped: set NEO_AGY_BIN or NEO_REAL_ANTIGRAVITY=1 to run against the real Antigravity CLI");
+        return;
+    }
+    // Auto mode, the CLI's default since 1.5.7, runs commands in a sandbox whose network has only loopback.
+    // `/proc/net/dev` lists the interfaces of the reader's own network namespace, after two header lines.
+    let interfaces = std::fs::read_to_string("/proc/net/dev").unwrap().lines().count() - 2;
+    let mut f = fixture();
+    f.send("r1", "Run the shell command `tail -n +3 /proc/net/dev | wc -l` and reply with the number it prints only.").await;
+    f.turn().await;
+    let said = f.messages();
+    let answer = said.iter().rev().find(|(role, _)| *role == Role::Assistant).map(|(_, text)| text.trim().to_string());
+    assert_eq!(answer, Some(interfaces.to_string()), "{said:?}");
+    f.session.dispose().await;
+}

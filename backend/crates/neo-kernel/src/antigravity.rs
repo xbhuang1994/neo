@@ -143,7 +143,15 @@ pub fn hooks_file(command: &str) -> Value {
 pub fn launch(options: &AntigravityOptions, bridge: &Path, resume: Option<&str>) -> Launch {
     let mut args: Vec<String> = ["--input-format", "stream-json", "--output-format", "stream-json", "--disable-slash-commands"].map(String::from).to_vec();
     args.extend(["--add-dir".into(), bridge.display().to_string(), "--agent".into(), AGENT.into()]);
-    let settings = json!({"permissions": {"allow": [format!("mcp({}/*)", mcp_server_name())]}});
+    // Since 1.5.7 the CLI starts in auto mode, which runs commands in a terminal sandbox with no network and asks a
+    // person before leaving it, and out of it every command waits for a person's review; nobody is there to answer
+    // either. Neo's PreToolUse hook decides instead, as `bypassPermissions` lets it on Claude Code, so commands run
+    // on this machine and reach its network.
+    let settings = json!({
+        "agentMode": "",
+        "toolPermission": "always-proceed",
+        "permissions": {"allow": [format!("mcp({}/*)", mcp_server_name())]},
+    });
     args.extend(["--settings".into(), settings.to_string()]);
     if let Some(model) = options.model.as_deref().filter(|model| !model.is_empty()) {
         args.extend(["--model".into(), model.into()]);
@@ -1146,7 +1154,7 @@ mod tests {
         assert_eq!(after("--model").as_deref(), Some("gemini-x"));
         assert_eq!(after("--effort").as_deref(), Some("high"));
         assert_eq!(after("--conversation").as_deref(), Some("c-1"));
-        assert_eq!(after("--settings").as_deref(), Some(r#"{"permissions":{"allow":["mcp(neo_neo/*)"]}}"#));
+        assert_eq!(after("--settings").as_deref(), Some(r#"{"agentMode":"","permissions":{"allow":["mcp(neo_neo/*)"]},"toolPermission":"always-proceed"}"#));
         assert_eq!(args.last().map(String::as_str), Some("-p="));
         assert!(args.contains(&"--disable-slash-commands".to_string()));
         assert!(!launch(&AntigravityOptions::default(), Path::new("/b"), None).args.iter().any(|arg| arg == "--conversation" || arg == "--model"));
