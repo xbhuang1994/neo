@@ -108,8 +108,8 @@ impl App {
         let tools = OnceTools {
             specs: vec![ToolSpec {
                 name: "sidecar_reply".into(),
-                description: format!("Send the concise read-only answer (at most {IM_WORDS} words) directly to the person's conversation."),
-                schema: json!({"type": "object", "additionalProperties": false, "required": ["text"], "properties": {"text": {"type": "string", "description": format!("At most {IM_WORDS} words; Markdown is supported.")}}}),
+                description: format!("Send the concise read-only answer (at most {IM_WORDS} words; each Chinese character counts as one word, max {IM_WORDS} characters) directly to the person's conversation."),
+                schema: json!({"type": "object", "additionalProperties": false, "required": ["text"], "properties": {"text": {"type": "string", "description": format!("At most {IM_WORDS} words (each Chinese character counts as one word); Markdown is supported.")}}}),
             }],
             call: Box::new(move |name, arguments| {
                 let answer = tool_answer.clone();

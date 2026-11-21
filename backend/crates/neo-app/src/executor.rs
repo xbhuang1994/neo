@@ -2,7 +2,7 @@
 //! running workers, bounds how many work at once, and reports each worker's turns to the Engine.
 
 use crate::app::App;
-use crate::cards::{batch_line, capped, input_message, input_resource, mandate_instructions, trigger_message, ASSIGNMENT_CHARS, RETRIED};
+use crate::cards::{batch_line, capped, input_message, input_resource, mandate_instructions, worker_trigger_message, ASSIGNMENT_CHARS, RETRIED};
 use crate::effects::Failure;
 use crate::health::Health;
 use crate::kernels::SessionRole;
@@ -96,7 +96,7 @@ fn valid_name(name: &str) -> bool {
 }
 
 /// What a worktree name must be, in words for the model.
-pub const WORKTREE_NAME_RULE: &str = "Use 1–4 short English words in lowercase kebab-case, at most 32 characters";
+pub const WORKTREE_NAME_RULE: &str = "Use 1–4 short English words in lowercase kebab-case (first word letters only, no leading digits), at most 32 characters";
 
 /// Whether a ticket's requested short name is 1–4 lowercase kebab-case words of at most 32 characters.
 pub fn valid_worktree_name(name: &str) -> bool {
@@ -354,10 +354,16 @@ impl App {
         }
     }
 
+    fn trigger_acknowledged(&self, trigger_id: &str) -> bool {
+        self.store.reply_status(&key(&["ack", trigger_id])).is_some()
+    }
+
     /// The message an Input reaches its worker as, a reference to its resource when long.
     fn input_text(&self, ticket: &Ticket, input: &TicketInput) -> String {
         let card = match input {
-            TicketInput::Trigger { trigger_id, note, .. } => self.store.trigger(trigger_id).map(|trigger| trigger_message(&trigger, note.as_deref())),
+            TicketInput::Trigger { trigger_id, note, .. } => {
+                self.store.trigger(trigger_id).map(|trigger| worker_trigger_message(&trigger, note.as_deref(), self.trigger_acknowledged(&trigger.id)))
+            }
             _ => None,
         };
         let message = input_message(input, card);
@@ -432,7 +438,7 @@ impl App {
                 }
             }
             if let Some(source) = self.store.trigger(&ticket.origin.trigger_id) {
-                card["trigger"] = trigger_message(&source, None);
+                card["trigger"] = worker_trigger_message(&source, None, self.trigger_acknowledged(&source.id));
             }
             let batch: Vec<Value> = ticket
                 .origin
@@ -571,13 +577,13 @@ impl App {
         if unload && !self.store_ticket(ticket_id).is_some_and(|ticket| ticket.live()) {
             self.exec().left.remove(ticket_id);
             self.stop_worker(ticket_id, "Ticket ended");
-            self.effects.kick();
+            self.effects.wake_kind(crate::effects::LAUNCH);
             return;
         }
         self.worker_ended(ticket_id, loaded, note);
         self.board.set("worker", Health::ready("Worker events are handled"));
         // A slot is free: a launch that waited for one may go.
-        self.effects.kick();
+        self.effects.wake_kind(crate::effects::LAUNCH);
     }
 
     /// The worker's turn ended while its jobs or subagents run; their ends wake it, so it keeps its slot. A handoff to

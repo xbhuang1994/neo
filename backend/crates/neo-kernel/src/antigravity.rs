@@ -54,16 +54,17 @@ pub fn effort_of(level: Option<&str>) -> Option<&'static str> {
 }
 
 /// The kinds of built-in tool a Session may be allowed, in the host's words.
-pub const TOOL_KINDS: &[&str] = &["read", "bash", "edit", "write", "task"];
+pub const TOOL_KINDS: &[&str] = &["read", "bash", "edit", "write", "task", "web"];
 
-/// The runtime's tools for each kind. Tools of no kind, such as fetching a web page, come with `bash`.
+/// The runtime's tools for each kind.
 fn runtime_tools(kind: &str) -> &'static [&'static str] {
     match kind {
-        "read" => &["view_file", "list_dir", "grep_search", "find_by_name"],
-        "bash" => &["run_command", "command_status", "send_command_input", "manage_task", "wait", "read_url_content", "search_web"],
-        "edit" => &["replace_file_content", "multi_replace_file_content"],
-        "write" => &["write_to_file"],
-        "task" => &["invoke_subagent", "manage_subagents"],
+        "read" => &["view_file", "list_dir", "grep_search", "find_by_name", "read_file", "view_file_outline", "view_code_item"],
+        "bash" => &["run_command", "command_status", "send_command_input", "manage_task", "wait", "schedule"],
+        "web" => &["read_url_content", "search_web"],
+        "edit" => &["replace_file_content", "multi_replace_file_content", "edit_file", "delete_file", "move_file"],
+        "write" => &["write_to_file", "write_file"],
+        "task" => &["invoke_subagent", "manage_subagents", "define_subagent", "send_message", "run_workflow"],
         _ => &[],
     }
 }
@@ -92,6 +93,8 @@ pub struct AntigravityOptions {
     /// conversation's workspace folders from when it began, and its subagents load hooks from those, so a continued
     /// conversation needs its bridge where it was. Without one, each process gets a folder of its own.
     pub bridge_id: Option<String>,
+    /// Whether to block inheriting global customizations (skills, rules, plugins, subagents) in addition to MCP servers.
+    pub isolate_customizations: bool,
 }
 
 /// The folder beside `cwd` that carries a Session's agent and plugin. Its path extends `cwd`'s, so it sorts after it.
@@ -123,8 +126,9 @@ pub fn agent_file(options: &AntigravityOptions) -> String {
             }
         }
     }
+    let customizations = if options.isolate_customizations { "\ninheritCustomizations: false" } else { "" };
     format!(
-        "---\nname: {AGENT}\ndescription: A Neo Session.\nplugins:\n  - {PLUGIN}\ntools: [{}]\n---\n{}\n",
+        "---\nname: {AGENT}\ndescription: A Neo Session.\ninheritMcp: false{customizations}\nplugins:\n  - {PLUGIN}\ntools: [{}]\n---\n{}\n",
         tools.join(", "),
         options.system_prompt.trim_end()
     )
@@ -136,8 +140,8 @@ pub fn hooks_file(command: &str) -> Value {
     json!({
         PLUGIN: {
             "PreToolUse": [{"matcher": "*", "hooks": handler(600)}],
-            "PostToolUse": [{"matcher": "*", "hooks": handler(30)}],
-            "PreInvocation": handler(30),
+            "PostToolUse": [{"matcher": "run_command", "hooks": handler(30)}],
+            "SessionStart": handler(30),
             "Stop": handler(30),
         }
     })
@@ -186,12 +190,14 @@ pub fn host_view(tool: &str, input: &Value) -> (String, Value) {
     match tool {
         "run_command" => ("bash".into(), json!({"command": input["CommandLine"].as_str().unwrap_or("")})),
         "send_command_input" => ("bash".into(), json!({"command": input["Input"].as_str().unwrap_or("")})),
+        "schedule" => ("bash".into(), input.clone()),
         "write_file" | "write_to_file" => ("write".into(), path()),
         "edit_file" | "replace_file_content" | "multi_replace_file_content" | "sed_file" | "notebook_edit" | "delete_file" | "move_file" => {
             ("edit".into(), path())
         }
-        "read_file" | "view_file" | "list_dir" | "grep_search" | "find_by_name" => ("read".into(), input.clone()),
-        "invoke_subagent" | "define_subagent" | "manage_subagents" | "browser_subagent" => ("task".into(), input.clone()),
+        "read_file" | "view_file" | "list_dir" | "grep_search" | "find_by_name" | "view_file_outline" | "view_code_item" => ("read".into(), input.clone()),
+        "invoke_subagent" | "browser_subagent" | "run_workflow" => ("task".into(), input.clone()),
+        "define_subagent" | "manage_subagents" | "send_message" => ("task_manage".into(), input.clone()),
         _ => (tool.to_string(), input.clone()),
     }
 }
@@ -240,11 +246,15 @@ pub fn relay_hook(url: &str, input: &mut impl Read, output: &mut impl Write) -> 
     let mut body = Vec::new();
     input.read_to_end(&mut body).map_err(|error| format!("Cannot read the hook's input: {error}"))?;
     let mut stream = std::net::TcpStream::connect(address).map_err(|error| format!("Cannot reach Neo at {address}: {error}"))?;
+    let _ = stream.set_nodelay(true);
     // The guard may take its time; Antigravity's own limit on the hook ends it first.
     let _ = stream.set_read_timeout(Some(Duration::from_secs(900)));
     let head =
         format!("POST {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
-    stream.write_all(head.as_bytes()).and_then(|_| stream.write_all(&body)).map_err(|error| format!("Cannot send the hook to Neo: {error}"))?;
+    let mut buf = Vec::with_capacity(head.len() + body.len());
+    buf.extend_from_slice(head.as_bytes());
+    buf.extend_from_slice(&body);
+    stream.write_all(&buf).map_err(|error| format!("Cannot send the hook to Neo: {error}"))?;
     let mut reply = Vec::new();
     stream.read_to_end(&mut reply).map_err(|error| format!("Neo did not answer the hook: {error}"))?;
     let split = reply.windows(4).position(|window| window == b"\r\n\r\n").ok_or("Neo's answer to the hook is malformed")?;
@@ -297,6 +307,7 @@ async fn start_server(host: Arc<dyn ToolHost>, on_tool_call: Option<Arc<dyn Fn()
     let routes = Routes { host, token: token.clone(), on_tool_call, on_hook };
     let task = tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
+            let _ = stream.set_nodelay(true);
             tokio::spawn(serve_connection(stream, routes.clone()));
         }
     });
@@ -384,8 +395,9 @@ async fn respond(writer: &mut tokio::net::tcp::OwnedWriteHalf, status: u16, body
         head.push_str("Content-Type: application/json\r\n");
     }
     head.push_str("\r\n");
-    writer.write_all(head.as_bytes()).await?;
-    writer.write_all(&body).await?;
+    let mut buf = head.into_bytes();
+    buf.extend_from_slice(&body);
+    writer.write_all(&buf).await?;
     writer.flush().await
 }
 
@@ -431,6 +443,7 @@ struct Bridge {
     dir: PathBuf,
     /// What this process wrote to the folder's marker: the host's process id and a unique stamp.
     stamp: String,
+    removed: bool,
 }
 
 impl Bridge {
@@ -442,14 +455,15 @@ impl Bridge {
         let failed = |error: std::io::Error| format!("Cannot write Antigravity's bridge at {}: {error}", dir.display());
         std::fs::create_dir_all(dir.join(".agents").join("agents")).map_err(failed)?;
         std::fs::create_dir_all(&plugin).map_err(failed)?;
-        let bridge = Bridge { dir: dir.clone(), stamp: format!("{} {}", std::process::id(), uuid()) };
+        let bridge = Bridge { dir: dir.clone(), stamp: format!("{} {}", std::process::id(), uuid()), removed: false };
         std::fs::write(dir.join(BRIDGE_MARKER), &bridge.stamp).map_err(failed)?;
         std::fs::write(dir.join(".agents").join("agents").join(format!("{AGENT}.md")), agent_file(options)).map_err(failed)?;
         let manifest = json!({"name": PLUGIN, "description": "Neo's tools and tool-call guard", "version": env!("CARGO_PKG_VERSION")});
         std::fs::write(plugin.join("plugin.json"), manifest.to_string()).map_err(failed)?;
         let mut relay = options.hook_relay.clone();
         relay.push(server.hook_url());
-        std::fs::write(plugin.join("hooks.json"), hooks_file(&shell_command(&relay)).to_string()).map_err(failed)?;
+        let command = if cfg!(unix) { format!("exec {}", shell_command(&relay)) } else { shell_command(&relay) };
+        std::fs::write(plugin.join("hooks.json"), hooks_file(&command).to_string()).map_err(failed)?;
         let servers = if has_tools {
             json!({MCP_SERVER: {"url": server.mcp_url(), "headers": {"Authorization": format!("Bearer {}", server.token)}}})
         } else {
@@ -457,6 +471,20 @@ impl Bridge {
         };
         std::fs::write(plugin.join("mcp_config.json"), json!({"mcpServers": servers}).to_string()).map_err(failed)?;
         Ok(bridge)
+    }
+
+    fn remove_sync(dir: &Path, stamp: &str) {
+        if std::fs::read_to_string(dir.join(BRIDGE_MARKER)).is_ok_and(|owner| owner == stamp) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// Remove the bridge directory on the blocking pool, unless a later process took it over.
+    async fn remove(mut self) {
+        self.removed = true;
+        let dir = self.dir.clone();
+        let stamp = self.stamp.clone();
+        let _ = tokio::task::spawn_blocking(move || Self::remove_sync(&dir, &stamp)).await;
     }
 
     /// The folder holds `path`.
@@ -467,8 +495,8 @@ impl Bridge {
 
 impl Drop for Bridge {
     fn drop(&mut self) {
-        if std::fs::read_to_string(self.dir.join(BRIDGE_MARKER)).is_ok_and(|owner| owner == self.stamp) {
-            let _ = std::fs::remove_dir_all(&self.dir);
+        if !self.removed {
+            Self::remove_sync(&self.dir, &self.stamp);
         }
     }
 }
@@ -502,6 +530,8 @@ struct Subagent {
     start_time: i64,
     /// Its task, from the message that started it, once its transcript shows it.
     label: Option<String>,
+    /// How many times we tried reading its transcript for a label without success.
+    label_attempts: u8,
     /// What it does now: its latest tool call.
     activity: Option<String>,
 }
@@ -511,7 +541,7 @@ fn subagent_task(transcript: &str) -> Option<String> {
     use std::io::BufRead;
     let path = transcript.strip_prefix("file://").unwrap_or(transcript);
     let mut first = String::new();
-    std::io::BufReader::new(std::fs::File::open(path).ok()?).take(1 << 20).read_line(&mut first).ok()?;
+    std::io::BufReader::new(std::fs::File::open(path).ok()?).take(64 * 1024).read_line(&mut first).ok()?;
     let content = serde_json::from_str::<Value>(&first).ok()?["content"].as_str()?.to_string();
     let text = content.split_once(" content=").map_or(content.as_str(), |(_, text)| text);
     let line = text.lines().map(str::trim).find(|line| !line.is_empty() && !line.starts_with('<'))?;
@@ -565,6 +595,7 @@ struct Shared {
     commands: BTreeMap<String, Command>,
     /// Subagents' conversations that have not stopped.
     subagents: BTreeMap<String, Subagent>,
+    closed: bool,
     model: Option<String>,
     thinking: Option<String>,
 }
@@ -640,8 +671,14 @@ impl AntigravityDriver {
 
     /// The host's server, started once per driver.
     async fn server(&self) -> Result<Arc<HostServer>, String> {
-        if let Some(server) = lock(&self.shared).server.clone() {
-            return Ok(server);
+        {
+            let shared = lock(&self.shared);
+            if shared.closed {
+                return Err("The session is closed".into());
+            }
+            if let Some(server) = shared.server.clone() {
+                return Ok(server);
+            }
         }
         let weak = self.weak.clone();
         let on_call: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
@@ -660,7 +697,11 @@ impl AntigravityDriver {
             })
         });
         let server = Arc::new(start_server(self.host.clone(), Some(on_call), Some(on_hook)).await?);
-        lock(&self.shared).server = Some(server.clone());
+        let mut shared = lock(&self.shared);
+        if shared.closed {
+            return Err("The session is closed".into());
+        }
+        shared.server = Some(server.clone());
         Ok(server)
     }
 
@@ -670,6 +711,9 @@ impl AntigravityDriver {
         let _one = self.starting.lock().await;
         let stale = {
             let mut shared = lock(&self.shared);
+            if shared.closed {
+                return Err("The session is closed".into());
+            }
             let wanted = (shared.model.clone(), shared.thinking.clone());
             match shared.process.clone() {
                 Some(process) if shared.started_with == wanted || !shared.turns.is_empty() => return Ok(process),
@@ -678,26 +722,58 @@ impl AntigravityDriver {
             }
         };
         if let Some((Some(process), bridge)) = stale {
-            process.close(Duration::from_secs(5)).await;
-            drop(bridge);
+            process.close(Duration::from_secs(2)).await;
+            if let Some(bridge) = bridge {
+                bridge.remove().await;
+            }
         }
         let server = self.server().await?;
         let mut options = self.options.clone();
         let resume = {
             let shared = lock(&self.shared);
+            if shared.closed {
+                return Err("The session is closed".into());
+            }
             options.model = shared.model.clone();
             options.thinking = shared.thinking.clone();
             shared.conversation.clone().or(resume)
         };
-        let bridge = Bridge::create(&options, &server, !self.host.specs().is_empty())?;
-        let (process, lines) = Proc::spawn(&launch(&options, &bridge.dir, resume.as_deref()))?;
-        let generation = {
+        let has_tools = !self.host.specs().is_empty();
+        let bridge_options = options.clone();
+        let bridge_server = server.clone();
+        let bridge = tokio::task::spawn_blocking(move || Bridge::create(&bridge_options, &bridge_server, has_tools))
+            .await
+            .map_err(|error| format!("Cannot write Antigravity's bridge: {error}"))??;
+        if lock(&self.shared).closed {
+            bridge.remove().await;
+            return Err("The session is closed".into());
+        }
+        let (process, lines) = match Proc::spawn(&launch(&options, &bridge.dir, resume.as_deref())) {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                bridge.remove().await;
+                return Err(error);
+            }
+        };
+        let committed = {
             let mut shared = lock(&self.shared);
-            shared.generation += 1;
-            shared.process = Some(process.clone());
-            shared.bridge = Some(bridge);
-            shared.started_with = (options.model.clone(), options.thinking.clone());
-            shared.generation
+            if shared.closed {
+                Err(bridge)
+            } else {
+                shared.generation += 1;
+                shared.process = Some(process.clone());
+                shared.bridge = Some(bridge);
+                shared.started_with = (options.model.clone(), options.thinking.clone());
+                Ok(shared.generation)
+            }
+        };
+        let generation = match committed {
+            Ok(generation) => generation,
+            Err(bridge) => {
+                process.close(Duration::from_secs(2)).await;
+                bridge.remove().await;
+                return Err("The session is closed".into());
+            }
         };
         tokio::spawn(self.clone().read(lines, generation));
         Ok(process)
@@ -717,7 +793,9 @@ impl AntigravityDriver {
                         let (process, bridge) = shared.reset();
                         (awaited, process, bridge)
                     };
-                    drop(bridge);
+                    if let Some(bridge) = bridge {
+                        bridge.remove().await;
+                    }
                     self.emit(DriverEvent::Exited { error, awaited });
                     return;
                 }
@@ -855,7 +933,9 @@ impl AntigravityDriver {
         if let Some(process) = process {
             process.close(Duration::from_secs(3)).await;
         }
-        drop(bridge);
+        if let Some(bridge) = bridge {
+            bridge.remove().await;
+        }
         self.emit(DriverEvent::Exited { error: Some(error), awaited: false });
     }
 
@@ -870,7 +950,7 @@ impl AntigravityDriver {
             shared.conversation.as_deref() == Some(conversation.as_str())
         };
         match payload["hookEventName"].as_str().unwrap_or("") {
-            "PreInvocation" => {
+            "PreInvocation" | "SessionStart" => {
                 if main {
                     self.take_started();
                 } else {
@@ -936,13 +1016,20 @@ impl AntigravityDriver {
 
     /// A subagent's conversation is running: list it, and read its task until its transcript shows it.
     fn subagent_seen(&self, conversation: &str, payload: &Value) {
-        if lock(&self.shared).subagents.get(conversation).is_some_and(|subagent| subagent.label.is_some()) {
+        if lock(&self.shared).subagents.get(conversation).is_some_and(|subagent| subagent.label.is_some() || subagent.label_attempts >= 3) {
             return;
         }
         let label = payload["transcriptPath"].as_str().and_then(subagent_task);
         let mut shared = lock(&self.shared);
-        let subagent = shared.subagents.entry(conversation.to_string()).or_insert(Subagent { start_time: now_ms(), label: None, activity: None });
-        subagent.label = subagent.label.take().or(label);
+        let subagent =
+            shared.subagents.entry(conversation.to_string()).or_insert(Subagent { start_time: now_ms(), label: None, label_attempts: 0, activity: None });
+        if subagent.label.is_none() {
+            if label.is_some() {
+                subagent.label = label;
+            } else {
+                subagent.label_attempts = subagent.label_attempts.saturating_add(1);
+            }
+        }
     }
 
     /// Whether a tool call may run: the Session's tools, Neo's bridge left alone, then the guard.
@@ -957,8 +1044,12 @@ impl AntigravityDriver {
         }
         let (name, input) = host_view(tool, input);
         let allowed = |kind: &str| self.options.tools.iter().any(|known| known == kind);
-        let permitted =
-            if TOOL_KINDS.contains(&name.as_str()) { allowed(&name) } else { self.host.specs().iter().any(|spec| spec.name == name) || allowed("bash") };
+        let permitted = match name.as_str() {
+            "task_manage" => allowed("task"),
+            "read_url_content" | "search_web" => allowed("web"),
+            kind if TOOL_KINDS.contains(&kind) => allowed(kind),
+            _ => self.host.specs().iter().any(|spec| spec.name == name) || allowed("bash"),
+        };
         if !permitted {
             return Guard::Block("This Session cannot use that tool".into());
         }
@@ -1010,6 +1101,9 @@ impl Driver for Antigravity {
     fn kernel(&self) -> &'static str {
         "antigravity"
     }
+    fn warm<'a>(&'a self, resume: Option<String>) -> BoxFut<'a, Result<(), String>> {
+        Box::pin(async move { self.0.process(resume).await.map(|_| ()) })
+    }
     fn submit<'a>(&'a self, id: &'a str, content: &'a [Block], _deliver: Deliver, resume: Option<String>) -> BoxFut<'a, Result<(), String>> {
         Box::pin(async move {
             let process = self.0.process(resume).await?;
@@ -1037,7 +1131,9 @@ impl Driver for Antigravity {
             if let Some(process) = process {
                 process.close(Duration::from_secs(3)).await;
             }
-            drop(bridge);
+            if let Some(bridge) = bridge {
+                bridge.remove().await;
+            }
             if untaken {
                 self.0.emit(DriverEvent::Exited { error: None, awaited: false });
             } else if busy {
@@ -1107,13 +1203,16 @@ impl Driver for Antigravity {
         Box::pin(async move {
             let (process, bridge, _server) = {
                 let mut shared = lock(&self.0.shared);
+                shared.closed = true;
                 let (process, bridge) = shared.reset();
                 (process, bridge, shared.server.take())
             };
             if let Some(process) = process {
-                process.close(Duration::from_secs(5)).await;
+                process.close(Duration::from_secs(2)).await;
             }
-            drop(bridge);
+            if let Some(bridge) = bridge {
+                bridge.remove().await;
+            }
         })
     }
 }
@@ -1134,10 +1233,17 @@ mod tests {
     #[test]
     fn sees_runtime_tools_as_the_host_names_them() {
         assert_eq!(host_view("run_command", &json!({"CommandLine": "ls", "WaitMsBeforeAsync": 5000})), ("bash".into(), json!({"command": "ls"})));
+        assert_eq!(host_view("schedule", &json!({"Prompt": "ping"})), ("bash".into(), json!({"Prompt": "ping"})));
         assert_eq!(host_view("write_file", &json!({"Path": "/w/a.txt", "Content": "x"})), ("write".into(), json!({"path": "/w/a.txt"})));
         assert_eq!(host_view("replace_file_content", &json!({"TargetFile": "/w/a"})), ("edit".into(), json!({"path": "/w/a"})));
         assert_eq!(host_view("read_file", &json!({})).0, "read");
+        assert_eq!(host_view("view_file_outline", &json!({})).0, "read");
+        assert_eq!(host_view("view_code_item", &json!({})).0, "read");
         assert_eq!(host_view("invoke_subagent", &json!({})).0, "task");
+        assert_eq!(host_view("run_workflow", &json!({})).0, "task");
+        assert_eq!(host_view("manage_subagents", &json!({})).0, "task_manage");
+        assert_eq!(host_view("define_subagent", &json!({})).0, "task_manage");
+        assert_eq!(host_view("send_message", &json!({})).0, "task_manage");
         assert_eq!(host_view("read_url_content", &json!({})).0, "read_url_content");
     }
 
@@ -1172,14 +1278,22 @@ mod tests {
 
     #[test]
     fn writes_the_agent_with_the_tools_of_its_kinds_and_its_prompt() {
-        let options =
+        let mut options =
             AntigravityOptions { system_prompt: "Be brief.\n".into(), tools: vec!["read".into(), "bash".into(), "read".into()], ..Default::default() };
         let agent = agent_file(&options);
         assert!(agent.starts_with(&format!("---\nname: {AGENT}\n")), "{agent}");
-        assert!(agent.contains("plugins:\n  - neo\n"), "{agent}");
-        assert!(agent.contains("tools: [view_file, list_dir, grep_search, find_by_name, run_command,"), "{agent}");
+        assert!(agent.contains("description: A Neo Session.\ninheritMcp: false\nplugins:\n  - neo\n"), "{agent}");
+        assert!(!agent.contains("inheritCustomizations"), "{agent}");
+        assert!(
+            agent.contains("tools: [view_file, list_dir, grep_search, find_by_name, read_file, view_file_outline, view_code_item, run_command,"),
+            "{agent}"
+        );
         assert!(!agent.contains("write_to_file"));
         assert!(agent.ends_with("---\nBe brief.\n"), "{agent}");
+
+        options.isolate_customizations = true;
+        let isolated = agent_file(&options);
+        assert!(isolated.contains("description: A Neo Session.\ninheritMcp: false\ninheritCustomizations: false\nplugins:\n  - neo\n"), "{isolated}");
     }
 
     #[test]
@@ -1187,8 +1301,11 @@ mod tests {
         let hooks = hooks_file("relay");
         assert_eq!(hooks["neo"]["PreToolUse"][0]["matcher"], "*");
         assert_eq!(hooks["neo"]["PreToolUse"][0]["hooks"][0]["command"], "relay");
+        assert_eq!(hooks["neo"]["PostToolUse"][0]["matcher"], "run_command");
+        assert_eq!(hooks["neo"]["PostToolUse"][0]["hooks"][0]["command"], "relay");
         assert_eq!(hooks["neo"]["Stop"][0]["command"], "relay");
-        assert_eq!(hooks["neo"]["PreInvocation"][0]["command"], "relay");
+        assert_eq!(hooks["neo"]["SessionStart"][0]["command"], "relay");
+        assert!(hooks["neo"].get("PreInvocation").is_none());
     }
 
     #[cfg(unix)]
@@ -1288,6 +1405,120 @@ mod tests {
         assert!(relay_hook("http://127.0.0.1:1/hook/x", &mut &b"{}"[..], &mut Vec::new()).is_err());
     }
 
+    #[tokio::test]
+    async fn keeps_alive_mcp_connections_without_nagle_stall() {
+        let server = start_server(Arc::new(Echo), None, None).await.unwrap();
+        let stream = TcpStream::connect(format!("127.0.0.1:{}", server.port)).await.unwrap();
+        let _ = stream.set_nodelay(true);
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        let payload = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 1, "method": "ping"})).unwrap();
+        let head = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\n\r\n",
+            server.port,
+            server.token,
+            payload.len()
+        );
+        let mut req = head.into_bytes();
+        req.extend_from_slice(&payload);
+
+        let started = std::time::Instant::now();
+        for _ in 0..5 {
+            writer.write_all(&req).await.unwrap();
+            writer.flush().await.unwrap();
+            let mut status = String::new();
+            reader.read_line(&mut status).await.unwrap();
+            assert!(status.starts_with("HTTP/1.1 200 "), "{status}");
+            let mut content_length = 0usize;
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).await.unwrap();
+                let trimmed = header.trim_end();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = trimmed.split_once(':') {
+                    if name.trim().eq_ignore_ascii_case("content-length") {
+                        content_length = value.trim().parse().unwrap();
+                    }
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            reader.read_exact(&mut body).await.unwrap();
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["id"], 1);
+        }
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_millis(50), "5 keep-alive requests took {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn judges_web_task_manage_and_read_tools_according_to_session_kinds() {
+        struct TaskCapHost;
+        impl ToolHost for TaskCapHost {
+            fn specs(&self) -> Vec<ToolSpec> {
+                Vec::new()
+            }
+            fn call<'a>(&'a self, _name: &'a str, _arguments: Value) -> BoxFut<'a, Result<Value, String>> {
+                Box::pin(async { Ok(json!({})) })
+            }
+            fn guard<'a>(&'a self, tool: &'a str, _input: &'a Value) -> BoxFut<'a, Guard> {
+                Box::pin(async move {
+                    if tool == "task" {
+                        Guard::Block("max subagents reached".into())
+                    } else {
+                        Guard::Allow
+                    }
+                })
+            }
+        }
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let router = AntigravityDriver::new(AntigravityOptions { tools: vec!["read".into(), "bash".into()], ..Default::default() }, Arc::new(Echo), tx.clone());
+        assert_eq!(router.judge("view_file_outline", &json!({})).await, Guard::Allow);
+        assert_eq!(router.judge("view_code_item", &json!({})).await, Guard::Allow);
+        assert_eq!(router.judge("schedule", &json!({})).await, Guard::Allow);
+        assert!(matches!(router.judge("read_url_content", &json!({})).await, Guard::Block(_)));
+        assert!(matches!(router.judge("search_web", &json!({})).await, Guard::Block(_)));
+        assert!(matches!(router.judge("manage_subagents", &json!({})).await, Guard::Block(_)));
+
+        let worker = AntigravityDriver::new(
+            AntigravityOptions { tools: vec!["read".into(), "bash".into(), "task".into(), "web".into()], ..Default::default() },
+            Arc::new(TaskCapHost),
+            tx,
+        );
+        assert_eq!(worker.judge("read_url_content", &json!({})).await, Guard::Allow);
+        assert_eq!(worker.judge("search_web", &json!({})).await, Guard::Allow);
+        assert_eq!(worker.judge("manage_subagents", &json!({})).await, Guard::Allow);
+        assert_eq!(worker.judge("define_subagent", &json!({})).await, Guard::Allow);
+        assert_eq!(worker.judge("send_message", &json!({})).await, Guard::Allow);
+        assert_eq!(worker.judge("invoke_subagent", &json!({})).await, Guard::Block("max subagents reached".into()));
+        assert_eq!(worker.judge("run_workflow", &json!({})).await, Guard::Block("max subagents reached".into()));
+    }
+
+    #[test]
+    fn caps_subagent_label_attempts_after_three_misses() {
+        let dir = neo_testkit::TempDir::new("agy-subagent-attempts");
+        let transcript = dir.join("transcript.jsonl");
+        std::fs::write(&transcript, "{\"content\":\"Do the task\\n\"}\n").unwrap();
+        let missing = dir.join("missing.jsonl");
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let driver = AntigravityDriver::new(AntigravityOptions::default(), Arc::new(Echo), tx);
+
+        for _ in 0..4 {
+            driver.subagent_seen("sub-miss", &json!({"transcriptPath": missing.display().to_string()}));
+        }
+        driver.subagent_seen("sub-miss", &json!({"transcriptPath": transcript.display().to_string()}));
+        let shared = lock(&driver.shared);
+        assert_eq!(shared.subagents["sub-miss"].label_attempts, 3);
+        assert_eq!(shared.subagents["sub-miss"].label, None);
+        drop(shared);
+
+        driver.subagent_seen("sub-hit", &json!({"transcriptPath": transcript.display().to_string()}));
+        assert_eq!(lock(&driver.shared).subagents["sub-hit"].label.as_deref(), Some("Do the task"));
+    }
+
     #[cfg(unix)]
     mod lifecycle {
         use super::*;
@@ -1333,7 +1564,7 @@ for raw in sys.stdin:
     if "prompt?" in text:
         out("step_update", {"step_index": next_step(), "state": "DONE", "step_type": "agent_response", "text_delta": "prompt says: " + agent.split("---\n")[-1].strip()})
     if "tool" in text:
-        hook("PreInvocation", {})
+        hook("SessionStart", {})
         decision = hook("PreToolUse", {"toolCall": {"id": "c1", "name": "call_mcp_tool", "args": {"ServerName": "neo_neo", "ToolName": "echo", "Arguments": {"text": "ok"}}}})
         i = next_step()
         out("step_update", {"step_index": i, "state": "ACTIVE", "step_type": "tool", "tool_name": "call_mcp_tool", "tool_info": {"name": "call_mcp_tool", "parameters": {"ToolName": "echo"}}})
@@ -1501,6 +1732,24 @@ sys.stdout.write(urllib.request.urlopen(req, timeout=30).read().decode())
             assert_eq!(f.session.journal().pending().len(), 1);
             assert!(f.said().iter().any(|text| text.contains("agent refused to start")), "{:?}", f.said());
             f.session.dispose().await;
+            let _ = std::fs::remove_dir_all(&f.dir);
+        }
+
+        #[tokio::test]
+        async fn warms_without_starting_a_turn_and_cleans_up_on_close() {
+            let mut f = fixture();
+            f.session.warm().await.unwrap();
+            assert!(matches!(f.events.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)));
+            assert!(f.session.driver().pid().is_some());
+            assert!(lock(&f.driver.shared).turns.is_empty());
+            let bridge = lock(&f.driver.shared).bridge.as_ref().map(|bridge| bridge.dir.clone()).unwrap();
+            assert!(bridge.is_dir());
+
+            f.session.dispose().await;
+            assert!(!bridge.exists());
+            assert!(f.session.warm().await.is_ok());
+            assert!(f.session.driver().warm(None).await.is_err());
+            assert!(!bridge.exists());
             let _ = std::fs::remove_dir_all(&f.dir);
         }
     }

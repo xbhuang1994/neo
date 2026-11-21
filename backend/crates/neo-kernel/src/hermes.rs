@@ -13,8 +13,8 @@ use crate::types::{uuid, Block, BoxFut, Deliver, Guard, JobKind, KernelJob, Mess
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 use tokio::sync::{mpsc, oneshot};
 
 /// The Python bridge source embedded in the binary and written to the kernel directory before launch.
@@ -95,33 +95,53 @@ fn console_script_python(program: &Path) -> Option<PathBuf> {
     head.contains("python").then(|| PathBuf::from(head))
 }
 
+type ProbeCache = Mutex<HashMap<(PathBuf, Option<SystemTime>), Option<Vec<String>>>>;
+static PROBE_CACHE: OnceLock<ProbeCache> = OnceLock::new();
+
 /// Resolve how `program` runs `bridge_file` with `bridge_args` inside Hermes's Python environment.
 pub async fn resolve_launch(program: &Path, bridge_file: &Path, bridge_args: &[String], cwd: &Path, env: &BTreeMap<String, String>) -> Launch {
     let env_remove: Vec<String> = crate::claude::SESSION_VARIABLES.iter().map(|name| name.to_string()).collect();
 
     // 1. Official Hermes launcher (`install.sh` / `install.ps1` / `hermes update`): `--print-runtime-command`
     // outputs JSON `["<python>", "-I", "-c", "<bootstrap>"]` activating PM's committed dependency store.
-    let mut probe = tokio::process::Command::new(program);
-    probe.arg("--print-runtime-command").envs(env).stdin(std::process::Stdio::null()).kill_on_drop(true);
-    for key in &env_remove {
-        probe.env_remove(key);
-    }
-    if let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(15), probe.output()).await {
-        if output.status.success() {
-            if let Ok(mut command) = serde_json::from_slice::<Vec<String>>(&output.stdout) {
-                if command.len() >= 4 && command.iter().any(|part| part.contains(DEFAULT_MODULE_CALL)) {
-                    for part in &mut command {
-                        if part.contains(DEFAULT_MODULE_CALL) {
-                            *part = part.replace(DEFAULT_MODULE_CALL, BRIDGE_PATH_CALL);
-                        }
-                    }
-                    let python = PathBuf::from(command.remove(0));
-                    command.push(bridge_file.display().to_string());
-                    command.extend(bridge_args.iter().cloned());
-                    return Launch { program: python, args: command, cwd: cwd.to_path_buf(), env: env.clone(), env_remove };
+    // Cache the probe template per (program, mtime) once `probe.output()` finishes without timing out.
+    let key = (program.to_path_buf(), std::fs::metadata(program).ok().and_then(|meta| meta.modified().ok()));
+    let cache = PROBE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cached = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(&key).cloned();
+    let template = match cached {
+        Some(hit) => hit,
+        None => {
+            let mut probe = tokio::process::Command::new(program);
+            probe.arg("--print-runtime-command").envs(env).stdin(std::process::Stdio::null()).kill_on_drop(true);
+            for key in &env_remove {
+                probe.env_remove(key);
+            }
+            match tokio::time::timeout(Duration::from_secs(15), probe.output()).await {
+                Ok(Ok(output)) => {
+                    let found = if output.status.success() {
+                        serde_json::from_slice::<Vec<String>>(&output.stdout)
+                            .ok()
+                            .filter(|command| command.len() >= 4 && command.iter().any(|part| part.contains(DEFAULT_MODULE_CALL)))
+                    } else {
+                        None
+                    };
+                    cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(key, found.clone());
+                    found
                 }
+                Ok(Err(_)) | Err(_) => None,
             }
         }
+    };
+    if let Some(mut command) = template {
+        for part in &mut command {
+            if part.contains(DEFAULT_MODULE_CALL) {
+                *part = part.replace(DEFAULT_MODULE_CALL, BRIDGE_PATH_CALL);
+            }
+        }
+        let python = PathBuf::from(command.remove(0));
+        command.push(bridge_file.display().to_string());
+        command.extend(bridge_args.iter().cloned());
+        return Launch { program: python, args: command, cwd: cwd.to_path_buf(), env: env.clone(), env_remove };
     }
 
     // 2. Editable / `uv` / `pip` console script (`#!...python...` importing `hermes_cli`).
@@ -215,6 +235,7 @@ struct Shared {
     requests: HashMap<String, oneshot::Sender<Result<Value, String>>>,
     ready: Option<oneshot::Sender<Result<(), String>>>,
     awaiting_async: bool,
+    closed: bool,
     model: Option<String>,
     thinking: Option<String>,
 }
@@ -264,25 +285,45 @@ impl HermesDriver {
     /// The running process, starting one that resumes `resume` when none runs.
     async fn process(self: &Arc<Self>, resume: Option<String>) -> Result<Arc<Proc>, String> {
         let _one = self.starting.lock().await;
-        if let Some(process) = lock(&self.shared).process.clone() {
-            return Ok(process);
+        {
+            let state = lock(&self.shared);
+            if state.closed {
+                return Err("The session is closed".into());
+            }
+            if let Some(process) = state.process.clone() {
+                return Ok(process);
+            }
         }
         ensure_bridge_file(&self.options.bridge_file)?;
         std::fs::create_dir_all(&self.options.cwd).map_err(|error| format!("Cannot create {}: {error}", self.options.cwd.display()))?;
         let (model, thinking) = {
             let state = lock(&self.shared);
+            if state.closed {
+                return Err("The session is closed".into());
+            }
             (state.model.clone(), state.thinking.clone())
         };
         let launch = resolve_launch(&self.options.program, &self.options.bridge_file, &[], &self.options.cwd, &self.options.env).await;
+        if lock(&self.shared).closed {
+            return Err("The session is closed".into());
+        }
         let (process, lines) = Proc::spawn(&launch)?;
         let (ready_tx, ready_rx) = oneshot::channel();
         let generation = {
             let mut state = lock(&self.shared);
-            state.generation += 1;
-            state.process = Some(process.clone());
-            state.ready = Some(ready_tx);
-            state.awaiting_async = false;
-            state.generation
+            if state.closed {
+                None
+            } else {
+                state.generation += 1;
+                state.process = Some(process.clone());
+                state.ready = Some(ready_tx);
+                state.awaiting_async = false;
+                Some(state.generation)
+            }
+        };
+        let Some(generation) = generation else {
+            process.close(Duration::from_secs(2)).await;
+            return Err("The session is closed".into());
         };
         let reader = self.clone();
         tokio::spawn(async move { reader.read(generation, lines).await });
@@ -290,17 +331,31 @@ impl HermesDriver {
         let init = self.init_frame(model, thinking, resume);
         if let Err(error) = process.send(&init).await {
             self.close_now().await;
-            return Err(error);
+            return if lock(&self.shared).closed { Err("The session is closed".into()) } else { Err(error) };
         }
         match tokio::time::timeout(Duration::from_secs(60), ready_rx).await {
-            Ok(Ok(Ok(()))) => Ok(process),
+            Ok(Ok(Ok(()))) => {
+                if lock(&self.shared).closed {
+                    self.close_now().await;
+                    return Err("The session is closed".into());
+                }
+                Ok(process)
+            }
             Ok(Ok(Err(why))) => {
                 self.close_now().await;
-                Err(why)
+                if lock(&self.shared).closed {
+                    Err("The session is closed".into())
+                } else {
+                    Err(why)
+                }
             }
             _ => {
                 self.close_now().await;
-                Err("Hermes did not become ready within 60 seconds".into())
+                if lock(&self.shared).closed {
+                    Err("The session is closed".into())
+                } else {
+                    Err("Hermes did not become ready within 60 seconds".into())
+                }
             }
         }
     }
@@ -446,9 +501,13 @@ impl HermesDriver {
         let process = {
             let mut state = lock(&self.shared);
             state.generation += 1;
-            state.ready = None;
+            if let Some(ready) = state.ready.take() {
+                let _ = ready.send(Err("The session is closed".into()));
+            }
             state.awaiting_async = false;
-            state.requests.clear();
+            for (_, waiter) in state.requests.drain() {
+                let _ = waiter.send(Err("The session is closed".into()));
+            }
             state.process.take()
         };
         if let Some(process) = process {
@@ -464,6 +523,10 @@ pub struct Hermes(pub Arc<HermesDriver>);
 impl Driver for Hermes {
     fn kernel(&self) -> &'static str {
         "hermes"
+    }
+
+    fn warm<'a>(&'a self, resume: Option<String>) -> BoxFut<'a, Result<(), String>> {
+        Box::pin(async move { self.0.process(resume).await.map(|_| ()) })
     }
 
     fn submit<'a>(&'a self, id: &'a str, content: &'a [Block], deliver: Deliver, resume: Option<String>) -> BoxFut<'a, Result<(), String>> {
@@ -540,7 +603,10 @@ impl Driver for Hermes {
     }
 
     fn close(&self) -> BoxFut<'_, ()> {
-        Box::pin(async move { self.0.close_now().await })
+        Box::pin(async move {
+            lock(&self.0.shared).closed = true;
+            self.0.close_now().await;
+        })
     }
 }
 
@@ -579,6 +645,34 @@ mod tests {
         assert!(launch.args[2].contains(BRIDGE_PATH_CALL), "{:?}", launch.args);
         assert_eq!(launch.args[3], bridge.display().to_string());
         assert_eq!(launch.args[4], "--list-models");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn caches_the_runtime_command_probe_across_launches() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = neo_testkit::TempDir::new("hermes-probe-cache");
+        let launcher = dir.join("hermes");
+        let count_file = dir.join("probe-count");
+        let bootstrap = format!("import sys, runpy; {DEFAULT_MODULE_CALL}");
+        let payload = serde_json::to_string(&vec!["/usr/bin/python3", "-I", "-c", &bootstrap]).unwrap();
+        std::fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--print-runtime-command\" ]; then\n  printf x >> '{}'\n  cat <<'EOF'\n{payload}\nEOF\n  exit 0\nfi\nexit 1\n",
+                count_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bridge_a = dir.join("bridge-a.py");
+        let bridge_b = dir.join("bridge-b.py");
+        let first = resolve_launch(&launcher, &bridge_a, &[], dir.path(), &BTreeMap::new()).await;
+        let second = resolve_launch(&launcher, &bridge_b, &["--list-models".into()], dir.path(), &BTreeMap::new()).await;
+        assert_eq!(std::fs::read_to_string(&count_file).unwrap(), "x");
+        assert_eq!(first.args[3], bridge_a.display().to_string());
+        assert_eq!(second.args[3], bridge_b.display().to_string());
+        assert_eq!(second.args[4], "--list-models");
     }
 
     #[cfg(unix)]

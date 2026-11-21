@@ -41,6 +41,10 @@ pub enum DriverEvent {
 pub trait Driver: Send + Sync {
     /// The kernel's name, under which its session id is recorded.
     fn kernel(&self) -> &'static str;
+    /// Pre-warm the runtime process without starting a turn, resuming `resume` when known.
+    fn warm<'a>(&'a self, _resume: Option<String>) -> BoxFut<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
     /// Hand the runtime a user message, starting its process if none runs (resuming `resume`).
     fn submit<'a>(&'a self, id: &'a str, content: &'a [Block], deliver: Deliver, resume: Option<String>) -> BoxFut<'a, Result<(), String>>;
     /// Cancel the running turn.
@@ -210,13 +214,7 @@ impl Session {
                 };
                 let Some(entry_ids) = taken else { return };
                 self.journal.mark_taken(&entry_ids);
-                let request_ids = self
-                    .journal
-                    .entries()
-                    .iter()
-                    .filter(|entry| entry_ids.iter().any(|id| id == entry.id()))
-                    .filter_map(|entry| entry.request_id().map(str::to_string))
-                    .collect();
+                let request_ids = self.journal.request_ids_for(&entry_ids);
                 self.start_turn();
                 self.emit(KernelEvent::Taken { request_ids });
             }
@@ -265,13 +263,21 @@ impl Session {
         self.journal.flush().map_err(|error| format!("The session transcript cannot be written: {error}"))
     }
 
+    /// Pre-warm the underlying runtime process without starting a turn.
+    pub async fn warm(&self) -> Result<(), String> {
+        if self.is_disposed() {
+            return Ok(());
+        }
+        let resume = self.journal.kernel_session(self.driver.kernel());
+        self.driver.warm(resume).await
+    }
+
     /// Deliver a message to the model, once per request id. It is durable when this returns: a crash after that loses
     /// nothing, and sending the same request again only makes sure the runtime has it.
     pub async fn send(&self, request_id: &str, content: Vec<Block>, mode: Mode, presentation: &Presentation, input_ids: &[String]) -> Result<(), String> {
         if self.is_disposed() {
             return Err("The session was disposed".into());
         }
-        let flush = || self.journal.flush().map_err(|error| format!("The session transcript cannot be written: {error}"));
         let known = self.journal.request(request_id);
         if known.is_none() {
             let attribution = if presentation.from_user { "user" } else { "agent" };
@@ -283,7 +289,11 @@ impl Session {
                 Some(mode != Mode::Inject),
             );
         }
-        flush()?;
+        let journal = Arc::clone(&self.journal);
+        tokio::task::spawn_blocking(move || journal.flush())
+            .await
+            .map_err(|error| format!("The session transcript cannot be written: {error}"))?
+            .map_err(|error| format!("The session transcript cannot be written: {error}"))?;
         if mode == Mode::Inject {
             return Ok(());
         }
@@ -351,6 +361,7 @@ impl Session {
         self.begin_dispose();
         self.driver.close().await;
         self.state().in_turn = false;
-        let _ = self.journal.flush();
+        let journal = Arc::clone(&self.journal);
+        let _ = tokio::task::spawn_blocking(move || journal.flush()).await;
     }
 }

@@ -7,11 +7,13 @@ use crate::kernels::{display_name, support, ModelOption};
 use crate::sessions::worker_session_id;
 use crate::settings::{limits, Kernel, RoleModel, Settings};
 use crate::text::clip;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 /// How old a kernel's model list may be before it is listed again in the background.
 const MODEL_LIST_STALE: Duration = Duration::from_secs(60);
+/// How long a worker's background jobs are cached across overlapping UI poll requests.
+const JOBS_CACHE_TTL: Duration = Duration::from_millis(750);
 
 /// What a kernel said when last asked for its models.
 pub(crate) struct ModelList {
@@ -155,20 +157,58 @@ impl App {
         })
     }
 
+    async fn cached_running_jobs(&self, ticket_id: &str) -> Vec<crate::executor::WorkerJob> {
+        if self.session(&worker_session_id(ticket_id)).is_none_or(|loaded| loaded.session.is_disposed()) {
+            return Vec::new();
+        }
+        {
+            let cache = self.jobs_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some((at, jobs)) = cache.get(ticket_id) {
+                if at.elapsed() < JOBS_CACHE_TTL {
+                    return jobs.clone();
+                }
+            }
+        }
+        let jobs = self.running_jobs(ticket_id).await;
+        self.jobs_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(ticket_id.to_string(), (Instant::now(), jobs.clone()));
+        jobs
+    }
+
     /// What is at work now, for the app's ticker: whether the main Session is thinking, and a line for each busy
     /// worker on what it is doing. Read from memory only, so the app may ask every few seconds.
     pub async fn activity_view(&self) -> Value {
         let router = self.router_thinking();
-        let mut workers = Vec::new();
-        for ticket_id in self.busy_tickets() {
-            let Some(ticket) = self.store_ticket(&ticket_id).filter(|ticket| ticket.ended.is_none()) else { continue };
-            let loaded = self.session(&worker_session_id(&ticket_id));
+        let live: Vec<Ticket> =
+            self.busy_tickets().into_iter().filter_map(|ticket_id| self.store_ticket(&ticket_id).filter(|ticket| ticket.ended.is_none())).collect();
+        let mut jobs_by_ticket: HashMap<String, Vec<crate::executor::WorkerJob>> = HashMap::new();
+        if !live.is_empty() {
+            if let Some(app) = self.weak.upgrade() {
+                let mut set = tokio::task::JoinSet::new();
+                for ticket in &live {
+                    let app = app.clone();
+                    let id = ticket.id.clone();
+                    set.spawn(async move {
+                        let jobs = app.cached_running_jobs(&id).await;
+                        (id, jobs)
+                    });
+                }
+                while let Some(res) = set.join_next().await {
+                    if let Ok((id, jobs)) = res {
+                        jobs_by_ticket.insert(id, jobs);
+                    }
+                }
+            } else {
+                for ticket in &live {
+                    jobs_by_ticket.insert(ticket.id.clone(), self.cached_running_jobs(&ticket.id).await);
+                }
+            }
+        }
+        let mut workers = Vec::with_capacity(live.len());
+        for ticket in live {
+            let loaded = self.session(&worker_session_id(&ticket.id));
             let streaming = loaded.as_ref().is_some_and(|loaded| loaded.session.is_streaming());
-            let recent = loaded.as_ref().map(|loaded| {
-                let journal = loaded.session.journal();
-                journal.entries_from(journal.len().saturating_sub(12))
-            });
-            let jobs = self.running_jobs(&ticket_id).await;
+            let recent = loaded.as_ref().map(|loaded| loaded.session.journal().entries_tail(12).1);
+            let jobs = jobs_by_ticket.remove(&ticket.id).unwrap_or_default();
             let job = jobs.first().map(|job| format!("后台 · {}", job.label.lines().next().unwrap_or("")));
             let report = ticket.latest().and_then(|assignment| assignment.report.as_ref()).map(|report| report.summary.clone());
             let line = match (streaming, recent.as_deref().and_then(doing), job) {
@@ -230,11 +270,9 @@ impl App {
             .collect()
     }
 
-    async fn worker_card(&self, ticket: &Ticket) -> Value {
+    fn worker_card_with_jobs(&self, ticket: &Ticket, jobs: Vec<crate::executor::WorkerJob>) -> Value {
         let session = self.session(&worker_session_id(&ticket.id));
-        let background: Vec<Value> = self
-            .running_jobs(&ticket.id)
-            .await
+        let background: Vec<Value> = jobs
             .into_iter()
             .map(|job| {
                 // Its latest line of progress: a subagent's current step, or the end of a job's output.
@@ -263,15 +301,49 @@ impl App {
         })
     }
 
+    async fn worker_card(&self, ticket: &Ticket) -> Value {
+        let jobs = self.cached_running_jobs(&ticket.id).await;
+        self.worker_card_with_jobs(ticket, jobs)
+    }
+
     /// Every ticket with its worker, open ones first and each group by latest change.
     pub async fn worker_cards(&self) -> Vec<Value> {
         let mut tickets = self.store.tickets();
         tickets.sort_by(|left, right| left.ended.is_some().cmp(&right.ended.is_some()).then_with(|| right.updated_at.cmp(&left.updated_at)));
-        let mut cards = Vec::with_capacity(tickets.len());
-        for ticket in &tickets {
-            cards.push(self.worker_card(ticket).await);
+        let active_ids: Vec<String> = tickets
+            .iter()
+            .filter(|ticket| self.session(&worker_session_id(&ticket.id)).is_some_and(|loaded| !loaded.session.is_disposed()))
+            .map(|ticket| ticket.id.clone())
+            .collect();
+        let mut jobs_by_ticket: HashMap<String, Vec<crate::executor::WorkerJob>> = HashMap::new();
+        if !active_ids.is_empty() {
+            if let Some(app) = self.weak.upgrade() {
+                let mut set = tokio::task::JoinSet::new();
+                for id in active_ids {
+                    let app = app.clone();
+                    set.spawn(async move {
+                        let jobs = app.cached_running_jobs(&id).await;
+                        (id, jobs)
+                    });
+                }
+                while let Some(res) = set.join_next().await {
+                    if let Ok((id, jobs)) = res {
+                        jobs_by_ticket.insert(id, jobs);
+                    }
+                }
+            } else {
+                for id in active_ids {
+                    jobs_by_ticket.insert(id.clone(), self.cached_running_jobs(&id).await);
+                }
+            }
         }
-        cards
+        tickets
+            .iter()
+            .map(|ticket| {
+                let jobs = jobs_by_ticket.remove(&ticket.id).unwrap_or_default();
+                self.worker_card_with_jobs(ticket, jobs)
+            })
+            .collect()
     }
 
     /// One ticket with its Inputs, newest first, and its worker's latest thirty transcript entries.
@@ -288,16 +360,19 @@ impl App {
                 line
             })
             .collect();
-        let recent: Vec<Value> = self
-            .worker_transcript(ticket_id)
+        let (start_index, entries) = match self.session(&worker_session_id(ticket_id)) {
+            Some(loaded) => loaded.session.journal().entries_tail(120),
+            None => (0, self.worker_transcript(ticket_id)),
+        };
+        let recent: Vec<Value> = entries
             .iter()
             .enumerate()
-            .filter_map(|(index, entry)| {
+            .filter_map(|(offset, entry)| {
                 let (role, text) = activity(entry);
                 if text.is_empty() {
                     return None;
                 }
-                let mut line = json!({"id": index, "role": role, "text": text});
+                let mut line = json!({"id": start_index + offset, "role": role, "text": text});
                 if let Some(at) = parse_iso(entry.timestamp()) {
                     line["at"] = at.into();
                 }

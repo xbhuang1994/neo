@@ -57,8 +57,12 @@ fn common(common: &Common, config: &ConfigFile) -> (PathBuf, PathBuf, bool) {
 
 fn kernels(plan: &Plan) -> RealKernels {
     let program_dir = paths::program_dir();
-    // Each program is looked for whenever it is needed, so one installed while this runs is found.
-    let find = Arc::new(|kernel: Kernel| {
+    // Cache each discovered runtime binary while it stays on disk, re-probing when missing or replaced.
+    let cache: Arc<std::sync::Mutex<std::collections::BTreeMap<Kernel, PathBuf>>> = Default::default();
+    let find = Arc::new(move |kernel: Kernel| {
+        if let Some(path) = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(&kernel).filter(|path| path.is_file()).cloned() {
+            return Some(path);
+        }
         let variable = match kernel {
             Kernel::Claude => "NEO_CLAUDE_BIN",
             Kernel::Omp => "NEO_OMP_BIN",
@@ -66,7 +70,14 @@ fn kernels(plan: &Plan) -> RealKernels {
             Kernel::Hermes => "NEO_HERMES_BIN",
         };
         let name = kernels::program_name(kernel);
-        paths::find_runtime(name, env_path(variable), std::env::var_os("PATH").as_deref(), &paths::install_dirs(name))
+        let found = paths::find_runtime(name, env_path(variable), std::env::var_os("PATH").as_deref(), &paths::install_dirs(name));
+        let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(ref path) = found {
+            guard.insert(kernel, path.clone());
+        } else {
+            guard.remove(&kernel);
+        }
+        found
     });
     let shim = paths::find_shim(env_path("NEO_SHIM"), program_dir.as_deref());
     // Every Session meets the blocked commands first on its path.
@@ -279,7 +290,7 @@ fn main() {
     let program = args.next().unwrap_or_default();
     // Started from the folder of blocked commands, this program is the refusal of the command it is named after.
     let stand_in = |path: &Path| path.parent().and_then(Path::file_name).is_some_and(|folder| folder == "worker-bin");
-    if stand_in(Path::new(&program)) || std::env::current_exe().is_ok_and(|path| stand_in(&path)) {
+    if stand_in(Path::new(&program)) {
         eprintln!("{}", blocked::refusal(&blocked::invoked_as(&program)));
         std::process::exit(blocked::REFUSED_STATUS);
     }
@@ -294,6 +305,10 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+    if std::env::current_exe().is_ok_and(|path| stand_in(&path)) {
+        eprintln!("{}", blocked::refusal(&blocked::invoked_as(&program)));
+        std::process::exit(blocked::REFUSED_STATUS);
     }
     let command = match cli::parse(&args) {
         Ok(command) => command,

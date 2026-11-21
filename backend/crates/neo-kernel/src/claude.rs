@@ -237,6 +237,7 @@ struct Shared {
     running: bool,
     /// The runtime works on a wake the host cancelled; what it says meanwhile is dropped.
     suppressing: bool,
+    closed: bool,
     model: Option<String>,
     thinking: Option<String>,
 }
@@ -264,31 +265,79 @@ impl ClaudeDriver {
     /// The running process, starting one that resumes `resume` when none runs.
     async fn process(self: &Arc<Self>, resume: Option<String>) -> Result<Arc<Proc>, String> {
         let _one = self.starting.lock().await;
-        if let Some(process) = lock(&self.shared).process.clone() {
-            return Ok(process);
+        {
+            let shared = lock(&self.shared);
+            if shared.closed {
+                return Err("The session is closed".into());
+            }
+            if let Some(process) = shared.process.clone() {
+                return Ok(process);
+            }
         }
         let session_id = uuid();
         let mut options = self.options.clone();
         {
             let shared = lock(&self.shared);
+            if shared.closed {
+                return Err("The session is closed".into());
+            }
             options.model = shared.model.clone();
             options.thinking = shared.thinking.clone();
         }
         let (process, lines) = Proc::spawn(&launch(&options, resume.as_deref(), &session_id))?;
         let generation = {
             let mut shared = lock(&self.shared);
-            shared.generation += 1;
-            shared.process = Some(process.clone());
-            shared.generation
+            if shared.closed {
+                None
+            } else {
+                shared.generation += 1;
+                shared.process = Some(process.clone());
+                Some(shared.generation)
+            }
+        };
+        let Some(generation) = generation else {
+            process.close(Duration::from_secs(3)).await;
+            return Err("The session is closed".into());
         };
         let _ = self.events.send(DriverEvent::SessionId(resume.unwrap_or(session_id)));
         tokio::spawn(self.clone().read(lines, generation));
         let request = initialize(&self.options, !self.host.specs().is_empty());
         match tokio::time::timeout(Duration::from_secs(60), self.control(&process, request)).await {
-            Ok(Ok(_)) => Ok(process),
-            Ok(Err(error)) => Err(format!("Claude Code refused to start: {error}")),
-            Err(_) => Err("Claude Code did not answer within 60 seconds".into()),
+            Ok(Ok(_)) => {
+                if lock(&self.shared).closed {
+                    self.forget(&process).await;
+                    return Err("The session is closed".into());
+                }
+                Ok(process)
+            }
+            Ok(Err(error)) => {
+                self.forget(&process).await;
+                if lock(&self.shared).closed {
+                    Err("The session is closed".into())
+                } else {
+                    Err(format!("Claude Code refused to start: {error}"))
+                }
+            }
+            Err(_) => {
+                self.forget(&process).await;
+                if lock(&self.shared).closed {
+                    Err("The session is closed".into())
+                } else {
+                    Err("Claude Code did not answer within 60 seconds".into())
+                }
+            }
         }
+    }
+
+    async fn forget(&self, process: &Arc<Proc>) {
+        {
+            let mut shared = lock(&self.shared);
+            if shared.process.as_ref().is_some_and(|current| Arc::ptr_eq(current, process)) {
+                shared.process = None;
+                shared.generation += 1;
+            }
+        }
+        process.close(Duration::from_secs(1)).await;
     }
 
     /// Send a control request and wait for its answer.
@@ -574,6 +623,9 @@ impl Driver for Claude {
     fn kernel(&self) -> &'static str {
         "claude"
     }
+    fn warm<'a>(&'a self, resume: Option<String>) -> BoxFut<'a, Result<(), String>> {
+        Box::pin(async move { self.0.process(resume).await.map(|_| ()) })
+    }
     fn submit<'a>(&'a self, id: &'a str, content: &'a [Block], deliver: Deliver, resume: Option<String>) -> BoxFut<'a, Result<(), String>> {
         Box::pin(async move {
             let process = self.0.process(resume).await?;
@@ -661,8 +713,12 @@ impl Driver for Claude {
             let process = {
                 let mut shared = lock(&self.0.shared);
                 // Lines of the closed process are ignored from here on.
+                shared.closed = true;
                 shared.generation += 1;
                 shared.tasks.clear();
+                for (_, answer) in shared.requests.drain() {
+                    let _ = answer.send(Err("The session is closed".into()));
+                }
                 shared.process.take()
             };
             if let Some(process) = process {

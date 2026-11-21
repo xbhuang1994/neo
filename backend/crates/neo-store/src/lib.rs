@@ -144,7 +144,9 @@ impl Store {
     }
 
     fn prepare(db: Connection) -> Result<Store, StoreError> {
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)")?;
+        db.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-16000; CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        )?;
         let version: Option<String> = db.query_row("SELECT value FROM kv WHERE key='schema'", [], |row| row.get(0)).optional()?;
         let version = version.map(|value| value.parse::<i64>().unwrap_or(-1));
         if let Some(found) = version.filter(|found| *found != SCHEMA_VERSION) {
@@ -166,7 +168,9 @@ impl Store {
             CREATE INDEX IF NOT EXISTS trigger_at ON trigger(at);
             CREATE INDEX IF NOT EXISTS trigger_thread_at ON trigger_thread(thread, at);
             CREATE INDEX IF NOT EXISTS decision_thread ON decision(thread);
-            CREATE INDEX IF NOT EXISTS effect_due ON effect(kind, due, seq);",
+            CREATE INDEX IF NOT EXISTS effect_due ON effect(kind, due, seq);
+            CREATE INDEX IF NOT EXISTS effect_kind_seq ON effect(kind, seq);
+            CREATE INDEX IF NOT EXISTS outbox_ticket_reply ON outbox(value ->> '$.ticketId', value ->> '$.queuedAt') WHERE value ->> '$.kind' = 'reply';",
         )?;
         for (table, name, definition) in SETS {
             let exists: bool =
@@ -290,6 +294,11 @@ impl Store {
             }
             Ok(())
         });
+    }
+
+    /// The latest `limit` tickets, newest first.
+    pub fn recent_tickets(&self, limit: i64) -> Vec<Ticket> {
+        self.values("SELECT value FROM ticket ORDER BY rowid DESC LIMIT ?1", params![limit])
     }
 }
 

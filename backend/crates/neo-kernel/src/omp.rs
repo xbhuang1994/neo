@@ -186,6 +186,7 @@ struct Shared {
     ready: Option<oneshot::Sender<Result<(), String>>>,
     /// The last turn ended with background jobs running.
     awaiting_async: bool,
+    closed: bool,
     model: Option<String>,
     thinking: Option<String>,
 }
@@ -215,12 +216,21 @@ impl OmpDriver {
     /// The running process, starting one that resumes the context file `resume` when none runs.
     async fn process(self: &Arc<Self>, resume: Option<String>) -> Result<Arc<Proc>, String> {
         let _one = self.starting.lock().await;
-        if let Some(process) = lock(&self.shared).process.clone() {
-            return Ok(process);
+        {
+            let shared = lock(&self.shared);
+            if shared.closed {
+                return Err("The session is closed".into());
+            }
+            if let Some(process) = shared.process.clone() {
+                return Ok(process);
+            }
         }
         let mut options = self.options.clone();
         {
             let shared = lock(&self.shared);
+            if shared.closed {
+                return Err("The session is closed".into());
+            }
             options.model = shared.model.clone();
             options.thinking = shared.thinking.clone();
         }
@@ -230,10 +240,18 @@ impl OmpDriver {
         let (ready, is_ready) = oneshot::channel();
         let generation = {
             let mut shared = lock(&self.shared);
-            shared.generation += 1;
-            shared.process = Some(process.clone());
-            shared.ready = Some(ready);
-            shared.generation
+            if shared.closed {
+                None
+            } else {
+                shared.generation += 1;
+                shared.process = Some(process.clone());
+                shared.ready = Some(ready);
+                Some(shared.generation)
+            }
+        };
+        let Some(generation) = generation else {
+            process.close(Duration::from_secs(1)).await;
+            return Err("The session is closed".into());
         };
         tokio::spawn(self.clone().read(lines, generation));
         let started = async {
@@ -254,14 +272,28 @@ impl OmpDriver {
             Ok::<(), String>(())
         };
         match tokio::time::timeout(Duration::from_secs(90), started).await {
-            Ok(Ok(())) => Ok(process),
+            Ok(Ok(())) => {
+                if lock(&self.shared).closed {
+                    self.forget(&process).await;
+                    return Err("The session is closed".into());
+                }
+                Ok(process)
+            }
             Ok(Err(error)) => {
                 self.forget(&process).await;
-                Err(format!("Oh My Pi did not start: {error}"))
+                if lock(&self.shared).closed {
+                    Err("The session is closed".into())
+                } else {
+                    Err(format!("Oh My Pi did not start: {error}"))
+                }
             }
             Err(_) => {
                 self.forget(&process).await;
-                Err("Oh My Pi was not ready within 90 seconds".into())
+                if lock(&self.shared).closed {
+                    Err("The session is closed".into())
+                } else {
+                    Err("Oh My Pi was not ready within 90 seconds".into())
+                }
             }
         }
     }
@@ -453,6 +485,9 @@ impl Driver for Omp {
     fn kernel(&self) -> &'static str {
         "omp"
     }
+    fn warm<'a>(&'a self, resume: Option<String>) -> BoxFut<'a, Result<(), String>> {
+        Box::pin(async move { self.0.process(resume).await.map(|_| ()) })
+    }
     fn submit<'a>(&'a self, _id: &'a str, content: &'a [Block], deliver: Deliver, resume: Option<String>) -> BoxFut<'a, Result<(), String>> {
         Box::pin(async move {
             let process = self.0.process(resume).await?;
@@ -540,8 +575,16 @@ impl Driver for Omp {
         Box::pin(async move {
             let process = {
                 let mut shared = lock(&self.0.shared);
+                shared.closed = true;
                 shared.generation += 1;
                 shared.awaiting_async = false;
+                if let Some(ready) = shared.ready.take() {
+                    let _ = ready.send(Err("The session is closed".into()));
+                }
+                let waiting: Vec<_> = shared.commands.drain().map(|(_, answer)| answer).collect();
+                for answer in waiting.into_iter().chain(std::mem::take(&mut shared.shim).into_values()) {
+                    let _ = answer.send(Err("The session is closed".into()));
+                }
                 shared.process.take()
             };
             if let Some(process) = process {

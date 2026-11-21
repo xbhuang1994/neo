@@ -134,11 +134,14 @@ pub fn followup_relay(records: &dyn FollowupRecords, trigger: &neo_core::model::
 pub fn result_relay(ticket: &Ticket, state: &str, text: &str, reply_to: Option<&str>) -> Relay {
     let id = key(&["worker-result", &ticket.id, &ticket.updated_at, text]);
     let mut report = json!({"kind": "worker_report", "ticket": brief_card(ticket), "trigger_id": ticket.origin.trigger_id, "state": state});
+    if let Some(execution) = &ticket.execution {
+        report["directory"] = execution.directory.clone().into();
+    }
     if let Some(reply_to) = reply_to {
         report["answer_to"] = reply_to.into();
     }
-    report["summary"] = clip(text, 600).into();
-    if text.chars().count() > 600 {
+    report["summary"] = clip(text, 2000).into();
+    if text.chars().count() > 2000 {
         report["chars"] = text.chars().count().into();
     }
     report["read"] = format!("ticket/{}/result", ticket.id).into();
@@ -160,7 +163,10 @@ pub(crate) fn state_name(state: ReportState) -> &'static str {
 /// end, or answer is a report relay, while routine progress stays internal.
 pub fn report_relay(ticket: &Ticket, report: &WorkerReport) -> Option<Relay> {
     if let (Question::Ask(_), Some(asked)) = (&report.question, &ticket.attention) {
-        let text = json!({"kind": "worker_attention", "ticket": brief_card(ticket), "state": state_name(report.state), "read": format!("ticket/{}/result", ticket.id)});
+        let mut text = json!({"kind": "worker_attention", "ticket": brief_card(ticket), "state": state_name(report.state), "read": format!("ticket/{}/result", ticket.id)});
+        if !report.summary.is_empty() {
+            text["summary"] = clip(&report.summary, 600).into();
+        }
         return Some(Relay { id: format!("attention:{}:{}", ticket.id, asked.id), text: text.to_string() });
     }
     if report.state == ReportState::Progress && report.answers.is_none() {

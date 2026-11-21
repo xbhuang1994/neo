@@ -10,7 +10,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -88,6 +88,7 @@ pub struct Effects {
     now: Clock,
     kinds: Mutex<BTreeMap<String, Arc<Kind>>>,
     seq: AtomicI64,
+    wake_gen: AtomicU64,
     /// The kind and key of every effect that runs now.
     running: Mutex<Vec<(String, String)>>,
     started: AtomicBool,
@@ -95,7 +96,7 @@ pub struct Effects {
     /// Wakes the dispatcher.
     work: Notify,
     /// Signals that an effect finished.
-    finished: Notify,
+    pub(crate) finished: Notify,
     weak: Weak<Effects>,
 }
 
@@ -118,6 +119,7 @@ impl Effects {
             now,
             kinds: Mutex::new(BTreeMap::new()),
             seq,
+            wake_gen: AtomicU64::new(0),
             running: Mutex::new(Vec::new()),
             started: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
@@ -127,7 +129,7 @@ impl Effects {
         })
     }
 
-    fn running(&self) -> std::sync::MutexGuard<'_, Vec<(String, String)>> {
+    pub(crate) fn running(&self) -> std::sync::MutexGuard<'_, Vec<(String, String)>> {
         self.running.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
     fn kinds(&self) -> Vec<(String, Arc<Kind>)> {
@@ -191,12 +193,27 @@ impl Effects {
                 if effects.stopped.load(Ordering::SeqCst) {
                     return;
                 }
-                effects.dispatch();
                 let wake = effects.work.notified();
-                // Rows whose retry is due later are picked up by the tick.
-                let _ = tokio::time::timeout(Duration::from_millis(500), wake).await;
+                tokio::pin!(wake);
+                // Register before looking, so a kick during dispatch is not missed.
+                wake.as_mut().enable();
+                effects.dispatch();
+                match effects.store.effect_next_due() {
+                    None => wake.await,
+                    Some(due) => {
+                        let wait_ms = (due - (effects.now)()).clamp(10, 500) as u64;
+                        let _ = tokio::time::timeout(Duration::from_millis(wait_ms), wake).await;
+                    }
+                }
             }
         });
+    }
+
+    /// Pull unfailed waiting effects of `kind` forward to now and wake the dispatcher.
+    pub fn wake_kind(&self, kind: &str) {
+        self.wake_gen.fetch_add(1, Ordering::SeqCst);
+        self.store.effect_wake_kind(kind, (self.now)());
+        self.kick();
     }
 
     /// Run whatever is due as soon as possible.
@@ -234,7 +251,7 @@ impl Effects {
         }
     }
 
-    fn dispatch(&self) {
+    pub(crate) fn dispatch(&self) {
         if !self.started.load(Ordering::SeqCst) || self.stopped.load(Ordering::SeqCst) {
             return;
         }
@@ -271,6 +288,7 @@ impl Effects {
     }
 
     async fn attempt(&self, name: &str, kind: &Kind, row: &EffectRow) {
+        let wake_gen = self.wake_gen.load(Ordering::SeqCst);
         let payload = serde_json::from_str(&row.value).unwrap_or(Value::Null);
         // A handler that panics counts as a failure rather than leaving its row running forever.
         let outcome = match tokio::spawn((kind.run)(payload, row.key.clone())).await {
@@ -281,11 +299,17 @@ impl Effects {
             Ok(()) => self.store.effect_done(name, row),
             // Left untouched on shutdown, so it runs again on the next start.
             Err(_) if self.stopped.load(Ordering::SeqCst) => return,
-            Err(Failure::Later(_)) => self.store.effect_later(name, row, (self.now)() + kind.options.retry.0),
+            Err(Failure::Later(_)) => {
+                let due = if self.wake_gen.load(Ordering::SeqCst) != wake_gen { (self.now)() } else { (self.now)() + kind.options.retry.0 };
+                self.store.effect_later(name, row, due);
+            }
             Err(Failure::Error(error)) => {
                 let (initial, most) = kind.options.retry;
                 let delay = most.min(initial.saturating_mul(1 << row.attempts.clamp(0, 16)));
                 self.store.effect_failed(name, row, &error, (self.now)() + delay);
+                if name == REPLY && row.attempts + 1 == FAILURES_BEFORE_ERROR {
+                    self.wake_kind(name);
+                }
             }
         }
         self.report(name);

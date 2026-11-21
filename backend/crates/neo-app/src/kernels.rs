@@ -522,10 +522,10 @@ impl RealKernels {
         let program = self.require(Kernel::Claude)?;
         let names: Vec<String> = host.specs().into_iter().map(|tool| tool.name).collect();
         let worker = spec.role == SessionRole::Worker;
-        let note = if worker {
-            "Runtime note: you run in Claude Code. Tool names above map to `Read`, `Bash`, `Edit` and `Write`; application tools are exposed as `mcp__neo__<name>`. Spawn subagents (the `task` tool above) with `Agent` and `subagent_type: \"ticket-task\"`, setting `run_in_background: true` for long work; at most 8 run at once. Run any command that may take longer than a minute with `Bash` and `run_in_background: true`, and stop one you no longer need with `TaskStop`. A finished background command or subagent wakes you in this Session with its result; there is no `wait` tool, so end your turn to wait for it."
-        } else {
-            "Runtime note: you run in Claude Code. Tool names above map to `Read` and `Bash`; application tools are exposed as `mcp__neo__<name>`."
+        let note = match spec.role {
+            SessionRole::Worker => "Runtime note: you run in Claude Code. Tool names above map to `Read`, `Bash`, `Edit` and `Write`; application tools are exposed as `mcp__neo__<name>`. Spawn subagents (the `task` tool above) with `Agent` and `subagent_type: \"ticket-task\"`, setting `run_in_background: true` for parallel subagent fan-out and long work (at most 8 run at once). Run any command that may take longer than a minute with `Bash` and `run_in_background: true`, and stop one you no longer need with `TaskStop`. A finished background command or subagent wakes you in this Session with its result; there is no `wait` tool, so end your turn to wait for it.",
+            SessionRole::Sidecar => "Runtime note: you run in Claude Code. Tool names above map to `Read`; application tools are exposed as `mcp__neo__<name>`.",
+            SessionRole::Orchestrator | SessionRole::Watchdog => "Runtime note: you run in Claude Code. Tool names above map to `Read` and `Bash`; application tools are exposed as `mcp__neo__<name>`.",
         };
         let mut env = self.claude_env();
         let mut env_remove = Vec::new();
@@ -643,19 +643,22 @@ impl RealKernels {
             String::new()
         } else {
             format!(
-                " Application tools are on the MCP server `{server}`: call one with `call_mcp_tool`, `ServerName` `{server}` and `ToolName` its name above."
+                " Application tools are on MCP server `{server}`: call one with `call_mcp_tool` passing `ServerName: \"{server}\"`, `ToolName: \"<name>\"`, and `Arguments: {{...}}` (JSON object)."
             )
         };
         let note = match spec.role {
             SessionRole::Worker => format!(
-                "Runtime note: you run in the Antigravity CLI. Tool names above map to `view_file`, `run_command`, `write_to_file`, `replace_file_content`, and `invoke_subagent` for subagents.{application} A command still running after a few seconds moves to the background, and its end wakes you, as does a subagent's reply. Do not use browser, image, scheduling or web-search tools unless the ticket asks for them."
+                "Runtime note: you run in the Antigravity CLI. Tool names above map to `read_file`/`view_file`, `grep_search`, `find_by_name`, `list_dir`, `run_command`, `edit_file`/`replace_file_content`/`multi_replace_file_content`, `write_file`/`write_to_file`, and `invoke_subagent` / `define_subagent` / `manage_subagents` (plus `run_workflow` for Python `parallel()` / `pipeline()` fan-out workflows; at most 8 concurrent subagents).{application} A command that runs in the background or a subagent wakes you when finished; end your turn to wait instead of polling. Do not use browser or image tools unless the ticket asks for them."
             ),
-            _ => format!(
-                "Runtime note: you run in the Antigravity CLI. Tool names above map to `view_file` and `run_command`.{application} Do not use browser, image, scheduling or web-search tools."
+            SessionRole::Sidecar => format!(
+                "Runtime note: you run in the Antigravity CLI. Tool names above map to `read_file`/`view_file`, `grep_search`, `find_by_name`, and `list_dir`.{application}"
+            ),
+            SessionRole::Orchestrator | SessionRole::Watchdog => format!(
+                "Runtime note: you run in the Antigravity CLI. Tool names above map to `read_file`/`view_file`, `grep_search`, `find_by_name`, `list_dir`, and `run_command`.{application} Do not use browser, image, scheduling or web-search tools."
             ),
         };
         let tools: &[&str] = match spec.role {
-            SessionRole::Worker => &["read", "bash", "edit", "write", "task"],
+            SessionRole::Worker => &["read", "bash", "web", "edit", "write", "task"],
             SessionRole::Sidecar => &["read"],
             SessionRole::Orchestrator | SessionRole::Watchdog => &["read", "bash"],
         };
@@ -671,6 +674,7 @@ impl RealKernels {
             env: self.env.clone(),
             hook_relay: self.hook_relay.clone(),
             bridge_id: Some(key(&[&spec.session_id])[..8].to_string()),
+            isolate_customizations: spec.role != SessionRole::Worker,
         };
         Ok(Arc::new(Antigravity(AntigravityDriver::new(options, host, events))))
     }
@@ -683,7 +687,7 @@ impl RealKernels {
         let program = self.require(Kernel::Hermes)?;
         let worker = spec.role == SessionRole::Worker;
         let note = match spec.role {
-            SessionRole::Worker => "Runtime note: you run in Hermes Agent. Tool names above map to `read_file` (and `search_files`), `terminal` (and `process_manage`), `patch`, `write_file`, and `delegate_task` for subagents; application tools keep their bare names above. Run any command that may take longer than a minute with `terminal` setting `background: true` and `notify: true`, and stop one you no longer need with `process_manage` (`action: \"kill\"`). A finished background command wakes you in this Session with its result; end your turn to wait for it. Do not use browser or web-search tools unless the ticket asks for them.",
+            SessionRole::Worker => "Runtime note: you run in Hermes Agent. Tool names above map to `read_file` (and `search_files`), `terminal` (and `process_manage`), `patch`, `write_file`, and `delegate_task` for subagents (at most 8 concurrent subagents); application tools keep their bare names above. Run any command that may take longer than a minute with `terminal` setting `background: true` and `notify: true`, and stop one you no longer need with `process_manage` (`action: \"kill\"`). A finished background command wakes you in this Session with its result; end your turn to wait for it. Do not use browser or web-search tools unless the ticket asks for them.",
             SessionRole::Sidecar => "Runtime note: you run in Hermes Agent. Tool names above map to `read_file` and `search_files`; application tools keep their bare names above.",
             SessionRole::Orchestrator | SessionRole::Watchdog => "Runtime note: you run in Hermes Agent. Tool names above map to `read_file` (and `search_files`) and `terminal`; application tools keep their bare names above. Do not use web-search tools.",
         };

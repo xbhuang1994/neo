@@ -207,9 +207,14 @@ async fn write_response(stream: &mut TcpStream, response: &Response, keep: bool,
         head.push_str(&format!("{name}: {value}\r\n"));
     }
     head.push_str(if keep { "connection: keep-alive\r\n\r\n" } else { "connection: close\r\n\r\n" });
+    let mut buf = head.into_bytes();
+    let inline = !head_only && response.body.len() <= 256 * 1024;
+    if inline {
+        buf.extend_from_slice(&response.body);
+    }
     let write = async {
-        stream.write_all(head.as_bytes()).await?;
-        if !head_only {
+        stream.write_all(&buf).await?;
+        if !head_only && !inline {
             stream.write_all(&response.body).await?;
         }
         stream.flush().await

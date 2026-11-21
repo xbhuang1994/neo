@@ -76,6 +76,14 @@ impl Store {
             params![kind, now_ms, limit],
         )
     }
+    /// The earliest `due` timestamp across all queued effects, or `None` when empty.
+    pub fn effect_next_due(&self) -> Option<i64> {
+        self.with(|db| db.prepare_cached("SELECT MIN(due) FROM effect")?.query_row([], |row| row.get::<_, Option<i64>>(0)))
+    }
+    /// Pull unfailed waiting effects of `kind` forward to `now_ms`.
+    pub fn effect_wake_kind(&self, kind: &str, now_ms: i64) {
+        self.with(|db| db.prepare_cached("UPDATE effect SET due = ?2 WHERE kind = ?1 AND attempts = 0 AND due > ?2")?.execute(params![kind, now_ms]));
+    }
     fn effect_rows(&self, sql: &str, parameters: impl rusqlite::Params) -> Vec<EffectRow> {
         self.with(|db| {
             let mut statement = db.prepare_cached(sql)?;

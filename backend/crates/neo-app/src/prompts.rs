@@ -143,18 +143,19 @@ pub fn compose(role: Role, settings: &Settings) -> String {
         prompt_file(packaged!("shared")),
         prompt_file(if role == Role::Orchestrator { packaged!("orchestrator") } else { packaged!("worker") }),
         guide("Communication", packaged!("team/communication")),
-        guide("Ticket scope", packaged!("team/scope")),
-        guide("Delivery requirements", packaged!("team/delivery")),
-        guide("subscriptions", packaged!("subscriptions")),
-        guide("replies", packaged!("replies")),
     ];
     match role {
         Role::Orchestrator => {
+            sections.push(guide("subscriptions", packaged!("subscriptions")));
+            sections.push(guide("replies", packaged!("replies")));
             sections.push(guide("dispatch", packaged!("dispatch")));
             sections.push(prompt_file(packaged!("admission")));
             sections.push(format!("{}\n{}", prompt_file(packaged!("handoff")), prompt_file(packaged!("handoff-orchestrator"))));
         }
         Role::Worker => {
+            sections.push(guide("Ticket scope", packaged!("team/scope")));
+            sections.push(guide("Delivery requirements", packaged!("team/delivery")));
+            sections.push(guide("replies", packaged!("replies")));
             sections.push(guide("work", packaged!("work")));
             sections.push(format!("{}\n{}", prompt_file(packaged!("handoff")), prompt_file(packaged!("handoff-worker"))));
         }
@@ -196,8 +197,6 @@ mod tests {
                 "The orchestrator decides candidates",
                 "You are the orchestrator",
                 "## Communication",
-                "## Ticket scope",
-                "## Delivery requirements",
                 "## subscriptions",
                 "## replies",
                 "## dispatch",
@@ -214,7 +213,8 @@ mod tests {
                 "The orchestrator decides candidates",
                 "You are a worker.",
                 "## Communication",
-                "## subscriptions",
+                "## Ticket scope",
+                "## Delivery requirements",
                 "## replies",
                 "## work",
                 "Ticket handoff contract",
@@ -222,8 +222,18 @@ mod tests {
                 "Execution environment",
             ],
         );
-        assert!(!worker.contains("## Policy") && !worker.contains("## dispatch") && !worker.contains("You are the orchestrator"));
-        assert!(!orchestrator.contains("## work\n") && !orchestrator.contains("You are a worker."));
+        assert!(
+            !worker.contains("## Policy")
+                && !worker.contains("## dispatch")
+                && !worker.contains("## subscriptions")
+                && !worker.contains("You are the orchestrator")
+        );
+        assert!(
+            !orchestrator.contains("## work\n")
+                && !orchestrator.contains("## Ticket scope")
+                && !orchestrator.contains("## Delivery requirements")
+                && !orchestrator.contains("You are a worker.")
+        );
         // The Policy section closes the orchestrator's prompt, so changing it keeps the prefix before it.
         assert!(orchestrator.ends_with(&policy_section(&settings)));
         let mut changed = settings.clone();

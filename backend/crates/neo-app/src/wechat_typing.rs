@@ -3,7 +3,7 @@
 //! is alive, and takes it away once neither is.
 
 use crate::app::App;
-use crate::wechat_protocol::{Account, Error, Protocol};
+use crate::wechat_protocol::{Error, Protocol};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -61,30 +61,34 @@ impl App {
         let mut indicator = Indicator::default();
         while !*done.borrow() {
             // The poll keeps the account's context token current in the store.
-            if let Some(account) = self.wechat_account() {
-                self.wechat_typing_step(protocol, &account, self.agents_busy(), &mut indicator).await;
-            }
+            self.wechat_typing_step(protocol, &mut indicator).await;
             tokio::select! {
                 changed = done.changed() => if changed.is_err() { break },
                 _ = tokio::time::sleep(protocol.typing_check) => {}
             }
         }
-        if let (Some(account), true, Some((ticket, _))) = (self.wechat_account(), indicator.shown, &indicator.ticket) {
-            let _ = protocol.send_typing(&account, ticket, false).await;
+        if indicator.shown {
+            if let (Some((ticket, _)), Some(account)) = (&indicator.ticket, self.wechat_account()) {
+                let _ = protocol.send_typing(&account, ticket, false).await;
+            }
         }
     }
 
-    async fn wechat_typing_step(&self, protocol: &Protocol, account: &Account, busy: bool, indicator: &mut Indicator) {
+    async fn wechat_typing_step(&self, protocol: &Protocol, indicator: &mut Indicator) {
+        let busy = self.agents_busy();
         let now = Instant::now();
         if indicator.retry_at.is_some_and(|at| now < at) {
+            if !busy && !indicator.shown {
+                indicator.since = None;
+            }
             return;
         }
         if !busy {
             indicator.since = None;
             if indicator.shown {
                 indicator.shown = false;
-                if let Some((ticket, _)) = &indicator.ticket {
-                    match protocol.send_typing(account, ticket, false).await {
+                if let (Some((ticket, _)), Some(account)) = (&indicator.ticket, self.wechat_account()) {
+                    match protocol.send_typing(&account, ticket, false).await {
                         Ok(()) => indicator.worked(),
                         Err(error) => indicator.failed(protocol, error),
                     }
@@ -97,9 +101,10 @@ impl App {
         if indicator.since.is_some_and(|since| now < since + held) {
             return;
         }
+        let Some(account) = self.wechat_account() else { return };
         let ticket = match indicator.ticket.clone().filter(|(_, at)| now < *at + TICKET_LIFE) {
             Some((ticket, _)) => ticket,
-            None => match protocol.typing_ticket(account).await {
+            None => match protocol.typing_ticket(&account).await {
                 Ok(ticket) => {
                     indicator.ticket = Some((ticket.clone(), now));
                     ticket
@@ -108,7 +113,7 @@ impl App {
             },
         };
         let show = !indicator.shown;
-        match protocol.send_typing(account, &ticket, show).await {
+        match protocol.send_typing(&account, &ticket, show).await {
             Ok(()) => {
                 indicator.shown = show;
                 indicator.since = Some(now);

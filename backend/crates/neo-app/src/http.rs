@@ -1,6 +1,9 @@
 //! A small blocking HTTP client run off the async runtime, for the few outbound calls the application makes itself.
 
+use std::sync::OnceLock;
 use std::time::Duration;
+
+static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 
 /// A response's status, headers of interest and body.
 #[derive(Clone, Debug)]
@@ -49,8 +52,11 @@ impl std::fmt::Display for Failure {
 }
 
 fn blocking(request: Request) -> Result<Response, Failure> {
-    let agent = ureq::AgentBuilder::new().timeout(request.timeout).build();
+    let agent = AGENT.get_or_init(|| ureq::AgentBuilder::new().build());
     let mut call = agent.request(request.method, &request.url);
+    if !request.timeout.is_zero() {
+        call = call.timeout(request.timeout);
+    }
     for (name, value) in &request.headers {
         call = call.set(name, value);
     }

@@ -67,6 +67,13 @@ fn acknowledgement(text: &str) -> Result<&str, String> {
     Ok(text.trim())
 }
 
+fn direct_reply_text(text: &str) -> Result<String, String> {
+    if word_count(text) > IM_WORDS {
+        return Err(format!("direct_reply has at most {IM_WORDS} words (Chinese counts by character); write a concise reply."));
+    }
+    Ok(text.trim().to_string())
+}
+
 const READ_RESOURCE: &str = "The resource, as the tool's description lists them.";
 const READ_OFFSET: &str = "Copy next_offset from the previous page; it counts characters of a text and items of a list.";
 const READ_LIMIT: &str = "Characters of a text, 4000 by default and 8000 at most, or items of a list, 20 by default and 50 at most.";
@@ -81,125 +88,136 @@ fn read_spec(description: &str, worker: bool) -> ToolSpec {
     )
 }
 
+static MAIN_SPECS: std::sync::OnceLock<Vec<ToolSpec>> = std::sync::OnceLock::new();
+static WORKER_SPECS: std::sync::OnceLock<Vec<ToolSpec>> = std::sync::OnceLock::new();
+
 /// The main Session's tools.
 pub fn main_specs() -> Vec<ToolSpec> {
-    let ticket = json!({"ticket_id": {"type": "string"}});
-    vec![
-        read_spec("Read one page of a resource, such as the ticket list or a ticket. Follow next_offset, and next_resource where a page names one.", false),
-        spec(
-            "orchestrator_route",
-            "Route candidates, one item each by the card's trigger_id, in one call: accept an explicit request as a new ticket, attach follow-on work to an existing ticket (with an immediate acknowledgement), sidecar a read-only progress, summary or comparison question on a ticket without waking its worker, stop a ticket on a person's stop message, or ignore a candidate that needs no ticket or stop, as dispatch says. Items run in order and each is answered on its own; a refused item leaves the others. An inferred candidate may be ignored here; accepting one goes through orchestrator_eval_decide.",
-            json!({"decisions": {"type": "array", "minItems": 1, "maxItems": 20, "items": {"type": "object", "additionalProperties": false, "required": ["kind", "trigger_id"], "properties": {
-                "kind": {"type": "string", "enum": ["accept", "attach", "sidecar", "ignore", "stop"]},
-                "trigger_id": {"type": "string", "description": "The candidate card's trigger_id; deciding it decides its batch."},
-                "ticket_id": {"type": ["string", "null"], "description": "attach, sidecar and stop: the ticket."},
-                "title": {"type": ["string", "null"], "description": "accept: a short label of at most 200 characters describing the original request; no added requirements or implementation advice."},
-                "worktree_name": {"type": ["string", "null"], "description": "accept: a meaningful short English ticket name, e.g. fix-plan-color. Translate other languages into English; 1–4 lowercase words in kebab-case, at most 32 characters."},
-                "acknowledgement": {"type": ["string", "null"], "description": format!("accept (required) and attach (recommended): one brief sentence of at most {IM_WORDS} words naming the concrete change and intended result, written in the language the person wrote in: a Chinese message gets a Chinese acknowledgement, never English. It is posted at once as a reply to the original message, so do not quote it.")},
-                "note": {"type": ["string", "null"], "description": format!("accept, attach and sidecar: optional routing background or explicit human constraint, at most {NOTE_WORDS} words. Never implementation instructions.")},
-                "reason": {"type": ["string", "null"], "description": "ignore and stop: why, at most 500 characters; an ignore needs it."},
-                "answer": {"type": ["string", "null"], "description": "ignore only: for ordinary conversation that needs no ticket, the natural answer to send at once, in the language the person wrote in. Avoids another turn."},
-            }}}}),
-            &["decisions"],
-        ),
-        spec("orchestrator_ticket_retry", "Start a new assignment on an explicit human request to retry a ticket whose worker reported failed or blocked, or whose input was not delivered; the stalled one ends.", ticket.clone(), &["ticket_id"]),
-        spec("orchestrator_ticket_request_status", "Ask the worker of an idle ticket, one whose turn ended without a report, for a status report; for other tickets it sends nothing and returns the card.", ticket.clone(), &["ticket_id"]),
-        spec(
-            "orchestrator_ticket_note",
-            "Tell a ticket's worker a fact from other work, such as what another ticket found; it grants no authority.",
-            json!({"ticket_id": {"type": "string"}, "text": {"type": "string", "description": format!("At most {IM_WORDS} words.")}}),
-            &["ticket_id", "text"],
-        ),
-        spec("orchestrator_trigger_requeue", "Queue a trigger for a fresh assessment; a follow-up that reached a ticket comes back only from its worker.", json!({"trigger_id": {"type": "string"}}), &["trigger_id"]),
-        spec("orchestrator_eval", "Load a proactive candidate's window and its thread's tickets.", json!({"trigger_id": {"type": "string"}}), &["trigger_id"]),
-        spec(
-            "orchestrator_eval_read",
-            "Read more of a candidate's context, always with its trigger_id: a message whole by message_id, or a page of its thread by cursor.",
-            json!({"trigger_id": {"type": "string", "description": "The candidate's trigger_id."}, "resource": {"type": "string", "enum": ["message", "thread"]},
-                "message_id": {"type": "string", "description": "Only for message: omit for the trigger, or the id of a window message."},
-                "cursor": {"type": "string", "description": "Only for thread: omit on the first page, then the next_cursor returned."},
-                "offset": {"type": "integer", "minimum": 0, "description": "Text pagination: copy next_offset; keep the other arguments unchanged."}}),
-            &["trigger_id", "resource"],
-        ),
-        spec(
-            "orchestrator_eval_decide",
-            "Record the decision of an assessment, as admission describes it, after orchestrator_eval with the same trigger_id.",
-            json!({"trigger_id": {"type": "string"}, "decision": {"type": "string", "enum": ["accept", "ignore", "unavailable"]},
-                "rule_assessments": {"type": "array", "description": "One per enabled rule.", "items": {"type": "object", "additionalProperties": false, "required": ["rule_id", "matched", "reason"],
-                    "properties": {"rule_id": {"type": "string"}, "matched": {"type": "boolean"}, "reason": {"type": "string"}}}},
-                "direction": {"type": "object", "description": "Required for every decision.", "additionalProperties": false, "required": ["implementation_requested", "target_basis", "requires_design_decision", "evidence"],
-                    "properties": {"implementation_requested": {"type": "boolean"}, "target_basis": {"type": "string", "enum": ["specified", "existing-standard", "undetermined"]},
-                        "requires_design_decision": {"type": "boolean"}, "evidence": {"type": "string"}}},
-                "title": {"type": "string"}, "worktree_name": {"type": "string"}, "scope": {"type": "string"},
-                "intent_evidence": {"type": ["string", "null"], "description": "For acceptance: the quotes that establish the three facts."},
-                "acknowledgement": {"type": ["string", "null"], "description": "For acceptance: one sentence in the language the person wrote in; omit only when a matched rule asks for silence."},
-                "reason": {"type": "string"}}),
-            &["trigger_id", "decision", "rule_assessments", "direction", "title", "scope", "reason"],
-        ),
-        spec(
-            "orchestrator_reply",
-            "Send an answer to a human question, a ready result, or attention requiring human action, as the replies section says; the gate refuses anything else, such as progress.",
-            json!({"trigger_id": {"type": "string", "description": "The original human question, for an answer only."}, "ticket_id": {"type": "string"},
-                "purpose": {"type": "string", "enum": ["answer", "result", "attention"]},
-                "human_action": {"type": "string", "description": "Required for attention: the ticket's current attention question."}, "text": {"type": "string"}}),
-            &["purpose", "text"],
-        ),
-        spec(
-            "orchestrator_thread_unsubscribe",
-            "Drop every ticket subscription on a thread; a new positive decision can subscribe it again.",
-            json!({"thread": {"type": "string", "description": "Thread key, such as chat:web:main."}}),
-            &["thread"],
-        ),
-        spec(
-            "wechat_send_file",
-            "Send a local image, video, or other file to the bound WeChat user. Use an absolute path produced or verified during this conversation; an optional caption is sent first, and ticket_id records the delivery for that ticket's report so it is not sent twice. Requires an active binding.",
-            json!({"path": {"type": "string", "description": "Absolute local file path."}, "caption": {"type": "string"},
-                "ticket_id": {"type": "string", "description": "The ticket whose report this file delivers, when it delivers one."}}),
-            &["path"],
-        ),
-    ]
+    MAIN_SPECS
+        .get_or_init(|| {
+            let ticket = json!({"ticket_id": {"type": "string"}});
+            vec![
+                read_spec("Read one page of a resource, such as the ticket list or a ticket. Follow next_offset, and next_resource where a page names one.", false),
+                spec(
+                    "orchestrator_route",
+                    "Route candidates, one item each by the card's trigger_id, in one call: accept an explicit request as a new ticket, attach follow-on work to an existing ticket (with an immediate acknowledgement), sidecar a read-only progress, summary or comparison question on a ticket without waking its worker, stop a ticket on a person's stop message, or ignore a candidate that needs no ticket or stop, as dispatch says. Items run in order and each is answered on its own; a refused item leaves the others. An inferred candidate may be ignored here; accepting one goes through orchestrator_eval_decide.",
+                    json!({"decisions": {"type": "array", "minItems": 1, "maxItems": 20, "items": {"type": "object", "additionalProperties": false, "required": ["kind", "trigger_id"], "properties": {
+                        "kind": {"type": "string", "enum": ["accept", "attach", "sidecar", "ignore", "stop"]},
+                        "trigger_id": {"type": "string", "description": "The candidate card's trigger_id; deciding it decides its batch."},
+                        "ticket_id": {"type": ["string", "null"], "description": "attach, sidecar and stop: the ticket."},
+                        "title": {"type": ["string", "null"], "description": "accept: a short label of at most 200 characters describing the original request; no added requirements or implementation advice."},
+                        "worktree_name": {"type": ["string", "null"], "description": "accept: a meaningful short English ticket name, e.g. fix-plan-color. Translate other languages into English; 1–4 lowercase words in kebab-case (first word letters only, no digits in the first word), at most 32 characters."},
+                        "acknowledgement": {"type": ["string", "null"], "description": format!("accept (required) and attach (recommended): one brief sentence of at most {IM_WORDS} words naming the concrete change and intended result, written in the language the person wrote in: a Chinese message gets a Chinese acknowledgement, never English. It is posted at once as a reply to the original message, so do not quote it.")},
+                        "note": {"type": ["string", "null"], "description": format!("accept, attach and sidecar: optional routing background or explicit human constraint, at most {NOTE_WORDS} words. Never implementation instructions.")},
+                        "reason": {"type": ["string", "null"], "description": "ignore and stop: why, at most 500 characters; an ignore needs it."},
+                        "answer": {"type": ["string", "null"], "description": "ignore only: for ordinary conversation that needs no ticket, the natural answer to send at once, in the language the person wrote in. Avoids another turn."},
+                    }}}}),
+                    &["decisions"],
+                ),
+                spec("orchestrator_ticket_retry", "Start a new assignment on an explicit human request to retry a ticket whose worker reported failed or blocked, or whose input was not delivered; the stalled one ends.", ticket.clone(), &["ticket_id"]),
+                spec("orchestrator_ticket_request_status", "Ask the worker of an idle ticket, one whose turn ended without a report, for a status report; for other tickets it sends nothing and returns the card.", ticket.clone(), &["ticket_id"]),
+                spec(
+                    "orchestrator_ticket_note",
+                    "Tell a ticket's worker a fact from other work, such as what another ticket found; it grants no authority.",
+                    json!({"ticket_id": {"type": "string"}, "text": {"type": "string", "description": format!("At most {IM_WORDS} words.")}}),
+                    &["ticket_id", "text"],
+                ),
+                spec("orchestrator_trigger_requeue", "Queue a trigger for a fresh assessment; a follow-up that reached a ticket comes back only from its worker.", json!({"trigger_id": {"type": "string"}}), &["trigger_id"]),
+                spec("orchestrator_eval", "Load a proactive candidate's window and its thread's tickets.", json!({"trigger_id": {"type": "string"}}), &["trigger_id"]),
+                spec(
+                    "orchestrator_eval_read",
+                    "Read more of a candidate's context, always with its trigger_id: a message whole by message_id, or a page of its thread by cursor.",
+                    json!({"trigger_id": {"type": "string", "description": "The candidate's trigger_id."}, "resource": {"type": "string", "enum": ["message", "thread"]},
+                        "message_id": {"type": "string", "description": "Only for message: omit for the trigger, or the id of a window message."},
+                        "cursor": {"type": "string", "description": "Only for thread: omit on the first page, then the next_cursor returned."},
+                        "offset": {"type": "integer", "minimum": 0, "description": "Text pagination: copy next_offset; keep the other arguments unchanged."}}),
+                    &["trigger_id", "resource"],
+                ),
+                spec(
+                    "orchestrator_eval_decide",
+                    "Record the decision of an assessment, as admission describes it, after orchestrator_eval with the same trigger_id.",
+                    json!({"trigger_id": {"type": "string"}, "decision": {"type": "string", "enum": ["accept", "ignore", "unavailable"]},
+                        "rule_assessments": {"type": "array", "description": "One per enabled rule.", "items": {"type": "object", "additionalProperties": false, "required": ["rule_id", "matched", "reason"],
+                            "properties": {"rule_id": {"type": "string"}, "matched": {"type": "boolean"}, "reason": {"type": "string"}}}},
+                        "direction": {"type": "object", "description": "Required for every decision.", "additionalProperties": false, "required": ["implementation_requested", "target_basis", "requires_design_decision", "evidence"],
+                            "properties": {"implementation_requested": {"type": "boolean"}, "target_basis": {"type": "string", "enum": ["specified", "existing-standard", "undetermined"]},
+                                "requires_design_decision": {"type": "boolean"}, "evidence": {"type": "string"}}},
+                        "title": {"type": "string"}, "worktree_name": {"type": "string"}, "scope": {"type": "string"},
+                        "intent_evidence": {"type": ["string", "null"], "description": "For acceptance: the quotes that establish the three facts."},
+                        "acknowledgement": {"type": ["string", "null"], "description": "For acceptance: one sentence in the language the person wrote in; omit only when a matched rule asks for silence."},
+                        "reason": {"type": "string"}}),
+                    &["trigger_id", "decision", "rule_assessments", "direction", "title", "scope", "reason"],
+                ),
+                spec(
+                    "orchestrator_reply",
+                    "Send an answer to a human question, a ready result, or attention requiring human action, as the replies section says; the gate refuses anything else, such as progress.",
+                    json!({"trigger_id": {"type": ["string", "null"], "description": "The original human question, for an answer only."}, "ticket_id": {"type": ["string", "null"]},
+                        "purpose": {"type": "string", "enum": ["answer", "result", "attention"]},
+                        "human_action": {"type": ["string", "null"], "description": "Required for attention: the ticket's current attention question."}, "text": {"type": "string"}}),
+                    &["purpose", "text"],
+                ),
+                spec(
+                    "orchestrator_thread_unsubscribe",
+                    "Drop every ticket subscription on a thread; a new positive decision can subscribe it again.",
+                    json!({"thread": {"type": "string", "description": "Thread key, such as chat:web:main."}}),
+                    &["thread"],
+                ),
+                spec(
+                    "wechat_send_file",
+                    "Send a local image, video, or other file to the bound WeChat user. Use an absolute path produced or verified during this conversation; an optional caption is sent first, and ticket_id records the delivery for that ticket's report so it is not sent twice. Requires an active binding.",
+                    json!({"path": {"type": "string", "description": "Absolute local file path."}, "caption": {"type": "string"},
+                        "ticket_id": {"type": "string", "description": "The ticket whose report this file delivers, when it delivers one."}}),
+                    &["path"],
+                ),
+            ]
+        })
+        .clone()
 }
 
 /// A worker Session's tools.
 pub fn worker_specs() -> Vec<ToolSpec> {
-    vec![
-        read_spec("Read one page of a resource of this ticket. Follow next_offset, and next_resource where a page names one.", true),
-        spec(
-            "orchestrator_ack",
-            "Acknowledge one original human request before substantial work, as the replies section says; it posts as a reply to that message.",
-            json!({"trigger_id": {"type": "string"}, "text": {"type": "string", "description": format!("At most {IM_WORDS} words; Markdown is supported.")}}),
-            &["trigger_id", "text"],
-        ),
-        spec(
-            "orchestrator_thread_unrelated",
-            "Stop following an attached thread that is not about this ticket, as the work section says; its own thread cannot be dropped.",
-            json!({"thread": {"type": "string", "description": "The thread key, which trigger/<id> of one of its messages shows as thread."}, "reason": {"type": "string", "description": "One sentence on why the thread is not about this ticket."}}),
-            &["thread", "reason"],
-        ),
-        spec(
-            "orchestrator_thread_follow",
-            "Follow a related thread for context only.",
-            json!({"thread": {"type": "string", "description": "Thread key, <source>:<id>."}, "reason": {"type": "string", "description": "How it relates, in one sentence."}}),
-            &["thread", "reason"],
-        ),
-        spec(
-            "orchestrator_trigger_handback",
-            "Hand back a message that asks for work beyond this ticket or for another one, for a fresh assessment; once per message. queued is false while another ticket still decides it, and for a message that was never this ticket's to decide.",
-            json!({"trigger_id": {"type": "string"}, "reason": {"type": "string", "description": "One sentence on what it asks for beyond this ticket."}}),
-            &["trigger_id", "reason"],
-        ),
-        spec(
-            "orchestrator_report",
-            "Report progress, ready, blocked, failed or dropped, as the work and handoff sections say.",
-            json!({"state": {"type": "string", "enum": ["progress", "ready", "blocked", "failed", "dropped"]}, "summary": {"type": "string"},
-                "human_action": {"type": ["string", "null"], "description": "One concrete question for a person, also with state=progress; omit to keep the pending one, null to clear it."},
-                "question_for_trigger_id": {"type": "string", "description": "With human_action: the human message that raised the question, which is asked where that person wrote."},
-                "reply_to_trigger_id": {"type": "string", "description": "The human message this report answers, including a no-work acknowledgement; never for routine progress."},
-                "direct_reply": {"type": "string", "description": format!("Optional reply of at most {IM_WORDS} words sent at once to the person's conversation: valid when answering reply_to_trigger_id, or on state=ready when no file needs sending.")},
-                "topic": {"type": "string", "description": format!("What this ticket is about, in one or two sentences of at most {TOPIC_CHARS} characters: the subject, the files or area it touches and where it stands. Send it with the first report and whenever it changes.")}}),
-            &["state", "summary"],
-        ),
-    ]
+    WORKER_SPECS
+        .get_or_init(|| {
+            vec![
+                read_spec("Read one page of a resource of this ticket. Follow next_offset, and next_resource where a page names one.", true),
+                spec(
+                    "orchestrator_ack",
+                    "Acknowledge one original human request before substantial work, as the replies section says; it posts as a reply to that message.",
+                    json!({"trigger_id": {"type": "string"}, "text": {"type": "string", "description": format!("At most {IM_WORDS} words; Markdown is supported.")}}),
+                    &["trigger_id", "text"],
+                ),
+                spec(
+                    "orchestrator_thread_unrelated",
+                    "Stop following an attached thread that is not about this ticket, as the work section says; its own thread cannot be dropped.",
+                    json!({"thread": {"type": "string", "description": "The thread key, which trigger/<id> of one of its messages shows as thread."}, "reason": {"type": "string", "description": "One sentence on why the thread is not about this ticket."}}),
+                    &["thread", "reason"],
+                ),
+                spec(
+                    "orchestrator_thread_follow",
+                    "Follow a related thread for context only.",
+                    json!({"thread": {"type": "string", "description": "Thread key, <source>:<id>."}, "reason": {"type": "string", "description": "How it relates, in one sentence."}}),
+                    &["thread", "reason"],
+                ),
+                spec(
+                    "orchestrator_trigger_handback",
+                    "Hand back a message that asks for work beyond this ticket or for another one, for a fresh assessment; once per message. queued is false while another ticket still decides it, and for a message that was never this ticket's to decide.",
+                    json!({"trigger_id": {"type": "string"}, "reason": {"type": "string", "description": "One sentence on what it asks for beyond this ticket."}}),
+                    &["trigger_id", "reason"],
+                ),
+                spec(
+                    "orchestrator_report",
+                    "Report progress, ready, blocked, failed or dropped, as the work and handoff sections say.",
+                    json!({"state": {"type": "string", "enum": ["progress", "ready", "blocked", "failed", "dropped"]}, "summary": {"type": "string"},
+                        "human_action": {"type": ["string", "null"], "description": "One concrete question for a person, also with state=progress; omit to keep the pending one, null to clear it."},
+                        "question_for_trigger_id": {"type": ["string", "null"], "description": "With human_action: the human message that raised the question, which is asked where that person wrote."},
+                        "reply_to_trigger_id": {"type": ["string", "null"], "description": "The human message this report answers, including a no-work acknowledgement; never for routine progress."},
+                        "direct_reply": {"type": ["string", "null"], "description": format!("Default reply of at most {IM_WORDS} words (Chinese counts by character) in the person's language, sent directly to their conversation: pass this on state=ready and whenever answering reply_to_trigger_id (including no-work follow-ups), unless a local file must be delivered over a WeChat conversation (thread starts with chat:wechat:).")},
+                        "topic": {"type": ["string", "null"], "description": format!("What this ticket is about, in one or two sentences of at most {TOPIC_CHARS} characters: the subject, the files or area it touches and where it stands. Send it with the first report and whenever it changes.")}}),
+                    &["state", "summary"],
+                ),
+            ]
+        })
+        .clone()
 }
 
 fn user(error: UserError) -> String {
@@ -522,7 +540,7 @@ impl App {
                     text: text.to_string(),
                 };
                 let reply = self.engine.reply(request).map_err(user)?;
-                self.outbox.sent().await;
+                self.outbox.wait_for(&reply.id).await;
                 Ok(json!({"status": self.store.reply_status(&reply.id).unwrap_or(reply.status)}))
             }
             "orchestrator_thread_unsubscribe" => {
@@ -573,7 +591,7 @@ impl App {
                     })
                     .map_err(user)?;
                 if reply.status != ReplyStatus::Sent {
-                    self.outbox.sent().await;
+                    self.outbox.wait_for(&reply.id).await;
                 }
                 Ok(json!({"trigger_id": trigger_id, "acknowledgement": self.store.reply_status(&reply.id).unwrap_or(reply.status), "reused": reply.reused}))
             }
@@ -618,9 +636,7 @@ impl App {
     }
 
     async fn worker_report(self: &Arc<Self>, ticket_id: &str, args: Args) -> Result<Value, String> {
-        if !self.store_ticket(ticket_id).is_some_and(|ticket| ticket.live()) {
-            return Err("Ticket ended; do not resume it".into());
-        }
+        let ticket = self.store_ticket(ticket_id).filter(|ticket| ticket.live()).ok_or("Ticket ended; do not resume it")?;
         let state = match args.required("state")? {
             "progress" => ReportState::Progress,
             "ready" => ReportState::Ready,
@@ -635,12 +651,10 @@ impl App {
             Some(Value::String(text)) if !text.trim().is_empty() && text.trim().chars().count() <= 1000 => Question::Ask(text.trim().to_string()),
             Some(_) => return Err("human_action is one concrete question of at most 1000 characters, or null to clear the pending one".into()),
         };
-        let direct = match args.text("direct_reply") {
-            Some(text) => Some(acknowledgement(text)?.to_string()),
-            None => None,
-        };
-        if let (Some(text), Some(answered)) = (&direct, args.text("reply_to_trigger_id")) {
-            if let Some(problem) = self.wrong_language(answered, "direct_reply", text) {
+        let direct = args.text("direct_reply").map(direct_reply_text).transpose()?;
+        if let Some(text) = &direct {
+            let target_trigger = args.text("reply_to_trigger_id").or((state == ReportState::Ready).then_some(ticket.origin.trigger_id.as_str()));
+            if let Some(problem) = target_trigger.and_then(|trigger_id| self.wrong_language(trigger_id, "direct_reply", text)) {
                 return Err(problem);
             }
         }
@@ -654,37 +668,37 @@ impl App {
             topic: args.text("topic").map(|topic| clip(topic.trim(), TOPIC_CHARS)),
         };
         // The report, and either the direct reply or the relay to the main Session, are recorded together.
-        let (result, direct_sent) = self
+        let (result, direct_reply_id) = self
             .store
             .atomic(|| {
                 let updated = self.engine.report(ticket_id, report.clone())?;
-                let mut direct_sent = false;
+                let mut direct_reply_id: Option<String> = None;
                 if let Some(text) = direct.as_ref().filter(|_| updated.attention.is_none()) {
                     if let Some(answered) = &report.answers {
-                        self.engine.reply(ReplyRequest {
+                        let reply = self.engine.reply(ReplyRequest {
                             purpose: Purpose::Answer,
                             ticket_id: Some(ticket_id.to_string()),
                             trigger_id: Some(answered.clone()),
                             question: None,
                             text: text.clone(),
                         })?;
-                        direct_sent = true;
+                        direct_reply_id = Some(reply.id);
                     } else if state == ReportState::Ready && !updated.channels.is_empty() {
-                        self.engine.reply(ReplyRequest {
+                        let reply = self.engine.reply(ReplyRequest {
                             purpose: Purpose::Result,
                             ticket_id: Some(ticket_id.to_string()),
                             trigger_id: None,
                             question: None,
                             text: text.clone(),
                         })?;
-                        direct_sent = true;
+                        direct_reply_id = Some(reply.id);
                     }
                 }
-                if direct_sent {
+                if let Some(id) = direct_reply_id {
                     self.notify(receipt_notice(
                         json!({"worker_direct_reply": {"ticket_id": ticket_id, "state": args.text("state"), "reply": direct, "note": "The person already has this reply; send nothing more for it."}}),
                     ));
-                    return Ok((json!({"reported": true, "notification": "direct_outbox"}), true));
+                    return Ok((json!({"reported": true, "notification": "direct_outbox"}), Some(id)));
                 }
                 let relay = report_relay(&updated, &report);
                 let mut result = json!({"reported": true, "notification": if relay.is_some() { "orchestrator" } else { "internal_only" }});
@@ -694,11 +708,11 @@ impl App {
                 if let Some(attention) = &updated.attention {
                     result["attention"] = serde_json::to_value(attention).unwrap_or_default();
                 }
-                Ok::<(Value, bool), UserError>((result, false))
+                Ok::<(Value, Option<String>), UserError>((result, None))
             })
             .map_err(user)?;
-        if direct_sent {
-            self.outbox.sent().await;
+        if let Some(id) = direct_reply_id {
+            self.outbox.wait_for(&id).await;
         }
         self.passes.pump();
         Ok(result)

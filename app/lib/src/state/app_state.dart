@@ -212,6 +212,15 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  Future<Worker?> _fetchSelectedWorker(ApiClient api, String ticketId) async {
+    try {
+      return await api.worker(ticketId);
+    } on ApiException catch (error) {
+      if (error.status == 404) return null;
+      rethrow;
+    }
+  }
+
   Future<void> _refresh() async {
     final api = client;
     if (api == null) return;
@@ -220,19 +229,18 @@ class AppState extends ChangeNotifier {
     try {
       final wantHealth = health == null || _ticks % 5 == 0;
       _ticks++;
-      final (fetched, raw) = await api.messages();
-      final fetchedWorkers = await api.workers();
-      final fetchedActivity = await api.activity();
-      final fetchedHealth = wantHealth ? await api.health() : null;
       final selected = selectedWorkerId;
-      Worker? fetchedDetail;
-      if (selected != null) {
-        try {
-          fetchedDetail = await api.worker(selected);
-        } on ApiException catch (error) {
-          if (error.status != 404) rethrow;
-        }
-      }
+      final messagesFuture = api.messages();
+      final workersFuture = api.workers();
+      final activityFuture = api.activity();
+      final healthFuture = wantHealth ? api.health() : Future<Health?>.value(null);
+      final detailFuture = selected != null ? _fetchSelectedWorker(api, selected) : Future<Worker?>.value(null);
+      await Future.wait<Object?>([messagesFuture, workersFuture, activityFuture, healthFuture, detailFuture]);
+      final (fetched, raw) = await messagesFuture;
+      final fetchedWorkers = await workersFuture;
+      final fetchedActivity = await activityFuture;
+      final fetchedHealth = await healthFuture;
+      final fetchedDetail = await detailFuture;
       if (epoch != _epoch) return;
       if (raw != _messagesRaw) {
         _messagesRaw = raw;

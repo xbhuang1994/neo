@@ -474,7 +474,7 @@ impl App {
         }
         let mut lingering = Vec::new();
         let mut nudged = false;
-        for ticket in self.store.tickets().into_iter().take(50) {
+        for ticket in self.store.recent_tickets(50) {
             let Some(missing) = self.missing_reply(&ticket, now) else { continue };
             let count = {
                 let mut memory = self.watchdog.memory();
@@ -548,13 +548,16 @@ impl App {
     }
 
     fn recent_transcript(&self, ticket_id: &str, count: usize) -> Vec<Value> {
-        let lines: Vec<Value> = self
-            .worker_transcript(ticket_id)
+        let (start_index, entries) = match self.session(&worker_session_id(ticket_id)) {
+            Some(loaded) => loaded.session.journal().entries_tail(count * 3),
+            None => (0, self.worker_transcript(ticket_id)),
+        };
+        let lines: Vec<Value> = entries
             .iter()
             .enumerate()
-            .filter_map(|(index, entry)| {
+            .filter_map(|(offset, entry)| {
                 let (role, text) = excerpt(entry);
-                (!text.is_empty()).then(|| json!({"index": index, "role": role, "at": entry.timestamp(), "text": text}))
+                (!text.is_empty()).then(|| json!({"index": start_index + offset, "role": role, "at": entry.timestamp(), "text": text}))
             })
             .collect();
         lines[lines.len().saturating_sub(count)..].to_vec()

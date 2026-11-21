@@ -32,7 +32,35 @@ pub struct Loaded {
 #[derive(Default)]
 pub struct SessionsState {
     loaded: Mutex<HashMap<String, Arc<Loaded>>>,
-    opening: tokio::sync::Mutex<()>,
+    opening: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl SessionsState {
+    fn opening_lock(&self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.opening
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+}
+
+struct CleanOpening<'a> {
+    state: &'a SessionsState,
+    id: &'a str,
+    lock: &'a Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Drop for CleanOpening<'_> {
+    fn drop(&mut self) {
+        let mut map = self.state.opening.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = map.get(self.id) {
+            if Arc::ptr_eq(entry, self.lock) && Arc::strong_count(self.lock) == 2 {
+                map.remove(self.id);
+            }
+        }
+    }
 }
 
 /// The id of a ticket's worker Session.
@@ -78,7 +106,7 @@ impl ToolHost for SessionTools {
         Box::pin(async move {
             let (Some(app), Some(ticket_id)) = (self.app.upgrade(), &self.ticket_id) else { return Guard::Allow };
             // A worker whose ticket ended does nothing more, whatever its model still tries.
-            if !app.store_ticket(ticket_id).is_some_and(|ticket| ticket.live()) {
+            if !app.ticket_is_live(ticket_id) {
                 return Guard::Block("Ticket ended; new work needs a new authorized ticket".into());
             }
             if tool == "Agent" || tool == "task" {
@@ -214,7 +242,9 @@ impl App {
         if let Some(loaded) = self.session(session_id) {
             return Ok(loaded);
         }
-        let _one = self.sessions.opening.lock().await;
+        let lock = self.sessions.opening_lock(session_id);
+        let _clean = CleanOpening { state: &self.sessions, id: session_id, lock: &lock };
+        let _one = lock.lock().await;
         if let Some(loaded) = self.session(session_id) {
             return Ok(loaded);
         }
@@ -307,7 +337,18 @@ impl App {
     /// Reopen the main Session from its transcript, so its system prompt is composed from the settings now.
     pub async fn reopen_orchestrator(self: &Arc<Self>) -> Result<(), String> {
         self.stop_session(&self.master_id).await;
-        self.ensure_orchestrator().await.map(|_| ())
+        let main = self.ensure_orchestrator().await?;
+        if !self.paused() {
+            let weak = self.weak.clone();
+            self.rt.spawn(async move {
+                if let Some(app) = weak.upgrade() {
+                    if !app.closing() && !app.paused() {
+                        let _ = main.session.warm().await;
+                    }
+                }
+            });
+        }
+        Ok(())
     }
 
     /// Apply the settings' model choices to the open Sessions on the kernel of their role, from their next turn.

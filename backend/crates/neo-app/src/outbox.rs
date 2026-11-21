@@ -41,13 +41,22 @@ impl Outbox {
     /// An Outbox that delivers through `channels`; nothing goes out while `paused` holds.
     pub fn new(store: Arc<Store>, effects: Arc<Effects>, channels: Arc<dyn Channels>, paused: Arc<dyn Fn() -> bool + Send + Sync>) -> Arc<Outbox> {
         let deliver_store = store.clone();
+        let wake_effects = Arc::downgrade(&effects);
         effects.handle(
             REPLY,
             Arc::new(move |_payload, id| {
-                let (store, channels) = (deliver_store.clone(), channels.clone());
-                Box::pin(async move { deliver(&store, channels.as_ref(), &id).await })
+                let (store, channels, effects) = (deliver_store.clone(), channels.clone(), wake_effects.clone());
+                Box::pin(async move {
+                    let result = deliver(&store, channels.as_ref(), &id).await;
+                    if result.is_ok() {
+                        if let Some(effects) = effects.upgrade() {
+                            effects.wake_kind(REPLY);
+                        }
+                    }
+                    result
+                })
             }),
-            Options { limit: Arc::new(move || if paused() { 0 } else { 1 }), retry: (5_000, 300_000), ..Options::default() },
+            Options { limit: Arc::new(move || if paused() { 0 } else { 4 }), retry: (5_000, 300_000), ..Options::default() },
         );
         Arc::new(Outbox { store, effects })
     }
@@ -55,6 +64,25 @@ impl Outbox {
     /// Resolves once every message that can go out now has.
     pub async fn sent(&self) {
         self.effects.idle(Some(REPLY)).await;
+    }
+
+    /// Resolves once message `id` is no longer pending, or no `reply` effect is running or able to start now.
+    pub async fn wait_for(&self, id: &str) {
+        loop {
+            let finished = self.effects.finished.notified();
+            tokio::pin!(finished);
+            // Register before looking, so an effect that ends in between is not missed.
+            finished.as_mut().enable();
+            if self.store.reply_status(id) != Some(ReplyStatus::Pending) {
+                return;
+            }
+            self.effects.dispatch();
+            let active = self.effects.running().iter().any(|(kind, _)| kind == REPLY);
+            if !active {
+                return;
+            }
+            finished.await;
+        }
     }
 }
 

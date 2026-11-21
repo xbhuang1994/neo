@@ -8,7 +8,7 @@ use crate::policy::{assessment_outcome, direction_allowed, Assessment};
 use crate::settings::CHAT_SOURCE;
 use crate::text::{checked_im_text, clip, word_count, IM_WORDS};
 use crate::tools::Args;
-use neo_core::model::{thread_key, DecisionKind, Strength, Trigger};
+use neo_core::model::{thread_key, DecisionKind, Strength, Ticket, Trigger};
 use neo_core::ports::{Candidate, OutcomeKind, Repositories};
 use neo_core::reasons::reason_text;
 use neo_kernel::session::{Mode, Presentation};
@@ -17,7 +17,12 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 /// How many tickets a chat candidate's card shows inline; older ones stay behind `orchestrator_read`.
-const CHAT_RELATED: usize = 8;
+const CHAT_RELATED: usize = 12;
+
+fn related_limit(tickets: &[Ticket]) -> usize {
+    let open_count = tickets.iter().filter(|ticket| ticket.ended.is_none()).count();
+    CHAT_RELATED.max(open_count).min(24)
+}
 /// Workers that handed one message back before no open ticket is taken to own it: it is new work.
 const MISS_LIMIT: usize = 3;
 const TRIGGER_CHARS: usize = 4000;
@@ -64,12 +69,13 @@ impl App {
             card["handed_back"] = handed_back.into();
         }
         let chat = primary.source == CHAT_SOURCE;
+        let limit = related_limit(&candidate.tickets);
         let related = if chat {
-            related_tickets(&candidate.tickets, CHAT_RELATED, |ticket| {
+            related_tickets(&candidate.tickets, limit, |ticket| {
                 routing_card(ticket, self.store.trigger(&ticket.origin.trigger_id).map(|trigger| trigger.text).as_deref())
             })
         } else {
-            related_tickets(&candidate.tickets, CHAT_RELATED, ticket_card)
+            related_tickets(&candidate.tickets, limit, ticket_card)
         };
         card.as_object_mut().expect("a card is an object").extend(related.as_object().cloned().unwrap_or_default());
         let delivered = self.store.disposition(&primary.id).map(|disposition| disposition.fanout).unwrap_or_default();
@@ -77,11 +83,11 @@ impl App {
             card["delivered_to"] = delivered.into();
         }
         card["next_action"] = if missed {
-            format!("{MISS_LIMIT} tickets handed this message back, so no ticket owns it: treat it as new work and route it with orchestrator_route kind=accept; do not attach it to another ticket. If it is ordinary conversation needing no ticket, use kind=ignore with answer set instead.")
+            format!("{MISS_LIMIT} handbacks: route with orchestrator_route kind=accept (never attach), or kind=ignore with answer if chat only.")
         } else if candidate.strength == Strength::Explicit {
-            "Route it with orchestrator_route as dispatch says: accept, attach, sidecar, stop or ignore. If ordinary conversation needs no ticket, use kind=ignore with answer set to a natural response in the language the person wrote in (a Chinese message gets a Chinese answer) and their tone; it is sent in the same call, without another turn.".to_string()
+            "Route via orchestrator_route (accept, attach, sidecar, stop, ignore); for plain chat, use ignore with answer in user's language.".to_string()
         } else {
-            "Ignore it with orchestrator_route if the card shows it touches no enabled rule; else assess it with orchestrator_eval, orchestrator_eval_read, then orchestrator_eval_decide.".to_string()
+            "Ignore with orchestrator_route if no rule applies; else run orchestrator_eval, orchestrator_eval_read, orchestrator_eval_decide.".to_string()
         }
         .into();
         card
@@ -167,7 +173,7 @@ impl App {
         if !others.is_empty() {
             fields.insert("batch".into(), others.into());
         }
-        fields.extend(related_tickets(&candidate.tickets, CHAT_RELATED, ticket_card).as_object().cloned().unwrap_or_default());
+        fields.extend(related_tickets(&candidate.tickets, related_limit(&candidate.tickets), ticket_card).as_object().cloned().unwrap_or_default());
         // The rules are in the main Session's Policy section, which names the version this Eval was built from.
         fields.insert("policy_version".into(), candidate.policy_version.clone().into());
         fields.insert(

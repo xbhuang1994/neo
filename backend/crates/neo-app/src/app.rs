@@ -92,6 +92,8 @@ pub struct App {
     /// Why each custom provider could not list its models the last time it was asked.
     pub(crate) provider_problems: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
     pub(crate) model_lists: std::sync::Mutex<std::collections::BTreeMap<crate::settings::Kernel, crate::views::ModelList>>,
+    pub(crate) live_tickets: std::sync::Mutex<std::collections::HashSet<String>>,
+    pub(crate) jobs_cache: std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Vec<crate::executor::WorkerJob>)>>,
 }
 
 struct ExecutorPort(Weak<App>);
@@ -158,6 +160,7 @@ impl App {
         let policy: Arc<dyn Policy> = Arc::new(SettingsPolicy::new((*current).clone(), sources.clone()));
         let rt = Handle::current();
         let wechat = machine.wechat.clone();
+        let live_tickets: std::collections::HashSet<String> = store.open_tickets().into_iter().map(|t| t.id).collect();
         Ok(Arc::new_cyclic(|weak: &Weak<App>| {
             let paused = {
                 let weak = weak.clone();
@@ -217,6 +220,8 @@ impl App {
                 logins: Default::default(),
                 provider_problems: Default::default(),
                 model_lists: Default::default(),
+                live_tickets: std::sync::Mutex::new(live_tickets),
+                jobs_cache: Default::default(),
             }
         }))
     }
@@ -304,7 +309,31 @@ impl App {
         self.effects.enqueue(effects::NOTICE, &notice.name, &json!({"value": notice.value}));
     }
 
+    pub(crate) fn ticket_is_live(&self, ticket_id: &str) -> bool {
+        self.live_tickets.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).contains(ticket_id)
+    }
+
     fn emitted(&self, event: &DomainEvent, at: &str) {
+        match event {
+            DomainEvent::TicketCreated { ticket_id, .. } | DomainEvent::TicketResumed { ticket_id, .. } => {
+                let (weak, ticket_id) = (self.weak.clone(), ticket_id.clone());
+                self.store.after_commit(move || {
+                    if let Some(app) = weak.upgrade() {
+                        app.live_tickets.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(ticket_id);
+                    }
+                });
+            }
+            DomainEvent::TicketEnded { ticket_id, .. } => {
+                let (weak, ticket_id) = (self.weak.clone(), ticket_id.clone());
+                self.store.after_commit(move || {
+                    if let Some(app) = weak.upgrade() {
+                        app.live_tickets.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&ticket_id);
+                        app.jobs_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&ticket_id);
+                    }
+                });
+            }
+            _ => {}
+        }
         if self.quiet.load(Ordering::SeqCst) > 0 {
             return;
         }
@@ -382,7 +411,17 @@ impl App {
             }
         }
         if self.kernels.unavailable(self.settings().kernel).is_none() {
-            self.ensure_orchestrator().await?;
+            let main = self.ensure_orchestrator().await?;
+            if !self.paused() {
+                let weak = self.weak.clone();
+                self.rt.spawn(async move {
+                    if let Some(app) = weak.upgrade() {
+                        if !app.closing() && !app.paused() {
+                            let _ = main.session.warm().await;
+                        }
+                    }
+                });
+            }
         }
         if self.closing() {
             return Ok(());

@@ -8,9 +8,13 @@ use neo_core::reasons::{reason_text, Reason};
 use neo_core::stage::{ticket_stage, TicketStage};
 use serde_json::{json, Map, Value};
 
+fn preview_chars(text: &str, limit: usize) -> String {
+    clip(&text.split_whitespace().collect::<Vec<_>>().join(" "), limit)
+}
+
 /// Collapses whitespace and cuts text for a preview.
 pub fn preview(text: &str) -> String {
-    clip(&text.split_whitespace().collect::<Vec<_>>().join(" "), 160)
+    preview_chars(text, 160)
 }
 
 fn object(value: Value) -> Map<String, Value> {
@@ -166,6 +170,8 @@ pub fn text_page(resource: &str, text: &str, offset: usize, limit: usize) -> Val
 /// The longest assignment or input text a message carries whole.
 pub const ASSIGNMENT_CHARS: usize = 1500;
 const TRIGGER_CHARS: usize = 600;
+/// The longest trigger text a worker message carries whole.
+pub const WORKER_TRIGGER_CHARS: usize = 4000;
 
 /// `text` whole, or its start with its length and where to read the rest.
 pub fn capped(text: &str, limit: usize, read: &str) -> Value {
@@ -176,19 +182,32 @@ pub fn capped(text: &str, limit: usize, read: &str) -> Value {
     }
 }
 
-/// A trigger as a worker or the main Session reads it.
-pub fn trigger_message(trigger: &Trigger, note: Option<&str>) -> Value {
+fn trigger_card_with_limit(trigger: &Trigger, note: Option<&str>, limit: usize) -> Map<String, Value> {
     let mut message = object(json!({"trigger_id": trigger.id, "from": trigger.actor.id, "thread": thread_key(&trigger.threads[0]), "at": trigger.at}));
-    extend(&mut message, capped(&trigger.text, TRIGGER_CHARS, &format!("trigger/{}", trigger.id)));
+    extend(&mut message, capped(&trigger.text, limit, &format!("trigger/{}", trigger.id)));
     if let Some(note) = note {
         message.insert("routing_note".into(), note.into());
+    }
+    message
+}
+
+/// A trigger as the main Session reads it.
+pub fn trigger_message(trigger: &Trigger, note: Option<&str>) -> Value {
+    trigger_card_with_limit(trigger, note, TRIGGER_CHARS).into()
+}
+
+/// A trigger as a worker Session reads it, carrying up to [`WORKER_TRIGGER_CHARS`] inline and whether it was already acknowledged.
+pub fn worker_trigger_message(trigger: &Trigger, note: Option<&str>, acknowledged: bool) -> Value {
+    let mut message = trigger_card_with_limit(trigger, note, WORKER_TRIGGER_CHARS);
+    if acknowledged {
+        message.insert("acknowledged".into(), true.into());
     }
     message.into()
 }
 
 /// A batch peer of a ticket's origin trigger, in a line.
 pub fn batch_line(trigger: &Trigger) -> Value {
-    json!({"trigger_id": trigger.id, "from": trigger.actor.id, "at": trigger.at, "preview": preview(&trigger.text), "read": format!("trigger/{}", trigger.id)})
+    json!({"trigger_id": trigger.id, "from": trigger.actor.id, "at": trigger.at, "preview": preview_chars(&trigger.text, 500), "read": format!("trigger/{}", trigger.id)})
 }
 
 /// The resource a long Input is read from.
@@ -196,7 +215,7 @@ pub fn input_resource(ticket_id: &str, input_id: &str) -> String {
     format!("ticket/{ticket_id}/input/{}", key(&[input_id]))
 }
 
-const RESUMED: &str = "This ticket ended earlier and the message that follows resumed it under the same mandate. First judge from the message and this ticket's topic alone whether it belongs here; if it does not, hand it back with orchestrator_trigger_handback at once, without inspecting the directory. If it asks for more within the original scope, inspect the directory and its history and continue; if it asks for work beyond that scope or for another ticket, hand it back with orchestrator_trigger_handback and report dropped, with a summary that only says it was handed back and no topic, never the subject of that message. No new work does not mean no reply: for thanks, acknowledgements, or other human follow-ups needing no work, report dropped with reply_to_trigger_id set to that message and a short natural response in summary, so the orchestrator can answer. Report ready when follow-up work is done. Do not repeat completed work.";
+const RESUMED: &str = "This ticket ended earlier and the message that follows resumed it under the same mandate. First judge from the message and this ticket's topic alone whether it belongs here; if it does not, hand it back with orchestrator_trigger_handback at once, without inspecting the directory. If it asks for more within the original scope, inspect the directory and its history and continue; if it asks for work beyond that scope or for another ticket, hand it back with orchestrator_trigger_handback and report dropped, with a summary that only says it was handed back and no topic, never the subject of that message. No new work does not mean no reply: for thanks, acknowledgements, or other human follow-ups needing no work, report dropped with reply_to_trigger_id set to that message and direct_reply set to a short natural response (at most 100 words in their language; Chinese counts by character) so it goes out directly. Report ready when follow-up work is done. Do not repeat completed work.";
 /// What a retried Assignment is told.
 pub const RETRIED: &str = "A person retried this ticket. Continue the assignment from the current state of the directory and its history.";
 

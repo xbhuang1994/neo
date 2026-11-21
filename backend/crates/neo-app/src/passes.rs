@@ -125,7 +125,6 @@ impl Passes {
         if self.stopped.load(Ordering::SeqCst) {
             return;
         }
-        self.effects.kick();
         // While processing is paused, the Engine only notes the pause on running Evals so they do not expire.
         let passed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.engine.evaluate_due()));
         match passed {

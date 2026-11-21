@@ -9,8 +9,9 @@ use crate::types::{uuid, Block, Message};
 use neo_core::time::now_iso;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -108,6 +109,10 @@ enum Mark {
 struct Inner {
     file: File,
     entries: Vec<Entry>,
+    /// Index into `entries` by entry id.
+    id_index: HashMap<String, usize>,
+    /// Index into `entries` by delivery request id.
+    request_index: HashMap<String, usize>,
     /// Entry ids the model has not been shown, in order, with whether each asks for a turn.
     pending: Vec<(String, bool)>,
     sessions: Vec<(String, String)>,
@@ -140,8 +145,19 @@ impl Journal {
         options.create_new(true).append(true);
         private(&mut options);
         let file = options.open(&path)?;
-        let journal =
-            Journal { path, inner: Mutex::new(Inner { file, entries: Vec::new(), pending: Vec::new(), sessions: Vec::new(), name: None, failure: None }) };
+        let journal = Journal {
+            path,
+            inner: Mutex::new(Inner {
+                file,
+                entries: Vec::new(),
+                id_index: HashMap::new(),
+                request_index: HashMap::new(),
+                pending: Vec::new(),
+                sessions: Vec::new(),
+                name: None,
+                failure: None,
+            }),
+        };
         journal.write(&Mark::Header { id, cwd: cwd.display().to_string(), timestamp: now_iso() });
         journal.flush()?;
         Ok(journal)
@@ -152,18 +168,26 @@ impl Journal {
         let mut inner = Inner {
             file: OpenOptions::new().append(true).open(path)?,
             entries: Vec::new(),
+            id_index: HashMap::new(),
+            request_index: HashMap::new(),
             pending: Vec::new(),
             sessions: Vec::new(),
             name: None,
             failure: None,
         };
         let mut header = false;
-        for line in BufReader::new(File::open(path)?).lines() {
+        let mut reader = File::open(path)?;
+        for line in BufReader::new(&reader).lines() {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
             if let Ok(entry) = serde_json::from_str::<Entry>(&line) {
+                let index = inner.entries.len();
+                inner.id_index.entry(entry.id().to_string()).or_insert(index);
+                if let Some(request_id) = entry.request_id() {
+                    inner.request_index.entry(request_id.to_string()).or_insert(index);
+                }
                 inner.entries.push(entry);
                 continue;
             }
@@ -187,9 +211,13 @@ impl Journal {
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{} is not a session transcript of this program", path.display())));
         }
         // A crash can leave the last line without its newline; the next append must start a new line.
-        let text = std::fs::read(path)?;
-        if text.last().is_some_and(|byte| *byte != b'\n') {
-            inner.file.write_all(b"\n")?;
+        if reader.metadata()?.len() > 0 {
+            reader.seek(SeekFrom::End(-1))?;
+            let mut last = [0u8; 1];
+            reader.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                inner.file.write_all(b"\n")?;
+            }
         }
         Ok(Journal { path: path.to_path_buf(), inner: Mutex::new(inner) })
     }
@@ -230,13 +258,28 @@ impl Journal {
     pub fn entries_from(&self, from: usize) -> Vec<Entry> {
         self.inner().entries.iter().skip(from).cloned().collect()
     }
+    /// The last `count` entries together with their starting index in the transcript.
+    pub fn entries_tail(&self, count: usize) -> (usize, Vec<Entry>) {
+        let inner = self.inner();
+        let start = inner.entries.len().saturating_sub(count);
+        (start, inner.entries[start..].to_vec())
+    }
+    /// Look up the request ids carried by the entries with these ids, in entry order.
+    pub fn request_ids_for(&self, entry_ids: &[String]) -> Vec<String> {
+        let inner = self.inner();
+        let mut indices: Vec<usize> = entry_ids.iter().filter_map(|id| inner.id_index.get(id).copied()).collect();
+        indices.sort_unstable();
+        indices.dedup();
+        indices.into_iter().filter_map(|index| inner.entries.get(index).and_then(|entry| entry.request_id()).map(str::to_string)).collect()
+    }
     /// Whether a delivery with this request id was appended.
     pub fn has_request(&self, request_id: &str) -> bool {
-        self.inner().entries.iter().any(|entry| entry.request_id() == Some(request_id))
+        self.inner().request_index.contains_key(request_id)
     }
     /// The entry of a delivery.
     pub fn request(&self, request_id: &str) -> Option<Entry> {
-        self.inner().entries.iter().find(|entry| entry.request_id() == Some(request_id)).cloned()
+        let inner = self.inner();
+        inner.request_index.get(request_id).and_then(|&index| inner.entries.get(index)).cloned()
     }
 
     /// Append what the application puts into the Session. With `pending`, the model is shown it: on a turn it asks
@@ -257,6 +300,11 @@ impl Journal {
             inner.pending.push((entry.id().to_string(), trigger));
             Self::write_line(&mut inner, &Mark::Pending { id: entry.id().to_string(), trigger });
         }
+        let index = inner.entries.len();
+        inner.id_index.entry(entry.id().to_string()).or_insert(index);
+        if let Some(request_id) = entry.request_id() {
+            inner.request_index.entry(request_id.to_string()).or_insert(index);
+        }
         inner.entries.push(entry.clone());
         entry
     }
@@ -266,6 +314,8 @@ impl Journal {
         let entry = Entry::Message { id: uuid(), timestamp: now_iso(), message };
         let mut inner = self.inner();
         Self::write_line(&mut inner, &entry);
+        let index = inner.entries.len();
+        inner.id_index.entry(entry.id().to_string()).or_insert(index);
         inner.entries.push(entry.clone());
         entry
     }
@@ -276,7 +326,9 @@ impl Journal {
         inner
             .pending
             .iter()
-            .filter_map(|(id, trigger)| inner.entries.iter().find(|entry| entry.id() == id).map(|entry| Pending { entry: entry.clone(), trigger: *trigger }))
+            .filter_map(|(id, trigger)| {
+                inner.id_index.get(id).and_then(|&index| inner.entries.get(index)).map(|entry| Pending { entry: entry.clone(), trigger: *trigger })
+            })
             .collect()
     }
     /// Whether an entry still waits to be shown to the model.
@@ -401,11 +453,19 @@ mod tests {
             (Some("c-2"), Some("/sessions/o.jsonl"), None)
         );
         assert!(journal.has_request("chat:1") && journal.has_request("r1") && !journal.has_request("missing"));
+        assert_eq!(journal.request("r1").unwrap().request_id(), Some("r1"));
+        assert!(journal.request("missing").is_none());
         assert_eq!(journal.pending().iter().map(|p| p.entry.request_id().unwrap().to_string()).collect::<Vec<_>>(), vec!["n1"]);
         assert_eq!(journal.chat().iter().map(|entry| entry.request_id().unwrap().to_string()).collect::<Vec<_>>(), vec!["chat:1"]);
         assert_eq!(journal.last_assistant_text().as_deref(), Some("On it"));
         assert_eq!(journal.last_stop_reason().as_deref(), Some("stop"));
         assert_eq!(journal.entries_from(3).len(), 1);
+        let (tail_start, tail) = journal.entries_tail(2);
+        assert_eq!(tail_start, 2);
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].request_id(), Some("n1"));
+        let all = journal.entries();
+        assert_eq!(journal.request_ids_for(&[all[2].id().to_string(), all[0].id().to_string(), all[3].id().to_string()]), vec!["chat:1", "n1"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
