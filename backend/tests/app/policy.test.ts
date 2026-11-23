@@ -1113,6 +1113,9 @@ describe("policy & settings fidelity edge cases", () => {
 
     // Non-Option fields reject null just like Rust serde.
     expect(() => parseSettings({ paused: null })).toThrow("Invalid settings");
+    expect(() => parseSettings({ recoveryMode: "yes" })).toThrow("Invalid settings");
+    expect(parseSettings({}).recoveryMode).toBe(true);
+    expect(parseSettings({ recoveryMode: false }).recoveryMode).toBe(false);
     expect(() => parseSettings({ policy: { sources: { chat: { bots: null } } } })).toThrow(
       "Invalid settings",
     );

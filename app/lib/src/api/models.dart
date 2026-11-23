@@ -284,6 +284,7 @@ class Rule {
 class GeneralSettings {
   GeneralSettings.fromJson(Map<String, dynamic> json)
     : paused = json['paused'] == true,
+      recoveryMode = json['recoveryMode'] != false,
       evalMode = _map(json['eval'])['mode'] as String? ?? 'observe',
       evalTimeoutSeconds = (_map(json['eval'])['timeoutSeconds'] as num?)?.toInt() ?? 120,
       maxWorkers = (_map(json['executor'])['maxWorkers'] as num?)?.toInt() ?? 3,
@@ -303,6 +304,7 @@ class GeneralSettings {
   }
 
   bool paused;
+  bool recoveryMode;
   String evalMode;
   int evalTimeoutSeconds;
   int maxWorkers;

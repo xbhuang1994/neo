@@ -132,6 +132,9 @@ abstract class Strings {
   String get general;
   String get pauseProcessing;
   String get pauseHint;
+  String get recoveryMode;
+  String get enableRecoveryMode;
+  String get recoveryModeHint;
   String get maxWorkers;
   String get workDirectory;
   String workDirectoryHint(String fallback);
@@ -429,6 +432,12 @@ class ZhStrings extends Strings {
   String get pauseProcessing => '暂停处理';
   @override
   String get pauseHint => '暂停后不评估、不启动任务、不发送回复；消息照常接收。';
+  @override
+  String get recoveryMode => '自动恢复';
+  @override
+  String get enableRecoveryMode => '开启恢复模式';
+  @override
+  String get recoveryModeHint => '开启后，独立守护进程在检测到 Neo 长时间不可用时会自动调用后端 Worker 修复并重启；关闭后不自动触发修复。';
   @override
   String get maxWorkers => '同时运行的 Worker';
   @override
@@ -795,6 +804,12 @@ class EnStrings extends Strings {
   String get pauseProcessing => 'Pause processing';
   @override
   String get pauseHint => 'While paused nothing is assessed, started or sent; messages are still received.';
+  @override
+  String get recoveryMode => 'Recovery mode';
+  @override
+  String get enableRecoveryMode => 'Enable recovery mode';
+  @override
+  String get recoveryModeHint => 'When enabled, the independent recovery daemon invokes the configured worker to repair and restart Neo after prolonged downtime; when off, automatic repair is skipped.';
   @override
   String get maxWorkers => 'Workers at once';
   @override

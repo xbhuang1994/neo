@@ -790,6 +790,21 @@ class _GeneralSettingsState extends LoadingState<GeneralSettingsSection, General
           ],
         ),
         Group(
+          title: strings.recoveryMode,
+          footer: strings.recoveryModeHint,
+          children: [
+            Field(
+              label: strings.enableRecoveryMode,
+              trailing: CupertinoSwitch(
+                key: const ValueKey('recovery-mode-switch'),
+                value: settings.recoveryMode,
+                // The recovery mode toggle applies at once, by itself.
+                onChanged: busy ? null : (enabled) => unawaited(run(() async => _take(await widget.api.saveGeneral({'recoveryMode': enabled})))),
+              ),
+            ),
+          ],
+        ),
+        Group(
           title: strings.workDirectory,
           footer: strings.blockedHint,
           children: [

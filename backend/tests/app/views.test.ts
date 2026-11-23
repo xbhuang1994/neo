@@ -291,9 +291,10 @@ describe("views", () => {
       let view = f.app.generalView() as Record<string, unknown>;
       expect([
         view.paused,
+        view.recoveryMode,
         (view.eval as Record<string, unknown>).mode,
         (view.executor as Record<string, unknown>).maxWorkers,
-      ]).toEqual([false, "observe", 3]);
+      ]).toEqual([false, true, "observe", 3]);
       expect((view.limits as Record<string, unknown>).maxWorkers).toEqual([1, 16]);
       expect((view.defaults as Record<string, unknown>).directory).toBe(f.dir.join("state/work"));
       const sources = (view.policy as Record<string, unknown>).sources as Record<
@@ -347,9 +348,15 @@ describe("views", () => {
       expect(await refused({ executor: { maxWorkers: 99 } })).toContain("1 to 16");
       expect((await refused({ kernel: "antigravity" })).startsWith("Unknown field kernel")).toBe(true);
       expect(await refused({ executor: { workers: 2 } })).toContain("unknown field");
-      expect(await refused({})).toBe("Send at least one of paused, eval, executor, policy");
+      expect(await refused({})).toBe("Send at least one of paused, recoveryMode, eval, executor, policy");
       expect(await refused("paused")).toBe("Expected a JSON object");
       expect(f.app.settings().executor.maxWorkers).toBe(5);
+
+      // Recovery mode toggles immediately without reopening the orchestrator and persists across restarts.
+      opened = f.kernels.opened.length;
+      expect(((await f.app.updateGeneral({ recoveryMode: false })) as Record<string, unknown>).recoveryMode).toBe(false);
+      expect(f.kernels.opened.length).toBe(opened);
+      expect(f.app.settings().recoveryMode).toBe(false);
 
       // The pause holds work, and lifting it lets it go on.
       opened = f.kernels.opened.length;
@@ -368,10 +375,11 @@ describe("views", () => {
       f = await f.restart();
       view = f.app.generalView() as Record<string, unknown>;
       expect([
+        view.recoveryMode,
         (view.executor as Record<string, unknown>).maxWorkers,
         (view.eval as Record<string, unknown>).mode,
         ((view.policy as Record<string, unknown>).rules as Record<string, unknown>[])[0].id,
-      ]).toEqual([5, "auto", "docs"]);
+      ]).toEqual([false, 5, "auto", "docs"]);
       await f.app.stop();
     } finally {
       await f.cleanup();

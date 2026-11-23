@@ -140,6 +140,8 @@ export type Models = Partial<Record<Kernel, RoleModels>>;
 export interface Settings {
   /** Processing is paused: nothing is assessed, launched or sent. */
   paused: boolean;
+  /** Whether the independent recovery daemon may automatically repair and restart Neo after prolonged downtime. */
+  recoveryMode: boolean;
   /** The agent runtime in use. */
   kernel: Kernel;
   /** What authorizes work. */
@@ -177,7 +179,7 @@ const ID_LIKE_RE = /^[A-Za-z0-9_-]+$/;
 const SOURCE_NAME_RE = /^[a-z][a-z0-9-]*$/;
 const COMMAND_NAME_RE = /^[A-Za-z0-9._-]+$/;
 
-const SETTINGS_KEYS = new Set<string>(["paused", "kernel", "policy", "eval", "executor", "models"]);
+const SETTINGS_KEYS = new Set<string>(["paused", "recoveryMode", "kernel", "policy", "eval", "executor", "models"]);
 const POLICY_KEYS = new Set<string>(["rules", "sources"]);
 const RULE_KEYS = new Set<string>(["id", "name", "enabled", "instruction"]);
 const SOURCE_POLICY_KEYS = new Set<string>(["allowed", "bots", "admission"]);
@@ -496,6 +498,7 @@ function deserializeSettings(value: unknown): Settings {
   rejectUnknownFields(obj, SETTINGS_KEYS);
   return {
     paused: obj.paused === undefined ? false : expectBoolean(obj.paused, "paused"),
+    recoveryMode: obj.recoveryMode === undefined ? true : expectBoolean(obj.recoveryMode, "recoveryMode"),
     kernel: obj.kernel === undefined ? DEFAULT_KERNEL : parseKernel(obj.kernel, "kernel"),
     policy: obj.policy === undefined ? defaultPolicyConfig() : parsePolicyConfig(obj.policy),
     eval: obj.eval === undefined ? defaultEvalConfig() : parseEvalConfig(obj.eval),
@@ -572,6 +575,7 @@ export function defaultRoleModels(): RoleModels {
 export function defaultSettings(): Settings {
   return {
     paused: false,
+    recoveryMode: true,
     kernel: DEFAULT_KERNEL,
     policy: defaultPolicyConfig(),
     eval: defaultEvalConfig(),
@@ -647,6 +651,7 @@ export function cloneSettings(settings: Settings): Settings {
   }
   return {
     paused: settings.paused,
+    recoveryMode: settings.recoveryMode,
     kernel: settings.kernel,
     policy: {
       rules: settings.policy.rules.map((rule) => ({

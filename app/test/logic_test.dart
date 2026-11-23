@@ -153,6 +153,7 @@ void main() {
     test('sends general settings back block by block', () {
       final settings = GeneralSettings.fromJson({
         'paused': true,
+        'recoveryMode': false,
         'eval': {'mode': 'auto', 'timeoutSeconds': 60},
         'executor': {'maxWorkers': 5, 'directory': '/work', 'prepare': 'git clone x', 'prepareShell': 'pwsh', 'blockedCommands': ['docker']},
         'policy': {
@@ -170,7 +171,8 @@ void main() {
         },
         'limits': {'maxWorkers': [1, 16]},
       });
-      expect((settings.paused, settings.evalMode, settings.maxWorkers, settings.maxWorkersRange, settings.evalTimeoutRange), (true, 'auto', 5, (1, 16), (30, 600)));
+      expect((settings.paused, settings.recoveryMode, settings.evalMode, settings.maxWorkers, settings.maxWorkersRange, settings.evalTimeoutRange), (true, false, 'auto', 5, (1, 16), (30, 600)));
+      expect(GeneralSettings.fromJson(const {}).recoveryMode, true);
       expect(settings.chatSenders, ['web:local', 'wechat:u1']);
       settings
         ..prepareShell = ' '

@@ -214,6 +214,7 @@ export interface ModelsView {
 /** Wire payload of `GET /api/settings/general` and `PUT /api/settings/general`. */
 export interface GeneralView {
   paused: boolean;
+  recoveryMode: boolean;
   eval: EvalConfig;
   executor: ExecutorConfig;
   policy: PolicyConfig;
@@ -901,6 +902,7 @@ export function generalView(app: AppContext): GeneralView {
   const settings = app.settings();
   return {
     paused: settings.paused,
+    recoveryMode: settings.recoveryMode,
     eval: settings.eval,
     executor: settings.executor,
     policy: settings.policy,
@@ -917,10 +919,10 @@ export function generalView(app: AppContext): GeneralView {
 
 /** Change some of the general settings: each block that is sent replaces that block whole, and the others stay. */
 export async function updateGeneral(app: AppContext, value: unknown): Promise<GeneralView> {
-  const fields = objectKeys(value, ["paused", "eval", "executor", "policy"]);
+  const fields = objectKeys(value, ["paused", "recoveryMode", "eval", "executor", "policy"]);
   const keys = Object.keys(fields);
   if (keys.length === 0) {
-    throw new Error("Send at least one of paused, eval, executor, policy");
+    throw new Error("Send at least one of paused, recoveryMode, eval, executor, policy");
   }
   const before = app.settings();
   const block = keys.slice().sort().join(",");

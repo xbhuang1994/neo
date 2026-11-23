@@ -41,6 +41,7 @@ Stored in the database; changed in the app or through the API. As JSON:
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `paused` | `false` | While true nothing is assessed, launched or sent; messages are still received |
+| `recoveryMode` | `true` | Whether the independent recovery daemon automatically runs the configured worker to repair and restart Neo after prolonged downtime |
 | `kernel` | `antigravity` | The execution kernel (`antigravity`) |
 | `models.antigravity.eval` | `null` | The main Session's model: `{provider, model}`, or `null` for Antigravity's default |
 | `models.antigravity.executor` | `null` | The workers' model, likewise |
@@ -81,8 +82,8 @@ JSON over HTTP, as [006 Deployment](006-deployment.md) says who may call. Errors
 | `POST /api/settings/accounts/login/input` | `{text}`: passes one line to the login, such as the code a page shows or the address the browser landed on (for a callback to the backend's own machine) |
 | `POST /api/settings/accounts/login/cancel` | Ends the login in progress |
 | `POST /api/settings/accounts/logout` | `{}` (or empty body): logs out by deleting the Antigravity CLI's login file |
-| `GET /api/settings/general` | `{paused, eval, executor, policy, defaults, limits}` |
-| `PUT /api/settings/general` | Any of `paused`, `eval`, `executor`, `policy`; each block sent replaces that block whole |
+| `GET /api/settings/general` | `{paused, recoveryMode, eval, executor, policy, defaults, limits}` |
+| `PUT /api/settings/general` | Any of `paused`, `recoveryMode`, `eval`, `executor`, `policy`; each block sent replaces that block whole |
 | `GET /api/wechat` | `{state, message, qrContent?, senderId?}`; `state` is `disconnected`, `waiting`, `scaned`, `verify`, `connected` or `error` |
 | `POST /api/wechat/connect` | Starts a login, or takes up the binding |
 | `POST /api/wechat/verify` | `{code}`: the verification code the phone shows |

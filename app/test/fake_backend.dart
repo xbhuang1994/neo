@@ -50,6 +50,7 @@ class FakeBackend {
   Map<String, dynamic> models = {'eval': null, 'executor': null};
   Map<String, dynamic> general = {
     'paused': false,
+    'recoveryMode': true,
     'eval': {'mode': 'observe', 'timeoutSeconds': 120},
     'executor': {'maxWorkers': 3, 'directory': '', 'prepare': '', 'blockedCommands': <String>[]},
     'policy': {

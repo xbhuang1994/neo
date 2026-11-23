@@ -472,6 +472,16 @@ void main() {
     await settle(tester);
     expect(find.text('已暂停'), findsWidgets);
 
+    // Recovery mode switch also applies immediately.
+    final recoverySwitch = find.byKey(const ValueKey('recovery-mode-switch'));
+    await show(tester, recoverySwitch);
+    await tester.tap(recoverySwitch);
+    await settle(tester);
+    expect(backend.general['recoveryMode'], false);
+    await tester.tap(recoverySwitch);
+    await settle(tester);
+    expect(backend.general['recoveryMode'], true);
+
     // Everything else is saved together.
     await show(tester, button('+').first);
     await tester.tap(button('+').first);
