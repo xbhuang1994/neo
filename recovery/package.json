@@ -1,0 +1,17 @@
+{
+  "name": "neo-recovery-daemon",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Independent watchdog and auto-recovery daemon for Neo, decoupled from Neo business logic.",
+  "scripts": {
+    "check": "bun check",
+    "start": "bun run src/main.ts start",
+    "doctor": "bun run src/main.ts doctor",
+    "test": "bun test ./tests/unit.test.ts ./tests/integration.test.ts",
+    "build": "bun build --compile --minify --bytecode src/main.ts --outfile dist/neo-recovery"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.5"
+  }
+}
