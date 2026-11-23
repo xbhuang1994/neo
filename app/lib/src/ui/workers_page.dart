@@ -1,8 +1,11 @@
 /// The tasks and their workers: a list, and one of them in detail.
 library;
 
+import 'dart:async';
+
 import 'package:cupertino_ui/cupertino_ui.dart';
 
+import '../api/client.dart';
 import '../api/models.dart';
 import '../l10n/strings.dart';
 import '../state/app_state.dart';
@@ -140,19 +143,74 @@ class WorkerList extends StatelessWidget {
 }
 
 /// One task: its facts, what needs a person, its background jobs, its latest report and its recent activity.
-class WorkerDetail extends StatelessWidget {
+class WorkerDetail extends StatefulWidget {
   const WorkerDetail({super.key, required this.worker});
 
   final Worker? worker;
 
   @override
+  State<WorkerDetail> createState() => _WorkerDetailState();
+}
+
+class _WorkerDetailState extends State<WorkerDetail> {
+  bool _stopping = false;
+  String? _error;
+
+  @override
+  void didUpdateWidget(WorkerDetail oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.worker?.ticketId != widget.worker?.ticketId) {
+      _stopping = false;
+      _error = null;
+    }
+  }
+
+  Future<void> _stop(Worker worker) async {
+    if (_stopping || !worker.active) return;
+    final state = AppScope.of(context);
+    final strings = Strings.read(context);
+    final confirmed = await showCupertinoDialog<bool>(
+      context: context,
+      builder: (context) {
+        final fonts = fallbackFonts(context);
+        return CupertinoAlertDialog(
+          title: Text(strings.stopWorkerConfirmTitle, style: fonts),
+          content: Text(strings.stopWorkerConfirmBody, style: fonts),
+          actions: [
+            CupertinoDialogAction(onPressed: () => Navigator.of(context).pop(false), child: Text(strings.cancel, style: fonts)),
+            CupertinoDialogAction(isDestructiveAction: true, onPressed: () => Navigator.of(context).pop(true), child: Text(strings.stopWorkerConfirm, style: fonts)),
+          ],
+        );
+      },
+    );
+    if (confirmed != true || !mounted) return;
+    setState(() {
+      _stopping = true;
+      _error = null;
+    });
+    try {
+      await state.stopWorker(worker.ticketId);
+    } on ApiException catch (error) {
+      if (mounted) {
+        setState(() => _error = error.unreachable ? strings.stopWorkerFailed : error.message);
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _stopping = false);
+      }
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final worker = this.worker;
+    final worker = widget.worker;
     if (worker == null) return const Center(child: CupertinoActivityIndicator(radius: 12));
+    final state = AppScope.of(context);
     final strings = Strings.read(context);
     final palette = Palette.of(context);
     final typo = Typo.of(context);
     final (status, color) = workerStatus(worker, strings, palette);
+    final online = state.link == Link.online;
     final attention = worker.deliveryError ?? worker.question;
     final facts = <(String, String)>[
       (strings.ticket, worker.ticketId),
@@ -180,10 +238,44 @@ class WorkerDetail extends StatelessWidget {
         child: ListView(
           padding: const EdgeInsets.all(grid * 2.5),
           children: [
-            Align(alignment: Alignment.centerLeft, child: Pill(status, color: color, dot: worker.tone == WorkerTone.working)),
+            Row(
+              children: [
+                Expanded(child: Align(alignment: Alignment.centerLeft, child: Pill(status, color: color, dot: worker.tone == WorkerTone.working))),
+                if (worker.active) ...[
+                  const SizedBox(width: grid),
+                  CupertinoButton(
+                    key: const ValueKey('stop-worker'),
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    minimumSize: const Size(0, 30),
+                    borderRadius: BorderRadius.circular(8),
+                    color: palette.red.withValues(alpha: 0.12),
+                    disabledColor: palette.fill,
+                    onPressed: online && !_stopping ? () => unawaited(_stop(worker)) : null,
+                    child: _stopping
+                        ? Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const CupertinoActivityIndicator(radius: 7),
+                              const SizedBox(width: 6),
+                              Text(strings.stoppingWorker, style: typo.footnote.copyWith(color: palette.red, fontWeight: FontWeight.w600)),
+                            ],
+                          )
+                        : Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(CupertinoIcons.stop_circle, size: 15, color: online ? palette.red : palette.tertiary),
+                              const SizedBox(width: 5),
+                              Text(strings.stopWorker, style: typo.footnote.copyWith(color: online ? palette.red : palette.tertiary, fontWeight: FontWeight.w600)),
+                            ],
+                          ),
+                  ),
+                ],
+              ],
+            ),
             const SizedBox(height: grid),
             Text(worker.title, style: typo.title.copyWith(fontSize: 20)),
             if (worker.digest != null) Padding(padding: const EdgeInsets.only(top: 4), child: Text(worker.digest!, style: typo.footnote)),
+            if (_error != null) Padding(padding: const EdgeInsets.only(top: grid), child: Notice(_error!)),
             const SizedBox(height: grid * 2),
             card(
               Column(

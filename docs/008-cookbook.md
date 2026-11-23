@@ -30,45 +30,35 @@ flutter analyze && flutter test        # host_io_test starts ../backend/target/d
 
 None of these call a model or WeChat. The application tests replace the runtime process with a scripted one: the Sessions, journals, effect queue, Engine and store are the real ones.
 
-### With the real runtimes
+### With the real runtime
 
-These start the real `claude`, `omp` and `hermes` programs against a model endpoint on a loopback port that the test scripts. They need the runtimes installed, no account and no network, and take a few minutes:
+The Antigravity CLI signs in to Google, so its opt-in tests run against real models: they need a signed-in `agy` (`NEO_AGY_BIN` when not on `PATH`) and the network (`NEO_AGY_MODEL` picks the model, by default `gemini-3.8-flash-low`). Both the protocol test and the product test use the pure-Rust `neo-agent agy-hook` relay:
 
 ```sh
 cd backend
-NEO_REAL_KERNELS=1 cargo test -p neo-kernel --test claude_real --test omp_real --test hermes_real -- --test-threads=1
-NEO_REAL_KERNELS=1 cargo test -p neo-agent --test real -- --test-threads=1
-```
-
-The first group exercises each protocol: a host tool, a refused built-in tool, resuming after a restart, a notice joining the next turn, a background job and its cancellation. The second drives the whole product as a process: a chat message over HTTP becomes a Ticket, a worker writes a file with its shell, and the result comes back. `NEO_CLAUDE_BIN`, `NEO_OMP_BIN` and `NEO_HERMES_BIN` name the programs when they are not on `PATH`.
-
-The Antigravity CLI signs in to Google, so its tests run against its real models: they need a signed-in `agy` and the network, and are opted into on their own (`NEO_AGY_MODEL` picks the model, by default `gemini-3.8-flash-low`). The protocol test also needs `python3`, which stands in for the hook relay; the product test uses `neo-agent agy-hook` itself:
-
-```sh
 NEO_REAL_ANTIGRAVITY=1 cargo test -p neo-kernel --test antigravity_real -- --test-threads=1
-NEO_REAL_ANTIGRAVITY=1 cargo test -p neo-agent --test real does_a_request_end_to_end_on_antigravity
+NEO_REAL_ANTIGRAVITY=1 cargo test -p neo-agent --test real -- --test-threads=1
 ```
 
 ### In a browser
 
 ```sh
 cargo build -p neo-agent -p neo-testkit      # in backend/
-packaging/e2e/run-web-e2e.sh                 # needs the web build, claude, and the playwright package with its Chromium
+packaging/e2e/run-web-e2e.sh                 # needs the web build and the playwright package with its Chromium
 ```
 
-It starts a scripted model, the backend with the real `claude` runtime and Chromium, sends a message in the page, waits for the answer and the task, opens the settings, and fails on any console error or any request that leaves the server. Screenshots go to `.artifacts/web-e2e`. With `NEO_E2E_PACKAGE=<unpacked server package>` it tests that package instead, with the runtime and web app it bundles.
+It starts the backend with the pure-Rust `fixture-agy` stand-in and Chromium, sends a message in the page, waits for the answer and the task, opens the settings, and fails on any console error or any request that leaves the server. Screenshots go to `.artifacts/web-e2e`. With `NEO_E2E_PACKAGE=<unpacked server package>` it tests that package instead, with the web app it bundles.
 
-## A scripted model
+## A stand-in runtime
 
-`neo-testkit` has an Anthropic Messages endpoint and an OpenAI chat-completions endpoint whose every answer a closure gives, as text or tool calls. `ticket_flow` is one such script: an orchestrator that accepts each request and sends each result, and a worker that writes a file and reports. `fixture-model anthropic|openai` runs it as a program and prints its address, for trying the product by hand:
+`neo-testkit` builds `fixture-agy`, a pure-Rust stand-in for `agy` that lists fixture models and drives Neo's orchestrator and worker MCP tools over the bridge folder:
 
 ```sh
-backend/target/debug/fixture-model anthropic &        # prints http://127.0.0.1:<port>
-ANTHROPIC_BASE_URL=http://127.0.0.1:<port> ANTHROPIC_API_KEY=x \
+NEO_AGY_BIN=backend/target/debug/fixture-agy \
   backend/target/debug/neo-agent serve --data-dir /tmp/neo-try --web-dir app/build/web
 ```
 
-A scripted endpoint shows that the product's own parts work together. It says nothing about a real model's judgement; do not claim it does.
+A stand-in runtime shows that the product's own parts work together. It says nothing about a real model's judgement; do not claim it does.
 
 ## What is not tested here
 

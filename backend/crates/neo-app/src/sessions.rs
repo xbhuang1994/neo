@@ -2,7 +2,7 @@
 
 use crate::app::App;
 use crate::effects::Failure;
-use crate::kernels::{overrides_subagent, SessionRole, SessionSpec, MAX_SUBAGENTS};
+use crate::kernels::{SessionRole, SessionSpec, MAX_SUBAGENTS};
 use crate::prompts;
 use crate::settings::{Kernel, RoleModel, Settings};
 use neo_core::ids::key;
@@ -83,7 +83,6 @@ pub struct ChatAttachment {
 struct SessionTools {
     app: Weak<App>,
     ticket_id: Option<String>,
-    cwd: PathBuf,
 }
 
 impl ToolHost for SessionTools {
@@ -109,13 +108,7 @@ impl ToolHost for SessionTools {
             if !app.ticket_is_live(ticket_id) {
                 return Guard::Block("Ticket ended; new work needs a new authorized ticket".into());
             }
-            if tool == "Agent" || tool == "task" {
-                if tool == "Agent" && overrides_subagent(&self.cwd) {
-                    return Guard::Block(format!(
-                        "A project agent definition named {} would replace the ticket subagent; subagents are unavailable for this ticket",
-                        crate::kernels::SUBAGENT
-                    ));
-                }
+            if tool == "task" {
                 if let Some(loaded) = app.session(&worker_session_id(ticket_id)) {
                     if loaded.session.driver().jobs().await.iter().filter(|job| job.kind == JobKind::Task).count() >= MAX_SUBAGENTS {
                         return Guard::Block(format!("At most {MAX_SUBAGENTS} subagents run at once; wait for one to finish"));
@@ -208,26 +201,19 @@ impl App {
         self.sessions.loaded.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(session_id).cloned()
     }
 
-    /// The kernel a Session of a role runs on: workers on theirs, everything else on the main Session's.
-    pub(crate) fn role_kernel(settings: &Settings, role: SessionRole) -> Kernel {
-        match role {
-            SessionRole::Worker => settings.worker_kernel(),
-            SessionRole::Orchestrator | SessionRole::Sidecar | SessionRole::Watchdog => settings.kernel,
-        }
+    /// The kernel a Session runs on.
+    pub(crate) fn role_kernel(settings: &Settings, _role: SessionRole) -> Kernel {
+        settings.kernel
     }
 
     fn role_model(settings: &Settings, role: SessionRole) -> Option<RoleModel> {
-        let kernel = Self::role_kernel(settings, role);
-        let models = settings.models_of(kernel);
-        let model = match role {
+        let models = settings.models_of(Self::role_kernel(settings, role));
+        match role {
             SessionRole::Worker => models.executor,
             SessionRole::Orchestrator => models.eval,
-            // One-off turns run on the main Session's kernel, with its model, else that kernel's workers' model.
+            // One-off turns run with the main Session's model, else the workers' model.
             SessionRole::Sidecar | SessionRole::Watchdog => models.eval.or(models.executor),
-        };
-        // A level saved before the kernel stopped taking one is not passed on.
-        let levels = crate::kernels::support(kernel).thinking_levels;
-        model.map(|model| RoleModel { thinking_level: model.thinking_level.filter(|_| !levels.is_empty()), ..model })
+        }
     }
 
     /// The open Session with this id, opening it on the current kernel from its transcript when it is not.
@@ -250,6 +236,11 @@ impl App {
         }
         if self.closing() {
             return Err("neo-agent is stopping".into());
+        }
+        if let Some(tid) = ticket_id {
+            if !self.ticket_is_live(tid) {
+                return Err("Ticket ended".into());
+            }
         }
         let settings = self.settings();
         let kernel = Self::role_kernel(&settings, role);
@@ -274,7 +265,7 @@ impl App {
             system_prompt: prompts::compose(if role == SessionRole::Worker { prompts::Role::Worker } else { prompts::Role::Orchestrator }, &settings),
             model: Self::role_model(&settings, role),
         };
-        let host = Arc::new(SessionTools { app: self.weak.clone(), ticket_id: ticket_id.map(str::to_string), cwd: cwd.to_path_buf() });
+        let host = Arc::new(SessionTools { app: self.weak.clone(), ticket_id: ticket_id.map(str::to_string) });
         let (reports, runtime) = tokio::sync::mpsc::unbounded_channel();
         let driver = self.kernels.open(kernel, &spec, host, reports)?;
         let session = Session::new(Arc::new(journal), driver, runtime);
@@ -311,7 +302,12 @@ impl App {
 
     /// Close a Session; its transcript stays, and it reopens from it.
     pub async fn stop_session(&self, session_id: &str) {
-        let loaded = self.sessions.loaded.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(session_id);
+        let loaded = {
+            let lock = self.sessions.opening_lock(session_id);
+            let _clean = CleanOpening { state: &self.sessions, id: session_id, lock: &lock };
+            let _one = lock.lock().await;
+            self.sessions.loaded.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(session_id)
+        };
         if let Some(loaded) = loaded {
             loaded.session.dispose().await;
         }
@@ -351,17 +347,13 @@ impl App {
         Ok(())
     }
 
-    /// Apply the settings' model choices to the open Sessions on the kernel of their role, from their next turn.
+    /// Apply the settings' model choices to open Sessions, from their next turn.
     pub async fn apply_models(&self) {
         let settings = self.settings();
         let all: Vec<Arc<Loaded>> = self.sessions.loaded.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).values().cloned().collect();
-        for loaded in all.into_iter().filter(|loaded| loaded.kernel == Self::role_kernel(&settings, loaded.role) && !loaded.session.is_disposed()) {
-            let Some(model) = Self::role_model(&settings, loaded.role) else { continue };
-            let name = match loaded.kernel {
-                Kernel::Claude | Kernel::Antigravity => model.model.clone(),
-                Kernel::Omp | Kernel::Hermes => format!("{}/{}", model.provider, model.model),
-            };
-            loaded.session.driver().set_model(Some(&name), model.thinking_level.as_deref()).await;
+        for loaded in all.into_iter().filter(|loaded| !loaded.session.is_disposed()) {
+            let model = Self::role_model(&settings, loaded.role);
+            loaded.session.driver().set_model(model.as_ref().map(|model| model.model.as_str()), None).await;
         }
     }
 

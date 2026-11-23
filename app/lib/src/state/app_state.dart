@@ -298,6 +298,21 @@ class AppState extends ChangeNotifier {
     await refresh();
   }
 
+  /// Stop a task together with its worker, subagents and background jobs.
+  Future<Worker> stopWorker(String ticketId) async {
+    final api = client;
+    if (api == null) throw ApiException(0, 'offline');
+    final stopped = await api.stopWorker(ticketId);
+    if (selectedWorkerId == ticketId) {
+      detail = stopped;
+    }
+    workers = [for (final worker in workers) worker.ticketId == ticketId ? stopped : worker];
+    _workersRaw = workers.map((worker) => worker.raw).join('\n');
+    _notify();
+    await refresh();
+    return stopped;
+  }
+
   /// Show a worker's detail, or none.
   void selectWorker(String? ticketId) {
     if (selectedWorkerId == ticketId) return;

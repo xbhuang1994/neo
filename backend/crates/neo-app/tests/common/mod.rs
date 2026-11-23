@@ -95,11 +95,8 @@ pub struct Scripted {
     #[allow(clippy::type_complexity)]
     pub set_models: Mutex<Vec<(String, Option<String>, Option<String>)>>,
     pub closed: Mutex<Vec<String>>,
-    /// The custom providers the application handed over last.
-    pub providers: Mutex<Vec<neo_app::providers::ResolvedProvider>>,
-    /// What an import from Oh My Pi finds.
-    #[allow(clippy::type_complexity)]
-    pub importable: Mutex<Vec<(neo_app::providers::Provider, Option<String>)>>,
+    /// When set, `Driver::cancel` returns false (simulating Antigravity, which cannot cancel one job from outside).
+    pub refuse_cancel: AtomicBool,
 }
 
 struct ScriptedDriver {
@@ -141,6 +138,9 @@ impl Driver for ScriptedDriver {
     }
     fn cancel<'a>(&'a self, id: &'a str) -> BoxFut<'a, bool> {
         Box::pin(async move {
+            if self.kernels.refuse_cancel.load(Ordering::SeqCst) {
+                return false;
+            }
             let mut jobs = self.jobs.lock().unwrap();
             let before = jobs.len();
             jobs.retain(|job| job.id != id);
@@ -256,12 +256,6 @@ impl Kernels for ScriptedKernels {
             *self.0.unavailable.lock().unwrap() = None;
             Ok(std::path::PathBuf::from("/installed").join(kernel.as_str()))
         })
-    }
-    fn set_providers(&self, providers: Vec<neo_app::providers::ResolvedProvider>) {
-        *self.0.providers.lock().unwrap() = providers;
-    }
-    fn imported_providers(&self) -> Vec<(neo_app::providers::Provider, Option<String>)> {
-        self.0.importable.lock().unwrap().clone()
     }
 }
 

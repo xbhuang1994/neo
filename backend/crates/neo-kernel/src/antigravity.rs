@@ -59,11 +59,11 @@ pub const TOOL_KINDS: &[&str] = &["read", "bash", "edit", "write", "task", "web"
 /// The runtime's tools for each kind.
 fn runtime_tools(kind: &str) -> &'static [&'static str] {
     match kind {
-        "read" => &["view_file", "list_dir", "grep_search", "find_by_name", "read_file", "view_file_outline", "view_code_item"],
+        "read" => &["view_file", "list_dir", "grep_search", "find_by_name"],
         "bash" => &["run_command", "command_status", "send_command_input", "manage_task", "wait", "schedule"],
         "web" => &["read_url_content", "search_web"],
-        "edit" => &["replace_file_content", "multi_replace_file_content", "edit_file", "delete_file", "move_file"],
-        "write" => &["write_to_file", "write_file"],
+        "edit" => &["replace_file_content", "multi_replace_file_content"],
+        "write" => &["write_to_file"],
         "task" => &["invoke_subagent", "manage_subagents", "define_subagent", "send_message", "run_workflow"],
         _ => &[],
     }
@@ -93,8 +93,6 @@ pub struct AntigravityOptions {
     /// conversation's workspace folders from when it began, and its subagents load hooks from those, so a continued
     /// conversation needs its bridge where it was. Without one, each process gets a folder of its own.
     pub bridge_id: Option<String>,
-    /// Whether to block inheriting global customizations (skills, rules, plugins, subagents) in addition to MCP servers.
-    pub isolate_customizations: bool,
 }
 
 /// The folder beside `cwd` that carries a Session's agent and plugin. Its path extends `cwd`'s, so it sorts after it.
@@ -126,9 +124,8 @@ pub fn agent_file(options: &AntigravityOptions) -> String {
             }
         }
     }
-    let customizations = if options.isolate_customizations { "\ninheritCustomizations: false" } else { "" };
     format!(
-        "---\nname: {AGENT}\ndescription: A Neo Session.\ninheritMcp: false{customizations}\nplugins:\n  - {PLUGIN}\ntools: [{}]\n---\n{}\n",
+        "---\nname: {AGENT}\ndescription: A Neo Session.\nplugins:\n  - {PLUGIN}\ntools: [{}]\n---\n{}\n",
         tools.join(", "),
         options.system_prompt.trim_end()
     )
@@ -153,8 +150,7 @@ pub fn launch(options: &AntigravityOptions, bridge: &Path, resume: Option<&str>)
     args.extend(["--add-dir".into(), bridge.display().to_string(), "--agent".into(), AGENT.into()]);
     // Since 1.5.7 the CLI starts in auto mode, which runs commands in a terminal sandbox with no network and asks a
     // person before leaving it, and out of it every command waits for a person's review; nobody is there to answer
-    // either. Neo's PreToolUse hook decides instead, as `bypassPermissions` lets it on Claude Code, so commands run
-    // on this machine and reach its network.
+    // either. Neo's PreToolUse hook decides instead, so commands run on this machine and reach its network.
     let settings = json!({
         "agentMode": "",
         "toolPermission": "always-proceed",
@@ -172,13 +168,7 @@ pub fn launch(options: &AntigravityOptions, bridge: &Path, resume: Option<&str>)
     }
     // Print mode, its prompts coming as stream-json lines.
     args.push("-p=".into());
-    Launch {
-        program: options.program.clone(),
-        args,
-        cwd: options.cwd.clone(),
-        env: options.env.clone(),
-        env_remove: crate::claude::SESSION_VARIABLES.iter().map(|name| name.to_string()).collect(),
-    }
+    Launch { program: options.program.clone(), args, cwd: options.cwd.clone(), env: options.env.clone(), env_remove: Vec::new() }
 }
 
 /// A runtime tool call in the host's words: the kind or host tool it is, and the input the guard judges.
@@ -192,10 +182,8 @@ pub fn host_view(tool: &str, input: &Value) -> (String, Value) {
         "send_command_input" => ("bash".into(), json!({"command": input["Input"].as_str().unwrap_or("")})),
         "schedule" => ("bash".into(), input.clone()),
         "write_file" | "write_to_file" => ("write".into(), path()),
-        "edit_file" | "replace_file_content" | "multi_replace_file_content" | "sed_file" | "notebook_edit" | "delete_file" | "move_file" => {
-            ("edit".into(), path())
-        }
-        "read_file" | "view_file" | "list_dir" | "grep_search" | "find_by_name" | "view_file_outline" | "view_code_item" => ("read".into(), input.clone()),
+        "edit_file" | "replace_file_content" | "multi_replace_file_content" | "sed_file" | "notebook_edit" => ("edit".into(), path()),
+        "read_file" | "view_file" | "list_dir" | "grep_search" | "find_by_name" => ("read".into(), input.clone()),
         "invoke_subagent" | "browser_subagent" | "run_workflow" => ("task".into(), input.clone()),
         "define_subagent" | "manage_subagents" | "send_message" => ("task_manage".into(), input.clone()),
         _ => (tool.to_string(), input.clone()),
@@ -591,8 +579,10 @@ struct Shared {
     /// Tool steps already recorded, and those whose result was.
     calls: HashSet<i64>,
     results: HashSet<i64>,
-    /// Commands running, by tool call id.
+    /// Commands running synchronously, by tool call id.
     commands: BTreeMap<String, Command>,
+    /// Background shell commands moved async by `run_command`, by Antigravity task id.
+    background_tasks: BTreeMap<String, Command>,
     /// Subagents' conversations that have not stopped.
     subagents: BTreeMap<String, Subagent>,
     closed: bool,
@@ -611,6 +601,7 @@ impl Shared {
         self.calls.clear();
         self.results.clear();
         self.commands.clear();
+        self.background_tasks.clear();
         self.subagents.clear();
         (self.process.take(), self.bridge.take())
     }
@@ -632,6 +623,25 @@ fn lock(shared: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
 
 fn clip(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
+}
+
+/// Extracts the Antigravity task id when `run_command` moves to a background task.
+fn background_task_id(output: &str) -> Option<String> {
+    const MARKER: &str = "Tool is running as a background task with task id:";
+    let rest = output.split_once(MARKER)?.1.trim_start();
+    let id = rest.split_whitespace().next()?.trim_matches(|c: char| matches!(c, '"' | '\'' | '.' | ',' | ';'));
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// True when `manage_task` output indicates the task is no longer running.
+fn background_task_done(action: &str, output: &str) -> bool {
+    action.eq_ignore_ascii_case("kill")
+        || output.contains("Status: DONE")
+        || output.contains("Status: FAILED")
+        || output.contains("Status: CANCELED")
+        || output.contains("Status: CANCELLED")
+        || output.contains("canceled")
+        || output.contains("cancelled")
 }
 
 impl AntigravityDriver {
@@ -789,7 +799,7 @@ impl AntigravityDriver {
                 Line::Exited(error) => {
                     let (awaited, _process, bridge) = {
                         let mut shared = lock(&self.shared);
-                        let awaited = shared.awaiting || !shared.subagents.is_empty();
+                        let awaited = shared.awaiting || !shared.subagents.is_empty() || !shared.background_tasks.is_empty();
                         let (process, bridge) = shared.reset();
                         (awaited, process, bridge)
                     };
@@ -873,6 +883,21 @@ impl AntigravityDriver {
                             .map(str::to_string)
                             .or_else(|| info["error"]["message"].as_str().map(str::to_string))
                             .unwrap_or_else(|| if kind == "subagent" { format!("subagent {}", state.to_lowercase()) } else { state.to_lowercase() });
+                        if kind == "tool" {
+                            let tool_name = step["tool_name"].as_str().or(info["name"].as_str()).unwrap_or("");
+                            if tool_name == "run_command" {
+                                if let Some(task_id) = background_task_id(&text) {
+                                    let command = info["parameters"]["CommandLine"].as_str().unwrap_or("").to_string();
+                                    let conversation = shared.conversation.clone().unwrap_or_default();
+                                    shared.background_tasks.insert(task_id, Command { conversation, command, start_time: now_ms() });
+                                }
+                            } else if tool_name == "manage_task" {
+                                let action = info["parameters"]["Action"].as_str().unwrap_or("");
+                                if let Some(task_id) = info["parameters"]["TaskId"].as_str().filter(|_| background_task_done(action, &text)) {
+                                    shared.background_tasks.remove(task_id);
+                                }
+                            }
+                        }
                         emitted.push(Message { role: Role::ToolResult, content: vec![Block::text(clip(&text, 2000))], stop_reason: None });
                     }
                 }
@@ -897,6 +922,7 @@ impl AntigravityDriver {
             // The turn ran to its end, background work included.
             let main = shared.conversation.clone();
             shared.commands.retain(|_, command| Some(&command.conversation) != main.as_ref());
+            shared.background_tasks.clear();
             shared.subagents.clear();
             let turn = shared.turns.pop_front();
             (turn, said, shared.turns.is_empty())
@@ -1092,6 +1118,16 @@ impl AntigravityDriver {
     fn current(&self) -> Option<Arc<Proc>> {
         lock(&self.shared).process.clone()
     }
+
+    /// The live bridge folder for the active process, if any.
+    pub fn bridge_dir(&self) -> Option<PathBuf> {
+        lock(&self.shared).bridge.as_ref().map(|bridge| bridge.dir.clone())
+    }
+
+    /// Whether any turn is currently queued or running on the driver.
+    pub fn has_active_turns(&self) -> bool {
+        !lock(&self.shared).turns.is_empty()
+    }
 }
 
 /// Lets the driver be used through `Arc<dyn Driver>` while its methods need the `Arc` to spawn tasks.
@@ -1177,6 +1213,17 @@ impl Driver for Antigravity {
                     pids: Vec::new(),
                 }
             }));
+            // Commands moved async by `run_command` stay tracked until `manage_task` finishes/kills them or the turn ends.
+            jobs.extend(shared.background_tasks.iter().map(|(id, command)| KernelJob {
+                id: id.clone(),
+                kind: JobKind::Bash,
+                label: command.command.clone(),
+                start_time: command.start_time,
+                progress: None,
+                command: Some(command.command.clone()),
+                own: true,
+                pids: Vec::new(),
+            }));
             jobs
         })
     }
@@ -1235,10 +1282,11 @@ mod tests {
         assert_eq!(host_view("run_command", &json!({"CommandLine": "ls", "WaitMsBeforeAsync": 5000})), ("bash".into(), json!({"command": "ls"})));
         assert_eq!(host_view("schedule", &json!({"Prompt": "ping"})), ("bash".into(), json!({"Prompt": "ping"})));
         assert_eq!(host_view("write_file", &json!({"Path": "/w/a.txt", "Content": "x"})), ("write".into(), json!({"path": "/w/a.txt"})));
+        assert_eq!(host_view("write_to_file", &json!({"TargetFile": "/w/b.txt"})), ("write".into(), json!({"path": "/w/b.txt"})));
         assert_eq!(host_view("replace_file_content", &json!({"TargetFile": "/w/a"})), ("edit".into(), json!({"path": "/w/a"})));
+        assert_eq!(host_view("edit_file", &json!({"Path": "/w/b"})), ("edit".into(), json!({"path": "/w/b"})));
         assert_eq!(host_view("read_file", &json!({})).0, "read");
-        assert_eq!(host_view("view_file_outline", &json!({})).0, "read");
-        assert_eq!(host_view("view_code_item", &json!({})).0, "read");
+        assert_eq!(host_view("view_file", &json!({})).0, "read");
         assert_eq!(host_view("invoke_subagent", &json!({})).0, "task");
         assert_eq!(host_view("run_workflow", &json!({})).0, "task");
         assert_eq!(host_view("manage_subagents", &json!({})).0, "task_manage");
@@ -1258,10 +1306,10 @@ mod tests {
 
     #[test]
     fn parses_the_model_list() {
-        let listed = "Fetching available models...\ngemini-3.8-flash-low\tGemini 3.8 Flash (Low)\nclaude-opus-5-5-high\tClaude Opus 5.5 (High)\n\n";
+        let listed = "Fetching available models...\ngemini-3.8-flash-low\tGemini 3.8 Flash (Low)\ngemini-3.8-pro-high\tGemini 3.8 Pro (High)\n\n";
         assert_eq!(
             parse_models(listed),
-            vec![("gemini-3.8-flash-low".into(), "Gemini 3.8 Flash (Low)".into()), ("claude-opus-5-5-high".into(), "Claude Opus 5.5 (High)".into())]
+            vec![("gemini-3.8-flash-low".into(), "Gemini 3.8 Flash (Low)".into()), ("gemini-3.8-pro-high".into(), "Gemini 3.8 Pro (High)".into())]
         );
     }
 
@@ -1278,22 +1326,24 @@ mod tests {
 
     #[test]
     fn writes_the_agent_with_the_tools_of_its_kinds_and_its_prompt() {
-        let mut options =
+        let options =
             AntigravityOptions { system_prompt: "Be brief.\n".into(), tools: vec!["read".into(), "bash".into(), "read".into()], ..Default::default() };
         let agent = agent_file(&options);
         assert!(agent.starts_with(&format!("---\nname: {AGENT}\n")), "{agent}");
-        assert!(agent.contains("description: A Neo Session.\ninheritMcp: false\nplugins:\n  - neo\n"), "{agent}");
+        assert!(agent.contains("description: A Neo Session.\nplugins:\n  - neo\n"), "{agent}");
+        assert!(!agent.contains("inheritMcp"), "{agent}");
         assert!(!agent.contains("inheritCustomizations"), "{agent}");
-        assert!(
-            agent.contains("tools: [view_file, list_dir, grep_search, find_by_name, read_file, view_file_outline, view_code_item, run_command,"),
-            "{agent}"
-        );
+        assert!(agent.contains("tools: [view_file, list_dir, grep_search, find_by_name, run_command,"), "{agent}");
         assert!(!agent.contains("write_to_file"));
         assert!(agent.ends_with("---\nBe brief.\n"), "{agent}");
 
-        options.isolate_customizations = true;
-        let isolated = agent_file(&options);
-        assert!(isolated.contains("description: A Neo Session.\ninheritMcp: false\ninheritCustomizations: false\nplugins:\n  - neo\n"), "{isolated}");
+        let full = agent_file(&AntigravityOptions { tools: TOOL_KINDS.iter().map(|kind| (*kind).into()).collect(), ..Default::default() });
+        for unsupported in ["view_file_outline", "view_code_item", "delete_file", "move_file"] {
+            assert!(!full.contains(unsupported), "{unsupported} in {full}");
+        }
+        for (legacy, alias) in [("view_file", "read_file"), ("replace_file_content", "edit_file"), ("write_to_file", "write_file")] {
+            assert!(full.contains(legacy) && !full.contains(alias), "conflicting pair {legacy}/{alias} in {full}");
+        }
     }
 
     #[test]
@@ -1475,8 +1525,8 @@ mod tests {
 
         let (tx, _rx) = mpsc::unbounded_channel();
         let router = AntigravityDriver::new(AntigravityOptions { tools: vec!["read".into(), "bash".into()], ..Default::default() }, Arc::new(Echo), tx.clone());
-        assert_eq!(router.judge("view_file_outline", &json!({})).await, Guard::Allow);
-        assert_eq!(router.judge("view_code_item", &json!({})).await, Guard::Allow);
+        assert_eq!(router.judge("read_file", &json!({})).await, Guard::Allow);
+        assert_eq!(router.judge("view_file", &json!({})).await, Guard::Allow);
         assert_eq!(router.judge("schedule", &json!({})).await, Guard::Allow);
         assert!(matches!(router.judge("read_url_content", &json!({})).await, Guard::Block(_)));
         assert!(matches!(router.judge("search_web", &json!({})).await, Guard::Block(_)));
@@ -1519,238 +1569,55 @@ mod tests {
         assert_eq!(lock(&driver.shared).subagents["sub-hit"].label.as_deref(), Some("Do the task"));
     }
 
-    #[cfg(unix)]
-    mod lifecycle {
-        use super::*;
-        use crate::journal::Journal;
-        use crate::session::{Mode, Presentation, Session};
-        use crate::types::KernelEvent;
-        use std::os::unix::fs::PermissionsExt;
-
-        /// A stand-in for `agy`: it reads the bridge the driver wrote, calls hooks and the MCP server as the runtime
-        /// would, and writes stream-json lines.
-        const FAKE_AGY: &str = r#"#!/usr/bin/env python3
-import json, sys, os, subprocess, urllib.request, glob, re
-args = sys.argv[1:]
-bridge = args[args.index("--add-dir") + 1]
-conv = args[args.index("--conversation") + 1] if "--conversation" in args else "conv-1"
-plugin = os.path.join(bridge, ".agents", "plugins", "neo")
-hooks = json.load(open(os.path.join(plugin, "hooks.json")))["neo"]
-mcp = json.load(open(os.path.join(plugin, "mcp_config.json")))["mcpServers"].get("neo")
-agent = open(os.path.join(bridge, ".agents", "agents", "neo-session.md")).read()
-def out(event, body):
-    sys.stdout.write(json.dumps({"event": event, event: dict(body, conversation_id=conv)}) + "\n"); sys.stdout.flush()
-def hook(name, payload):
-    handler = hooks[name][0]["hooks"][0] if name in ("PreToolUse", "PostToolUse") else hooks[name][0]
-    payload = dict(payload, hookEventName=name, conversationId=payload.get("conversationId", conv))
-    done = subprocess.run(handler["command"], shell=True, input=json.dumps(payload).encode(), capture_output=True)
-    if done.returncode != 0: return {"decision": "deny", "reason": "hook failed"}
-    return json.loads(done.stdout or b"{}")
-def mcp_call(name, arguments):
-    req = urllib.request.Request(mcp["url"], data=json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": name, "arguments": arguments}}).encode(), headers=mcp["headers"], method="POST")
-    return json.loads(urllib.request.urlopen(req, timeout=5).read())["result"]["content"][0]["text"]
-sys.stdout.write(json.dumps({"event": "init", "conversation_id": conv, "init": {"agent": "neo-session"}}) + "\n"); sys.stdout.flush()
-step = 0
-def next_step():
-    global step
-    step += 1
-    return step
-for raw in sys.stdin:
-    text = json.loads(raw)["message"]["content"]
-    if "refuse" in text:
-        out("result", {"status": "ERROR", "error": "agent refused to start", "num_turns": 0})
-        continue
-    out("step_update", {"step_index": next_step(), "state": "DONE", "step_type": "user_input"})
-    if "prompt?" in text:
-        out("step_update", {"step_index": next_step(), "state": "DONE", "step_type": "agent_response", "text_delta": "prompt says: " + agent.split("---\n")[-1].strip()})
-    if "tool" in text:
-        hook("SessionStart", {})
-        decision = hook("PreToolUse", {"toolCall": {"id": "c1", "name": "call_mcp_tool", "args": {"ServerName": "neo_neo", "ToolName": "echo", "Arguments": {"text": "ok"}}}})
-        i = next_step()
-        out("step_update", {"step_index": i, "state": "ACTIVE", "step_type": "tool", "tool_name": "call_mcp_tool", "tool_info": {"name": "call_mcp_tool", "parameters": {"ToolName": "echo"}}})
-        result = mcp_call("echo", {"text": "ok", "toolSummary": "x"}) if decision.get("decision") == "allow" else decision.get("reason")
-        out("step_update", {"step_index": i, "state": "DONE", "step_type": "tool", "tool_name": "call_mcp_tool", "tool_info": {"name": "call_mcp_tool", "parameters": {"ToolName": "echo"}, "output": result}})
-        hook("PostToolUse", {"toolCall": {"id": "c1", "name": "call_mcp_tool"}})
-    if "forbidden" in text:
-        decision = hook("PreToolUse", {"toolCall": {"id": "c2", "name": "run_command", "args": {"CommandLine": "forbidden"}}})
-        i = next_step()
-        out("step_update", {"step_index": i, "state": "ERROR", "step_type": "tool", "tool_name": "run_command", "tool_info": {"name": "run_command", "parameters": {"CommandLine": "forbidden"}, "error": {"message": "denied: " + decision.get("reason", "")}}})
-    if "bridge" in text:
-        decision = hook("PreToolUse", {"toolCall": {"id": "c3", "name": "write_to_file", "args": {"TargetFile": os.path.join(bridge, "x")}}})
-        out("step_update", {"step_index": next_step(), "state": "DONE", "step_type": "agent_response", "text_delta": decision["decision"] + ": " + decision.get("reason", "")})
-    if "background" in text:
-        hook("PreToolUse", {"toolCall": {"id": "bg1", "name": "run_command", "args": {"CommandLine": "sleep 1"}}})
-        hook("Stop", {"fullyIdle": False})
-        open(os.path.join(bridge, "..", "bg-waiting"), "w").write("1")
-        import time
-        while not os.path.exists(os.path.join(bridge, "..", "bg-release")): time.sleep(0.05)
-        hook("PostToolUse", {"toolCall": {"id": "bg1", "name": "run_command"}})
-        hook("Stop", {"fullyIdle": True})
-        out("step_update", {"step_index": next_step(), "state": "DONE", "step_type": "agent_response", "text_delta": "background done"})
-    out("step_update", {"step_index": next_step(), "state": "ACTIVE", "step_type": "agent_response", "text_delta": "Done "})
-    out("step_update", {"step_index": step, "state": "DONE", "step_type": "agent_response", "text_delta": text[:12]})
-    out("result", {"status": "SUCCESS", "response": "", "num_turns": 1})
-"#;
-
-        /// A hook relay in Python, standing in for `neo-agent agy-hook`.
-        const RELAY: &str = r#"#!/usr/bin/env python3
-import sys, urllib.request
-req = urllib.request.Request(sys.argv[1], data=sys.stdin.buffer.read(), headers={"Content-Type": "application/json"}, method="POST")
-sys.stdout.write(urllib.request.urlopen(req, timeout=30).read().decode())
-"#;
-
-        fn script(dir: &Path, name: &str, text: &str) -> PathBuf {
-            let path = dir.join(name);
-            std::fs::write(&path, text).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            path
-        }
-
-        struct Fixture {
-            dir: PathBuf,
-            session: Arc<Session>,
-            events: tokio::sync::broadcast::Receiver<KernelEvent>,
-            driver: Arc<AntigravityDriver>,
-        }
-
-        fn fixture() -> Fixture {
-            let dir = std::env::temp_dir().join(format!("neo-agy-test-{}-{}", std::process::id(), uuid()));
-            let cwd = dir.join("work");
-            std::fs::create_dir_all(&cwd).unwrap();
-            let program = script(&dir, "fake-agy.py", FAKE_AGY);
-            let relay = script(&dir, "relay.py", RELAY);
-            let journal = Arc::new(Journal::create(&dir, &cwd).unwrap());
-            let options = AntigravityOptions {
-                program,
-                cwd,
-                system_prompt: "You are the fixture.".into(),
-                tools: vec!["read".into(), "bash".into(), "write".into()],
-                hook_relay: vec![relay.display().to_string()],
-                ..Default::default()
-            };
-            let (reports, runtime) = mpsc::unbounded_channel();
-            let driver = AntigravityDriver::new(options, Arc::new(Echo), reports);
-            let session = Session::new(journal, Arc::new(Antigravity(driver.clone())), runtime);
-            let events = session.subscribe();
-            Fixture { dir, session, events, driver }
-        }
-
-        impl Fixture {
-            async fn turn(&mut self) -> Vec<KernelEvent> {
-                let mut seen = Vec::new();
-                loop {
-                    let event = tokio::time::timeout(Duration::from_secs(20), self.events.recv()).await.expect("the turn ends").unwrap();
-                    let done = matches!(event, KernelEvent::AgentEnd { .. });
-                    seen.push(event);
-                    if done {
-                        return seen;
-                    }
-                }
+    #[tokio::test]
+    async fn tracks_backgrounded_run_command_tasks_until_killed_or_turn_ends() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let driver = AntigravityDriver::new(AntigravityOptions::default(), Arc::new(Echo), tx);
+        let wrapper = Antigravity(driver.clone());
+        driver.handle(&json!({"event": "init", "conversation_id": "conv-1"}));
+        driver.step(&json!({
+            "step_index": 1,
+            "state": "DONE",
+            "step_type": "tool",
+            "tool_name": "run_command",
+            "tool_info": {
+                "name": "run_command",
+                "parameters": {"CommandLine": "python train.py --epochs 100"},
+                "output": "Tool is running as a background task with task id: conv-1/task-9\nTask logs are available at: /tmp/task-9.log"
             }
-            async fn send(&self, id: &str, text: &str) {
-                self.session.send(id, vec![Block::text(text)], Mode::Queue, &Presentation::default(), &[]).await.unwrap();
+        }));
+        let jobs = wrapper.jobs().await;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!((jobs[0].id.as_str(), jobs[0].kind, jobs[0].label.as_str()), ("conv-1/task-9", JobKind::Bash, "python train.py --epochs 100"));
+
+        driver.step(&json!({
+            "step_index": 2,
+            "state": "DONE",
+            "step_type": "tool",
+            "tool_name": "manage_task",
+            "tool_info": {
+                "name": "manage_task",
+                "parameters": {"Action": "kill", "TaskId": "conv-1/task-9"},
+                "output": "Task \"conv-1/task-9\" canceled."
             }
-            fn said(&self) -> Vec<String> {
-                self.session
-                    .journal()
-                    .entries()
-                    .iter()
-                    .filter_map(|entry| match entry {
-                        crate::journal::Entry::Message { message, .. } => Some(crate::types::text_of(&message.content)),
-                        _ => None,
-                    })
-                    .collect()
+        }));
+        assert!(wrapper.jobs().await.is_empty());
+
+        // Also cleared when the turn finishes.
+        driver.step(&json!({
+            "step_index": 3,
+            "state": "DONE",
+            "step_type": "tool",
+            "tool_name": "run_command",
+            "tool_info": {
+                "name": "run_command",
+                "parameters": {"CommandLine": "sleep 60"},
+                "output": "Tool is running as a background task with task id: conv-1/task-10"
             }
-        }
-
-        #[tokio::test]
-        async fn runs_turns_with_host_tools_hooks_and_the_agent_prompt() {
-            let mut f = fixture();
-            f.send("r1", "prompt? and tool").await;
-            let seen = f.turn().await;
-            assert!(seen.contains(&KernelEvent::Taken { request_ids: vec!["r1".into()] }), "{seen:?}");
-            assert_eq!(seen.last(), Some(&KernelEvent::AgentEnd { terminal: true, awaiting_async: false }));
-            assert!(f.session.journal().pending().is_empty());
-            assert_eq!(f.session.journal().kernel_session("antigravity").as_deref(), Some("conv-1"));
-            let said = f.said();
-            assert!(said.iter().any(|text| text == "prompt says: You are the fixture."), "{said:?}");
-            assert!(said.iter().any(|text| text == r#"{"text":"ok"}"#), "the host tool ran without display arguments: {said:?}");
-            assert!(said.iter().any(|text| text == "Done prompt? and"), "{said:?}");
-
-            // A refused command reaches the model with the guard's reason, and the turn goes on.
-            f.send("r2", "forbidden").await;
-            f.turn().await;
-            assert!(f.said().iter().any(|text| text == "denied: refused"), "{:?}", f.said());
-
-            // Neo's bridge is not the model's to change.
-            f.send("r3", "bridge").await;
-            f.turn().await;
-            assert!(f.said().iter().any(|text| text.starts_with("deny: That folder is Neo's link")), "{:?}", f.said());
-
-            // Two messages sent together run as two turns, in order.
-            f.send("r4", "first").await;
-            f.send("r5", "second").await;
-            let mut seen = f.turn().await;
-            if !seen.iter().any(|event| matches!(event, KernelEvent::Taken { request_ids } if request_ids == &["r5".to_string()])) {
-                seen.extend(f.turn().await);
-            }
-            assert!(seen.iter().any(|event| matches!(event, KernelEvent::Taken { request_ids } if request_ids == &["r5".to_string()])), "{seen:?}");
-            assert!(f.said().iter().any(|text| text == "Done second"), "{:?}", f.said());
-            assert!(f.session.journal().pending().is_empty());
-
-            let bridge = lock(&f.driver.shared).bridge.as_ref().map(|bridge| bridge.dir.clone()).unwrap();
-            assert!(bridge.join(".agents/plugins/neo/hooks.json").is_file());
-            f.session.dispose().await;
-            assert!(!bridge.exists(), "the bridge goes with the process");
-            let _ = std::fs::remove_dir_all(&f.dir);
-        }
-
-        #[tokio::test]
-        async fn ends_the_turn_while_background_work_runs_and_lists_it() {
-            let mut f = fixture();
-            f.send("r1", "background").await;
-            let seen = f.turn().await;
-            assert_eq!(seen.last(), Some(&KernelEvent::AgentEnd { terminal: false, awaiting_async: true }), "{seen:?}");
-            let jobs = f.session.driver().jobs().await;
-            assert_eq!(jobs.len(), 1, "{jobs:?}");
-            assert_eq!((jobs[0].kind, jobs[0].command.as_deref(), jobs[0].own), (JobKind::Bash, Some("sleep 1"), true));
-            std::fs::write(f.dir.join("bg-release"), "1").unwrap();
-            let seen = f.turn().await;
-            assert_eq!(seen.last(), Some(&KernelEvent::AgentEnd { terminal: true, awaiting_async: false }), "{seen:?}");
-            assert!(f.session.driver().jobs().await.is_empty());
-            assert!(f.said().iter().any(|text| text == "background done"), "{:?}", f.said());
-            f.session.dispose().await;
-            let _ = std::fs::remove_dir_all(&f.dir);
-        }
-
-        #[tokio::test]
-        async fn keeps_a_message_the_runtime_refused_pending() {
-            let mut f = fixture();
-            f.send("r1", "refuse").await;
-            let seen = f.turn().await;
-            assert!(!seen.iter().any(|event| matches!(event, KernelEvent::Taken { .. })), "{seen:?}");
-            assert_eq!(f.session.journal().pending().len(), 1);
-            assert!(f.said().iter().any(|text| text.contains("agent refused to start")), "{:?}", f.said());
-            f.session.dispose().await;
-            let _ = std::fs::remove_dir_all(&f.dir);
-        }
-
-        #[tokio::test]
-        async fn warms_without_starting_a_turn_and_cleans_up_on_close() {
-            let mut f = fixture();
-            f.session.warm().await.unwrap();
-            assert!(matches!(f.events.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)));
-            assert!(f.session.driver().pid().is_some());
-            assert!(lock(&f.driver.shared).turns.is_empty());
-            let bridge = lock(&f.driver.shared).bridge.as_ref().map(|bridge| bridge.dir.clone()).unwrap();
-            assert!(bridge.is_dir());
-
-            f.session.dispose().await;
-            assert!(!bridge.exists());
-            assert!(f.session.warm().await.is_ok());
-            assert!(f.session.driver().warm(None).await.is_err());
-            assert!(!bridge.exists());
-            let _ = std::fs::remove_dir_all(&f.dir);
-        }
+        }));
+        assert_eq!(wrapper.jobs().await.len(), 1);
+        lock(&driver.shared).turns.push_back(Turn { id: "t1".into(), taken: true });
+        driver.result(&json!({"status": "SUCCESS"}));
+        assert!(wrapper.jobs().await.is_empty());
     }
 }

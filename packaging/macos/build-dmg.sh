@@ -33,9 +33,8 @@ rustup target add "$target" >/dev/null 2>&1 || true
 app="$root/app/build/macos/Build/Products/Release/Neo.app"
 [ -d "$app" ] || { echo "the app was not built at $app" >&2; exit 1; }
 # One architecture per image: the backend is built for one.
-mkdir -p "$app/Contents/Helpers" "$app/Contents/Resources/shim"
+mkdir -p "$app/Contents/Helpers"
 cp "$root/backend/target/$target/release/neo-agent" "$app/Contents/Helpers/neo-agent"
-cp "$root/shim/neo-omp-shim.ts" "$app/Contents/Resources/shim/"
 
 identity=${MACOS_SIGN_IDENTITY:--}
 options=""

@@ -96,6 +96,12 @@ abstract class Strings {
   String backgroundCount(int count);
   String runningFor(Duration elapsed);
   String get notStarted;
+  String get stopWorker;
+  String get stoppingWorker;
+  String get stopWorkerConfirmTitle;
+  String get stopWorkerConfirmBody;
+  String get stopWorkerConfirm;
+  String get stopWorkerFailed;
 
   // Settings
   String get connection;
@@ -110,26 +116,15 @@ abstract class Strings {
   String get invalidAddress;
   String get kernelAndModels;
   String get kernel;
-  String get kernelHintOmp;
-  String get kernelHintClaude;
   String get kernelHintAntigravity;
-  String get kernelHintHermes;
-  String get kernelSwitchHint;
-  String get switchingKernel;
   String get orchestratorModel;
   String get workerModel;
-  String get orchestratorKernel;
-  String get workerKernel;
-  String get sameAsOrchestrator;
   String get listingModels;
-  String get savingKernel;
   String get install;
   String get installing;
   String installed(String kernel);
   String get antigravitySignIn;
-  String get hermesSetup;
   String get followKernelDefault;
-  String get thinking;
   String get current;
   String get save;
   String get saved;
@@ -189,37 +184,13 @@ abstract class Strings {
   /// A component's name, in words.
   String component(String name);
 
-  // Providers and accounts
-  String get customProviders;
-  String get providersFooter;
-  String get noProviders;
-  String get addProvider;
-  String get importFromOmp;
-  String importedProviders(int count);
-  String get editProvider;
-  String get providerName;
-  String get providerApi;
-  String get baseUrl;
-  String get apiKey;
-  String get apiKeyPlaceholder;
-  String apiKeyKeep(String hint);
-  String get removeKey;
-  String get headers;
-  String get headersHint;
-  String get providerModels;
-  String get providerModelsHint;
-  String get usedBy;
-  String get unsupportedApi;
-  String get delete;
-  String get kernelAccounts;
+  // Account
+  String get antigravityAccount;
   String get accountsFooter;
   String get notLoggedIn;
   String get logIn;
   String get logOut;
-  String get addApiKey;
-  String get providerId;
-  String get otherProvider;
-  String loginRunning(String kernel);
+  String get loginRunning;
   String get loginDone;
   String get loginFailed;
   String get pasteCode;
@@ -228,10 +199,6 @@ abstract class Strings {
   String get copied;
   String get notInstalledShort;
   String get loggedOut;
-  String get keyAdded;
-  String get refreshModels;
-  String get modelsListed;
-  String get modelsAfterSave;
 }
 
 /// Gives the widgets below it their words.
@@ -393,6 +360,18 @@ class ZhStrings extends Strings {
   String runningFor(Duration elapsed) => elapsed.inMinutes < 1 ? '刚开始' : elapsed.inHours < 1 ? '已运行 ${elapsed.inMinutes} 分钟' : '已运行 ${elapsed.inHours} 小时 ${elapsed.inMinutes % 60} 分钟';
   @override
   String get notStarted => '未启动';
+  @override
+  String get stopWorker => '终止任务';
+  @override
+  String get stoppingWorker => '正在终止…';
+  @override
+  String get stopWorkerConfirmTitle => '终止任务？';
+  @override
+  String get stopWorkerConfirmBody => '将立即终止该任务及其所有子任务和后台进程，并将任务标记为「已结束」。';
+  @override
+  String get stopWorkerConfirm => '终止';
+  @override
+  String get stopWorkerFailed => '终止失败';
 
   @override
   String get connection => '连接';
@@ -419,31 +398,13 @@ class ZhStrings extends Strings {
   @override
   String get kernel => '执行内核';
   @override
-  String get kernelHintOmp => '模型来自 Oh My Pi 的 provider 配置。';
-  @override
-  String get kernelHintClaude => '运行 Claude Code：认证与默认模型取自 ANTHROPIC_* 环境，只使用模型名。';
-  @override
   String get kernelHintAntigravity => '运行 Antigravity CLI（agy）：使用它已登录的 Google 账号与 agy models 列出的模型；后台任务与子代理结束时会唤醒 worker，但不能单独取消。';
-  @override
-  String get kernelHintHermes => '运行 Hermes Agent（hermes）：模型与认证来自 ~/.hermes 配置，Worker 启用跨会话记忆与技能演进。';
-  @override
-  String get kernelSwitchHint => '选好内核与模型后点「保存」才生效；每个内核有自己的一套模型配置。调度换内核时主会话在新内核上重开（对话记录保留），运行中的 Worker 在原内核上完成。';
-  @override
-  String get switchingKernel => '正在切换内核…';
   @override
   String get orchestratorModel => '评估与调度模型';
   @override
   String get workerModel => 'Worker 模型';
   @override
-  String get orchestratorKernel => '调度内核';
-  @override
-  String get workerKernel => 'Worker 内核';
-  @override
-  String get sameAsOrchestrator => '同调度内核';
-  @override
   String get listingModels => '正在读取模型列表…';
-  @override
-  String get savingKernel => '正在保存并切换…';
   @override
   String get install => '安装';
   @override
@@ -453,11 +414,7 @@ class ZhStrings extends Strings {
   @override
   String get antigravitySignIn => '首次使用前，在终端运行一次 agy 登录 Google 账号。';
   @override
-  String get hermesSetup => '首次使用前，在终端运行 hermes setup 配置模型提供商。';
-  @override
   String get followKernelDefault => '跟随内核默认';
-  @override
-  String get thinking => '思考档位';
   @override
   String get current => '当前';
   @override
@@ -589,53 +546,11 @@ class ZhStrings extends Strings {
     _ => name,
   };
 
-  // Providers and accounts
+  // Account
   @override
-  String get customProviders => '自定义供应商';
+  String get antigravityAccount => 'Antigravity 账号';
   @override
-  String get providersFooter => '多个内核共享同一份供应商配置，模型列表自动从供应商接口获取：Oh My Pi 支持任意 API，Hermes 支持 OpenAI 与 Anthropic API，Claude Code 只支持 Anthropic API，Antigravity 不支持自定义供应商。首次启动时导入 Oh My Pi 的 models.yml。密钥单独保存，不进入设置历史；修改对之后打开的会话生效。';
-  @override
-  String get noProviders => '还没有自定义供应商';
-  @override
-  String get addProvider => '添加供应商';
-  @override
-  String get importFromOmp => '从 Oh My Pi 导入';
-  @override
-  String importedProviders(int count) => '导入了 $count 个供应商';
-  @override
-  String get editProvider => '编辑供应商';
-  @override
-  String get providerName => '名称';
-  @override
-  String get providerApi => 'API';
-  @override
-  String get baseUrl => 'Base URL';
-  @override
-  String get apiKey => 'API 密钥';
-  @override
-  String get apiKeyPlaceholder => '密钥或环境变量名';
-  @override
-  String apiKeyKeep(String hint) => '已保存 $hint，留空则保留';
-  @override
-  String get removeKey => '不使用密钥';
-  @override
-  String get headers => '请求头';
-  @override
-  String get headersHint => '每行一个：Name: value';
-  @override
-  String get providerModels => '模型';
-  @override
-  String get providerModelsHint => '每行一个：模型 ID，可加 | 显示名';
-  @override
-  String get usedBy => '使用的内核';
-  @override
-  String get unsupportedApi => '不支持此 API';
-  @override
-  String get delete => '删除';
-  @override
-  String get kernelAccounts => '内核账号';
-  @override
-  String get accountsFooter => '登录在后端所在机器上进行：打开链接完成授权，再把页面给出的代码粘贴回来；若浏览器跳到 localhost 打不开，把地址栏的完整网址粘贴回来即可。设备码登录在网页上确认后会自动完成。';
+  String get accountsFooter => '登录在后端所在机器上进行：打开链接完成授权，再把页面给出的代码粘贴回来；若浏览器跳到 localhost 打不开，把地址栏的完整网址粘贴回来即可。';
   @override
   String get notLoggedIn => '未登录';
   @override
@@ -643,13 +558,7 @@ class ZhStrings extends Strings {
   @override
   String get logOut => '登出';
   @override
-  String get addApiKey => '添加 API 密钥';
-  @override
-  String get providerId => '供应商 ID';
-  @override
-  String get otherProvider => '其他…';
-  @override
-  String loginRunning(String kernel) => '正在登录 $kernel';
+  String get loginRunning => '正在登录 Antigravity';
   @override
   String get loginDone => '登录成功';
   @override
@@ -666,14 +575,6 @@ class ZhStrings extends Strings {
   String get notInstalledShort => '未安装';
   @override
   String get loggedOut => '已登出';
-  @override
-  String get keyAdded => '密钥已添加';
-  @override
-  String get refreshModels => '刷新模型';
-  @override
-  String get modelsListed => '模型由供应商接口自动获取';
-  @override
-  String get modelsAfterSave => '保存后自动从供应商接口获取模型';
 }
 
 /// English.
@@ -825,6 +726,18 @@ class EnStrings extends Strings {
   String runningFor(Duration elapsed) => elapsed.inMinutes < 1 ? 'just started' : elapsed.inHours < 1 ? 'running ${elapsed.inMinutes} min' : 'running ${elapsed.inHours} h ${elapsed.inMinutes % 60} min';
   @override
   String get notStarted => 'Not started';
+  @override
+  String get stopWorker => 'Stop task';
+  @override
+  String get stoppingWorker => 'Stopping…';
+  @override
+  String get stopWorkerConfirmTitle => 'Stop this task?';
+  @override
+  String get stopWorkerConfirmBody => 'This stops the task together with all its subagents and background jobs, and marks it as ended.';
+  @override
+  String get stopWorkerConfirm => 'Stop';
+  @override
+  String get stopWorkerFailed => 'Could not stop the task';
 
   @override
   String get connection => 'Connection';
@@ -851,32 +764,13 @@ class EnStrings extends Strings {
   @override
   String get kernel => 'Kernel';
   @override
-  String get kernelHintOmp => 'Models come from Oh My Pi\'s provider configuration.';
-  @override
-  String get kernelHintClaude => 'Runs Claude Code: sign-in and the default model come from the ANTHROPIC_* environment; only model names are used.';
-  @override
   String get kernelHintAntigravity => 'Runs the Antigravity CLI (agy): it uses the Google account agy is signed in to and the models agy models lists; background jobs and subagents wake the worker when they end but cannot be cancelled one by one.';
-  @override
-  String get kernelHintHermes => 'Runs Hermes Agent (hermes): models and sign-in come from ~/.hermes, and workers keep cross-session memory and learned skills.';
-  @override
-  String get kernelSwitchHint =>
-      'Kernels and models apply when you save; each kernel has its own model choices. A new main kernel reopens the main session on it with its transcript; running workers finish on theirs.';
-  @override
-  String get switchingKernel => 'Switching the kernel…';
   @override
   String get orchestratorModel => 'Assessment and routing model';
   @override
   String get workerModel => 'Worker model';
   @override
-  String get orchestratorKernel => 'Main session kernel';
-  @override
-  String get workerKernel => 'Worker kernel';
-  @override
-  String get sameAsOrchestrator => 'Same as the main session';
-  @override
   String get listingModels => 'Listing models…';
-  @override
-  String get savingKernel => 'Saving and switching…';
   @override
   String get install => 'Install';
   @override
@@ -886,11 +780,7 @@ class EnStrings extends Strings {
   @override
   String get antigravitySignIn => 'Before first use, run agy once in a terminal to sign in with Google.';
   @override
-  String get hermesSetup => 'Before first use, run hermes setup in a terminal to configure a model provider.';
-  @override
   String get followKernelDefault => 'Kernel default';
-  @override
-  String get thinking => 'Thinking';
   @override
   String get current => 'current';
   @override
@@ -1022,53 +912,11 @@ class EnStrings extends Strings {
     _ => name,
   };
 
-  // Providers and accounts
+  // Account
   @override
-  String get customProviders => 'Custom providers';
+  String get antigravityAccount => 'Antigravity account';
   @override
-  String get providersFooter => 'One provider configuration shared by the kernels, its models listed by the provider\'s own API: Oh My Pi takes any API, Hermes the OpenAI and Anthropic APIs, Claude Code only the Anthropic API, and Antigravity none. Oh My Pi\'s models.yml is imported on first start. Keys are kept apart from the settings history; changes apply to sessions opened afterwards.';
-  @override
-  String get noProviders => 'No custom providers yet';
-  @override
-  String get addProvider => 'Add provider';
-  @override
-  String get importFromOmp => 'Import from Oh My Pi';
-  @override
-  String importedProviders(int count) => 'Imported $count providers';
-  @override
-  String get editProvider => 'Edit provider';
-  @override
-  String get providerName => 'Name';
-  @override
-  String get providerApi => 'API';
-  @override
-  String get baseUrl => 'Base URL';
-  @override
-  String get apiKey => 'API key';
-  @override
-  String get apiKeyPlaceholder => 'A key or a variable\'s name';
-  @override
-  String apiKeyKeep(String hint) => 'Saved $hint; leave empty to keep it';
-  @override
-  String get removeKey => 'Use no key';
-  @override
-  String get headers => 'Headers';
-  @override
-  String get headersHint => 'One per line: Name: value';
-  @override
-  String get providerModels => 'Models';
-  @override
-  String get providerModelsHint => 'One per line: the model id, optionally | a display name';
-  @override
-  String get usedBy => 'Used by';
-  @override
-  String get unsupportedApi => 'Does not speak this API';
-  @override
-  String get delete => 'Delete';
-  @override
-  String get kernelAccounts => 'Kernel accounts';
-  @override
-  String get accountsFooter => 'Logging in runs on the backend\'s machine: open the link, authorize, and paste back the code the page shows. If the browser lands on a localhost address that does not open, paste that whole address. A device-code login finishes by itself once approved.';
+  String get accountsFooter => 'Logging in runs on the backend\'s machine: open the link, authorize, and paste back the code the page shows. If the browser lands on a localhost address that does not open, paste that whole address.';
   @override
   String get notLoggedIn => 'Not logged in';
   @override
@@ -1076,13 +924,7 @@ class EnStrings extends Strings {
   @override
   String get logOut => 'Log out';
   @override
-  String get addApiKey => 'Add API key';
-  @override
-  String get providerId => 'Provider id';
-  @override
-  String get otherProvider => 'Other…';
-  @override
-  String loginRunning(String kernel) => 'Logging in to $kernel';
+  String get loginRunning => 'Logging in to Antigravity';
   @override
   String get loginDone => 'Logged in';
   @override
@@ -1099,12 +941,4 @@ class EnStrings extends Strings {
   String get notInstalledShort => 'Not installed';
   @override
   String get loggedOut => 'Logged out';
-  @override
-  String get keyAdded => 'Key added';
-  @override
-  String get refreshModels => 'Refresh models';
-  @override
-  String get modelsListed => 'Models are listed by the provider\'s API';
-  @override
-  String get modelsAfterSave => 'Models are fetched from the provider\'s API once saved';
 }

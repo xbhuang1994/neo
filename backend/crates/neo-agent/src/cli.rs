@@ -11,13 +11,12 @@ Neo
 Usage:
   neo-agent serve [options]            Run as a server: the API, and the web app when its files are found.
   neo-agent desktop-sidecar [options]  Run as the desktop app's backend (started by the app itself).
-  neo-agent doctor [options]           Check what this machine provides: runtimes, git, directories.
+  neo-agent doctor [options]           Check what this machine provides: Antigravity CLI, git, directories.
   neo-agent version                    Print the version.
 
 Options for serve:
-  --config <file>         A JSON file with dataDir, agentDir, host, port, token, webDir.
+  --config <file>         A JSON file with dataDir, host, port, token, webDir.
   --data-dir <dir>        Where state is kept. Default: the per-user data directory.
-  --agent-dir <dir>       Oh My Pi's agent directory. Default: $PI_CODING_AGENT_DIR, else ~/.omp/agent.
   --host <host>           Address to listen on. Default: 127.0.0.1.
   --port <port>           Port to listen on. Default: 3082; 0 picks a free one.
   --token <token>         Access token (at least 16 characters); also NEO_TOKEN. Required unless listening on loopback.
@@ -26,13 +25,12 @@ Options for serve:
   --allow-multiple        Allow another instance for a different data directory; also NEO_ALLOW_MULTIPLE=1.
 
 Options for desktop-sidecar:
-  --data-dir <dir>, --agent-dir <dir>, --allow-multiple as above.
+  --data-dir <dir>, --allow-multiple as above.
   --port <port>           Default: 0.
   --token-stdin           Read the access token from the first line of standard input.
 
 Environment:
-  NEO_CLAUDE_BIN, NEO_OMP_BIN, NEO_AGY_BIN, NEO_HERMES_BIN
-                              The runtime programs, when not on PATH or where their installers put them.
+  NEO_AGY_BIN                   The Antigravity CLI program, when not on PATH or where its installer puts it.
   NEO_DATA_DIR                  Same as --data-dir.
 ";
 
@@ -41,8 +39,6 @@ Environment:
 pub struct Common {
     /// `--data-dir`.
     pub data_dir: Option<PathBuf>,
-    /// `--agent-dir`.
-    pub agent_dir: Option<PathBuf>,
     /// `--allow-multiple`.
     pub allow_multiple: bool,
 }
@@ -98,8 +94,6 @@ pub enum Command {
 pub struct ConfigFile {
     /// Where state is kept.
     pub data_dir: Option<PathBuf>,
-    /// Oh My Pi's agent directory.
-    pub agent_dir: Option<PathBuf>,
     /// Address to listen on.
     pub host: Option<String>,
     /// Port to listen on.
@@ -151,7 +145,6 @@ fn flag(name: &str, inline: Option<&str>) -> Result<bool, String> {
 fn shared<'a>(common: &mut Common, name: &str, inline: Option<&'a str>, args: &mut Args<'a>) -> Result<bool, String> {
     match name {
         "--data-dir" => common.data_dir = Some(PathBuf::from(args.value(name, inline)?)),
-        "--agent-dir" => common.agent_dir = Some(PathBuf::from(args.value(name, inline)?)),
         "--allow-multiple" => common.allow_multiple = flag(name, inline)?,
         _ => return Ok(false),
     }
@@ -229,11 +222,11 @@ mod tests {
             (Ok(Command::Help), Ok(Command::Help), Ok(Command::Version), Ok(Command::Version))
         );
         assert_eq!(parsed("serve"), Ok(Command::Serve(Serve::default())));
-        let Ok(Command::Serve(serve)) = parsed("serve --host 0.0.0.0 --port=8080 --token abcdefghijklmnop --data-dir /srv/neo --web-dir=/srv/web --config c.json --init-settings s.json --allow-multiple --agent-dir /srv/omp") else {
+        let Ok(Command::Serve(serve)) = parsed("serve --host 0.0.0.0 --port=8080 --token abcdefghijklmnop --data-dir /srv/neo --web-dir=/srv/web --config c.json --init-settings s.json --allow-multiple") else {
             panic!("serve parses")
         };
         assert_eq!((serve.host.as_deref(), serve.port, serve.token.as_deref()), (Some("0.0.0.0"), Some(8080), Some("abcdefghijklmnop")));
-        assert_eq!(serve.common, Common { data_dir: Some("/srv/neo".into()), agent_dir: Some("/srv/omp".into()), allow_multiple: true });
+        assert_eq!(serve.common, Common { data_dir: Some("/srv/neo".into()), allow_multiple: true });
         assert_eq!((serve.web_dir, serve.config, serve.init_settings), (Some("/srv/web".into()), Some("c.json".into()), Some("s.json".into())));
         assert_eq!(
             parsed("desktop-sidecar --port 0 --token-stdin --data-dir=/d"),
@@ -246,6 +239,7 @@ mod tests {
     fn says_what_is_wrong_with_a_command_line() {
         assert_eq!(parsed("run").unwrap_err(), "Unknown command run; see neo-agent help");
         assert_eq!(parsed("serve --verbose").unwrap_err(), "Unknown option --verbose for serve; see neo-agent help");
+        assert_eq!(parsed("serve --agent-dir /srv/omp").unwrap_err(), "Unknown option --agent-dir for serve; see neo-agent help");
         assert_eq!(parsed("serve --port").unwrap_err(), "--port needs a value");
         assert_eq!(parsed("serve --port=").unwrap_err(), "--port needs a value");
         assert_eq!(parsed("serve --port 70000").unwrap_err(), "--port takes a number from 0 to 65535, not \"70000\"");
@@ -261,7 +255,7 @@ mod tests {
         let file = dir.join("config.json");
         std::fs::write(&file, r#"{"dataDir": "/srv/neo", "host": "0.0.0.0", "port": 3082, "token": "abcdefghijklmnop", "webDir": "/srv/web"}"#).unwrap();
         let config = ConfigFile::read(&file).unwrap();
-        assert_eq!((config.data_dir, config.host.as_deref(), config.port, config.agent_dir), (Some("/srv/neo".into()), Some("0.0.0.0"), Some(3082), None));
+        assert_eq!((config.data_dir, config.host.as_deref(), config.port), (Some("/srv/neo".into()), Some("0.0.0.0"), Some(3082)));
         std::fs::write(&file, r#"{"stateDir": "/srv/neo"}"#).unwrap();
         assert!(ConfigFile::read(&file).unwrap_err().contains("unknown field `stateDir`"));
         assert!(ConfigFile::read(&dir.join("missing.json")).unwrap_err().starts_with("Cannot read "));

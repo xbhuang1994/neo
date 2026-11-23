@@ -1,9 +1,9 @@
 #!/bin/sh
-# Run the browser test of the web app: a fake model, the real backend with the real `claude` runtime, and Chromium.
+# Run the browser test of the web app: the real backend with the pure-Rust `fixture-agy` stand-in, and Chromium.
 #
 # Usage: packaging/e2e/run-web-e2e.sh [screenshot-dir]
 # With NEO_E2E_PACKAGE=<unpacked package folder>, the packaged program is tested instead, with the web app it bundles.
-# Needs: cargo build -p neo-agent -p neo-testkit, flutter build web (see docs), `claude` on PATH or NEO_CLAUDE_BIN,
+# Needs: cargo build -p neo-agent -p neo-testkit, flutter build web (see docs),
 #        and the `playwright` package where node finds it (NODE_PATH) with its Chromium installed.
 set -eu
 root=$(cd "$(dirname "$0")/../.." && pwd)
@@ -12,20 +12,14 @@ shift 2>/dev/null || true
 work=$(mktemp -d)
 cleanup() {
   [ -n "${agent:-}" ] && kill "$agent" 2>/dev/null || true
-  [ -n "${model:-}" ] && kill "$model" 2>/dev/null || true
   wait 2>/dev/null || true
   rm -rf "$work"
 }
 trap cleanup EXIT INT TERM
-mkdir -p "$work/home" "$work/config"
-
-"$root/backend/target/debug/fixture-model" anthropic > "$work/model.url" &
-model=$!
-for _ in $(seq 50); do [ -s "$work/model.url" ] && break; sleep 0.1; done
-model_url=$(head -1 "$work/model.url")
+mkdir -p "$work/home"
 
 cat > "$work/settings.json" <<JSON
-{"kernel": "claude", "models": {"claude": {"eval": {"provider": "anthropic", "model": "fixture"}, "executor": {"provider": "anthropic", "model": "fixture"}}}}
+{"kernel": "antigravity", "models": {"antigravity": {"eval": {"provider": "antigravity", "model": "gemini-3.8-flash-low"}, "executor": {"provider": "antigravity", "model": "gemini-3.8-flash-low"}}}}
 JSON
 if [ -n "${NEO_E2E_PACKAGE:-}" ]; then
   program=$NEO_E2E_PACKAGE/neo-agent
@@ -34,10 +28,9 @@ else
   program=$root/backend/target/debug/neo-agent
   set -- --web-dir "$root/app/build/web"
 fi
-export NEO_CLAUDE_BIN="${NEO_CLAUDE_BIN:-$(command -v claude)}"
-HOME="$work/home" NEO_RUNTIME_DIR="$work/run" NEO_OMP_BIN="$work/none" \
-ANTHROPIC_BASE_URL="$model_url" ANTHROPIC_API_KEY=fixture-key \
-CLAUDE_CONFIG_DIR="$work/config" DISABLE_TELEMETRY=1 DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+unset NEO_TOKEN NEO_DATA_DIR
+export NEO_AGY_BIN="${NEO_AGY_BIN:-$root/backend/target/debug/fixture-agy}"
+HOME="$work/home" NEO_RUNTIME_DIR="$work/run" \
   "$program" serve --port 0 --data-dir "$work/data" --init-settings "$work/settings.json" "$@" \
   > "$work/agent.out" 2> "$work/agent.log" &
 agent=$!

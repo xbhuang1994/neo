@@ -2,8 +2,8 @@
 ; the current user without administrator rights.
 ;
 ; Build: iscc /DAppVersion=0.5.0 /DStage=<folder> packaging\windows\neo-agent.iss
-; <folder> holds what packaging\windows\stage.ps1 put together: the Flutter app (neo_agent.exe, its DLLs and data),
-; neo-agent.exe and shim\. The agent runtimes are not bundled; the app installs them.
+; <folder> holds what packaging\windows\stage.ps1 put together: the Flutter app (neo_agent.exe, its DLLs and data)
+; and neo-agent.exe. The Antigravity CLI is not bundled; the app installs it.
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"

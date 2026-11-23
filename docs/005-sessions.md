@@ -28,7 +28,7 @@ A journal that cannot be read stops the Session from opening, with its path name
 
 ## Models
 
-A role's model is the one the settings name for the current kernel, or the kernel's default. A change applies to open Sessions of that kernel from their next turn. On Oh My Pi an unknown model is refused when it is chosen.
+A role's model is the one the settings name for Antigravity, or Antigravity's default. A change applies to open Sessions from their next turn.
 
 ## The conversation
 

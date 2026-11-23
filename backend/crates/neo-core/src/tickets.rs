@@ -411,6 +411,9 @@ impl Engine {
         let left = self.untaken(&ticket, &unread);
         ticket.ended = Some(Ended { at: at.clone(), by, outcome, reason: why.clone() });
         ticket.undelivered.clear();
+        if outcome != TicketOutcome::Completed {
+            ticket.answers.clear();
+        }
         ticket.updated_at = self.now();
         ticket.attention = None;
         ticket.delivery = None;

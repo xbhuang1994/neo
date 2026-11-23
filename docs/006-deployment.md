@@ -28,13 +28,12 @@ The desktop app adds its own check, so that starting it twice shows the window t
 
 | Thing | Where the program looks |
 | --- | --- |
-| The `claude`, `omp`, `agy` and `hermes` runtimes | `NEO_CLAUDE_BIN` / `NEO_OMP_BIN` / `NEO_AGY_BIN` / `NEO_HERMES_BIN`, else `PATH`, else where each one's official installer puts it: `~/.local/bin`; on Windows `%USERPROFILE%\.local\bin`, `%LOCALAPPDATA%\omp`, `%LOCALAPPDATA%\agy\bin` and `%LOCALAPPDATA%\hermes\bin`. None is bundled. Each is looked for whenever it is needed, so one installed while the backend runs is used at once; the settings' **Install** runs the official installer. `agy` needs a sign-in with `agy` once; `hermes` needs `hermes setup` once |
-| The Oh My Pi extension | `NEO_SHIM`, else a `shim` folder beside the program |
+| The Antigravity CLI (`agy`) | `NEO_AGY_BIN`, else `PATH`, else where its official installer puts it: `~/.local/bin`; on Windows `%USERPROFILE%\.local\bin` and `%LOCALAPPDATA%\agy\bin`. Not bundled. Looked for whenever it is needed, so one installed while the backend runs is used at once; the settings' **Install** runs the official installer. Sign in with Google under Settings → Antigravity account or by running `agy` once |
 | The web app's files | `--web-dir`, else a `web` folder beside the program |
 | `git` | `PATH`. Workers that use git need it installed; nothing else does |
-| Model access | Claude Code: the `ANTHROPIC_*` environment and the user's Claude Code settings. Oh My Pi: its agent directory (`--agent-dir`, by default `PI_CODING_AGENT_DIR` or `~/.omp/agent`, the one the person's `omp` uses). Antigravity: the Google account `agy` is signed in to. Hermes Agent: `~/.hermes` (`HERMES_HOME`) |
+| Model access | The Google account `agy` is signed in to |
 
-`neo-agent doctor` prints all of these as it finds them, and fails when no kernel can run. The application starts without a kernel too: it says so in the app, keeps messages, and works once one is installed or chosen.
+`neo-agent doctor` prints all of these as it finds them, and fails when Antigravity cannot run. The application starts without `agy` too: it says so in the app, keeps messages, and works once Antigravity is installed.
 
 A desktop app started from the Finder or a launcher has only the system's folders on its `PATH`; it adds the usual places of user-installed tools (`/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` and a few more) for its backend.
 
@@ -55,9 +54,9 @@ The store has a schema version. A data directory of another version is refused w
 
 ## Settings
 
-Everything a person configures is in the app's settings and stored in the database as numbered revisions: the kernel and models, the pause, the number of workers, the task directory, the prepare command and its shell, blocked commands, proactive assessment and its rules, and who may write.
+Everything a person configures is in the app's settings and stored in the database as numbered revisions: the Antigravity models, the pause, the number of workers, the task directory, the prepare command and its shell, blocked commands, proactive assessment and its rules, and who may write.
 
-The command line and the optional configuration file of `serve` carry only what belongs to the machine: the data directory, the agent directory, the address, the port, the token and the web folder. A server that should start from particular settings takes `--init-settings <file>`, which is read only when no settings are stored yet.
+The command line and the optional configuration file of `serve` carry only what belongs to the machine: the data directory, the address, the port, the token and the web folder. A server that should start from particular settings takes `--init-settings <file>`, which is read only when no settings are stored yet.
 
 ## Who may call the API
 
@@ -73,10 +72,10 @@ The server speaks plain HTTP. On a network that is not trusted, put it behind a 
 | Sign | Cause and remedy |
 | --- | --- |
 | "Neo is already running" | Another instance holds the lock. Use the open window, or stop the running service. `--allow-multiple` with another data directory runs a second one |
-| "… is not installed" | The kernel's runtime is missing. Install it from the settings, set `NEO_CLAUDE_BIN` / `NEO_OMP_BIN` / `NEO_AGY_BIN` / `NEO_HERMES_BIN`, or choose another kernel. `neo-agent doctor` shows what is found |
+| "… is not installed" | The Antigravity CLI (`agy`) is missing. Install it from the settings or set `NEO_AGY_BIN`. `neo-agent doctor` shows what is found |
 | "Installing … failed" | The official installer failed; the message ends with its last lines. It needs `bash` and `curl` (PowerShell on Windows) and the network |
 | "Listening on … needs an access token" | A server address that is not loopback needs `--token` or `NEO_TOKEN` |
 | The app says a token is needed | The server has one: enter it under Settings → Connection |
 | A data directory is refused for its schema version | It was written by another release line. Start with a new data directory |
-| A worker fails with a model error | The kernel's model access: for Claude Code the `ANTHROPIC_*` environment, for Oh My Pi the providers in its agent directory, for Antigravity its sign-in, for Hermes Agent its `~/.hermes` providers. The error is the runtime's own |
+| A worker fails with a model error | Check Antigravity's Google sign-in under Settings → Antigravity account. The error is the runtime's own |
 | A macOS app that "cannot be opened" | An app that is not notarized must be allowed once; see `SETUP.md` |

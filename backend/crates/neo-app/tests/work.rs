@@ -563,11 +563,11 @@ async fn shows_images_to_the_model_inlines_text_files_and_saves_the_rest() {
 #[tokio::test(flavor = "multi_thread")]
 async fn says_why_nothing_runs_when_the_kernel_is_missing_and_still_keeps_messages() {
     let f = fixture().await;
-    *f.kernels.unavailable.lock().unwrap() = Some("The Oh My Pi program (omp) was not found.".into());
+    *f.kernels.unavailable.lock().unwrap() = Some("Antigravity CLI (agy) is not installed.".into());
     f.app.start().await.unwrap();
     let health = f.app.board.get("kernel").unwrap();
-    assert_eq!((health.state, health.detail.as_str()), ("error", "The Oh My Pi program (omp) was not found."));
-    assert!(f.app.receive_web("hello", vec![], None).await.unwrap_err().contains("omp"));
+    assert_eq!((health.state, health.detail.as_str()), ("error", "Antigravity CLI (agy) is not installed."));
+    assert!(f.app.receive_web("hello", vec![], None).await.unwrap_err().contains("agy"));
     assert!(f.kernels.opened.lock().unwrap().is_empty());
     f.app.stop().await;
 }
@@ -625,13 +625,10 @@ async fn sends_a_result_once_when_the_worker_replied_directly_and_the_orchestrat
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn runs_workers_on_their_own_kernel_and_model_beside_the_main_sessions() {
+async fn runs_workers_with_their_own_model_on_antigravity() {
     let f = started().await;
-    // The main Session stays on Oh My Pi; workers go to Claude Code, each with its kernel's model.
-    let view = f.app.set_kernel(json!({"workerKernel": "claude"})).await.unwrap();
-    assert_eq!((view["kernel"].as_str(), view["workerKernel"].as_str(), view["workerKernelFollows"].as_bool()), (Some("omp"), Some("claude"), Some(false)));
-    f.app.update_models(json!({"eval": null, "executor": {"provider": "anthropic", "model": "opus"}})).await.unwrap();
-    assert_eq!(f.app.board.get("kernel").map(|health| health.detail), Some("Main Session on omp, workers on claude".to_string()));
+    f.app.update_models(json!({"eval": null, "executor": {"provider": "antigravity", "model": "gemini-3.8-pro-high"}})).await.unwrap();
+    assert_eq!(f.app.board.get("kernel").map(|health| health.detail), Some("Running on antigravity".to_string()));
     f.script(model(|turn| {
         Box::pin(async move {
             match turn.role {
@@ -647,15 +644,167 @@ async fn runs_workers_on_their_own_kernel_and_model_beside_the_main_sessions() {
     f.until("the result is delivered", || replies(&f).len() == 2).await;
     f.settle().await;
     let opened = f.kernels.opened_on.lock().unwrap().clone();
-    assert!(opened.contains(&(SessionRole::Orchestrator, Kernel::Omp)), "{opened:?}");
-    assert!(opened.contains(&(SessionRole::Worker, Kernel::Claude)), "{opened:?}");
-    assert!(!opened.contains(&(SessionRole::Worker, Kernel::Omp)), "{opened:?}");
+    assert!(opened.contains(&(SessionRole::Orchestrator, Kernel::Antigravity)), "{opened:?}");
+    assert!(opened.contains(&(SessionRole::Worker, Kernel::Antigravity)), "{opened:?}");
     let worker = f.kernels.opened.lock().unwrap().iter().find(|spec| spec.role == SessionRole::Worker).cloned().unwrap();
-    assert_eq!(worker.model.map(|model| model.model), Some("opus".into()));
+    assert_eq!(worker.model.map(|model| model.model), Some("gemini-3.8-pro-high".into()));
+    f.app.stop().await;
+}
 
-    // Following the main Session again, the next worker opens on its kernel.
-    let view = f.app.set_kernel(json!({"workerKernel": null})).await.unwrap();
-    assert_eq!((view["workerKernel"].as_str(), view["workerKernelFollows"].as_bool()), (Some("omp"), Some(true)));
-    assert_eq!(f.app.settings().worker_kernel, None);
+#[tokio::test(flavor = "multi_thread")]
+async fn relays_sidecar_failure_to_orchestrator_after_bounded_retries() {
+    let f = started().await;
+    let failed_cards: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen = failed_cards.clone();
+    f.script(model(move |turn| {
+        let seen = seen.clone();
+        Box::pin(async move {
+            match turn.role {
+                SessionRole::Worker => {
+                    turn.call("orchestrator_report", json!({"state": "progress", "summary": "Running epoch 1.", "topic": "Training"})).await?;
+                    Ok("Running.".into())
+                }
+                SessionRole::Sidecar => Err("sidecar runtime error".into()),
+                _ => {
+                    for message in messages(&turn.text) {
+                        if message["kind"] == "candidate" && message["text"] == "How is it going?" {
+                            turn.call(
+                                "orchestrator_route",
+                                json!({"decisions": [{"kind": "sidecar", "trigger_id": message["trigger_id"], "ticket_id": message["related_tickets"][0]["ticket_id"]}]}),
+                            )
+                            .await?;
+                            return Ok("Done.".into());
+                        }
+                        if message["kind"] == "sidecar_failed" {
+                            seen.lock().unwrap().push(message.clone());
+                            turn.call(
+                                "orchestrator_reply",
+                                json!({"purpose": "answer", "trigger_id": message["trigger_id"], "text": "Fallback answer."}),
+                            )
+                            .await?;
+                            return Ok("Done.".into());
+                        }
+                    }
+                    orchestrate(&turn).await
+                }
+            }
+        })
+    }));
+    f.app.receive_web("Train it.", vec![], None).await.unwrap();
+    f.until("the worker reported progress", || f.tickets().first().is_some_and(|ticket| ticket.latest_report().is_some())).await;
+    f.settle().await;
+    f.app.receive_web("How is it going?", vec![], None).await.unwrap();
+    // Bounded retries with exponential backoff (2s + 4s) plus orchestrator fallback.
+    for _ in 0..1500 {
+        if replies(&f).len() == 2 && !f.app.effects.pending(neo_app::effects::SIDECAR, None) {
+            break;
+        }
+        f.app.passes.pump();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    f.settle().await;
+    assert_eq!(f.ran(SessionRole::Sidecar).len(), 3);
+    assert!(!f.app.effects.pending(neo_app::effects::SIDECAR, None));
+    {
+        let cards = failed_cards.lock().unwrap();
+        assert_eq!(cards.len(), 1, "{cards:#?}");
+        assert!(cards[0]["error"].as_str().is_some_and(|err| err.contains("sidecar runtime error")));
+    }
+    assert_eq!(replies(&f), vec![ACCEPT.to_string(), "Fallback answer.".to_string()]);
+    f.app.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stops_open_and_failed_workers_via_stop_worker_ticket_and_refuses_completed_or_stopped() {
+    let f = started().await;
+    let worker_turn: Arc<Mutex<Option<Turn>>> = Arc::new(Mutex::new(None));
+    let kept = worker_turn.clone();
+    let mode = Arc::new(Mutex::new("background"));
+    let script_mode = mode.clone();
+    f.script(model(move |turn| {
+        let kept = kept.clone();
+        let mode = script_mode.clone();
+        Box::pin(async move {
+            match turn.role {
+                SessionRole::Worker => {
+                    let current_mode = *mode.lock().unwrap();
+                    match current_mode {
+                        "background" => {
+                            turn.call("orchestrator_report", json!({"state": "progress", "summary": "Running subagent and shell."})).await?;
+                            turn.jobs.lock().unwrap().push(Fixture::job("task_1", JobKind::Task, "subagent slice"));
+                            turn.jobs.lock().unwrap().push(Fixture::job("bg_1", JobKind::Bash, "make train"));
+                            *kept.lock().unwrap() = Some(turn);
+                            Ok("Running in background.".into())
+                        }
+                        "fail" => Err("model error".into()),
+                        _ => {
+                            turn.call("orchestrator_report", json!({"state": "ready", "summary": "All done."})).await?;
+                            Ok("Finished.".into())
+                        }
+                    }
+                }
+                _ => {
+                    for message in messages(&turn.text) {
+                        match message["kind"].as_str() {
+                            Some("candidate") => {
+                                accept(&turn, &message).await?;
+                            }
+                            Some("worker_report") if message["state"] == "ready" => {
+                                turn.call(
+                                    "orchestrator_reply",
+                                    json!({"ticket_id": message["ticket"]["ticket_id"], "purpose": "result", "text": "It is done."}),
+                                )
+                                .await?;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok("Done.".into())
+                }
+            }
+        })
+    }));
+
+    // 1. Active working ticket with both subagent and background shell job.
+    f.app.receive_web("Run subagent and job.", vec![], None).await.unwrap();
+    f.until("worker turn stored", || worker_turn.lock().unwrap().is_some()).await;
+    f.settle().await;
+    let working_id = f.ticket(0).id;
+    let detail_before = f.app.worker_detail(&working_id).await.unwrap();
+    assert_eq!(detail_before["background"].as_array().map(Vec::len), Some(2));
+    assert_eq!(f.app.active_workers(), 1);
+
+    let stopped = f.app.stop_worker_ticket(&working_id).await.unwrap();
+    assert_eq!(stopped["stage"], json!({"stage": "ended"}));
+    assert_eq!(stopped["outcome"], "stopped");
+    assert_eq!(stopped["session"], json!({"loaded": false, "streaming": false}));
+    assert_eq!(stopped["background"], json!([]));
+    assert!(f.kernels.closed.lock().unwrap().contains(&format!("worker-{working_id}")));
+    assert_eq!(f.app.active_workers(), 0);
+    assert_eq!(f.app.stop_worker_ticket(&working_id).await, Err(neo_app::executor::StopWorkerError::AlreadyEnded));
+
+    // 2. Failed ticket (`person/failed`) can also be stopped and then refuses a second stop.
+    *mode.lock().unwrap() = "fail";
+    f.app.receive_web("Fail this one.", vec![], None).await.unwrap();
+    f.until("failed ticket recorded", || {
+        f.tickets().iter().any(|ticket| ticket.id != working_id && ticket_stage(ticket) == TicketStage::Person(PersonAction::Failed))
+    })
+    .await;
+    f.settle().await;
+    let failed_id = f.tickets().into_iter().find(|ticket| ticket.id != working_id).unwrap().id;
+    let stopped_failed = f.app.stop_worker_ticket(&failed_id).await.unwrap();
+    assert_eq!(stopped_failed["stage"], json!({"stage": "ended"}));
+    assert_eq!(stopped_failed["outcome"], "stopped");
+    assert_eq!(f.app.stop_worker_ticket(&failed_id).await, Err(neo_app::executor::StopWorkerError::AlreadyEnded));
+
+    // 3. Completed ticket refuses stop and unknown ticket returns NotFound.
+    *mode.lock().unwrap() = "complete";
+    f.app.receive_web("Complete this one.", vec![], None).await.unwrap();
+    f.until("completed ticket recorded", || f.tickets().iter().any(|ticket| ticket.id != working_id && ticket.id != failed_id && ticket.ended.is_some())).await;
+    f.settle().await;
+    let completed_id = f.tickets().into_iter().find(|ticket| ticket.id != working_id && ticket.id != failed_id).unwrap().id;
+    assert_eq!(f.app.stop_worker_ticket(&completed_id).await, Err(neo_app::executor::StopWorkerError::AlreadyEnded));
+    assert_eq!(f.tickets().into_iter().find(|ticket| ticket.id == completed_id).unwrap().ended.unwrap().outcome, TicketOutcome::Completed);
+    assert_eq!(f.app.stop_worker_ticket("missing").await, Err(neo_app::executor::StopWorkerError::NotFound));
     f.app.stop().await;
 }

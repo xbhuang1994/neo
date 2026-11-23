@@ -16,10 +16,7 @@ flowchart LR
     App --> Store[(neo-store: SQLite)]
     App --> Kernel[neo-kernel]
   end
-  Kernel -->|child process per Session| Claude[claude]
-  Kernel -->|child process per Session| OMP[omp + shim]
   Kernel -->|child process per Session| AGY[agy]
-  Kernel -->|child process per Session| Hermes[hermes]
   App -->|HTTPS| WeChat[WeChat iLink]
 ```
 
@@ -42,13 +39,13 @@ The backend and the interface are separate programs that share only the HTTP API
 
 ## Concurrency and shutdown
 
-The Engine is synchronous and runs under the store's lock, one command at a time. Everything that waits — runtimes, the network, timers — is asynchronous and calls the Engine in short steps. Each Session's runtime is a child process in its own process group, read by one task.
+The Engine is synchronous and runs under the store's lock, one command at a time. Everything that waits — the runtime, the network, timers — is asynchronous and calls the Engine in short steps. Each Session's runtime is a child process in its own process group, read by one task.
 
 Stopping goes in order: no new passes, the Watchdog and the WeChat poll end, every Session is barred from new work and closed, running effects finish. Waiting effects stay in the database for the next start.
 
 ## Dependencies
 
-The backend depends on: `tokio` (processes, sockets, timers), `rusqlite` with SQLite bundled, `serde` and `serde_json`, `ureq` with rustls (the outbound HTTPS calls), `sha2`, `aes`, `base64`, `getrandom` and `libc`. The HTTP server, the command line, MD5 for WeChat uploads, UUIDs and the word count are written here.
+The backend is pure Rust and depends on: `tokio` (processes, sockets, timers), `rusqlite` with SQLite bundled, `serde` and `serde_json`, `ureq` with rustls (the outbound HTTPS calls), `sha2`, `aes`, `base64`, `getrandom` and `libc`. The HTTP server, the command line, MD5 for WeChat uploads, UUIDs and the word count are written here.
 
 The app depends on: `cupertino_ui` (Flutter's Cupertino widgets), `cupertino_icons`, `http`, `file_selector` and `web`. Its state is a `ChangeNotifier`; its QR code encoder and its two languages are written here.
 
@@ -60,23 +57,22 @@ The app depends on: `cupertino_ui` (Flutter's Cupertino widgets), `cupertino_ico
 | `backend/crates/neo-core/src/engine.rs`, `intake.rs`, `evals.rs`, `tickets.rs`, `assignments.rs`, `replies.rs`, `stage.rs` | The Engine: receiving Triggers, Evals and Decisions, Tickets and follow-ups, Assignments and reports, replies, a Ticket's stage |
 | `backend/crates/neo-core/src/memory.rs` | An in-memory repository, for the Engine's tests |
 | `backend/crates/neo-store/src/lib.rs`, `read.rs`, `receipts.rs`, `effects.rs` | The SQLite repository and its transactions, read models, Outbox receipts, effect rows |
-| `backend/crates/neo-kernel/src/lib.rs`, `types.rs`, `journal.rs`, `session.rs`, `process.rs` | What a kernel is to the application: messages and events, the journal, the kernel-neutral Session, child processes |
-| `backend/crates/neo-kernel/src/claude.rs`, `omp.rs`, `antigravity.rs`, `hermes.rs` | The four kernels' protocols; Antigravity's writes the Session's bridge (agent, plugin, hooks) and serves the host's tools and the hooks on loopback with `neo-agent agy-hook`; Hermes's runs the embedded `hermes_bridge.py` inside Hermes's Python runtime |
+| `backend/crates/neo-kernel/src/lib.rs`, `types.rs`, `journal.rs`, `session.rs`, `process.rs` | What a kernel is to the application: messages and events, the journal, the Session wrapper, child processes |
+| `backend/crates/neo-kernel/src/antigravity.rs` | The Antigravity CLI protocol: writes the Session's bridge (agent, plugin, hooks) and serves the host's tools and hooks on loopback with `neo-agent agy-hook` |
 | `backend/crates/neo-app/src/lib.rs`, `app.rs`, `settings.rs`, `policy.rs`, `health.rs`, `text.rs`, `http.rs` | The application value and its wiring, settings, the Policy the settings make, component health, text limits, the outbound HTTP client |
 | `backend/crates/neo-app/src/effects.rs`, `passes.rs`, `outbox.rs`, `notices.rs` | The effect queue, orchestration passes, outbound messages, notices and relays to the main Session |
-| `backend/crates/neo-app/src/kernels.rs`, `sessions.rs`, `prompts.rs`, `tools.rs`, `resources.rs`, `cards.rs`, `assess.rs` | Launching runtimes per role, Sessions and the conversation, prompts, the tools of each role, readable resources, cards, candidate delivery and assessment |
-| `backend/crates/neo-app/src/providers.rs`, `provider_views.rs`, `accounts.rs` | Custom model providers the kernels share: their settings, kept-apart keys, the one-time import of Oh My Pi's models.yml, what each kernel is handed, and their API; each kernel's accounts, logging in through its own program, logging out and API keys |
+| `backend/crates/neo-app/src/kernels.rs`, `sessions.rs`, `prompts.rs`, `tools.rs`, `resources.rs`, `cards.rs`, `assess.rs` | Launching Antigravity per role, Sessions and the conversation, prompts, the tools of each role, readable resources, cards, candidate delivery and assessment |
+| `backend/crates/neo-app/src/accounts.rs` | Antigravity's Google account status, logging in through the Antigravity CLI and logging out |
 | `backend/crates/neo-app/src/executor.rs`, `blocked.rs`, `sidecar.rs`, `watchdog.rs`, `procinfo.rs` | The Executor, blocked commands, the Sidecar, the Watchdog and its process sampling |
 | `backend/crates/neo-app/src/chat.rs`, `wechat.rs`, `wechat_protocol.rs`, `wechat_typing.rs`, `views.rs` | The chat Source, the WeChat bridge, its protocol and its typing indicator (a model-free loop showing "typing" while the main Session or a worker is at work), what the API shows and changes |
 | `backend/crates/neo-http/src/lib.rs`, `server.rs`, `api.rs` | The HTTP server, the API's routes, access control, the web app's files |
 | `backend/crates/neo-agent/src/main.rs`, `cli.rs`, `paths.rs`, `instance.rs` | The program: its commands, the command line, where things are on a machine, the single instance |
-| `backend/crates/neo-testkit/src/lib.rs`, `http.rs`, `models.rs`, `backend/crates/neo-testkit/src/bin/fixture-model.rs` | Test support: temporary directories, a loopback server, fake model endpoints, and one as a program |
-| `shim/neo-omp-shim.ts` | The Oh My Pi extension: the tool-call guard and background-job control |
+| `backend/crates/neo-testkit/src/lib.rs`, `http.rs`, `backend/crates/neo-testkit/src/bin/fixture-agy.rs` | Test support: temporary directories, a loopback server, and a pure-Rust stand-in Antigravity CLI for browser tests |
 | `app/lib/main.dart` | The app's entry and root widget |
 | `app/lib/src/api/client.dart`, `models.dart` | The API client and what it carries |
 | `app/lib/src/state/app_state.dart` | Connection and polled state |
 | `app/lib/src/platform/host.dart`, `host_io.dart`, `host_web.dart`, `host_stub.dart` | Where the app runs: the desktop's backend process and single instance, the browser's origin and storage |
-| `app/lib/src/ui/shell.dart`, `chat_page.dart`, `workers_page.dart`, `settings_page.dart`, `accounts_settings.dart`, `activity_ticker.dart`, `scope.dart`, `widgets.dart`, `theme.dart`, `format.dart` | The frame and the three pages (the settings with the shared custom providers and kernel accounts), the bottom-right ticker of what is at work, shared widgets, the look, message formatting |
+| `app/lib/src/ui/shell.dart`, `chat_page.dart`, `workers_page.dart`, `settings_page.dart`, `accounts_settings.dart`, `activity_ticker.dart`, `scope.dart`, `widgets.dart`, `theme.dart`, `format.dart` | The frame and the three pages (the settings with Antigravity models and account login), the bottom-right ticker of what is at work, shared widgets, the look, message formatting |
 | `app/lib/src/qr/qr_code.dart`, `qr_view.dart` | The QR code encoder and its painter |
 | `app/lib/src/l10n/strings.dart` | The app's words in Chinese and English |
 
@@ -86,12 +82,12 @@ The app depends on: `cupertino_ui` (Flutter's Cupertino widgets), `cupertino_ico
 | --- | --- |
 | `backend/crates/neo-core/tests/engine.rs`, `tickets.rs`, `lifecycle.rs` | The Engine over the in-memory repository |
 | `backend/crates/neo-store/tests/core_engine.rs`, `store.rs` | The same Engine tests over SQLite; transactions, receipts, read models, effect rows, the schema version |
-| `backend/crates/neo-kernel/tests/session.rs` | The kernel-neutral Session and journal over a scripted driver |
-| `backend/crates/neo-kernel/tests/claude_real.rs`, `omp_real.rs`, `antigravity_real.rs`, `hermes_real.rs` | Each kernel's protocol against the real runtime and a fake model endpoint; Antigravity's against its real models, since it signs in to Google (opt-in) |
+| `backend/crates/neo-kernel/tests/session.rs` | The Session and journal over a scripted driver |
+| `backend/crates/neo-kernel/tests/antigravity_lifecycle.rs`, `antigravity_real.rs` | The Antigravity driver lifecycle with a pure-Rust stand-in process and hook relay; and against the real Antigravity CLI and its Google models (opt-in) |
 | `backend/crates/neo-app/tests/policy.rs`, `effects.rs` | The gate and Policy changes; the effect queue |
 | `backend/crates/neo-app/tests/flow.rs`, `work.rs`, `watchdog.rs`, `views.rs` | The application over a scripted kernel: the whole path of a request, workers at work, the Watchdog, what the API shows and changes |
 | `backend/crates/neo-app/tests/wechat.rs` | The WeChat bridge against a stand-in for its API |
 | `backend/crates/neo-http/tests/api.rs` | Every route's contract, access control, static files, the protocol's edges |
-| `backend/crates/neo-agent/tests/process.rs`, `real.rs`, `docs.rs` | The program as a process; the product end to end with a real kernel (opt-in); these documents |
+| `backend/crates/neo-agent/tests/process.rs`, `real.rs`, `docs.rs` | The program as a process; the product end to end with the real Antigravity CLI (opt-in); these documents |
 | `app/test/qr_code_test.dart`, `logic_test.dart`, `app_test.dart`, `host_io_test.dart`, `fake_backend.dart` | The QR encoder against an independent one; formatting, models, client and state; every page over a fake backend; the desktop host with real processes, the real backend among them |
-| `packaging/e2e/web-e2e.mjs`, `run-web-e2e.sh` | The web app in a real browser against the real backend and a real kernel |
+| `packaging/e2e/web-e2e.mjs`, `run-web-e2e.sh` | The web app in a real browser against the real backend and the fixture stand-in |

@@ -211,95 +211,55 @@ class ModelOption {
 
 /// A role's chosen model; `null` in its place follows the kernel's default.
 class RoleModel {
-  const RoleModel(this.provider, this.model, [this.thinkingLevel]);
+  const RoleModel(this.provider, this.model);
 
   static RoleModel? fromJson(Object? json) {
     if (json is! Map) return null;
-    return RoleModel(json['provider'] as String? ?? '', json['model'] as String? ?? '', _text(json['thinkingLevel']));
+    return RoleModel(json['provider'] as String? ?? '', json['model'] as String? ?? '');
   }
 
   final String provider;
   final String model;
-  final String? thinkingLevel;
 
-  Map<String, dynamic> toJson() => {'provider': provider, 'model': model, if (thinkingLevel != null) 'thinkingLevel': thinkingLevel};
-
-  RoleModel withThinking(String? level) => RoleModel(provider, model, level);
+  Map<String, dynamic> toJson() => {'provider': provider, 'model': model};
 
   @override
-  bool operator ==(Object other) => other is RoleModel && other.provider == provider && other.model == model && other.thinkingLevel == thinkingLevel;
+  bool operator ==(Object other) => other is RoleModel && other.provider == provider && other.model == model;
 
   @override
-  int get hashCode => Object.hash(provider, model, thinkingLevel);
+  int get hashCode => Object.hash(provider, model);
 }
 
-/// A kernel, whether its program is installed on the backend's machine and can run there, the models it offers,
-/// and the model choices kept for it.
-class KernelInfo {
-  KernelInfo.fromJson(Map<String, dynamic> json)
-    : id = json['id'] as String? ?? '',
-      problem = _text(json['problem']),
+/// The Antigravity CLI status and model settings, with what may be chosen.
+class ModelSettings {
+  ModelSettings.fromJson(Map<String, dynamic> json)
+    : kernel = json['kernel'] as String? ?? 'antigravity',
       installed = json['installed'] != false,
       installing = json['installing'] == true,
       installProgress = _text(json['installProgress']),
-      thinkingLevels = _list(_map(json['supports'])['thinkingLevels']).cast<String>(),
-      available = [for (final option in _list(json['available'])) ModelOption.fromJson(_map(option))],
-      listProblem = _text(json['listProblem']),
       loading = json['loading'] == true,
-      eval = RoleModel.fromJson(_map(json['models'])['eval']),
-      executor = RoleModel.fromJson(_map(json['models'])['executor']);
-
-  final String id;
-  final String? problem;
-  final bool installed;
-  final bool installing;
-
-  /// The last line its installer printed, while it is being installed: how far its download has come.
-  final String? installProgress;
-  final List<String> thinkingLevels;
-  final List<ModelOption> available;
-
-  /// Why it lists no models, when it cannot run or listing them failed.
-  final String? listProblem;
-
-  /// It is still listing its models.
-  final bool loading;
-  final RoleModel? eval;
-  final RoleModel? executor;
-}
-
-/// The kernel and model settings, with what may be chosen.
-class ModelSettings {
-  ModelSettings.fromJson(Map<String, dynamic> json)
-    : kernel = json['kernel'] as String? ?? 'omp',
-      workerKernel = _text(json['workerKernel']) ?? json['kernel'] as String? ?? 'omp',
-      workerKernelFollows = json['workerKernelFollows'] != false,
-      loading = json['loading'] == true,
-      kernels = [for (final kernel in _list(json['kernels'])) KernelInfo.fromJson(_map(kernel))],
-      thinkingLevels = _list(_map(json['supports'])['thinkingLevels']).cast<String>(),
       eval = RoleModel.fromJson(_map(json['current'])['eval']),
       executor = RoleModel.fromJson(_map(json['current'])['executor']),
       available = [for (final option in _list(json['available'])) ModelOption.fromJson(_map(option))],
-      problem = _text(json['problem']);
+      problem = _text(json['problem']),
+      listProblem = _text(json['listProblem']);
 
-  /// The kernel the main session runs on.
   final String kernel;
+  final bool installed;
+  final bool installing;
 
-  /// The kernel workers run on, and whether it follows the main session's.
-  final String workerKernel;
-  final bool workerKernelFollows;
+  /// The last line its installer printed, while it is being installed.
+  final String? installProgress;
 
-  /// A kernel is still listing its models.
+  /// Antigravity is still listing its models.
   final bool loading;
-  final List<KernelInfo> kernels;
-  final List<String> thinkingLevels;
   final RoleModel? eval;
   final RoleModel? executor;
   final List<ModelOption> available;
   final String? problem;
 
-  /// What is known of a kernel; an empty one when the backend did not list it.
-  KernelInfo info(String id) => kernels.firstWhere((kernel) => kernel.id == id, orElse: () => KernelInfo.fromJson({'id': id}));
+  /// Why it lists no models, when it cannot run or listing them failed.
+  final String? listProblem;
 }
 
 /// A rule of the Policy.
@@ -454,113 +414,20 @@ class Activity {
   bool get busy => router || workers.isNotEmpty;
 }
 
-/// A custom model provider the kernels share, as the backend shows it: its key only as a hint.
-class CustomProvider {
-  CustomProvider.fromJson(Map<String, dynamic> json)
-    : raw = Map<String, dynamic>.of(json)
-        ..remove('key')
-        ..remove('listsModels')
-        ..remove('modelsProblem'),
-      listsModels = json['listsModels'] != false,
-      modelsProblem = _text(json['modelsProblem']),
-      name = json['name'] as String? ?? '',
-      api = json['api'] as String? ?? 'openai-completions',
-      baseUrl = json['baseUrl'] as String? ?? '',
-      headers = _map(json['headers']).map((name, value) => MapEntry(name, '$value')),
-      models = [for (final model in _list(json['models'])) _map(model)],
-      kernels = _list(json['kernels']).cast<String>(),
-      keyHint = _text(json['key']);
+/// The Google account Antigravity is signed in with.
+class AntigravityAccount {
+  AntigravityAccount.fromJson(Map<String, dynamic> json) : email = json['email'] as String? ?? '', removable = json['removable'] == true;
 
-  /// Everything the backend sent but the key hint, to send back as it was.
-  final Map<String, dynamic> raw;
-  final String name;
-  final String api;
-  final String baseUrl;
-  final Map<String, String> headers;
+  static AntigravityAccount? maybe(Object? json) => json is Map ? AntigravityAccount.fromJson(_map(json)) : null;
 
-  /// Each model as the backend has it: `id`, `name`, and fields the app does not edit, which go back unchanged.
-  final List<Map<String, dynamic>> models;
-  final List<String> kernels;
-  final String? keyHint;
-
-  /// Whether its models are listed over its API rather than typed.
-  final bool listsModels;
-
-  /// Why its models could not be listed the last time.
-  final String? modelsProblem;
-}
-
-/// The custom providers, with the APIs a provider may speak and the ones each kernel can use.
-class ProvidersView {
-  ProvidersView.fromJson(Map<String, dynamic> json)
-    : providers = [for (final provider in _list(json['providers'])) CustomProvider.fromJson(_map(provider))],
-      apis = _list(json['apis']).cast<String>(),
-      serves = _map(json['serves']),
-      imported = (json['imported'] as num?)?.toInt();
-
-  final List<CustomProvider> providers;
-  final List<String> apis;
-  final Map<String, dynamic> serves;
-
-  /// How many an import added, after one.
-  final int? imported;
-
-  /// Whether a provider of an API lists its models itself.
-  bool listsModels(String api) => apis.contains(api);
-
-  /// Whether a kernel can use a provider of an API.
-  bool kernelServes(String kernel, String api) {
-    final apis = serves[kernel];
-    return apis == '*' || (apis is List && apis.contains(api));
-  }
-}
-
-/// An account a kernel is logged in with.
-class KernelAccount {
-  KernelAccount.fromJson(Map<String, dynamic> json)
-    : id = json['id'] as String? ?? '',
-      provider = json['provider'] as String? ?? '',
-      kind = json['kind'] as String? ?? '',
-      label = json['label'] as String? ?? '',
-      removable = json['removable'] == true;
-
-  final String id;
-  final String provider;
-  final String kind;
-  final String label;
+  final String email;
   final bool removable;
 }
 
-/// One kernel's accounts and what can be done about them.
-class KernelAccounts {
-  KernelAccounts.fromJson(Map<String, dynamic> json)
-    : id = json['id'] as String? ?? '',
-      installed = json['installed'] == true,
-      problem = _text(json['problem']),
-      accounts = [for (final account in _list(_map(json['accounts'])['accounts'])) KernelAccount.fromJson(_map(account))],
-      login = [for (final option in _list(_map(json['accounts'])['login'])) (_map(option)['id'] as String? ?? '', _map(option)['name'] as String? ?? '')],
-      anyProvider = _map(json['accounts'])['anyProvider'] == true,
-      apiKeys = _map(json['accounts'])['apiKeys'] == true,
-      note = _text(_map(json['accounts'])['note']);
-
-  final String id;
-  final bool installed;
-  final String? problem;
-  final List<KernelAccount> accounts;
-
-  /// The providers it can log in to, as (id, name).
-  final List<(String, String)> login;
-  final bool anyProvider;
-  final bool apiKeys;
-  final String? note;
-}
-
-/// A login run by the backend: the links to open, and what the login program printed.
+/// An Antigravity login run by the backend: the links to open, and what the login program printed.
 class LoginRun {
   LoginRun.fromJson(Map<String, dynamic> json)
     : id = (json['id'] as num?)?.toInt() ?? 0,
-      kernel = json['kernel'] as String? ?? '',
-      provider = json['provider'] as String? ?? '',
       state = json['state'] as String? ?? 'failed',
       links = _list(json['links']).cast<String>(),
       output = json['output'] as String? ?? '';
@@ -568,8 +435,6 @@ class LoginRun {
   static LoginRun? maybe(Object? json) => json is Map ? LoginRun.fromJson(_map(json)) : null;
 
   final int id;
-  final String kernel;
-  final String provider;
 
   /// `running`, `done` or `failed`.
   final String state;
@@ -579,14 +444,24 @@ class LoginRun {
   bool get running => state == 'running';
 }
 
-/// Every kernel's accounts, and the login in progress or the last one.
+/// Antigravity's account status, and any login in progress or the last one.
 class AccountsView {
   AccountsView.fromJson(Map<String, dynamic> json)
-    : kernels = [for (final kernel in _list(json['kernels'])) KernelAccounts.fromJson(_map(kernel))],
+    : installed = json['installed'] == true,
+      problem = _text(json['problem']),
+      account = AntigravityAccount.maybe(json['account']),
+      note = _text(json['note']),
       login = LoginRun.maybe(json['login']);
 
-  AccountsView.withLogin(AccountsView view, this.login) : kernels = view.kernels;
+  AccountsView.withLogin(AccountsView view, this.login)
+    : installed = view.installed,
+      problem = view.problem,
+      account = view.account,
+      note = view.note;
 
-  final List<KernelAccounts> kernels;
+  final bool installed;
+  final String? problem;
+  final AntigravityAccount? account;
+  final String? note;
   final LoginRun? login;
 }

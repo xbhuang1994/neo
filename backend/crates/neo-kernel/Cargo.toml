@@ -1,6 +1,6 @@
 [package]
 name = "neo-kernel"
-description = "Neo kernels: persistent agent sessions over the Claude Code, Oh My Pi and Antigravity command-line runtimes."
+description = "Neo kernel: persistent agent sessions over the Antigravity CLI runtime."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -18,3 +18,7 @@ libc.workspace = true
 
 [dev-dependencies]
 neo-testkit = { path = "../neo-testkit" }
+
+[[test]]
+name = "antigravity_lifecycle"
+harness = false

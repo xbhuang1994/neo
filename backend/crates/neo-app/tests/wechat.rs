@@ -616,6 +616,7 @@ async fn records_a_file_result_receipt_so_watchdog_and_restarts_do_not_resend_it
     f.settle().await;
     assert_eq!(wechat.seen.lock().unwrap().uploads, vec![b"report-v1".to_vec()]);
     assert_eq!(ready_relays(&f), 1);
+    assert!(f.ticket(0).answers.is_empty());
 
     // Watchdog sees the file receipt as the report's reply: neither auto-nudges nor patrols re-relay it.
     for _ in 0..3 {
@@ -658,8 +659,91 @@ async fn records_a_file_result_receipt_so_watchdog_and_restarts_do_not_resend_it
     f.until("the updated file was uploaded", || wechat.seen.lock().unwrap().uploads.len() == 3).await;
     f.settle().await;
     assert_eq!(wechat.seen.lock().unwrap().uploads[2], b"report-v2".to_vec());
+    assert!(f.ticket(0).answers.is_empty());
     f.app.watchdog_tick().await;
     f.settle().await;
     assert!(f.ran(SessionRole::Watchdog).is_empty());
+    f.app.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn clears_answers_after_wechat_file_delivery_so_resumed_progress_never_nudges() {
+    let (wechat, f) = quietly_bound(Duration::ZERO, Duration::from_secs(10)).await;
+    let phase = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let worker_phase = phase.clone();
+    f.script(model(move |turn| {
+        let worker_phase = worker_phase.clone();
+        Box::pin(async move {
+            match turn.role {
+                SessionRole::Worker => {
+                    let step = worker_phase.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if step == 0 {
+                        std::fs::write(turn.cwd.join("report.docx"), b"report-v1").map_err(|error| error.to_string())?;
+                        let trigger_id = messages(&turn.text)
+                            .iter()
+                            .rev()
+                            .find_map(|card| card["trigger"]["trigger_id"].as_str().or_else(|| card["trigger_id"].as_str()).map(str::to_string))
+                            .expect("the human trigger");
+                        turn.call("orchestrator_report", json!({"state": "ready", "reply_to_trigger_id": trigger_id, "summary": "Send report.docx."})).await?;
+                    } else {
+                        turn.jobs.lock().unwrap().push(Fixture::job("bg_1", neo_kernel::types::JobKind::Bash, "sleep 10"));
+                        turn.call("orchestrator_report", json!({"state": "progress", "summary": "Running v2 training."})).await?;
+                    }
+                    Ok("Done.".into())
+                }
+                SessionRole::Watchdog => Ok("Healthy.".into()),
+                _ => {
+                    for message in messages(&turn.text) {
+                        match message["kind"].as_str() {
+                            Some("candidate") if message["text"] == "生成第一版报告" => {
+                                turn.call(
+                                    "orchestrator_route",
+                                    json!({"decisions": [{"kind": "accept", "trigger_id": message["trigger_id"], "title": "报告研究", "worktree_name": "report-research", "acknowledgement": "收到。"}]}),
+                                )
+                                .await?;
+                            }
+                            Some("candidate") => {
+                                let ticket_id = message["related_tickets"][0]["ticket_id"].clone();
+                                turn.call(
+                                    "orchestrator_route",
+                                    json!({"decisions": [{"kind": "attach", "trigger_id": message["trigger_id"], "ticket_id": ticket_id, "acknowledgement": "收到：继续第二版。"}]}),
+                                )
+                                .await?;
+                            }
+                            Some("worker_report") if message["state"] == "ready" => {
+                                let ticket_id = message["ticket"]["ticket_id"].as_str().unwrap();
+                                let card = turn.call("orchestrator_read", json!({"resource": format!("ticket/{ticket_id}")})).await?;
+                                let path = format!("{}/report.docx", card["directory"].as_str().unwrap());
+                                turn.call("wechat_send_file", json!({"path": path, "caption": "已发送报告。", "ticket_id": ticket_id})).await?;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok("Done.".into())
+                }
+            }
+        })
+    }));
+    let progress_relays = |f: &Fixture| {
+        f.ran(SessionRole::Orchestrator)
+            .iter()
+            .filter(|ran| messages(&ran.text).iter().any(|message| message["kind"] == "worker_report" && message["state"] == "progress"))
+            .count()
+    };
+
+    wechat.seen.lock().unwrap().batches.push_back(json!([from_bound("ask-1", json!([{"type": 1, "text_item": {"text": "生成第一版报告"}}]))]));
+    f.until("first report uploaded", || wechat.seen.lock().unwrap().uploads.len() == 1).await;
+    f.settle().await;
+    assert!(f.ticket(0).answers.is_empty());
+
+    wechat.seen.lock().unwrap().batches.push_back(json!([from_bound("ask-2", json!([{"type": 1, "text_item": {"text": "继续第二版"}}]))]));
+    f.until("progress report recorded", || f.ticket(0).latest_report().is_some_and(|r| r.summary == "Running v2 training.")).await;
+    f.settle().await;
+
+    for _ in 0..3 {
+        f.app.watchdog_tick().await;
+        f.settle().await;
+    }
+    assert_eq!(progress_relays(&f), 0);
     f.app.stop().await;
 }

@@ -28,7 +28,6 @@ fn log(message: &str) {
 /// Everything a run needs, resolved from the command line, the environment and the configuration file.
 struct Plan {
     data_dir: PathBuf,
-    agent_dir: PathBuf,
     allow_multiple: bool,
     host: String,
     port: u16,
@@ -45,55 +44,30 @@ fn absolute(path: PathBuf) -> PathBuf {
     std::path::absolute(&path).unwrap_or(path)
 }
 
-fn common(common: &Common, config: &ConfigFile) -> (PathBuf, PathBuf, bool) {
+fn common(common: &Common, config: &ConfigFile) -> (PathBuf, bool) {
     let data_dir =
         absolute(common.data_dir.clone().or_else(|| env_path("NEO_DATA_DIR")).or_else(|| config.data_dir.clone()).unwrap_or_else(paths::default_data_dir));
-    let agent_dir = absolute(
-        common.agent_dir.clone().or_else(|| config.agent_dir.clone()).or_else(|| env_path("PI_CODING_AGENT_DIR")).unwrap_or_else(paths::omp_agent_dir),
-    );
     let allow_multiple = common.allow_multiple || std::env::var("NEO_ALLOW_MULTIPLE").is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
-    (data_dir, agent_dir, allow_multiple)
+    (data_dir, allow_multiple)
 }
 
 fn kernels(plan: &Plan) -> RealKernels {
-    let program_dir = paths::program_dir();
-    // Cache each discovered runtime binary while it stays on disk, re-probing when missing or replaced.
-    let cache: Arc<std::sync::Mutex<std::collections::BTreeMap<Kernel, PathBuf>>> = Default::default();
+    // Cache the discovered Antigravity CLI binary while it stays on disk, re-probing when missing or replaced.
+    let cache: Arc<std::sync::Mutex<Option<PathBuf>>> = Default::default();
     let find = Arc::new(move |kernel: Kernel| {
-        if let Some(path) = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(&kernel).filter(|path| path.is_file()).cloned() {
+        if let Some(path) = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref().filter(|path| path.is_file()).cloned() {
             return Some(path);
         }
-        let variable = match kernel {
-            Kernel::Claude => "NEO_CLAUDE_BIN",
-            Kernel::Omp => "NEO_OMP_BIN",
-            Kernel::Antigravity => "NEO_AGY_BIN",
-            Kernel::Hermes => "NEO_HERMES_BIN",
-        };
         let name = kernels::program_name(kernel);
-        let found = paths::find_runtime(name, env_path(variable), std::env::var_os("PATH").as_deref(), &paths::install_dirs(name));
-        let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(ref path) = found {
-            guard.insert(kernel, path.clone());
-        } else {
-            guard.remove(&kernel);
-        }
+        let found = paths::find_runtime(name, env_path("NEO_AGY_BIN"), std::env::var_os("PATH").as_deref(), &paths::install_dirs());
+        *cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = found.clone();
         found
     });
-    let shim = paths::find_shim(env_path("NEO_SHIM"), program_dir.as_deref());
     // Every Session meets the blocked commands first on its path.
     let env = [("PATH".to_string(), blocked::path_with(&plan.data_dir).to_string_lossy().to_string())].into_iter().collect();
     // Antigravity's hooks come back to this program.
     let hook_relay = std::env::current_exe().map(|exe| vec![exe.display().to_string(), "agy-hook".into()]).unwrap_or_default();
-    RealKernels {
-        state_dir: plan.data_dir.clone(),
-        agent_dir: plan.agent_dir.clone(),
-        find,
-        installing: Default::default(),
-        shim,
-        env,
-        hook_relay,
-        providers: Default::default(),
-    }
+    RealKernels { find, installing: Default::default(), env, hook_relay }
 }
 
 /// Waits until the process is asked to end: by a signal, or by `ended` (the desktop app going away).
@@ -141,12 +115,10 @@ async fn run(plan: Plan, sidecar: bool, ended: Option<tokio::sync::oneshot::Rece
         Refused::Failed(why) => fail(why),
     })?;
     let kernels = Arc::new(kernels(&plan));
-    for kernel in [Kernel::Claude, Kernel::Omp, Kernel::Antigravity, Kernel::Hermes] {
-        let name = kernels::display_name(kernel);
-        match (kernels.program(kernel), kernels.unavailable(kernel)) {
-            (Some(program), None) => log(&format!("{name}: {}", program.display())),
-            (_, problem) => log(&format!("{name}: {}", problem.unwrap_or_default())),
-        }
+    let name = kernels::display_name(Kernel::Antigravity);
+    match (kernels.program(Kernel::Antigravity), kernels.unavailable(Kernel::Antigravity)) {
+        (Some(program), None) => log(&format!("{name}: {}", program.display())),
+        (_, problem) => log(&format!("{name}: {}", problem.unwrap_or_default())),
     }
     let machine = Machine { state_dir: plan.data_dir.clone(), wechat: Default::default(), program: std::env::current_exe().ok() };
     let app = App::open(machine, kernels, Timings::default()).map_err(fail)?;
@@ -196,28 +168,26 @@ fn version_of(program: &Path) -> String {
     }
 }
 
-/// Print what this machine provides; succeeds when at least one kernel can run.
+/// Print what this machine provides; succeeds when Antigravity CLI can run.
 fn doctor(options: &Common) -> i32 {
-    let (data_dir, agent_dir, _) = common(options, &ConfigFile::default());
-    let plan = Plan { data_dir, agent_dir, allow_multiple: true, host: String::new(), port: 0, token: None, web_dir: None, init_settings: None };
+    let (data_dir, _) = common(options, &ConfigFile::default());
+    let plan = Plan { data_dir, allow_multiple: true, host: String::new(), port: 0, token: None, web_dir: None, init_settings: None };
     let kernels = kernels(&plan);
     let program_dir = paths::program_dir();
     println!("Neo {}", env!("CARGO_PKG_VERSION"));
     println!("Data directory:   {}", plan.data_dir.display());
-    println!("Agent directory:  {}", plan.agent_dir.display());
     println!("Instance lock:    {}", paths::runtime_dir().display());
-    let mut usable = 0;
-    for kernel in [Kernel::Claude, Kernel::Omp, Kernel::Antigravity, Kernel::Hermes] {
-        let name = format!("{}:", kernels::display_name(kernel));
-        match (kernels.program(kernel), kernels.unavailable(kernel)) {
-            (Some(program), None) => {
-                usable += 1;
-                println!("{name:<18}ok — {} ({})", program.display(), version_of(&program));
-            }
-            (_, problem) => println!("{name:<18}missing — {}", problem.unwrap_or_default()),
+    let name = format!("{}:", kernels::display_name(Kernel::Antigravity));
+    let usable = match (kernels.program(Kernel::Antigravity), kernels.unavailable(Kernel::Antigravity)) {
+        (Some(program), None) => {
+            println!("{name:<18}ok — {} ({})", program.display(), version_of(&program));
+            true
         }
-    }
-    println!("OMP extension:    {}{}", kernels.shim.display(), if kernels.shim.is_file() { "" } else { " (missing)" });
+        (_, problem) => {
+            println!("{name:<18}missing — {}", problem.unwrap_or_default());
+            false
+        }
+    };
     match paths::on_path("git", std::env::var_os("PATH").as_deref()) {
         Some(git) => println!("git:              ok — {} ({})", git.display(), version_of(&git)),
         None => println!("git:              missing — workers that use git need it installed"),
@@ -226,8 +196,8 @@ fn doctor(options: &Common) -> i32 {
         Some(web) => println!("Web app:          {}", web.display()),
         None => println!("Web app:          not found beside the program (serve --web-dir <dir> names it)"),
     }
-    if usable == 0 {
-        println!("No kernel can run: install Claude Code, Oh My Pi, the Antigravity CLI or Hermes Agent (the app's settings can install them), or set NEO_CLAUDE_BIN / NEO_OMP_BIN / NEO_AGY_BIN / NEO_HERMES_BIN.");
+    if !usable {
+        println!("Antigravity CLI (agy) cannot run: install it (the app's settings can install it), or set NEO_AGY_BIN.");
         return 1;
     }
     0
@@ -238,7 +208,7 @@ fn serve_plan(options: cli::Serve) -> Result<Plan, String> {
         Some(file) => ConfigFile::read(file)?,
         None => ConfigFile::default(),
     };
-    let (data_dir, agent_dir, allow_multiple) = common(&options.common, &config);
+    let (data_dir, allow_multiple) = common(&options.common, &config);
     let token =
         options.token.or_else(|| std::env::var("NEO_TOKEN").ok()).or(config.token).map(|token| token.trim().to_string()).filter(|token| !token.is_empty());
     let web_dir = options.web_dir.or(config.web_dir).map(absolute).or_else(|| paths::find_web(paths::program_dir().as_deref()));
@@ -247,7 +217,6 @@ fn serve_plan(options: cli::Serve) -> Result<Plan, String> {
     }
     Ok(Plan {
         data_dir,
-        agent_dir,
         allow_multiple,
         host: options.host.or(config.host).unwrap_or_else(|| "127.0.0.1".into()),
         port: options.port.or(config.port).unwrap_or(DEFAULT_PORT),
@@ -278,11 +247,8 @@ fn sidecar_plan(options: cli::Sidecar) -> Result<(Plan, tokio::sync::oneshot::Re
         }
         let _ = ended.send(());
     });
-    let (data_dir, agent_dir, allow_multiple) = common(&options.common, &ConfigFile::default());
-    Ok((
-        Plan { data_dir, agent_dir, allow_multiple, host: "127.0.0.1".into(), port: options.port, token: Some(token), web_dir: None, init_settings: None },
-        closed,
-    ))
+    let (data_dir, allow_multiple) = common(&options.common, &ConfigFile::default());
+    Ok((Plan { data_dir, allow_multiple, host: "127.0.0.1".into(), port: options.port, token: Some(token), web_dir: None, init_settings: None }, closed))
 }
 
 fn main() {

@@ -12,7 +12,7 @@ use crate::sessions::{worker_session_id, Loaded};
 use neo_core::assignments::WorkerReport;
 use neo_core::errors::UserError;
 use neo_core::ids::key;
-use neo_core::model::{Assignment, AssignmentState, Execution, ReportState, Ticket, TicketInput};
+use neo_core::model::{Assignment, AssignmentState, Execution, ReportState, Ticket, TicketEndBy, TicketInput};
 use neo_core::ports::{Accept, Repositories};
 use neo_kernel::session::{Mode, Presentation};
 use neo_kernel::types::{Block, JobKind, KernelEvent};
@@ -56,6 +56,17 @@ struct Inner {
 pub struct ExecutorState {
     inner: Mutex<Inner>,
     stopped: Notify,
+}
+
+/// Why a request to stop a ticket's worker could not run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StopWorkerError {
+    /// No ticket exists with this id.
+    NotFound,
+    /// The ticket is already ended (completed, stopped or dropped).
+    AlreadyEnded,
+    /// Stopping failed for another reason.
+    Failed(String),
 }
 
 /// A background job of a ticket's worker, for views and the Watchdog.
@@ -175,6 +186,12 @@ impl App {
         !inner.running.is_empty() || !inner.awaiting.is_empty() || !inner.starting.is_empty()
     }
 
+    /// Whether this ticket's worker is currently in a turn, starting, or awaiting a turn.
+    pub(crate) fn is_worker_active(&self, ticket_id: &str) -> bool {
+        let inner = self.exec();
+        inner.running.contains(ticket_id) || inner.awaiting.contains(ticket_id) || inner.starting.contains_key(ticket_id)
+    }
+
     /// The tickets whose worker is in a turn, being started or woken, or has background work that will wake it.
     pub fn busy_tickets(&self) -> Vec<String> {
         let inner = self.exec();
@@ -273,10 +290,12 @@ impl App {
     }
 
     /// End an Assignment's work once the Engine ended it: close its worker's Session, unless that worker is still in
-    /// the turn of its own final report, which then closes it.
+    /// the turn of its own final report, which then closes it. A human stop always terminates immediately.
     pub(crate) fn executor_stop(&self, ticket: &Ticket, assignment: &Assignment, reason: &str) {
+        let human_stop = ticket.ended.as_ref().is_some_and(|ended| ended.by == TicketEndBy::Human);
         let busy = matches!((&assignment.delivered_at, &assignment.report), (Some(delivered), Some(report)) if delivered >= &report.at);
-        let own_turn = assignment.report.as_ref().is_some_and(|report| matches!(report.state, ReportState::Ready | ReportState::Dropped))
+        let own_turn = !human_stop
+            && assignment.report.as_ref().is_some_and(|report| matches!(report.state, ReportState::Ready | ReportState::Dropped))
             && !busy
             && ticket.undelivered.is_empty();
         let (weak, ticket_id, reason) = (self.weak.clone(), ticket.id.clone(), reason.to_string());
@@ -297,15 +316,70 @@ impl App {
         });
     }
 
-    /// Close a ticket's worker Session in the background; [`App::worker_stopped`] waits for it.
+    /// Close a ticket's worker Session together with all its subagents, background jobs and detached workspace
+    /// processes; [`App::worker_stopped`] waits for it.
     fn stop_worker(&self, ticket_id: &str, _reason: &str) {
-        self.exec().stopping.insert(ticket_id.to_string());
+        if !self.exec().stopping.insert(ticket_id.to_string()) {
+            return;
+        }
         let (weak, ticket_id) = (self.weak.clone(), ticket_id.to_string());
         self.rt.spawn(async move {
             let Some(app) = weak.upgrade() else { return };
-            app.stop_session(&worker_session_id(&ticket_id)).await;
+            let session_id = worker_session_id(&ticket_id);
+            let mut stray_pids: Vec<u32> = Vec::new();
+            if let Some(loaded) = app.session(&session_id) {
+                loaded.session.begin_dispose();
+                let driver = loaded.session.driver().clone();
+                let mut roots: Vec<u32> = driver.pid().into_iter().collect();
+                let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                    let jobs = driver.jobs().await;
+                    let mut job_ids = Vec::with_capacity(jobs.len());
+                    for job in jobs {
+                        roots.extend(job.pids);
+                        job_ids.push(job.id);
+                    }
+                    if !job_ids.is_empty() {
+                        driver.acknowledge(&job_ids).await;
+                        let mut cancels = tokio::task::JoinSet::new();
+                        for job_id in job_ids {
+                            let driver = driver.clone();
+                            cancels.spawn(async move {
+                                let _ = driver.cancel(&job_id).await;
+                            });
+                        }
+                        while cancels.join_next().await.is_some() {}
+                    }
+                })
+                .await;
+                if !roots.is_empty() {
+                    stray_pids = tokio::task::spawn_blocking(move || crate::procinfo::tree(&roots).into_iter().map(|process| process.pid).collect())
+                        .await
+                        .unwrap_or_default();
+                }
+            }
+            app.stop_session(&session_id).await;
+            let ticket_dir = app.store_ticket(&ticket_id).filter(|ticket| !ticket.live()).and_then(|ticket| ticket.execution).and_then(|execution| {
+                let path = PathBuf::from(&execution.directory);
+                let safe_leaf = path.file_name().and_then(|name| name.to_str()) == Some(execution.name.as_str());
+                (safe_leaf && path.is_dir()).then_some(path)
+            });
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Some(directory) = ticket_dir {
+                    let canonical = directory.canonicalize().unwrap_or(directory);
+                    let dir_pids = crate::procinfo::in_directory(&canonical);
+                    if !dir_pids.is_empty() {
+                        stray_pids.extend(crate::procinfo::tree(&dir_pids).into_iter().map(|process| process.pid));
+                    }
+                }
+                if !stray_pids.is_empty() {
+                    crate::procinfo::terminate_pids(&stray_pids);
+                }
+            })
+            .await;
+            app.jobs_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&ticket_id);
             app.exec().stopping.remove(&ticket_id);
             app.executor.stopped.notify_waiters();
+            app.effects.wake_kind(crate::effects::LAUNCH);
         });
     }
     async fn worker_stopped(&self, ticket_id: &str) {
@@ -318,6 +392,37 @@ impl App {
             }
             stopped.await;
         }
+    }
+
+    /// Stop an open ticket from the UI together with its worker, subagents, background jobs and queued work, marking it
+    /// ended with outcome `stopped`, and return the refreshed worker detail view. Refuses unknown or already ended
+    /// tickets.
+    pub async fn stop_worker_ticket(&self, ticket_id: &str) -> Result<Value, StopWorkerError> {
+        let _ = self.store.atomic(|| {
+            let ticket = self.store_ticket(ticket_id).ok_or(StopWorkerError::NotFound)?;
+            if !ticket.live() {
+                return Err(StopWorkerError::AlreadyEnded);
+            }
+            self.engine.stop_ticket(ticket_id, Some("Stopped from task detail")).map_err(|error| StopWorkerError::Failed(error.message))?;
+            self.effects.cancel(crate::effects::DELIVERY, ticket_id);
+            for assignment in &ticket.assignments {
+                self.effects.cancel(crate::effects::LAUNCH, &assignment.id);
+            }
+            Ok(ticket)
+        })?;
+        {
+            let mut inner = self.exec();
+            inner.unload_after_end.remove(ticket_id);
+            inner.running.remove(ticket_id);
+            inner.awaiting.remove(ticket_id);
+            inner.left.remove(ticket_id);
+        }
+        self.stop_worker(ticket_id, "Stopped from task detail");
+        self.worker_stopped(ticket_id).await;
+        self.jobs_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(ticket_id);
+        self.effects.wake_kind(crate::effects::LAUNCH);
+        self.passes.pump();
+        self.worker_detail(ticket_id).await.ok_or(StopWorkerError::NotFound)
     }
 
     fn worker_failed(&self, ticket_id: &str, summary: &str) {
@@ -409,6 +514,7 @@ impl App {
         }
         let loaded = self.ensure_session(&session_id, &workspace, &ticket.title, SessionRole::Worker, Some(&ticket.id)).await?;
         if !current()? {
+            self.stop_session(&session_id).await;
             return Ok(());
         }
         let journal = loaded.session.journal();
@@ -460,6 +566,7 @@ impl App {
         let request_id = if later { format!("assignment:{}:{}", ticket.id, assignment.id) } else { first };
         let input_ids: Vec<String> = waiting.iter().map(|input| input.id().to_string()).collect();
         if !current()? {
+            self.stop_session(&session_id).await;
             return Err(Failure::Error("Launch authorization changed before worker delivery".into()));
         }
         self.send_to_worker(&loaded, &ticket.id, &request_id, parts.join("\n\n"), &input_ids).await?;
@@ -532,7 +639,10 @@ impl App {
         live()?;
         let directory = ticket.execution.as_ref().map(|execution| PathBuf::from(&execution.directory)).unwrap_or_default();
         let loaded = self.ensure_session(&worker_session_id(&ticket.id), &directory, &ticket.title, SessionRole::Worker, Some(&ticket.id)).await?;
-        live()?;
+        if let Err(error) = live() {
+            self.stop_session(&worker_session_id(&ticket.id)).await;
+            return Err(error);
+        }
         let ids = [input.id().to_string()];
         self.send_to_worker(&loaded, &ticket.id, input.id(), self.input_text(ticket, input), &ids).await?;
         self.engine.inputs_delivered(&ticket.id, &assignment.id, &ids).map_err(user)?;
@@ -636,6 +746,8 @@ impl App {
     }
 
     /// Cancel one hung or off-track background job of a ticket and wake its worker with why.
+    /// When the runtime cannot cancel a single job from outside (such as Antigravity), interrupts the stalled worker
+    /// runtime, cleans up hung child processes, and resumes the worker with the finding.
     pub async fn cancel_job(self: &Arc<Self>, ticket_id: &str, job_id: &str, reason: &str) -> Result<bool, String> {
         let Some(loaded) = self.session(&worker_session_id(ticket_id)).filter(|loaded| !loaded.session.is_disposed()) else { return Ok(false) };
         let running = self.running_jobs(ticket_id).await;
@@ -643,7 +755,8 @@ impl App {
         let driver = loaded.session.driver();
         driver.acknowledge(&[job_id.to_string()]).await;
         if !driver.cancel(job_id).await {
-            return Ok(false);
+            let note = format!("[Watchdog] Interrupted stalled session to stop background job {job_id} ({}): {reason}", target.label);
+            return self.interrupt_and_wake(ticket_id, &note, "watchdog-cancel").await;
         }
         let remaining: Vec<&str> = running.iter().filter(|job| job.id != job_id).map(|job| job.id.as_str()).collect();
         let mut note = format!("[Watchdog] Stopped background job {job_id} ({}): {reason}", target.label);
@@ -671,6 +784,92 @@ impl App {
             }
             return Err(error);
         }
+        Ok(true)
+    }
+
+    /// Interrupt a stalled or hung working turn (and any hung child/detached workspace processes) and immediately resume
+    /// the worker with a Watchdog recovery prompt.
+    pub async fn interrupt_worker(self: &Arc<Self>, ticket_id: &str, reason: &str) -> Result<bool, String> {
+        let note = format!("[Watchdog] Interrupted stalled turn: {reason}");
+        self.interrupt_and_wake(ticket_id, &note, "watchdog-interrupt").await
+    }
+
+    async fn interrupt_and_wake(self: &Arc<Self>, ticket_id: &str, note: &str, request_kind: &str) -> Result<bool, String> {
+        let Some(ticket) = self.store_ticket(ticket_id).filter(Ticket::live) else { return Ok(false) };
+        let Some(assignment) = ticket.running().cloned() else { return Ok(false) };
+        if self.exec().unload_after_end.contains(ticket_id) || self.closing() || self.paused() {
+            return Ok(false);
+        }
+        let session_id = worker_session_id(ticket_id);
+        let mut stray_pids: Vec<u32> = Vec::new();
+        if let Some(loaded) = self.session(&session_id) {
+            // Begin disposal first so closing the hung runtime cannot emit a spurious waiting/failed relay.
+            loaded.session.begin_dispose();
+            let driver = loaded.session.driver().clone();
+            let mut roots: Vec<u32> = driver.pid().into_iter().collect();
+            let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                let jobs = driver.jobs().await;
+                let mut job_ids = Vec::with_capacity(jobs.len());
+                for job in jobs {
+                    roots.extend(job.pids);
+                    job_ids.push(job.id);
+                }
+                if !job_ids.is_empty() {
+                    driver.acknowledge(&job_ids).await;
+                    let mut cancels = tokio::task::JoinSet::new();
+                    for job_id in job_ids {
+                        let driver = driver.clone();
+                        cancels.spawn(async move {
+                            let _ = driver.cancel(&job_id).await;
+                        });
+                    }
+                    while cancels.join_next().await.is_some() {}
+                }
+            })
+            .await;
+            if !roots.is_empty() {
+                stray_pids = tokio::task::spawn_blocking(move || crate::procinfo::tree(&roots).into_iter().map(|process| process.pid).collect())
+                    .await
+                    .unwrap_or_default();
+            }
+            self.stop_session(&session_id).await;
+        }
+        let ticket_dir = ticket.execution.as_ref().and_then(|execution| {
+            let path = PathBuf::from(&execution.directory);
+            let safe_leaf = path.file_name().and_then(|name| name.to_str()) == Some(execution.name.as_str());
+            (safe_leaf && path.is_dir()).then_some(path)
+        });
+        let cleanup_dir = ticket_dir.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(directory) = cleanup_dir {
+                let canonical = directory.canonicalize().unwrap_or(directory);
+                let dir_pids = crate::procinfo::in_directory(&canonical);
+                if !dir_pids.is_empty() {
+                    stray_pids.extend(crate::procinfo::tree(&dir_pids).into_iter().map(|process| process.pid));
+                }
+            }
+            if !stray_pids.is_empty() {
+                crate::procinfo::terminate_pids(&stray_pids);
+            }
+        })
+        .await;
+        {
+            let mut inner = self.exec();
+            inner.running.remove(ticket_id);
+            inner.awaiting.remove(ticket_id);
+            inner.left.remove(ticket_id);
+        }
+        self.jobs_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(ticket_id);
+        let directory = ticket.execution.as_ref().map(|execution| PathBuf::from(&execution.directory)).unwrap_or_default();
+        let loaded = self.ensure_session(&session_id, &directory, &ticket.title, SessionRole::Worker, Some(ticket_id)).await?;
+        let seq = {
+            let mut inner = self.exec();
+            inner.wake_seq += 1;
+            inner.wake_seq
+        };
+        let request_id = key(&[request_kind, ticket_id, &assignment.id, &seq.to_string(), &neo_core::time::now_iso()]);
+        let prompt = format!("{note} Inspect current workspace and logs: recover or continue the remaining work, or call orchestrator_report (ready, blocked, failed or dropped).");
+        self.send_to_worker(&loaded, ticket_id, &request_id, prompt, &[]).await?;
         Ok(true)
     }
 

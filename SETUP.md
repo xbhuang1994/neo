@@ -36,26 +36,11 @@ The package holds the backend and the web app, and runs from wherever it is unpa
 
 ## 2. Give it a model
 
-Open Settings → Kernel and models and choose the kernel the main session runs on and, if it is to be another one, the workers' kernel; nothing changes until you press Save. No kernel comes with Neo: it finds the `claude`, `omp`, `agy` and `hermes` programs already on the machine, on `PATH` or where their installers put them (`~/.local/bin`; on Windows also `%LOCALAPPDATA%\omp`, `%LOCALAPPDATA%\agy\bin` and `%LOCALAPPDATA%\hermes\bin`). A kernel that is missing shows an **Install** button, which runs the vendor's official installer (`curl -fsSL <script> | bash`, or `irm <script> | iex` on Windows) on the machine the backend runs on; the kernel can be chosen as soon as it finishes, without a restart. `NEO_CLAUDE_BIN`, `NEO_OMP_BIN`, `NEO_AGY_BIN` and `NEO_HERMES_BIN` name a program elsewhere.
+Neo runs on the **Antigravity CLI (`agy`)**. No runtime comes with Neo: it finds `agy` already on the machine, on `PATH` or where its installer puts it (`~/.local/bin`; on Windows also `%LOCALAPPDATA%\agy\bin`). If `agy` is missing, Settings → Kernel and models shows an **Install** button, which runs the official installer (`curl -fsSL https://antigravity.google/cli/install.sh | bash`, or `irm https://antigravity.google/cli/install.ps1 | iex` on Windows) on the machine the backend runs on; Antigravity is ready as soon as it finishes, without a restart. `NEO_AGY_BIN` names a program elsewhere.
 
-Each kernel needs model access of its own:
+After installing `agy`, sign in with Google under Settings → Antigravity account (or run `agy` once in a terminal). Open Settings → Kernel and models to pick the main session's model and the workers' model from the list `agy models` returns, or leave either on "Kernel default" to use Antigravity's own choice. While a Session runs, a folder named after its working directory with `.neo-` and an id sits beside it, and goes when the Session ends.
 
-**Claude Code.** It reads the environment the backend runs in, and your Claude Code settings (`~/.claude/settings.json`) for what the environment does not say:
-
-```sh
-export ANTHROPIC_API_KEY=...          # or ANTHROPIC_AUTH_TOKEN
-export ANTHROPIC_BASE_URL=...         # only for a gateway or a compatible endpoint
-```
-
-A desktop app started from the Dock or the Start menu does not see variables set in a shell profile: put them in `~/.claude/settings.json` under `env`, or sign in with `claude` once in a terminal.
-
-**Oh My Pi.** It uses the providers, models and sign-in of your own `omp`: the agent directory `~/.omp/agent` (or `PI_CODING_AGENT_DIR`), unless `--agent-dir` names another. Configure `omp` as usual and Neo offers the same models.
-
-**Antigravity CLI.** After installing it, run `agy` once in a terminal to sign in with Google. The backend offers the models `agy models` lists, and leaves the thinking effort to the model you choose. While a Session runs, a folder named after its working directory with `.neo-` and an id sits beside it, and goes when the Session ends.
-
-**Hermes Agent.** After installing it, run `hermes setup` once in a terminal to configure a model provider (such as OpenRouter, Nous Portal, Anthropic or a custom endpoint). It reads `~/.hermes` (or `HERMES_HOME`), offers the models configured there, and gives worker Sessions Hermes's persistent memory (`MEMORY.md`, `USER.md`) and learned skills.
-
-The settings page lists the models each role's kernel offers; leave a role on "kernel default" to use the runtime's own choice. A missing runtime or a failing model request is shown in the app in the runtime's own words.
+A missing runtime or a failing model request is shown in the app in the runtime's own words.
 
 Workers that use git need `git` installed. Nothing else is required.
 
@@ -83,7 +68,7 @@ Open `http://<server>:3082/` in a browser and enter the token under Settings →
 
 ```sh
 mkdir -p ~/.config/neo-agent ~/.config/systemd/user
-install -m 600 /dev/null ~/.config/neo-agent/neo-agent.env   # NEO_TOKEN=…, ANTHROPIC_* and PATH, one per line
+install -m 600 /dev/null ~/.config/neo-agent/neo-agent.env   # NEO_TOKEN=… and PATH, one per line
 cp /opt/neo-agent/neo-agent-user.service ~/.config/systemd/user/neo-agent.service
 systemctl --user daemon-reload && systemctl --user enable --now neo-agent
 loginctl enable-linger "$USER"                                 # start at boot, without a login
@@ -101,7 +86,7 @@ neo.example.com {
 
 With a proxy the server still needs the token, because requests no longer come under a loopback name: start it with `--host 127.0.0.1` and `NEO_TOKEN` set.
 
-**Starting from given settings.** `--init-settings settings.json` is read once, when the data directory has no settings yet; after that the settings are changed in the app. `--config file.json` holds the machine's options (`dataDir`, `agentDir`, `host`, `port`, `token`, `webDir`) instead of the command line.
+**Starting from given settings.** `--init-settings settings.json` is read once, when the data directory has no settings yet; after that the settings are changed in the app. `--config file.json` holds the machine's options (`dataDir`, `host`, `port`, `token`, `webDir`) instead of the command line.
 
 ## 5. Upgrade
 

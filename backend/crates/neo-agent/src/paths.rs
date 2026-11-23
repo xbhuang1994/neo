@@ -1,5 +1,5 @@
-//! Where things are on this machine: the per-user data directory, the place of the instance lock, the agent
-//! runtimes, the Oh My Pi extension and the web app's files.
+//! Where things are on this machine: the per-user data directory, the place of the instance lock, the Antigravity CLI
+//! runtime, and the web app's files.
 
 use std::path::{Path, PathBuf};
 
@@ -85,26 +85,15 @@ pub fn on_path(name: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     std::env::split_paths(path).flat_map(|dir| names(name).into_iter().map(move |file| dir.join(file))).find(|candidate| executable(candidate))
 }
 
-/// Oh My Pi's own agent directory, `~/.omp/agent`: the providers, models and sign-in the person's `omp` uses.
-pub fn omp_agent_dir() -> PathBuf {
-    home().join(".omp").join("agent")
-}
-
-/// Where an agent's official installer puts its program: `~/.local/bin` on macOS and Linux; on Windows Claude Code's
-/// `%USERPROFILE%\.local\bin`, Oh My Pi's `%LOCALAPPDATA%\omp`, the Antigravity CLI's `%LOCALAPPDATA%\agy\bin` and
-/// Hermes Agent's `%LOCALAPPDATA%\hermes\bin`.
-pub fn install_dirs(name: &str) -> Vec<PathBuf> {
+/// Where the Antigravity CLI official installer puts `agy`: `~/.local/bin` on macOS and Linux; on Windows
+/// `%LOCALAPPDATA%\agy\bin` and `%USERPROFILE%\.local\bin`.
+pub fn install_dirs() -> Vec<PathBuf> {
     let local_bin = home().join(".local").join("bin");
     if !cfg!(windows) {
         return vec![local_bin];
     }
     let app_data = var("LOCALAPPDATA").unwrap_or_else(|| home().join("AppData").join("Local"));
-    match name {
-        "omp" => vec![app_data.join("omp"), local_bin],
-        "agy" => vec![app_data.join("agy").join("bin"), local_bin],
-        "hermes" => vec![app_data.join("hermes").join("bin"), local_bin],
-        _ => vec![local_bin],
-    }
+    vec![app_data.join("agy").join("bin"), local_bin]
 }
 
 /// A runtime program: the one the environment names, else the one on `PATH`, else the one where its installer puts
@@ -118,18 +107,6 @@ pub fn find_runtime(name: &str, named: Option<PathBuf>, path: Option<&std::ffi::
         let dirs = std::env::join_paths(install_dirs).ok()?;
         on_path(name, Some(&dirs))
     })
-}
-
-/// The Oh My Pi extension file: the one `NEO_SHIM` names, else the bundled one, else the one of a source checkout.
-pub fn find_shim(named: Option<PathBuf>, program_dir: Option<&Path>) -> PathBuf {
-    const FILE: &str = "neo-omp-shim.ts";
-    if let Some(named) = named {
-        return named;
-    }
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../shim").join(FILE);
-    let found = program_dir.into_iter().flat_map(|dir| bundled(dir, "shim")).map(|dir| dir.join(FILE)).chain([source]).find(|file| file.is_file());
-    // A missing file is reported by name when Oh My Pi is chosen.
-    found.unwrap_or_else(|| program_dir.unwrap_or(Path::new(".")).join("shim").join(FILE))
 }
 
 /// The web app's files, when an installation has them beside the program.
@@ -156,38 +133,30 @@ mod tests {
         let dir = TempDir::new("paths");
         let (local, usr) = (dir.join("home/.local/bin"), dir.join("usr/bin"));
         let installed = [local.clone()];
-        program(&local.join("claude"));
         program(&local.join("agy"));
-        program(&usr.join("claude"));
+        program(&usr.join("tool"));
         let path = std::env::join_paths([dir.join("empty"), usr.clone()]).unwrap();
         // The path wins over the installer's folder, which is found when the path leaves it out.
-        assert_eq!(find_runtime("claude", None, Some(&path), &installed), Some(usr.join("claude")));
+        assert_eq!(find_runtime("tool", None, Some(&path), &installed), Some(usr.join("tool")));
         assert_eq!(find_runtime("agy", None, Some(&path), &installed), Some(local.join("agy")));
         assert_eq!(find_runtime("agy", None, None, &installed), Some(local.join("agy")));
         // The environment's choice wins over all, and a wrong one is not papered over.
-        program(&dir.join("custom/claude"));
-        assert_eq!(find_runtime("claude", Some(dir.join("custom/claude")), Some(&path), &installed), Some(dir.join("custom/claude")));
+        program(&dir.join("custom/agy"));
+        assert_eq!(find_runtime("agy", Some(dir.join("custom/agy")), Some(&path), &installed), Some(dir.join("custom/agy")));
         assert_eq!(find_runtime("agy", Some(dir.join("custom/missing")), Some(&path), &installed), None);
         // A file that cannot be run is no program.
         std::fs::write(usr.join("plain"), "text").unwrap();
         assert_eq!(find_runtime("plain", None, Some(&path), &[]), None);
-        assert_eq!(find_runtime("omp", None, Some(&path), &installed), None);
-        assert_eq!(find_runtime("claude", None, None, &[]), None);
+        assert_eq!(find_runtime("missing", None, Some(&path), &installed), None);
+        assert_eq!(find_runtime("agy", None, None, &[]), None);
     }
 
     #[test]
-    fn finds_the_extension_and_the_web_files_of_an_installation() {
+    fn finds_the_web_files_of_an_installation() {
         let dir = TempDir::new("bundle");
         let bin = dir.join("Neo.app/Contents/Helpers");
         std::fs::create_dir_all(&bin).unwrap();
-        // A source checkout has the extension; an installation's own comes first.
-        assert!(find_shim(None, Some(&bin)).ends_with("shim/neo-omp-shim.ts"));
-        assert!(find_shim(None, Some(&bin)).is_file(), "the repository's shim is found from a development build");
         let resources = dir.join("Neo.app/Contents/Resources");
-        std::fs::create_dir_all(resources.join("shim")).unwrap();
-        std::fs::write(resources.join("shim/neo-omp-shim.ts"), "// shim").unwrap();
-        assert_eq!(find_shim(None, Some(&bin)), resources.join("shim/neo-omp-shim.ts"));
-        assert_eq!(find_shim(Some("/elsewhere/shim.ts".into()), Some(&bin)), PathBuf::from("/elsewhere/shim.ts"));
         assert_eq!(find_web(Some(&bin)), None);
         std::fs::create_dir_all(resources.join("web")).unwrap();
         assert_eq!(find_web(Some(&bin)), None, "a folder without the page is no web app");

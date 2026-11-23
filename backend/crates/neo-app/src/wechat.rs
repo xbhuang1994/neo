@@ -803,10 +803,17 @@ impl App {
                     channel: neo_core::model::ChannelRef { source: crate::settings::CHAT_SOURCE.into(), thread: party, address },
                     text,
                     kind: neo_core::ports::MessageKind::Reply,
-                    ticket_id: Some(ticket_id),
+                    ticket_id: Some(ticket_id.clone()),
                 },
                 &report_at,
             );
+            let _ = self.store.atomic(|| {
+                if let Some(mut ticket) = self.store_ticket(&ticket_id).filter(|ticket| !ticket.answers.is_empty()) {
+                    ticket.answers.clear();
+                    neo_core::ports::Repositories::save_ticket(self.store.as_ref(), &ticket);
+                }
+                Ok::<(), ()>(())
+            });
         }
         Ok(json!({"sent": true, "name": name}))
     }

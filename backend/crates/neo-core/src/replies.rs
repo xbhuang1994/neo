@@ -185,8 +185,9 @@ impl Engine {
             ticket_id: ticket.as_ref().map(|t| t.id.clone()),
         });
         if request.purpose == Purpose::Result {
-            if let Some(ticket) = ticket.as_mut().filter(|ticket| ticket.result_sent != reported) {
+            if let Some(ticket) = ticket.as_mut().filter(|ticket| ticket.result_sent != reported || !ticket.answers.is_empty()) {
                 ticket.result_sent = reported;
+                ticket.answers.clear();
                 self.repo().save_ticket(ticket);
             }
         }

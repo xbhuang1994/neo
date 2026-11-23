@@ -1,4 +1,4 @@
-//! A persistent agent Session, the same for either kernel: its transcript, idempotent deliveries, and turn lifecycle.
+//! A persistent agent Session: its transcript, idempotent deliveries, and turn lifecycle.
 //!
 //! The Session owns the [`Journal`]; a [`Driver`] owns the runtime process and only runs the model. A delivery is
 //! durable once its entry is flushed to the journal, before the runtime sees it, and stays pending until the runtime

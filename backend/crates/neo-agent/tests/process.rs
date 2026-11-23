@@ -12,15 +12,12 @@ use std::time::{Duration, Instant};
 const PROGRAM: &str = env!("CARGO_BIN_EXE_neo-agent");
 const TOKEN: &str = "0123456789abcdef-token";
 
-/// The program with nothing of this machine leaking in: no runtimes, its own lock place.
+/// The program with nothing of this machine leaking in: no runtime, its own lock place.
 fn program(dir: &TempDir) -> Command {
     let mut command = Command::new(PROGRAM);
     command
         .env("NEO_RUNTIME_DIR", dir.join("run"))
-        .env("NEO_CLAUDE_BIN", dir.join("no-claude"))
-        .env("NEO_OMP_BIN", dir.join("no-omp"))
         .env("NEO_AGY_BIN", dir.join("no-agy"))
-        .env("NEO_HERMES_BIN", dir.join("no-hermes"))
         .env_remove("NEO_TOKEN")
         .env_remove("NEO_DATA_DIR")
         .env_remove("NEO_ALLOW_MULTIPLE")
@@ -142,26 +139,26 @@ fn answers_its_plain_commands() {
     short.stdin.as_ref().unwrap().write_all(b"short\n").unwrap();
     let short = short.wait_with_output().unwrap();
     assert_eq!((short.status.code(), text(&short.stderr).contains("at least 16 characters")), (Some(2), true));
-    // Without a kernel the check of the machine fails and says what to do; with one it passes.
+    // Without Antigravity the check of the machine fails and says what to do; with it, it passes.
     let doctor = run(program(&dir).args(["doctor", "--data-dir"]).arg(dir.join("d")));
     let report = text(&doctor.stdout);
     assert_eq!(doctor.status.code(), Some(1), "{report}");
     assert!(
-        report.contains("Claude Code:      missing")
-            && report.contains("No kernel can run")
+        report.contains("Antigravity CLI:  missing")
+            && report.contains("Antigravity CLI (agy) cannot run")
             && report.contains(&format!("Data directory:   {}", dir.join("d").display())),
         "{report}"
     );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let claude = dir.join("claude");
-        std::fs::write(&claude, "#!/bin/sh\necho '9.9.9 (Claude Code)'\n").unwrap();
-        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let doctor = run(program(&dir).args(["doctor", "--data-dir"]).arg(dir.join("d")).env("NEO_CLAUDE_BIN", &claude));
+        let agy = dir.join("agy");
+        std::fs::write(&agy, "#!/bin/sh\necho '9.9.9 (Antigravity CLI)'\n").unwrap();
+        std::fs::set_permissions(&agy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let doctor = run(program(&dir).args(["doctor", "--data-dir"]).arg(dir.join("d")).env("NEO_AGY_BIN", &agy));
         let report = text(&doctor.stdout);
         assert_eq!(doctor.status.code(), Some(0), "{report}");
-        assert!(report.contains(&format!("Claude Code:      ok — {} (9.9.9 (Claude Code))", claude.display())), "{report}");
+        assert!(report.contains(&format!("Antigravity CLI:  ok — {} (9.9.9 (Antigravity CLI))", agy.display())), "{report}");
     }
 }
 

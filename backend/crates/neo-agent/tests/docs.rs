@@ -100,9 +100,8 @@ fn names_every_source_file_in_the_architecture_tables() {
     files("backend/crates", &["rs"], &mut sources);
     files("app/lib", &["dart"], &mut sources);
     files("app/test", &["dart"], &mut sources);
-    files("shim", &["ts"], &mut sources);
     files("packaging/e2e", &["mjs", "sh"], &mut sources);
-    assert!(sources.len() > 80, "{} source files found", sources.len());
+    assert!(sources.len() > 70, "{} source files found", sources.len());
     // A table row names its first file whole and the others of the same folder by name.
     let mut named = BTreeSet::new();
     for line in architecture.lines().filter(|line| line.starts_with("| `")) {
@@ -123,12 +122,41 @@ fn names_every_source_file_in_the_architecture_tables() {
 }
 
 #[test]
+fn backend_contains_only_pure_rust_sources() {
+    let mut non_rust = BTreeSet::new();
+    files("backend/crates", &["py", "ts", "js", "mjs", "sh"], &mut non_rust);
+    assert!(non_rust.is_empty(), "backend contains non-Rust source files: {non_rust:#?}");
+    assert!(!root().join("shim").exists(), "obsolete shim directory still exists");
+}
+
+#[test]
 fn says_nothing_of_what_was_removed() {
     let root = root();
     let mut texts: Vec<(String, String)> = documents().into_iter().map(|(_, name, text)| (name, text)).collect();
     texts.push(("SETUP.md".into(), read(&root.join("SETUP.md"))));
     for (name, text) in &texts {
-        for removed in ["bun run", "config.json", "stateDir", "pull request", "gh api", "omp-superagent", "agy acp", "mcp_neo_"] {
+        for removed in [
+            "bun run",
+            "config.json",
+            "stateDir",
+            "pull request",
+            "gh api",
+            "omp-superagent",
+            "agy acp",
+            "mcp_neo_",
+            "Oh My Pi",
+            "Claude Code",
+            "Hermes",
+            "neo-omp-shim",
+            "hermes_bridge",
+            "NEO_CLAUDE_BIN",
+            "NEO_OMP_BIN",
+            "NEO_HERMES_BIN",
+            "NEO_SHIM",
+            "PI_CODING_AGENT_DIR",
+            "models.yml",
+            "--agent-dir",
+        ] {
             assert!(!text.contains(removed), "{name} still mentions {removed}");
         }
         // The earlier releases are named only where a person is told that their state cannot be opened.

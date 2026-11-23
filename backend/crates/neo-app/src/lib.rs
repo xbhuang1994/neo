@@ -18,8 +18,6 @@ pub mod passes;
 pub mod policy;
 pub mod procinfo;
 pub mod prompts;
-mod provider_views;
-pub mod providers;
 pub mod resources;
 pub mod sessions;
 pub mod settings;

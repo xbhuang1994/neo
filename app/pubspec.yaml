@@ -60,3 +60,6 @@ flutter:
     - family: NotoSansSC
       fonts:
         - asset: fonts/NotoSansSC-Regular.otf
+    - family: VariationSelectors
+      fonts:
+        - asset: fonts/VariationSelectors.ttf

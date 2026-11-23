@@ -1,8 +1,7 @@
 //! The Antigravity kernel against the real `agy` program and its real models: it needs a signed-in Antigravity CLI,
-//! the network and `python3`, which stands in for `neo-agent agy-hook` as the hooks' relay, and asks a small model to
-//! follow plain instructions. It runs only with `NEO_AGY_BIN=<program>`, or `NEO_REAL_ANTIGRAVITY=1` for the `agy` on
-//! `PATH`; otherwise each test notes that it was skipped. The model is `NEO_AGY_MODEL`, by default
-//! `gemini-3.8-flash-low`.
+//! the network and `neo-agent agy-hook` as the hooks' relay, and asks a small model to follow plain instructions. It
+//! runs only with `NEO_AGY_BIN=<program>`, or `NEO_REAL_ANTIGRAVITY=1` for the `agy` on `PATH`; otherwise each test
+//! notes that it was skipped. The model is `NEO_AGY_MODEL`, by default `gemini-3.8-flash-low`.
 
 use neo_kernel::antigravity::{Antigravity, AntigravityDriver, AntigravityOptions};
 use neo_kernel::journal::{Entry, Journal};
@@ -59,8 +58,22 @@ struct Fixture {
     events: broadcast::Receiver<KernelEvent>,
 }
 
-/// The hooks' relay: what `neo-agent agy-hook` does, in Python.
-const RELAY: &str = "import sys, urllib.request\nreq = urllib.request.Request(sys.argv[1], data=sys.stdin.buffer.read(), method='POST')\nsys.stdout.write(urllib.request.urlopen(req, timeout=600).read().decode())\n";
+/// The pure-Rust hook relay: `neo-agent agy-hook`, built in the workspace if needed.
+fn hook_relay() -> Vec<String> {
+    if let Some(bin) = std::env::var_os("NEO_AGENT_BIN").filter(|value| !value.is_empty()).map(PathBuf::from) {
+        return vec![bin.display().to_string(), "agy-hook".into()];
+    }
+    let name = if cfg!(windows) { "neo-agent.exe" } else { "neo-agent" };
+    let exe = std::env::current_exe().expect("test executable path");
+    let target_profile = exe.parent().and_then(|deps| deps.parent()).expect("target profile dir");
+    let bin = target_profile.join(name);
+    if !bin.is_file() {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let status = std::process::Command::new("cargo").args(["build", "--quiet", "-p", "neo-agent"]).current_dir(workspace).status().expect("cargo build");
+        assert!(status.success(), "cargo build -p neo-agent failed");
+    }
+    vec![bin.display().to_string(), "agy-hook".into()]
+}
 
 fn open(dir: TempDir, journal: Journal) -> Fixture {
     open_with(dir, journal, &["read", "bash"])
@@ -68,15 +81,13 @@ fn open(dir: TempDir, journal: Journal) -> Fixture {
 
 fn open_with(dir: TempDir, journal: Journal, tools: &[&str]) -> Fixture {
     let host = Arc::new(Host::default());
-    let relay = dir.join("relay.py");
-    std::fs::write(&relay, RELAY).unwrap();
     let options = AntigravityOptions {
         program: program().expect("checked by the test"),
         cwd: dir.join("work"),
         system_prompt: "You are a fixture worker. Do exactly what you are asked, nothing more, and answer in one short line.".into(),
         tools: tools.iter().map(|tool| tool.to_string()).collect(),
         model: Some(std::env::var("NEO_AGY_MODEL").unwrap_or_else(|_| "gemini-3.8-flash-low".into())),
-        hook_relay: vec!["python3".into(), relay.display().to_string()],
+        hook_relay: hook_relay(),
         // As in the application: one bridge folder per Session, kept across its processes.
         bridge_id: Some("fixture".into()),
         ..Default::default()

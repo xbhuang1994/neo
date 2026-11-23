@@ -56,9 +56,6 @@ Future<void> show(WidgetTester tester, Finder finder) async {
 }
 
 Finder nav(int index) => find.byKey(ValueKey('nav-$index'));
-
-/// A kernel on the main session's kernel switch.
-Finder segment(String name) => find.descendant(of: find.byKey(const ValueKey('orchestrator-kernel')), matching: find.text(name));
 Finder button(String label) => find.bySemanticsLabel(label);
 
 void main() {
@@ -166,12 +163,12 @@ void main() {
     expect(find.text('2.0 KB'), findsOneWidget);
 
     // A refused message stays written, and its second sending carries the same id.
-    backend.chatError = 'The Claude Code program (claude) was not found.';
+    backend.chatError = 'The Antigravity CLI (agy) was not found.';
     await tester.enterText(find.byType(CupertinoTextField), '看看这些文件');
     await tester.pump();
     await tester.tap(button('发送'));
     await settle(tester);
-    expect(find.text('The Claude Code program (claude) was not found.'), findsOneWidget);
+    expect(find.text('The Antigravity CLI (agy) was not found.'), findsOneWidget);
     expect(tester.widget<CupertinoTextField>(find.byType(CupertinoTextField)).controller!.text, '看看这些文件');
     expect(find.text('a.txt'), findsOneWidget);
     await tester.tap(button('发送'));
@@ -244,11 +241,11 @@ void main() {
     await settle(tester);
     expect(find.text('连接失败'), findsNothing);
     // A kernel that cannot run is named.
-    backend.kernelProblem = 'The Oh My Pi program (omp) was not found.';
+    backend.kernelProblem = 'The Antigravity CLI (agy) was not found.';
     await tester.pump(const Duration(seconds: 10));
     await settle(tester);
     expect(find.text('执行内核不可用'), findsOneWidget);
-    expect(find.text('The Oh My Pi program (omp) was not found.'), findsOneWidget);
+    expect(find.text('The Antigravity CLI (agy) was not found.'), findsOneWidget);
     await app.close();
   });
 
@@ -350,12 +347,33 @@ void main() {
     await app.close();
   });
 
-  testWidgets('chooses the kernels and their models, applying them only when saved', (tester) async {
-    final backend = FakeBackend();
+  testWidgets('chooses Antigravity models, applies them when saved, and installs agy with progress', (tester) async {
+    final backend = FakeBackend()..antigravityProblem = 'The Antigravity CLI (agy) was not found.';
     final app = await open(tester, backend);
     await tester.tap(nav(2));
     await settle(tester);
+    expect(find.text('Antigravity'), findsWidgets);
     expect(find.text('跟随内核默认'), findsNWidgets(2));
+
+    // When agy is missing, it can be installed from here while showing installer progress.
+    final install = find.byKey(const ValueKey('install-antigravity'));
+    await show(tester, install);
+    expect(find.textContaining('Antigravity: The Antigravity CLI (agy) was not found.'), findsOneWidget);
+    backend.installGate = Completer();
+    backend.installProgress = 'Downloading Antigravity CLI… 42%';
+    await tester.tap(install);
+    await settle(tester);
+    await tester.pump(const Duration(seconds: 2));
+    await settle(tester);
+    expect(find.text(backend.installProgress!), findsOneWidget);
+    expect(find.descendant(of: install, matching: find.byType(CupertinoActivityIndicator)), findsOneWidget);
+    backend.installGate!.complete();
+    await settle(tester);
+    expect(backend.installed, ['antigravity']);
+    expect(find.textContaining('Antigravity 已安装'), findsOneWidget);
+    expect(install, findsNothing);
+
+    // Pick orchestrator and worker models; changes apply only when saved.
     Future<void> save() async {
       final saving = find.byKey(const ValueKey('save-models'));
       await show(tester, saving);
@@ -365,116 +383,32 @@ void main() {
 
     await tester.tap(find.byKey(const ValueKey('model-评估与调度模型')));
     await settle(tester);
-    await tester.tap(find.text('Big · fixture/big'));
-    await settle(tester);
-    expect(find.text('fixture/big'), findsOneWidget);
-    // A model can be given a thinking level.
-    await tester.tap(find.text('  思考档位'));
-    await settle(tester);
-    await tester.tap(find.text('high'));
-    await settle(tester);
-    await save();
-    expect(backend.models['omp'], {
-      'eval': {'provider': 'fixture', 'model': 'big', 'thinkingLevel': 'high'},
-      'executor': null,
-    });
-    expect(find.text('已保存'), findsOneWidget);
-
-    // Choosing another kernel only prepares the switch: nothing is asked of the backend until it is saved.
-    final reads = backend.modelReads;
-    await show(tester, segment('Claude Code'));
-    await tester.tap(segment('Claude Code'));
-    await settle(tester);
-    expect((backend.kernel, backend.modelReads), ('omp', reads));
-    // The other kernel has its own choices, and the workers follow the main session's kernel.
-    expect(find.text('fixture/big'), findsNothing);
-    expect(find.text('同调度内核 · Claude Code'), findsOneWidget);
-    await save();
-    expect(backend.kernel, 'claude');
-    // A kernel that cannot run says why when saved, and nothing changes.
-    backend.claudeProblem = 'The Claude Code program (claude) was not found.';
-    await tester.tap(segment('Oh My Pi'));
-    await settle(tester);
-    await save();
-    expect(backend.kernel, 'omp');
-    await tester.tap(segment('Claude Code'));
-    await settle(tester);
-    await save();
-    expect(backend.kernel, 'omp');
-    expect(find.text('The Claude Code program (claude) was not found.'), findsWidgets);
-    // Antigravity is the third kernel, with its own models and no thinking level to choose.
-    await show(tester, segment('Antigravity'));
-    await tester.tap(segment('Antigravity'));
-    await settle(tester);
-    await tester.tap(find.byKey(const ValueKey('model-评估与调度模型')));
-    await settle(tester);
     await tester.tap(find.textContaining('Gemini 3.8 Flash (Low)'));
     await settle(tester);
     expect(find.text('antigravity/gemini-3.8-flash-low'), findsOneWidget);
-    expect(find.text('  思考档位'), findsNothing);
+    expect(backend.models['eval'], isNull);
+
+    await tester.tap(find.byKey(const ValueKey('model-Worker 模型')));
+    await settle(tester);
+    await tester.tap(find.textContaining('Gemini 3.8 Pro (High)'));
+    await settle(tester);
+    expect(find.text('antigravity/gemini-3.8-pro-high'), findsOneWidget);
+
     await save();
-    expect(backend.kernel, 'antigravity');
-    expect(backend.models['antigravity']!['eval'], {'provider': 'antigravity', 'model': 'gemini-3.8-flash-low'});
-    // Hermes is the fourth kernel, with provider/model choices and minimal through max effort.
-    await show(tester, segment('Hermes'));
-    await tester.tap(segment('Hermes'));
-    await settle(tester);
-    await tester.tap(find.byKey(const ValueKey('model-评估与调度模型')));
-    await settle(tester);
-    await tester.tap(find.textContaining('Claude Sonnet 4.6'));
-    await settle(tester);
-    expect(find.text('openrouter/anthropic/claude-sonnet-4.6'), findsOneWidget);
-    await tester.tap(find.text('  思考档位'));
-    await settle(tester);
-    await tester.tap(find.text('minimal'));
-    await settle(tester);
-    await save();
-    expect(backend.kernel, 'hermes');
-    expect(backend.models['hermes']!['eval'], {
-      'provider': 'openrouter',
-      'model': 'anthropic/claude-sonnet-4.6',
-      'thinkingLevel': 'minimal',
+    expect(backend.models, {
+      'eval': {'provider': 'antigravity', 'model': 'gemini-3.8-flash-low'},
+      'executor': {'provider': 'antigravity', 'model': 'gemini-3.8-pro-high'},
     });
-    // A kernel whose program is missing can be installed from here, and then chosen.
-    final install = find.byKey(const ValueKey('install-claude'));
-    await show(tester, install);
-    expect(find.textContaining('Claude Code: The Claude Code program'), findsOneWidget);
-    expect(find.byKey(const ValueKey('install-omp')), findsNothing);
-    // While it installs, the page says how far it has come.
-    backend.installGate = Completer();
-    backend.installProgress = '接收对象中:   3% (19605/507062), 8.04 MiB | 116.00 KiB/s';
-    await tester.tap(install);
-    await settle(tester);
-    await tester.pump(const Duration(seconds: 2));
-    await settle(tester);
-    expect(find.text(backend.installProgress!), findsOneWidget);
-    expect(find.descendant(of: install, matching: find.byType(CupertinoActivityIndicator)), findsOneWidget);
-    backend.installGate!.complete();
-    await settle(tester);
-    expect(backend.installed, ['claude']);
-    expect(find.text('Claude Code 已安装'), findsOneWidget);
-    expect(install, findsNothing);
-    await tester.tap(segment('Claude Code'));
-    await settle(tester);
-    await save();
-    expect(backend.kernel, 'claude');
+    expect(find.text('已保存'), findsOneWidget);
     await app.close();
   });
 
-  testWidgets('runs workers on a kernel of their own, once its models are listed', (tester) async {
+  testWidgets('polls until Antigravity finishes listing its models', (tester) async {
     final backend = FakeBackend()..antigravityListing = true;
     final app = await open(tester, backend);
     await tester.tap(nav(2));
     await settle(tester);
-    final workerKernel = find.byKey(const ValueKey('worker-kernel'));
-    await show(tester, workerKernel);
-    await tester.tap(workerKernel);
-    await settle(tester);
-    await tester.tap(find.text('Antigravity').last);
-    await settle(tester);
-    expect(find.descendant(of: workerKernel, matching: find.text('Antigravity')), findsOneWidget);
     expect(find.text('正在读取模型列表…'), findsOneWidget);
-    // The page asks again until the kernel has listed its models, and keeps the draft meanwhile.
     backend.antigravityListing = false;
     await tester.pump(const Duration(seconds: 2));
     await settle(tester);
@@ -489,44 +423,15 @@ void main() {
     await show(tester, saving);
     await tester.tap(saving);
     await settle(tester);
-    expect((backend.kernel, backend.workerKernel), ('omp', 'antigravity'));
-    expect(backend.models['antigravity']!['executor'], {'provider': 'antigravity', 'model': 'gemini-3.8-flash-low'});
-    expect(backend.models['omp']!['executor'], null);
+    expect(backend.models['executor'], {'provider': 'antigravity', 'model': 'gemini-3.8-flash-low'});
     await app.close();
   });
 
-  testWidgets('edits the shared providers and logs a kernel in with a pasted code', (tester) async {
+  testWidgets('logs Antigravity in with a pasted code, shows the Google account, and logs out', (tester) async {
     final backend = FakeBackend();
     final app = await open(tester, backend);
     await tester.tap(nav(2));
     await settle(tester);
-    // A provider is edited on a sheet; what the app does not edit goes back as it was.
-    final magpie = find.byKey(const ValueKey('provider-magpie'));
-    await show(tester, magpie);
-    await tester.tap(magpie);
-    await settle(tester);
-    // Its models come from its API: shown, not typed, and sent back as they were.
-    expect(find.byKey(const ValueKey('provider-models')), findsNothing);
-    expect(find.byKey(const ValueKey('provider-listed-models')), findsOneWidget);
-    await show(tester, find.byKey(const ValueKey('provider-key')));
-    await tester.enterText(find.byKey(const ValueKey('provider-key')), 'sk-new');
-    await show(tester, find.byKey(const ValueKey('save-provider')));
-    await tester.tap(find.byKey(const ValueKey('save-provider')));
-    await settle(tester);
-    final saved = ((backend.savedProviders.single as Map)['providers'] as List).single as Map;
-    expect(saved['apiKey'], 'sk-new');
-    expect(saved['models'], [
-      {'id': 'big', 'contextWindow': 1000},
-    ]);
-    expect(saved['kernels'], ['omp', 'hermes']);
-    expect(saved.containsKey('previousName'), false);
-    // Asking again lists them anew, and says what went wrong.
-    final refresh = find.byKey(const ValueKey('refresh-providers'));
-    await show(tester, refresh);
-    await tester.tap(refresh);
-    await settle(tester);
-    expect(find.text('magpie: cannot list models: refused'), findsOneWidget);
-    expect(find.textContaining('…abcd'), findsOneWidget);
 
     // Logging in shows the link and passes back the pasted code.
     final login = find.byKey(const ValueKey('login-antigravity'));
@@ -541,7 +446,14 @@ void main() {
     await settle(tester);
     expect(backend.pasted, ['code#state']);
     expect(find.text('登录成功'), findsWidgets);
-    expect(find.text('openai-codex · me@example.com · oauth'), findsOneWidget);
+    expect(find.text('Google · me@example.com'), findsOneWidget);
+
+    final logout = find.byKey(const ValueKey('logout-antigravity'));
+    await show(tester, logout);
+    await tester.tap(logout);
+    await settle(tester);
+    expect(find.text('已登出'), findsOneWidget);
+    expect(find.text('未登录'), findsOneWidget);
     await app.close();
   });
 
@@ -682,6 +594,73 @@ void main() {
     await tester.tap(find.widgetWithText(CupertinoButton, '连接'));
     await settle(tester);
     expect((app.state.link, host.backend.stopped, host.prefs['mode']), (Link.online, true, 'remote'));
+    await app.close();
+  });
+
+  testWidgets('stops active and failed tasks from task detail, and hides stop for completed or ended tasks', (tester) async {
+    final backend = FakeBackend()
+      ..addWorker(
+        't-run',
+        '执行子任务',
+        {'stage': 'working'},
+        streaming: true,
+        background: [
+          {'id': 'task_1', 'type': 'task', 'label': 'subagent', 'startedAt': '2026-05-01T09:00:00.000Z'},
+          {'id': 'bg_1', 'type': 'bash', 'label': 'make train', 'startedAt': '2026-05-01T09:00:00.000Z'},
+        ],
+      )
+      ..addWorker('t-fail', '异常失败任务', {'stage': 'person', 'action': 'failed'})
+      ..addWorker('t-done', '已完成任务', {'stage': 'ended'}, outcome: 'completed')
+      ..addWorker('t-ended', '已终止任务', {'stage': 'ended'}, outcome: 'stopped');
+    final app = await open(tester, backend, bundledCjk: true);
+    await tester.tap(nav(1));
+    await settle(tester);
+
+    final stopButton = find.byKey(const ValueKey('stop-worker'));
+
+    // 1. Running task shows Stop button; cancelling dialog keeps it running; confirming marks it 已结束.
+    await tester.tap(find.byKey(const ValueKey('worker-t-run')));
+    await settle(tester);
+    expect(stopButton, findsOneWidget);
+    await tester.tap(stopButton);
+    await settle(tester);
+    for (final label in ['终止任务？', '取消', '终止']) {
+      final drawn = tester.widget<RichText>(find.descendant(of: find.text(label), matching: find.byType(RichText)));
+      expect(drawn.text.style?.fontFamilyFallback, contains(cjkFont), reason: label);
+    }
+    await tester.tap(find.text('取消'));
+    await settle(tester);
+    expect(backend.stopped, isEmpty);
+    expect(stopButton, findsOneWidget);
+
+    await tester.tap(stopButton);
+    await settle(tester);
+    await tester.tap(find.text('终止'));
+    await settle(tester);
+    expect(backend.stopped, ['t-run']);
+    expect(stopButton, findsNothing);
+    expect(find.text('已结束'), findsWidgets);
+    expect(find.text('make train'), findsNothing);
+
+    // 2. Failed task can also be terminated and becomes 已结束 without the Stop button afterwards.
+    await tester.tap(find.byKey(const ValueKey('worker-t-fail')));
+    await settle(tester);
+    expect(stopButton, findsOneWidget);
+    await tester.tap(stopButton);
+    await settle(tester);
+    await tester.tap(find.text('终止'));
+    await settle(tester);
+    expect(backend.stopped, ['t-run', 't-fail']);
+    expect(stopButton, findsNothing);
+
+    // 3. Completed and already-ended tasks cannot be terminated again.
+    await tester.tap(find.byKey(const ValueKey('worker-t-done')));
+    await settle(tester);
+    expect(stopButton, findsNothing);
+    await tester.tap(find.byKey(const ValueKey('worker-t-ended')));
+    await settle(tester);
+    expect(stopButton, findsNothing);
+
     await app.close();
   });
 }

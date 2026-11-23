@@ -22,7 +22,7 @@ use neo_core::stage::{can_retry, ticket_stage, TicketStage};
 use neo_core::time::{now_ms, parse_iso};
 use neo_kernel::journal::Entry;
 use neo_kernel::types::{Block, Role, ToolSpec};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
@@ -71,8 +71,12 @@ fn ms(duration: Duration) -> i64 {
 }
 
 const MAX_AUTO_RETRIES: u32 = 2;
+const MAX_AUTO_INTERRUPTS: u32 = 2;
 const MAX_RELAY_NUDGES: u32 = 2;
+const MAX_MANUAL_RELAY_NUDGES: u32 = 2;
 const RECENT_WINDOW_MS: i64 = 24 * 60 * 60_000;
+const WATCHDOG_HISTORY_KEY: &str = "watchdog-history";
+const MAX_WATCHDOG_HISTORY: usize = 100;
 const IGNORED_DIRS: &[&str] = &[".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache", "target"];
 const MAX_FILES: usize = 200;
 const MAX_DEPTH: usize = 2;
@@ -188,6 +192,16 @@ fn scan_workspace(directory: Option<&Path>, now: i64) -> Scan {
     }
 }
 
+/// One persisted Watchdog audit record in SQLite `kv["watchdog-history"]`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct WatchdogEvent {
+    at: String,
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ticket_id: Option<String>,
+    detail: String,
+}
+
 /// What one look at a ticket found.
 #[derive(Clone, Debug, Default)]
 struct Sample {
@@ -196,7 +210,8 @@ struct Sample {
     cpu: u64,
     recent: Vec<FileInfo>,
     latest_mtime: i64,
-    /// Changes whenever the ticket, its files or its jobs' output do.
+    latest_transcript_at: i64,
+    /// Changes whenever the ticket, its transcript, its files or its jobs' output do.
     signature: String,
     log_tail: Option<LogTail>,
 }
@@ -243,7 +258,11 @@ fn carried(previous: Option<&Activity>, sample: &Sample, last_output_at: i64) ->
 fn judge_working(previous: Option<&Activity>, sample: &Sample, started: i64, now: i64, timings: &WatchdogTimings) -> (Activity, Option<Delta>) {
     let output_changed = previous.is_some_and(|previous| previous.signature != sample.signature);
     let cpu_delta = previous.map(|previous| sample.cpu.saturating_sub(previous.cpu)).unwrap_or(0);
-    let last_output_at = if output_changed { now } else { previous.map(|previous| previous.last_output_at).unwrap_or(started.max(sample.latest_mtime)) };
+    let last_output_at = if output_changed {
+        now
+    } else {
+        previous.map(|previous| previous.last_output_at).unwrap_or(started.max(sample.latest_mtime).max(sample.latest_transcript_at))
+    };
     let silent_ms = (now - last_output_at).max(0);
     let mut state = carried(previous, sample, last_output_at);
     let passes = output_changed
@@ -305,8 +324,22 @@ struct Memory {
     failure_seen: HashMap<String, String>,
     health_seen: HashMap<String, String>,
     relay_nudges: HashMap<String, u32>,
+    manual_relay_nudges: HashMap<String, (u32, i64)>,
     auto_retries: HashMap<String, u32>,
+    auto_interrupts: HashMap<String, u32>,
     seq: u64,
+}
+
+/// Suspects and patrol markers gathered before calling the Watchdog Session; markers are committed only once the
+/// inspection turn succeeds so a transient Watchdog error never permanently swallows a stalled or failed ticket.
+#[derive(Default)]
+struct PatrolBatch {
+    suspects: Vec<Value>,
+    health_errors: Vec<Value>,
+    patrolled_activity: Vec<(String, String)>,
+    patrolled_failures: Vec<(String, String)>,
+    patrolled_health: Vec<(String, String)>,
+    patrolled_relays: Vec<String>,
 }
 
 /// The Watchdog's state within the application.
@@ -337,9 +370,9 @@ pub fn watchdog_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "watchdog_intervene".into(),
-            description: "Intervene on a verified anomaly: wake a stranded worker, cancel one hung or off-track background job and wake its worker, retry a ticket that failed transiently, or relay a report again whose reply is missing.".into(),
+            description: "Intervene on a verified anomaly: wake a stranded worker, cancel one hung or off-track background job and wake its worker, interrupt a hung working turn/subprocesses and resume the worker, retry a ticket that failed transiently, or relay a report again whose reply is missing.".into(),
             schema: json!({"type": "object", "additionalProperties": false, "required": ["action", "ticket_id", "message"], "properties": {
-                "action": {"type": "string", "enum": ["wake_worker", "cancel_job", "retry_ticket", "relay_report"]},
+                "action": {"type": "string", "enum": ["wake_worker", "cancel_job", "interrupt_worker", "retry_ticket", "relay_report"]},
                 "ticket_id": {"type": "string"},
                 "job_id": {"type": "string", "description": "cancel_job: the background job's id."},
                 "message": {"type": "string", "maxLength": 1000, "description": "The finding or the recovery instruction, short and factual."}}}),
@@ -350,6 +383,22 @@ pub fn watchdog_specs() -> Vec<ToolSpec> {
 impl App {
     fn watchdog_health(&self, health: Health) {
         self.board.set("watchdog", health);
+    }
+
+    /// Log a Watchdog action or error to stderr and persist a bounded audit ring in `kv["watchdog-history"]`.
+    fn record_watchdog_event(&self, kind: &str, ticket_id: Option<&str>, detail: &str) {
+        let short = clip(detail, 320);
+        match ticket_id {
+            Some(tid) => eprintln!("[neo-agent] [watchdog] {kind} ticket={tid}: {short}"),
+            None => eprintln!("[neo-agent] [watchdog] {kind}: {short}"),
+        }
+        let mut history: Vec<WatchdogEvent> = self.store.get(WATCHDOG_HISTORY_KEY).unwrap_or_default();
+        history.push(WatchdogEvent { at: neo_core::time::now_iso(), kind: kind.to_string(), ticket_id: ticket_id.map(str::to_string), detail: short });
+        if history.len() > MAX_WATCHDOG_HISTORY {
+            let drain = history.len() - MAX_WATCHDOG_HISTORY;
+            history.drain(..drain);
+        }
+        self.store.set(WATCHDOG_HISTORY_KEY, &history);
     }
 
     /// Start the periodic passes.
@@ -383,7 +432,7 @@ impl App {
 
     /// Run one Watchdog pass; a caller that finds one running waits for that one instead.
     pub async fn watchdog_tick(self: &Arc<Self>) {
-        if self.closing() || self.paused() || self.kernels.unavailable(self.settings().kernel).is_some() {
+        if self.closing() || self.paused() {
             return;
         }
         let Ok(_running) = self.watchdog.active.try_lock() else {
@@ -393,6 +442,7 @@ impl App {
         if let Err(error) = self.watchdog_patrol().await {
             if !self.closing() {
                 self.watchdog_health(Health::error(format!("Watchdog patrol failed: {error}")));
+                self.record_watchdog_event("patrol_error", None, &error);
             }
         }
     }
@@ -404,15 +454,29 @@ impl App {
         if self.closing() || self.paused() {
             return Ok(());
         }
-        let (suspects, health_errors) = self.collect_suspects(now, &lingering).await;
-        if suspects.is_empty() && health_errors.is_empty() {
+        let batch = self.collect_suspects(now, &lingering).await;
+        if batch.suspects.is_empty() && batch.health_errors.is_empty() {
             self.watchdog_health(Health::ready("All active tickets and queues are healthy"));
             return Ok(());
         }
-        let mut patrol = json!({"kind": "watchdog_patrol", "at": neo_core::time::format_iso(now), "suspects": suspects});
-        if !health_errors.is_empty() {
-            patrol["health_errors"] = health_errors.into();
+        if let Some(problem) = self.kernels.unavailable(self.settings().kernel) {
+            return Err(format!("Watchdog kernel unavailable: {problem}"));
         }
+        let mut patrol = json!({"kind": "watchdog_patrol", "at": neo_core::time::format_iso(now), "suspects": batch.suspects});
+        if !batch.health_errors.is_empty() {
+            patrol["health_errors"] = batch.health_errors.clone().into();
+        }
+        let summary_labels: Vec<String> = batch
+            .suspects
+            .iter()
+            .map(|s| format!("{}:{}", s["kind"].as_str().unwrap_or("?"), s["ticket_id"].as_str().unwrap_or("?").chars().take(8).collect::<String>()))
+            .collect();
+        eprintln!(
+            "[neo-agent] [watchdog] patrolling {} suspect(s) [{}], {} health error(s)",
+            batch.suspects.len(),
+            summary_labels.join(", "),
+            batch.health_errors.len()
+        );
         let weak = self.weak.clone();
         let tools = OnceTools {
             specs: watchdog_specs(),
@@ -430,15 +494,44 @@ impl App {
         };
         let prompt = crate::prompts::watchdog_system(&self.settings());
         let note = self.run_once(SessionRole::Watchdog, &self.machine.state_dir, prompt, patrol.to_string(), tools, self.watchdog.timings.turn_timeout).await?;
-        if !note.is_empty() {
+        {
             let mut memory = self.watchdog.memory();
-            for suspect in &suspects {
-                if let Some(state) = suspect["ticket_id"].as_str().and_then(|id| memory.activity.get_mut(id)) {
-                    state.note = Some(clip(&note, 200));
+            for (ticket_id, sig) in batch.patrolled_activity {
+                let state = memory.activity.entry(ticket_id).or_default();
+                state.patrolled_at = Some(now);
+                state.patrolled_signature = Some(sig);
+            }
+            for (ticket_id, updated_at) in batch.patrolled_failures {
+                memory.failure_seen.insert(ticket_id, updated_at);
+            }
+            for (component, marker) in batch.patrolled_health {
+                memory.health_seen.insert(component, marker);
+            }
+            for missing_key in batch.patrolled_relays {
+                let entry = memory.manual_relay_nudges.entry(missing_key).or_insert((0, 0));
+                entry.0 += 1;
+                entry.1 = now;
+            }
+            if !note.is_empty() {
+                for suspect in &batch.suspects {
+                    if let Some(state) = suspect["ticket_id"].as_str().and_then(|id| memory.activity.get_mut(id)) {
+                        state.note = Some(clip(&note, 200));
+                    }
                 }
             }
         }
-        self.watchdog_health(Health::ready(format!("Inspected {} suspect ticket(s)", suspects.len())));
+        self.record_watchdog_event(
+            "patrol",
+            None,
+            &format!(
+                "inspected {} suspect(s) [{}], {} health error(s): {}",
+                batch.suspects.len(),
+                summary_labels.join(", "),
+                batch.health_errors.len(),
+                clip(&note, 160)
+            ),
+        );
+        self.watchdog_health(Health::ready(format!("Inspected {} suspect ticket(s)", batch.suspects.len())));
         Ok(())
     }
 
@@ -452,11 +545,13 @@ impl App {
             if ticket.running().is_some() {
                 if !ticket.undelivered.is_empty() && !self.effects.pending(effects::DELIVERY, Some(&ticket.id)) {
                     self.effects.enqueue(effects::DELIVERY, &ticket.id, &json!({"ticketId": ticket.id}));
+                    self.record_watchdog_event("heal_queue", Some(&ticket.id), "re-enqueued missing delivery effect");
                     changed = true;
                 }
             } else if let Some(latest) = ticket.latest().filter(|latest| latest.state == AssignmentState::Pending) {
                 if !self.effects.pending(effects::LAUNCH, Some(&latest.id)) {
                     self.effects.enqueue(effects::LAUNCH, &latest.id, &json!({"ticketId": ticket.id, "assignmentId": latest.id}));
+                    self.record_watchdog_event("heal_queue", Some(&ticket.id), &format!("re-enqueued missing launch effect for assignment {}", latest.id));
                     changed = true;
                 }
             }
@@ -467,8 +562,8 @@ impl App {
     }
 
     /// Remind the main Session of each report, question or answer a person has not been sent, twice at most; the
-    /// tickets still unanswered after that go to an inspection.
-    fn heal_unreplied(&self, now: i64) -> Vec<Ticket> {
+    /// tickets still unanswered after that go to an inspection (bounded by [`MAX_MANUAL_RELAY_NUDGES`]).
+    fn heal_unreplied(&self, now: i64) -> Vec<(Ticket, String)> {
         if self.effects.pending(effects::RELAY, None) || self.session(&self.master_id).is_some_and(|main| main.session.is_streaming()) {
             return Vec::new();
         }
@@ -478,15 +573,20 @@ impl App {
             let Some(missing) = self.missing_reply(&ticket, now) else { continue };
             let count = {
                 let mut memory = self.watchdog.memory();
-                let count = memory.relay_nudges.entry(missing).or_insert(0);
+                let count = memory.relay_nudges.entry(missing.clone()).or_insert(0);
                 (*count < MAX_RELAY_NUDGES).then(|| {
                     *count += 1;
                     *count
                 })
             };
             match count {
-                Some(attempt) => nudged |= self.relay_missing(&ticket, &format!("auto:{attempt}")),
-                None => lingering.push(ticket),
+                Some(attempt) => {
+                    if self.relay_missing(&ticket, &format!("auto:{attempt}")) {
+                        self.record_watchdog_event("auto_relay", Some(&ticket.id), &format!("auto:{attempt} ({missing})"));
+                        nudged = true;
+                    }
+                }
+                None => lingering.push((ticket, missing)),
             }
         }
         if nudged {
@@ -505,12 +605,16 @@ impl App {
             return Some(format!("attention:{}:{}", ticket.id, attention.id));
         }
         let report = ticket.latest_report()?;
+        // Routine progress and waiting reports never owe a human reply (open attention questions are checked above).
+        if matches!(report.state, ReportState::Progress | ReportState::Waiting) {
+            return None;
+        }
         let age = now - parse_iso(&report.at)?;
         if age < grace || age > RECENT_WINDOW_MS {
             return None;
         }
         let replied = self.store.replied_since(&ticket.id, &report.at);
-        if let Some(answer) = ticket.answers.first().filter(|_| !replied) {
+        if let Some(answer) = self.pending_answer(ticket).filter(|_| !replied) {
             return Some(format!("answer:{}:{}:{answer}", ticket.id, report.at));
         }
         let origin = self.store.trigger(&ticket.origin.trigger_id)?;
@@ -522,6 +626,36 @@ impl App {
             None => ticket.running().and_then(|running| running.report.as_ref()).is_some_and(|report| report.state == ReportState::Ready),
         };
         (ready && !replied).then(|| format!("result:{}:{}", ticket.id, report.at))
+    }
+
+    /// The first pending answer trigger not already satisfied by a reply on an earlier ended assignment.
+    /// For a dropped report, only considers triggers delivered to the latest assignment so stale entries from an
+    /// earlier assignment do not loop relays on a handback drop.
+    fn pending_answer<'a>(&self, ticket: &'a Ticket) -> Option<&'a str> {
+        let latest_id = ticket.latest().map(|assignment| assignment.id.as_str());
+        let dropped = ticket.latest_report().is_some_and(|report| report.state == ReportState::Dropped);
+        ticket.answers.iter().map(String::as_str).find(|id| {
+            let input = ticket.inputs.iter().find(|input| input.trigger_id() == Some(*id));
+            if dropped {
+                let delivered_here = matches!(
+                    input,
+                    Some(neo_core::model::TicketInput::Trigger { delivered_to: Some(assignment_id), .. }) if Some(assignment_id.as_str()) == latest_id
+                ) || (input.is_none() && ticket.origin.trigger_id == *id && ticket.assignments.len() == 1);
+                if !delivered_here {
+                    return false;
+                }
+            }
+            let earlier_replied = input
+                .and_then(|input| match input {
+                    neo_core::model::TicketInput::Trigger { delivered_to: Some(assignment_id), .. } => {
+                        ticket.assignments.iter().find(|assignment| assignment.id == *assignment_id && assignment.state == AssignmentState::Ended)
+                    }
+                    _ => None,
+                })
+                .and_then(|ended| ended.report.as_ref())
+                .is_some_and(|prior| self.store.replied_since(&ticket.id, &prior.at));
+            !earlier_replied
+        })
     }
 
     /// Relay a ticket's open question or latest report to the main Session again, under a request id of its own.
@@ -536,10 +670,10 @@ impl App {
             report_relay(ticket, &asked)
         } else {
             report.map(|report| {
-                let answer_to = ticket.answers.first().filter(|_| !self.store.replied_since(&ticket.id, &report.at));
+                let answer_to = self.pending_answer(ticket).filter(|_| !self.store.replied_since(&ticket.id, &report.at));
                 let state =
                     if ticket.ended.as_ref().is_some_and(|ended| ended.outcome == TicketOutcome::Completed) { "ready" } else { state_name(report.state) };
-                result_relay(ticket, state, &report.summary, answer_to.map(String::as_str))
+                result_relay(ticket, state, &report.summary, answer_to)
             })
         };
         let Some(relay) = relay else { return false };
@@ -563,10 +697,30 @@ impl App {
         lines[lines.len().saturating_sub(count)..].to_vec()
     }
 
-    /// Look at a ticket's processes and files. A job's own process ids come first; a runtime that names none, and a
-    /// ticket without jobs, are sampled by the processes working in the ticket's directory.
+    fn transcript_activity(&self, ticket_id: &str) -> (String, i64) {
+        let (start_index, entries) = match self.session(&worker_session_id(ticket_id)) {
+            Some(loaded) => loaded.session.journal().entries_tail(1),
+            None => {
+                let all = self.worker_transcript(ticket_id);
+                let len = all.len();
+                (len.saturating_sub(1), all.into_iter().rev().take(1).collect())
+            }
+        };
+        let Some(last) = entries.last() else {
+            return (String::new(), 0);
+        };
+        let index = start_index + entries.len().saturating_sub(1);
+        let ts = last.timestamp();
+        (format!("{index}:{ts}"), parse_iso(ts).unwrap_or(0))
+    }
+
+    /// Look at a ticket's workload processes and files, excluding the worker runtime process itself (`driver_pid`) so an
+    /// idle or stuck CLI process never masquerades as active computation or a detached job, while still seeing child
+    /// processes spawned by the worker even when they run in another working directory.
     async fn sample(&self, ticket: &Ticket, jobs: &[WorkerJob], now: i64) -> Sample {
         let directory = ticket.execution.as_ref().map(|execution| PathBuf::from(&execution.directory));
+        let driver_pid = self.session(&worker_session_id(&ticket.id)).and_then(|loaded| loaded.session.driver().pid());
+        let (transcript_sig, latest_transcript_at) = self.transcript_activity(&ticket.id);
         let mut roots: Vec<u32> = jobs.iter().flat_map(|job| job.pids.iter().copied()).collect();
         let pipes: Vec<String> = jobs
             .iter()
@@ -578,18 +732,24 @@ impl App {
             .collect();
         let updated = ticket.updated_at.clone();
         tokio::task::spawn_blocking(move || {
-            if let Some(directory) = directory.as_ref().filter(|_| roots.is_empty()) {
-                roots = procinfo::in_directory(&directory.canonicalize().unwrap_or_else(|_| directory.clone()));
+            if let Some(directory) = directory.as_ref() {
+                roots.extend(procinfo::in_directory(&directory.canonicalize().unwrap_or_else(|_| directory.clone())));
             }
-            let processes = procinfo::tree(&roots);
+            if let Some(pid) = driver_pid {
+                roots.push(pid);
+            }
+            let own_pid = std::process::id();
+            let processes: Vec<ProcessSnapshot> =
+                procinfo::tree(&roots).into_iter().filter(|process| process.pid != own_pid && Some(process.pid) != driver_pid).collect();
             let files = scan_workspace(directory.as_deref(), now);
             Sample {
                 process_count: processes.len(),
                 cpu: processes.iter().map(|process| process.cpu_ticks).sum(),
                 processes: processes.into_iter().take(16).collect(),
-                signature: format!("{updated}|{}:{}:{}|{}", files.count, files.total_bytes, files.latest_mtime, pipes.join("|")),
+                signature: format!("{updated}|{transcript_sig}|{}:{}:{}|{}", files.count, files.total_bytes, files.latest_mtime, pipes.join("|")),
                 recent: files.recent,
                 latest_mtime: files.latest_mtime,
+                latest_transcript_at,
                 log_tail: files.log_tail,
             }
         })
@@ -599,12 +759,15 @@ impl App {
 
     #[allow(clippy::too_many_arguments)]
     fn suspect(&self, kind: &str, ticket: &Ticket, jobs: &[WorkerJob], sample: &Sample, delta: Delta, elapsed_ms: Option<i64>, note: Option<String>) -> Value {
+        let session = self.session(&worker_session_id(&ticket.id));
+        let streaming = session.as_ref().is_some_and(|loaded| !loaded.session.is_disposed() && loaded.session.is_streaming());
         let mut suspect = json!({
             "kind": kind,
             "ticket_id": ticket.id,
             "title": ticket.title,
             "scope": ticket.mandate.scope,
             "state": card_state(ticket),
+            "session": {"loaded": session.is_some(), "streaming": streaming, "worker_active": self.is_worker_active(&ticket.id)},
             "running_jobs": jobs,
             "process_tree": sample.processes,
             "activity_delta": delta.json(),
@@ -632,14 +795,14 @@ impl App {
         suspect
     }
 
-    async fn collect_suspects(&self, now: i64, lingering: &[Ticket]) -> (Vec<Value>, Vec<Value>) {
+    async fn collect_suspects(&self, now: i64, lingering: &[(Ticket, String)]) -> PatrolBatch {
         let timings = self.watchdog.timings;
         let open = self.store.open_tickets();
         {
             let ids: HashSet<&str> = open.iter().map(|ticket| ticket.id.as_str()).collect();
             self.watchdog.memory().activity.retain(|id, _| ids.contains(id.as_str()));
         }
-        let mut suspects = Vec::new();
+        let mut batch = PatrolBatch::default();
         let mut seen: HashSet<String> = HashSet::new();
         for ticket in &open {
             let stage = ticket_stage(ticket);
@@ -647,10 +810,19 @@ impl App {
             let jobs = self.running_jobs(&ticket.id).await;
             let sample = self.sample(ticket, &jobs, now).await;
             let previous = self.watchdog.memory().activity.get(&ticket.id).cloned();
+            let session_streaming =
+                self.session(&worker_session_id(&ticket.id)).is_some_and(|loaded| !loaded.session.is_disposed() && loaded.session.is_streaming());
+            let worker_active = self.is_worker_active(&ticket.id) || session_streaming || !jobs.is_empty();
             let judged = match (stage, running) {
                 (TicketStage::Idle, _) => {
                     let since = parse_iso(running.and_then(|running| running.report.as_ref()).map(|report| report.at.as_str()).unwrap_or(&ticket.updated_at))
                         .unwrap_or(now);
+                    Some(("idle_without_followup", judge_idle(previous.as_ref(), &sample, since, now, &timings), since))
+                }
+                (TicketStage::Working { queued: false }, Some(running)) if !worker_active && ticket.undelivered.is_empty() => {
+                    // Ticket thinks it is working, yet no runtime turn, job, launch or delivery is active: stranded.
+                    let started = parse_iso(running.started_at.as_deref().unwrap_or(&ticket.created_at)).unwrap_or(now);
+                    let since = started.max(sample.latest_transcript_at);
                     Some(("idle_without_followup", judge_idle(previous.as_ref(), &sample, since, now, &timings), since))
                 }
                 (TicketStage::Working { queued: false }, Some(running)) => {
@@ -659,63 +831,81 @@ impl App {
                 }
                 _ => None,
             };
-            if let Some((kind, (state, delta), since)) = judged {
+            if let Some((kind, (mut state, delta), since)) = judged {
                 let note = state.note.clone();
-                self.watchdog.memory().activity.insert(ticket.id.clone(), state);
                 if let Some(delta) = delta {
+                    // Defer committing patrolled_at/patrolled_signature until run_once succeeds.
+                    state.patrolled_at = previous.as_ref().and_then(|prev| prev.patrolled_at);
+                    state.patrolled_signature = previous.as_ref().and_then(|prev| prev.patrolled_signature.clone());
+                    batch.patrolled_activity.push((ticket.id.clone(), sample.signature.clone()));
                     seen.insert(ticket.id.clone());
-                    suspects.push(self.suspect(kind, ticket, &jobs, &sample, delta, Some((now - since).max(0)), note));
+                    batch.suspects.push(self.suspect(kind, ticket, &jobs, &sample, delta, Some((now - since).max(0)), note));
                 }
+                self.watchdog.memory().activity.insert(ticket.id.clone(), state);
                 continue;
             }
             let failed = ticket.delivery.is_some()
                 || ticket.latest().and_then(|latest| latest.report.as_ref()).is_some_and(|report| report.state == ReportState::Failed);
             if can_retry(ticket) && failed {
                 let fresh = {
-                    let mut memory = self.watchdog.memory();
-                    let fresh = memory.auto_retries.get(&ticket.id).copied().unwrap_or(0) < MAX_AUTO_RETRIES
-                        && memory.failure_seen.get(&ticket.id) != Some(&ticket.updated_at);
-                    if fresh {
-                        memory.failure_seen.insert(ticket.id.clone(), ticket.updated_at.clone());
-                    }
-                    fresh
+                    let memory = self.watchdog.memory();
+                    memory.auto_retries.get(&ticket.id).copied().unwrap_or(0) < MAX_AUTO_RETRIES
+                        && memory.failure_seen.get(&ticket.id) != Some(&ticket.updated_at)
                 };
                 if fresh {
+                    batch.patrolled_failures.push((ticket.id.clone(), ticket.updated_at.clone()));
                     seen.insert(ticket.id.clone());
-                    suspects.push(self.suspect("delivery_or_transient_failure", ticket, &jobs, &sample, Delta::NONE, None, None));
+                    batch.suspects.push(self.suspect("delivery_or_transient_failure", ticket, &jobs, &sample, Delta::NONE, None, None));
                 }
             }
         }
-        for ticket in lingering {
-            let patrolled = self.watchdog.memory().activity.get(&ticket.id).and_then(|state| state.patrolled_at).unwrap_or(0);
-            if seen.contains(&ticket.id) || now - patrolled < ms(timings.unreplied_grace) {
+        for (ticket, missing_key) in lingering {
+            let skip = {
+                let memory = self.watchdog.memory();
+                let patrolled = memory.activity.get(&ticket.id).and_then(|state| state.patrolled_at).unwrap_or(0);
+                let (manual_count, last_manual) = memory.manual_relay_nudges.get(missing_key).copied().unwrap_or((0, 0));
+                seen.contains(&ticket.id)
+                    || now - patrolled < ms(timings.unreplied_grace)
+                    || manual_count >= MAX_MANUAL_RELAY_NUDGES
+                    || (manual_count > 0 && now - last_manual < ms(timings.long_task))
+            };
+            if skip {
                 continue;
             }
             let jobs = self.running_jobs(&ticket.id).await;
             let sample = self.sample(ticket, &jobs, now).await;
+            let previous = self.watchdog.memory().activity.get(&ticket.id).cloned();
             self.watchdog.memory().activity.insert(
                 ticket.id.clone(),
-                Activity { signature: sample.signature.clone(), last_output_at: now, cpu: sample.cpu, patrolled_at: Some(now), ..Activity::default() },
+                Activity {
+                    signature: sample.signature.clone(),
+                    last_output_at: now,
+                    cpu: sample.cpu,
+                    patrolled_at: previous.as_ref().and_then(|prev| prev.patrolled_at),
+                    patrolled_signature: previous.as_ref().and_then(|prev| prev.patrolled_signature.clone()),
+                    note: previous.and_then(|prev| prev.note),
+                },
             );
+            batch.patrolled_activity.push((ticket.id.clone(), sample.signature.clone()));
+            batch.patrolled_relays.push(missing_key.clone());
             seen.insert(ticket.id.clone());
-            suspects.push(self.suspect("unreplied_ticket", ticket, &jobs, &sample, Delta::NONE, None, None));
+            batch.suspects.push(self.suspect("unreplied_ticket", ticket, &jobs, &sample, Delta::NONE, None, None));
         }
-        let mut memory = self.watchdog.memory();
-        let health_errors = self
-            .board
-            .all()
-            .into_iter()
-            .filter(|(component, health)| component != "watchdog" && health.state == "error")
-            .filter_map(|(component, health)| {
+        {
+            let memory = self.watchdog.memory();
+            for (component, health) in self.board.all() {
+                if component == "watchdog" || health.state != "error" {
+                    continue;
+                }
                 let marker = format!("{}:{}", health.at, health.detail);
                 if memory.health_seen.get(&component) == Some(&marker) {
-                    return None;
+                    continue;
                 }
-                memory.health_seen.insert(component.clone(), marker);
-                Some(json!({"component": component, "detail": health.detail, "at": health.at}))
-            })
-            .collect();
-        (suspects, health_errors)
+                batch.patrolled_health.push((component.clone(), marker));
+                batch.health_errors.push(json!({"component": component, "detail": health.detail, "at": health.at}));
+            }
+        }
+        batch
     }
 
     /// A ticket in more depth than a patrol inlines, for the Watchdog Session.
@@ -728,7 +918,11 @@ impl App {
             "scope": ticket.mandate.scope,
             "answers_pending": ticket.answers,
             "delivery": ticket.delivery,
-            "session": {"loaded": session.is_some(), "streaming": session.is_some_and(|loaded| !loaded.session.is_disposed() && loaded.session.is_streaming())},
+            "session": {
+                "loaded": session.is_some(),
+                "streaming": session.is_some_and(|loaded| !loaded.session.is_disposed() && loaded.session.is_streaming()),
+                "worker_active": self.is_worker_active(ticket_id),
+            },
             "running_jobs": self.running_jobs(ticket_id).await,
             "assignments": newest_page(&ticket.assignments, 0, 3, |item| assignment_line(&ticket, item)).0,
             "inputs": newest_page(&ticket.inputs, 0, 8, |input| input_line(&ticket, input)).0,
@@ -736,7 +930,7 @@ impl App {
         }))
     }
 
-    /// Act on what a patrol found: wake a worker, cancel a job, retry a ticket, or relay a report again.
+    /// Act on what a patrol found: wake a worker, cancel a job, interrupt a hung worker, retry a ticket, or relay a report again.
     pub async fn watchdog_intervene(self: &Arc<Self>, arguments: Value) -> Result<Value, String> {
         let args = Args::of(arguments, &["action", "ticket_id", "job_id", "message"])?;
         let (action, ticket_id, message) = (args.required("action")?, args.required("ticket_id")?, args.required("message")?.trim());
@@ -750,15 +944,41 @@ impl App {
                 if woken {
                     self.passes.pump();
                 }
+                self.record_watchdog_event("intervene", Some(ticket_id), &format!("wake_worker woken={woken}: {message}"));
                 Ok(json!({"action": action, "ticket_id": ticket_id, "woken": woken}))
             }
             "cancel_job" => {
                 let job_id = args.text("job_id").ok_or("cancel_job requires job_id")?;
                 let cancelled = self.cancel_job(ticket_id, job_id, message).await?;
+                self.record_watchdog_event("intervene", Some(ticket_id), &format!("cancel_job job={job_id} cancelled={cancelled}: {message}"));
                 Ok(json!({"action": action, "ticket_id": ticket_id, "job_id": job_id, "cancelled": cancelled}))
             }
+            "interrupt_worker" => {
+                let refused = |reason: &str| {
+                    self.record_watchdog_event("intervene", Some(ticket_id), &format!("interrupt_worker refused ({reason}): {message}"));
+                    Ok(json!({"action": action, "ticket_id": ticket_id, "interrupted": false, "reason": reason}))
+                };
+                if !ticket.live() || ticket.running().is_none() {
+                    return refused("Ticket has no running worker");
+                }
+                {
+                    let memory = self.watchdog.memory();
+                    if memory.auto_interrupts.get(ticket_id).copied().unwrap_or(0) >= MAX_AUTO_INTERRUPTS {
+                        return refused("Auto-interrupt limit reached");
+                    }
+                }
+                let interrupted = self.interrupt_worker(ticket_id, message).await?;
+                if interrupted {
+                    *self.watchdog.memory().auto_interrupts.entry(ticket_id.to_string()).or_insert(0) += 1;
+                }
+                self.record_watchdog_event("intervene", Some(ticket_id), &format!("interrupt_worker interrupted={interrupted}: {message}"));
+                Ok(json!({"action": action, "ticket_id": ticket_id, "interrupted": interrupted}))
+            }
             "retry_ticket" => {
-                let refused = |reason: &str| Ok(json!({"action": action, "ticket_id": ticket_id, "retried": false, "reason": reason}));
+                let refused = |reason: &str| {
+                    self.record_watchdog_event("intervene", Some(ticket_id), &format!("retry_ticket refused ({reason}): {message}"));
+                    Ok(json!({"action": action, "ticket_id": ticket_id, "retried": false, "reason": reason}))
+                };
                 {
                     let mut memory = self.watchdog.memory();
                     let used = memory.auto_retries.entry(ticket_id.to_string()).or_insert(0);
@@ -772,6 +992,7 @@ impl App {
                 }
                 self.engine.retry_ticket(ticket_id).map_err(|error| error.message)?;
                 self.passes.pump();
+                self.record_watchdog_event("intervene", Some(ticket_id), &format!("retry_ticket retried=true: {message}"));
                 Ok(json!({"action": action, "ticket_id": ticket_id, "retried": true}))
             }
             "relay_report" => {
@@ -784,9 +1005,10 @@ impl App {
                 if relayed {
                     self.passes.pump();
                 }
+                self.record_watchdog_event("intervene", Some(ticket_id), &format!("relay_report relayed={relayed} tag={tag}: {message}"));
                 Ok(json!({"action": action, "ticket_id": ticket_id, "relayed": relayed}))
             }
-            _ => Err("action is wake_worker, cancel_job, retry_ticket or relay_report".into()),
+            _ => Err("action is wake_worker, cancel_job, interrupt_worker, retry_ticket or relay_report".into()),
         }
     }
 }
@@ -831,6 +1053,9 @@ mod tests {
         // A file written after the start counts as output from the first sight on.
         let recent = Sample { latest_mtime: start + 9 * MIN, ..sample("a", 0, 0) };
         assert_eq!(judge_working(None, &recent, start, start + 12 * MIN, &t).1, None);
+        // Recent transcript activity also counts as output even when workspace files did not change.
+        let stepping = Sample { latest_transcript_at: start + 10 * MIN, ..sample("a", 0, 0) };
+        assert_eq!(judge_working(None, &stepping, start, start + 12 * MIN, &t).1, None);
     }
 
     #[test]

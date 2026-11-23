@@ -4,6 +4,7 @@ use crate::server::{Request, Response};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use neo_app::app::App;
+use neo_app::executor::StopWorkerError;
 use neo_app::sessions::ChatAttachment;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
@@ -81,6 +82,13 @@ fn json_body(request: &Request) -> Result<Value, Response> {
     serde_json::from_slice(&request.body).map_err(|error| Response::error(400, &format!("Invalid JSON: {error}")))
 }
 
+fn optional_json_body(request: &Request) -> Result<Value, Response> {
+    if request.body.is_empty() {
+        return Ok(json!({}));
+    }
+    json_body(request)
+}
+
 fn attachment(value: &Value) -> Result<ChatAttachment, String> {
     if !value.is_object() {
         return Err("Invalid attachment".into());
@@ -131,28 +139,34 @@ async fn route(app: &Arc<App>, request: &Request) -> Result<Response, Response> 
         ("GET", "/api/messages") => ok(json!({"messages": app.panel_messages()})),
         ("GET", "/api/workers") => ok(json!({"workers": app.worker_cards().await})),
         ("GET", "/api/activity") => ok(app.activity_view().await),
+        ("POST", path) if path.starts_with("/api/workers/") && path.ends_with("/stop") => {
+            let id = &path["/api/workers/".len()..path.len() - "/stop".len()];
+            if id.is_empty() || id.contains('/') {
+                return Err(Response::error(404, "Worker not found"));
+            }
+            match app.stop_worker_ticket(id).await {
+                Ok(worker) => ok(worker),
+                Err(StopWorkerError::NotFound) => Err(Response::error(404, "Worker not found")),
+                Err(StopWorkerError::AlreadyEnded) => Err(Response::error(400, "Task has already ended")),
+                Err(StopWorkerError::Failed(error)) => Err(Response::error(400, &error)),
+            }
+        }
         ("GET", path) if path.starts_with("/api/workers/") => match app.worker_detail(&path["/api/workers/".len()..]).await {
             Some(worker) => ok(worker),
             None => Err(Response::error(404, "Worker not found")),
         },
         ("GET", "/api/settings/models") => ok(app.models_view().await),
         ("PUT", "/api/settings/models") => done(app.update_models(json_body(request)?).await),
-        ("PUT", "/api/settings/kernel") => done(app.set_kernel(json_body(request)?).await),
         ("POST", "/api/settings/kernel/install") => done(app.install_kernel(json_body(request)?).await),
-        ("GET", "/api/settings/providers") => ok(app.providers_view()),
-        ("PUT", "/api/settings/providers") => done(app.update_providers(json_body(request)?).await),
-        ("POST", "/api/settings/providers/import") => done(app.import_providers().await),
-        ("POST", "/api/settings/providers/refresh") => done(app.refresh_providers().await),
         ("GET", "/api/settings/accounts") => ok(app.accounts_view().await),
         ("GET", "/api/settings/accounts/login") => ok(json!({"login": app.login_view()})),
-        ("POST", "/api/settings/accounts/login") => done(app.start_login(json_body(request)?).await),
+        ("POST", "/api/settings/accounts/login") => done(app.start_login(optional_json_body(request)?).await),
         ("POST", "/api/settings/accounts/login/input") => done(app.login_input(json_body(request)?).await),
         ("POST", "/api/settings/accounts/login/cancel") => {
             app.cancel_login();
             ok(json!({"login": app.login_view()}))
         }
-        ("POST", "/api/settings/accounts/logout") => done(app.logout(json_body(request)?).await),
-        ("POST", "/api/settings/accounts/key") => done(app.add_api_key(json_body(request)?).await),
+        ("POST", "/api/settings/accounts/logout") => done(app.logout(optional_json_body(request)?).await),
         ("GET", "/api/settings/general") => ok(app.general_view()),
         ("PUT", "/api/settings/general") => done(app.update_general(json_body(request)?).await),
         ("POST", "/api/session/reset") => done(app.reset_orchestrator().await.map(|()| json!({"reset": true}))),

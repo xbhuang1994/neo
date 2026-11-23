@@ -124,11 +124,10 @@ void main() {
       ...Platform.environment,
       'NEO_DATA_DIR': '${dir.path}/data',
       'NEO_RUNTIME_DIR': '${dir.path}/run',
-      'NEO_CLAUDE_BIN': '${dir.path}/none',
-      'NEO_OMP_BIN': '${dir.path}/none',
+      'NEO_AGY_BIN': '${dir.path}/none',
     };
     // The app passes nothing but the search path; the rest of this is the test's own isolation.
-    final wrapper = script(dir, 'neo-agent', [for (final name in ['NEO_DATA_DIR', 'NEO_RUNTIME_DIR', 'NEO_CLAUDE_BIN', 'NEO_OMP_BIN']) 'export $name="${environment[name]}"', 'exec "${program.absolute.path}" "\$@"'].join('\n'));
+    final wrapper = script(dir, 'neo-agent', [for (final name in ['NEO_DATA_DIR', 'NEO_RUNTIME_DIR', 'NEO_AGY_BIN']) 'export $name="${environment[name]}"', 'exec "${program.absolute.path}" "\$@"'].join('\n'));
     final sidecar = Sidecar(program: wrapper)..start();
     final running = await reach(sidecar, BackendPhase.running);
     final api = ApiClient(Uri.parse('http://127.0.0.1:${running.port}'), token: running.token);

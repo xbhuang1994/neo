@@ -54,6 +54,72 @@ pub fn in_directory(directory: &Path) -> Vec<u32> {
     }
 }
 
+/// The current process id and its ancestors, so cleanup never signals the host process or its parents.
+fn self_ancestors() -> HashSet<u32> {
+    if cfg!(target_os = "linux") {
+        return linux::ancestors(std::process::id());
+    }
+    let table = table();
+    let parents: HashMap<u32, u32> = table.into_iter().map(|process| (process.pid, process.ppid)).collect();
+    let mut protected = HashSet::new();
+    let mut current = std::process::id();
+    for _ in 0..64 {
+        if current <= 1 || !protected.insert(current) {
+            break;
+        }
+        let Some(&ppid) = parents.get(&current) else { break };
+        current = ppid;
+    }
+    protected
+}
+
+/// Ask `pids` to exit gracefully and forcibly end any that remain, ignoring pid 0, this process and its ancestors.
+pub fn terminate_pids(pids: &[u32]) {
+    let protected = self_ancestors();
+    let mut targets: Vec<u32> = Vec::new();
+    let mut seen: HashSet<u32> = HashSet::new();
+    for &pid in pids {
+        if pid > 1 && !protected.contains(&pid) && seen.insert(pid) {
+            targets.push(pid);
+        }
+    }
+    if targets.is_empty() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        for &pid in &targets {
+            // SAFETY: `kill` takes a positive process id and SIGTERM to request shutdown.
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+        }
+        for _ in 0..12 {
+            // SAFETY: signal 0 only checks whether any target process still exists.
+            let any_alive = targets.iter().any(|&pid| unsafe { libc::kill(pid as i32, 0) } == 0);
+            if !any_alive {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        for &pid in &targets {
+            // SAFETY: signal 0 checks liveness and SIGKILL terminates remaining stragglers.
+            unsafe {
+                if libc::kill(pid as i32, 0) == 0 {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        for pid in targets {
+            let _ =
+                Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        }
+    }
+}
+
 fn run(program: &str, args: &[&str]) -> Option<String> {
     let output = Command::new(program).args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
     // `lsof` exits non-zero when some process cannot be read, and still lists the rest.
@@ -232,6 +298,25 @@ mod linux {
         found.sort_unstable();
         found
     }
+
+    /// `pid` and its ancestor process ids from `/proc/<pid>/stat`, capped to avoid loops.
+    pub fn ancestors(pid: u32) -> HashSet<u32> {
+        let mut set = HashSet::new();
+        let mut current = pid;
+        for _ in 0..64 {
+            if current <= 1 || !set.insert(current) {
+                break;
+            }
+            let Some(ppid) = std::fs::read_to_string(format!("/proc/{current}/stat")).ok().and_then(|stat| {
+                let end = stat.rfind(')')?;
+                stat.get(end + 2..)?.split_whitespace().nth(1)?.parse::<u32>().ok()
+            }) else {
+                break;
+            };
+            current = ppid;
+        }
+        set
+    }
 }
 
 #[cfg(test)]
@@ -322,6 +407,34 @@ mod tests {
         let _ = shell.wait();
         assert!(!in_directory(&directory).contains(&shell.id()));
         assert!(in_directory(Path::new("/nonexistent-directory")).is_empty());
+
+        // `terminate_pids` ends detached background processes while leaving our own process alone.
+        let mut detached = Command::new("sh").args(["-c", "sleep 30 >/dev/null 2>&1 </dev/null & echo $!"]).current_dir(&directory).output().unwrap();
+        assert!(detached.status.success());
+        let bg_pid: u32 = String::from_utf8_lossy(&detached.stdout).trim().parse().unwrap();
+        detached.stdout.clear();
+        let found_bg = (0..50).any(|_| {
+            if in_directory(&directory).contains(&bg_pid) {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                false
+            }
+        });
+        assert!(found_bg, "detached process should appear in directory");
+        terminate_pids(&[0, std::process::id(), bg_pid]);
+        // Wait briefly for reap/exit of the detached grandchild (reparented to init/subreaper).
+        let gone = (0..40).any(|_| {
+            let alive = std::path::Path::new(&format!("/proc/{bg_pid}")).exists()
+                && !std::fs::read_to_string(format!("/proc/{bg_pid}/stat")).is_ok_and(|stat| stat.contains(") Z "));
+            if !alive {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                false
+            }
+        });
+        assert!(gone, "detached pid {bg_pid} should be terminated");
         std::fs::remove_dir_all(&directory).unwrap();
     }
 }

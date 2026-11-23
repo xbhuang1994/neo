@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:neo_agent/src/api/client.dart';
@@ -7,6 +8,7 @@ import 'package:neo_agent/src/l10n/strings.dart';
 import 'package:neo_agent/src/platform/host.dart';
 import 'package:neo_agent/src/state/app_state.dart';
 import 'package:neo_agent/src/ui/format.dart';
+import 'package:neo_agent/src/ui/theme.dart';
 import 'package:flutter/widgets.dart';
 
 import 'fake_backend.dart';
@@ -176,9 +178,9 @@ void main() {
       expect(settings.executorJson(), {'maxWorkers': 5, 'directory': '/work', 'prepare': 'git clone x', 'blockedCommands': ['docker']});
       expect(settings.evalJson(), {'mode': 'auto', 'timeoutSeconds': 60});
       expect((settings.policyJson()['rules'] as List).single, {'id': 'a', 'name': 'A', 'enabled': true, 'instruction': 'Do A.'});
-      expect(RoleModel.fromJson({'provider': 'p', 'model': 'm'})?.toJson(), {'provider': 'p', 'model': 'm'});
+      expect(RoleModel.fromJson({'provider': 'antigravity', 'model': 'm'})?.toJson(), {'provider': 'antigravity', 'model': 'm'});
       expect(RoleModel.fromJson(null), isNull);
-      expect(const RoleModel('p', 'm', 'high'), const RoleModel('p', 'm').withThinking('high'));
+      expect(const RoleModel('antigravity', 'm'), const RoleModel('antigravity', 'm'));
     });
   });
 
@@ -253,5 +255,53 @@ void main() {
     expect([zh.chat, en.chat, zh.workersSummary(2, 5), en.workersSummary(2, 5)], ['对话', 'Chat', '2 个进行中 · 共 5 个', '2 active · 5 in all']);
     expect([zh.reportState('ready'), en.reportState('ready'), zh.reportState('other'), zh.component('kernel'), en.component('x')], ['已就绪', 'ready', 'other', '执行内核', 'x']);
     expect(zh.appName, en.appName);
+  });
+
+  group('web build', () {
+    test('pins CanvasKit and font fallbacks to local origins without remote URLs', () {
+      final bootstrap = File('web/flutter_bootstrap.js').readAsStringSync();
+      expect(bootstrap, contains('{{flutter_js}}'));
+      expect(bootstrap, contains('{{flutter_build_config}}'));
+      expect(bootstrap, contains('canvasKitBaseUrl'));
+      expect(bootstrap, contains('fontFallbackBaseUrl'));
+      expect(bootstrap, contains('assets/FontManifest.json'));
+      expect(bootstrap, contains('Noto Color Emoji '));
+      expect(bootstrap, isNot(contains('http://')));
+      expect(bootstrap, isNot(contains('https://')));
+
+      final webTheme = appTheme(bundledCjk: true).textTheme.textStyle.fontFamilyFallback;
+      expect(webTheme, equals(webFallbackFonts));
+      expect(webTheme, containsAll([cjkFont, ...emojiFonts, variationSelectorFont]));
+      expect(appTheme(bundledCjk: false).textTheme.textStyle.fontFamilyFallback, isNull);
+
+      final referenced = RegExp(r"'([^']+\.(?:woff2|ttf))'")
+          .allMatches(bootstrap)
+          .map((match) => match.group(1)!)
+          .toSet();
+      expect(referenced.length, 22);
+      for (final rel in referenced) {
+        final file = File('web/fonts/fallback/$rel');
+        expect(file.existsSync(), isTrue, reason: 'Missing local fallback font: $rel');
+        expect(file.lengthSync(), greaterThan(0), reason: 'Empty local fallback font: $rel');
+      }
+
+      for (var i = 0; i < 10; i++) {
+        expect(
+          referenced.where((path) => path.startsWith('notocoloremoji/v39/') && path.endsWith('.$i.woff2')),
+          hasLength(1),
+        );
+      }
+      expect(referenced.where((path) => path.startsWith('notosanssymbols/')), hasLength(1));
+      expect(referenced.where((path) => path.startsWith('notosanssymbols2/')), hasLength(6));
+      expect(referenced.where((path) => path.startsWith('notosansmath/')), hasLength(1));
+      expect(referenced.where((path) => path.startsWith('notosans/')), hasLength(1));
+      expect(referenced.where((path) => path.startsWith('roboto/')), hasLength(1));
+      expect(referenced.where((path) => path.startsWith('notosanssc/')), hasLength(1));
+      expect(referenced, contains('_empty.ttf'));
+
+      final variationSelectors = File('fonts/VariationSelectors.ttf');
+      expect(variationSelectors.existsSync(), isTrue);
+      expect(variationSelectors.lengthSync(), greaterThan(0));
+    });
   });
 }

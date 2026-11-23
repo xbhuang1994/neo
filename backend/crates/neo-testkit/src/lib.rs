@@ -1,8 +1,7 @@
-//! Test support: loopback fake model servers, so real agent runtimes can run complete turns without any network.
+//! Test support: temporary directories, a loopback HTTP server and a fixture Antigravity runtime for browser tests.
 #![deny(missing_docs)]
 
 pub mod http;
-pub mod models;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};

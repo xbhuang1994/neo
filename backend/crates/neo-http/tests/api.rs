@@ -61,12 +61,13 @@ async fn raw(server: &Server, bytes: &[u8]) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn serves_every_route_of_the_app() {
     let f = fixture().await;
-    *f.kernels.models.lock().unwrap() = vec![neo_app::kernels::ModelOption { id: "big".into(), provider: "fixture".into(), name: "Big".into() }];
+    *f.kernels.models.lock().unwrap() =
+        vec![neo_app::kernels::ModelOption { id: "gemini-3.8-flash-low".into(), provider: "antigravity".into(), name: "Gemini 3.8 Flash (Low)".into() }];
     f.app.start().await.unwrap();
     let (server, api) = open(&f, Access::default()).await;
 
     let (status, health) = api.get("/api/health").await;
-    assert_eq!((status, health["ready"].as_bool(), health["kernel"].as_str()), (200, Some(true), Some("omp")));
+    assert_eq!((status, health["ready"].as_bool(), health["kernel"].as_str()), (200, Some(true), Some("antigravity")));
     assert_eq!(api.get("/api/messages").await, (200, json!({"messages": []})));
     assert_eq!(api.get("/api/workers").await, (200, json!({"workers": []})));
     assert_eq!(api.get("/api/activity").await, (200, json!({"router": false, "workers": []})));
@@ -93,26 +94,31 @@ async fn serves_every_route_of_the_app() {
     assert_eq!((status, worker["ticketId"].as_str(), worker["recent"].is_array(), worker["inputs"].is_array()), (200, Some(id.as_str()), true, true));
     assert_eq!(api.get("/api/workers/missing").await, (404, json!({"error": "Worker not found"})));
     assert_eq!(api.get("/api/workers/a%2Fb").await.0, 404);
+    assert_eq!(api.call("POST", &format!("/api/workers/{id}/stop"), None).await, (400, json!({"error": "Task has already ended"})));
+    assert_eq!(api.call("POST", "/api/workers/missing/stop", None).await, (404, json!({"error": "Worker not found"})));
+    assert_eq!(api.call("POST", "/api/workers/a%2Fb/stop", None).await.0, 404);
+    assert_eq!(api.call("POST", "/api/workers//stop", None).await.0, 404);
 
-    // Models and the kernel.
+    // Models and Antigravity installation.
     let (status, models) = api.get("/api/settings/models").await;
-    assert_eq!((status, models["kernel"].as_str(), models["available"][0]["id"].as_str()), (200, Some("omp"), Some("big")));
-    let chosen = json!({"eval": {"provider": "fixture", "model": "big", "thinkingLevel": "low"}, "executor": null});
+    assert_eq!((status, models["kernel"].as_str(), models["available"][0]["id"].as_str()), (200, Some("antigravity"), Some("gemini-3.8-flash-low")));
+    let chosen = json!({"eval": {"provider": "antigravity", "model": "gemini-3.8-flash-low"}, "executor": null});
     let (status, models) = api.call("PUT", "/api/settings/models", Some(chosen.clone())).await;
     assert_eq!((status, &models["current"]), (200, &chosen));
-    assert_eq!(
-        api.call("PUT", "/api/settings/models", Some(json!({"eval": {"provider": "x", "model": "y"}, "executor": null}))).await,
-        (400, json!({"error": "Unknown OMP model: x/y"}))
-    );
-    let (status, switched) = api.call("PUT", "/api/settings/kernel", Some(json!({"kernel": "claude"}))).await;
-    assert_eq!((status, switched["kernel"].as_str()), (200, Some("claude")));
     let (status, installed) = api.call("POST", "/api/settings/kernel/install", Some(json!({"kernel": "antigravity"}))).await;
-    assert_eq!((status, installed["kernels"][2]["id"].as_str(), installed["kernels"][2]["installing"].as_bool()), (200, Some("antigravity"), Some(false)));
-    assert_eq!(
-        api.call("PUT", "/api/settings/kernel", Some(json!({"kernel": "other"}))).await,
-        (400, json!({"error": "kernel is omp, claude, antigravity or hermes"}))
-    );
-    assert_eq!(api.call("PUT", "/api/settings/kernel", Some(json!({"kernel": "omp"}))).await.1["current"], chosen);
+    assert_eq!((status, installed["kernel"].as_str(), installed["installing"].as_bool()), (200, Some("antigravity"), Some(false)));
+    assert_eq!(api.call("POST", "/api/settings/kernel/install", Some(json!({"kernel": "other"}))).await, (400, json!({"error": "kernel must be antigravity"})));
+    // Removed multi-kernel and custom-provider routes return 404.
+    assert_eq!(api.call("PUT", "/api/settings/kernel", Some(json!({"kernel": "antigravity"}))).await.0, 404);
+    assert_eq!(api.get("/api/settings/providers").await.0, 404);
+    assert_eq!(api.call("POST", "/api/settings/accounts/key", Some(json!({}))).await.0, 404);
+
+    // Antigravity-only account endpoint (no multi-kernel or provider fields accepted).
+    let (status, accounts) = api.get("/api/settings/accounts").await;
+    assert_eq!((status, accounts["installed"].as_bool(), accounts.get("kernels").is_none()), (200, Some(true), true));
+    assert_eq!(api.call("POST", "/api/settings/accounts/login", Some(json!({"kernel": "antigravity"}))).await, (400, json!({"error": "Unknown field kernel"})));
+    assert_eq!(api.call("POST", "/api/settings/accounts/login", Some(json!({"provider": "google"}))).await, (400, json!({"error": "Unknown field provider"})));
+    assert_eq!(api.call("POST", "/api/settings/accounts/logout", Some(json!({"account": "google"}))).await, (400, json!({"error": "Unknown field account"})));
 
     // General settings.
     let (status, general) = api.get("/api/settings/general").await;
@@ -353,5 +359,56 @@ async fn keeps_connections_open_and_refuses_what_it_cannot_serve() {
     let mut rest = Vec::new();
     assert_eq!(tokio::time::timeout(Duration::from_secs(5), idle.read_to_end(&mut rest)).await.expect("the idle connection is closed").unwrap_or(0), 0);
     assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+    f.app.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stops_an_active_worker_via_http_and_returns_ended_detail() {
+    use neo_app::kernels::SessionRole;
+    use neo_kernel::types::JobKind;
+
+    let f = fixture().await;
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mark = running.clone();
+    *f.kernels.model.lock().unwrap() = Some(model(move |turn| {
+        let mark = mark.clone();
+        Box::pin(async move {
+            match turn.role {
+                SessionRole::Worker => {
+                    turn.jobs.lock().unwrap().push(Fixture::job("task_1", JobKind::Task, "subagent"));
+                    turn.jobs.lock().unwrap().push(Fixture::job("bg_1", JobKind::Bash, "sleep 30"));
+                    mark.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok("Background jobs started.".into())
+                }
+                _ => {
+                    if let Some(card) = turn.card("kind").filter(|card| card["kind"] == "candidate") {
+                        turn.call(
+                            "orchestrator_route",
+                            json!({"decisions": [{"kind": "accept", "trigger_id": card["trigger_id"], "title": "Long job", "worktree_name": "long-job", "acknowledgement": "Starting."}]}),
+                        )
+                        .await?;
+                    }
+                    Ok("Done.".into())
+                }
+            }
+        })
+    }));
+    f.app.start().await.unwrap();
+    let (server, api) = open(&f, Access::default()).await;
+    api.call("POST", "/api/chat", Some(json!({"text": "Start a long background task.", "messageId": "web:stop1"}))).await;
+    f.until("worker is running", || running.load(std::sync::atomic::Ordering::SeqCst)).await;
+    f.settle().await;
+    let (_, workers) = api.get("/api/workers").await;
+    let id = workers["workers"][0]["ticketId"].as_str().unwrap().to_string();
+
+    let (status, stopped) = api.call("POST", &format!("/api/workers/{id}/stop"), None).await;
+    assert_eq!(status, 200, "{stopped}");
+    assert_eq!(stopped["stage"], json!({"stage": "ended"}));
+    assert_eq!(stopped["outcome"], "stopped");
+    assert_eq!(stopped["session"], json!({"loaded": false, "streaming": false}));
+    assert_eq!(stopped["background"], json!([]));
+    assert_eq!(api.call("POST", &format!("/api/workers/{id}/stop"), None).await, (400, json!({"error": "Task has already ended"})));
+
+    server.shutdown().await;
     f.app.stop().await;
 }

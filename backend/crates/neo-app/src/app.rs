@@ -89,8 +89,6 @@ pub struct App {
     pub(crate) wechat: crate::wechat::WeChatState,
     /// What each kernel offered when last asked for its models, and when; listing them can take seconds.
     pub(crate) logins: crate::accounts::Logins,
-    /// Why each custom provider could not list its models the last time it was asked.
-    pub(crate) provider_problems: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
     pub(crate) model_lists: std::sync::Mutex<std::collections::BTreeMap<crate::settings::Kernel, crate::views::ModelList>>,
     pub(crate) live_tickets: std::sync::Mutex<std::collections::HashSet<String>>,
     pub(crate) jobs_cache: std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Vec<crate::executor::WorkerJob>)>>,
@@ -218,7 +216,6 @@ impl App {
                 executor: ExecutorState::default(),
                 wechat: crate::wechat::WeChatState::new(wechat),
                 logins: Default::default(),
-                provider_problems: Default::default(),
                 model_lists: Default::default(),
                 live_tickets: std::sync::Mutex::new(live_tickets),
                 jobs_cache: Default::default(),
@@ -267,10 +264,7 @@ impl App {
                 if from != to {
                     self.engine.policy_changed(&from, &to, &effects);
                 }
-                // Custom providers are the kernels' plumbing, not something the main Session acts on.
-                if changed.iter().any(|path| path != "providers" && !path.starts_with("providers.") && !path.starts_with("providers[")) {
-                    self.notify(crate::notices::settings_notice(block, &changed));
-                }
+                self.notify(crate::notices::settings_notice(block, &changed));
                 Ok::<(), String>(())
             })
             .inspect_err(|_| {
@@ -355,7 +349,6 @@ impl App {
 
     /// Start everything: the main Session, interrupted work, the effect queue and the passes.
     pub async fn start(self: &Arc<Self>) -> Result<(), String> {
-        self.start_providers()?;
         let handler = |run: fn(Arc<App>, serde_json::Value, String) -> effects::Running| -> effects::Handler {
             let weak = self.weak.clone();
             Arc::new(move |payload, key| match weak.upgrade() {
@@ -404,11 +397,9 @@ impl App {
 
         self.sync_blocked();
         self.report_kernels();
-        // The settings page lists every kernel's models: ask for them now, so it need not wait.
-        for kernel in [Kernel::Omp, Kernel::Claude, Kernel::Antigravity, Kernel::Hermes] {
-            if self.kernels.unavailable(kernel).is_none() {
-                let _ = self.models_known(kernel);
-            }
+        // The settings page lists Antigravity's models: ask for them now, so it need not wait.
+        if self.kernels.unavailable(Kernel::Antigravity).is_none() {
+            let _ = self.models_known(Kernel::Antigravity);
         }
         if self.kernels.unavailable(self.settings().kernel).is_none() {
             let main = self.ensure_orchestrator().await?;

@@ -3,9 +3,9 @@
 
 use crate::app::App;
 use crate::cards::ticket_card;
-use crate::effects::Failure;
+use crate::effects::{self, Failure};
 use crate::kernels::SessionRole;
-use crate::notices::receipt_notice;
+use crate::notices::{receipt_notice, Relay};
 use crate::prompts::sidecar_prompt;
 use crate::sessions::OnceTools;
 use crate::text::{checked_im_text, clip, word_count, IM_WORDS};
@@ -19,6 +19,7 @@ use std::time::Duration;
 
 const REPORT_EXCERPT_CHARS: usize = 4000;
 const SUBDIRS_TO_LIST: &[&str] = &["docs", "results", "out", "run"];
+const SIDECAR_MAX_ATTEMPTS: i64 = 3;
 
 /// The files a person may ask about: the top of the ticket's directory and a few of its usual result folders.
 fn deliverables(directory: &Path) -> Vec<String> {
@@ -73,6 +74,10 @@ impl App {
         if !trigger.human || trigger.channel.is_none() {
             return Ok(());
         }
+        let attempts = self.store.effect_attempts(effects::SIDECAR, trigger_id).unwrap_or(0);
+        if attempts >= SIDECAR_MAX_ATTEMPTS {
+            return Ok(());
+        }
         let batch: Vec<String> =
             payload["batchIds"].as_array().map(|ids| ids.iter().filter_map(|id| id.as_str().map(str::to_string)).collect()).unwrap_or_default();
         let ids = if batch.is_empty() { vec![trigger_id.to_string()] } else { batch };
@@ -124,7 +129,27 @@ impl App {
             }),
         };
         let cwd = directory.unwrap_or_else(|| self.machine.state_dir.clone());
-        let said = self.run_once(SessionRole::Sidecar, &cwd, sidecar_prompt(), packet.to_string(), tools, Duration::from_secs(90)).await?;
+        let said = match self.run_once(SessionRole::Sidecar, &cwd, sidecar_prompt(), packet.to_string(), tools, Duration::from_secs(90)).await {
+            Ok(said) => said,
+            Err(error) => {
+                if self.closing() || self.paused() {
+                    return Err(Failure::Later(error));
+                }
+                if attempts + 1 < SIDECAR_MAX_ATTEMPTS {
+                    return Err(Failure::Error(error));
+                }
+                let card = json!({
+                    "kind": "sidecar_failed",
+                    "ticket_id": ticket.id,
+                    "trigger_id": trigger_id,
+                    "questions": questions,
+                    "error": clip(&error, 400),
+                    "note": "The read-only sidecar failed after retries. Answer concisely in the person's language from known ticket state (or explain briefly that live lookup failed) via orchestrator_reply with purpose=answer and trigger_id only (omit ticket_id)."
+                });
+                self.relay(Relay { id: format!("sidecar-failed:{trigger_id}"), text: card.to_string() });
+                return Ok(());
+            }
+        };
         let sent = replied.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
         let sent = match sent {
             Some(text) => text,

@@ -31,25 +31,16 @@ pub mod limits {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kernel {
-    /// Oh My Pi, driven over its RPC mode.
-    #[default]
-    Omp,
-    /// Claude Code, driven over its stream-json protocol.
-    Claude,
     /// The Antigravity CLI, driven in print mode with stream-json input and output.
+    #[default]
     Antigravity,
-    /// Hermes Agent, driven over a Python JSON-RPC bridge in its own runtime.
-    Hermes,
 }
 
 impl Kernel {
     /// The kernel's name in settings and API payloads.
     pub fn as_str(self) -> &'static str {
         match self {
-            Kernel::Omp => "omp",
-            Kernel::Claude => "claude",
             Kernel::Antigravity => "antigravity",
-            Kernel::Hermes => "hermes",
         }
     }
 }
@@ -221,20 +212,14 @@ impl Default for ExecutorConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RoleModel {
-    /// The provider, as the kernel names it; ignored by Claude Code.
+    /// The provider (`antigravity`).
     pub provider: String,
     /// The model id.
     pub model: String,
-    /// One of [`THINKING_LEVELS`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thinking_level: Option<String>,
 }
 
-/// The thinking levels a role model may name.
-pub const THINKING_LEVELS: &[&str] = &["auto", "off", "minimal", "low", "medium", "high", "xhigh", "max"];
-
-/// One kernel's model choices; `None` follows the kernel's default. Unknown keys are dropped, such as the `advisor` model
-/// earlier versions saved.
+/// Model choices for Antigravity; `None` follows the runtime's default. Unknown keys are dropped, such as the
+/// `advisor` model earlier versions saved.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleModels {
     /// The orchestrator, which assesses and routes.
@@ -264,16 +249,9 @@ pub struct Settings {
     /// How workers run.
     #[serde(default)]
     pub executor: ExecutorConfig,
-    /// Each kernel's own model choices.
+    /// Model choices for Antigravity.
     #[serde(default)]
     pub models: BTreeMap<Kernel, RoleModels>,
-    /// The runtime workers run on; `None` follows `kernel`, which the main Session runs on.
-    #[serde(default, rename = "workerKernel", skip_serializing_if = "Option::is_none")]
-    pub worker_kernel: Option<Kernel>,
-    /// Custom model providers the kernels share; `None` until the list is first set, when Oh My Pi's own are
-    /// imported. Their keys are kept apart, in [`crate::providers::ProviderKeys`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub providers: Option<Vec<crate::providers::Provider>>,
 }
 
 fn id_like(text: &str, max: usize) -> bool {
@@ -317,14 +295,6 @@ impl Settings {
                 model.model = model.model.trim().to_string();
             }
         }
-        for provider in self.providers.iter_mut().flatten() {
-            provider.normalize();
-        }
-    }
-
-    /// The custom providers, none before the list is first set.
-    pub fn provider_list(&self) -> &[crate::providers::Provider] {
-        self.providers.as_deref().unwrap_or_default()
     }
 
     /// Check every bound; the first problem is returned in words.
@@ -386,17 +356,9 @@ impl Settings {
                 if model.provider.is_empty() || model.model.is_empty() {
                     return Err("A model needs a provider and a model id".into());
                 }
-                if model.thinking_level.as_deref().is_some_and(|level| !THINKING_LEVELS.contains(&level)) {
-                    return Err(format!("Unknown thinking level {:?}", model.thinking_level.as_deref().unwrap_or("")));
-                }
             }
         }
-        crate::providers::validate(self.provider_list())
-    }
-
-    /// The runtime workers run on.
-    pub fn worker_kernel(&self) -> Kernel {
-        self.worker_kernel.unwrap_or(self.kernel)
+        Ok(())
     }
 
     /// A kernel's model choices.
@@ -404,9 +366,9 @@ impl Settings {
         self.models.get(&kernel).cloned().unwrap_or_default()
     }
 
-    /// The model choices in use: the main Session's on its kernel, the workers' on theirs.
+    /// The model choices in use.
     pub fn role_models(&self) -> RoleModels {
-        RoleModels { eval: self.models_of(self.kernel).eval, executor: self.models_of(self.worker_kernel()).executor }
+        self.models_of(self.kernel)
     }
 
     /// The listed sender an actor is, compared without case.
@@ -457,13 +419,34 @@ pub struct SettingsVersion {
 pub struct SettingsStore<'a>(pub &'a Store);
 
 impl SettingsStore<'_> {
+    fn read(&self, key: &str) -> Option<SettingsVersion> {
+        let mut value = self.0.get::<serde_json::Value>(key)?;
+        if let Some(settings) = value.get_mut("settings").and_then(serde_json::Value::as_object_mut) {
+            if settings.get("kernel").and_then(serde_json::Value::as_str).is_some_and(|kernel| kernel != Kernel::Antigravity.as_str()) {
+                settings.insert("kernel".into(), serde_json::Value::String(Kernel::Antigravity.as_str().into()));
+            }
+            settings.remove("workerKernel");
+            settings.remove("providers");
+            if let Some(models) = settings.get_mut("models").and_then(serde_json::Value::as_object_mut) {
+                models.retain(|kernel, _| kernel == Kernel::Antigravity.as_str());
+                if let Some(roles) = models.get_mut(Kernel::Antigravity.as_str()).and_then(serde_json::Value::as_object_mut) {
+                    for role in roles.values_mut() {
+                        if let Some(model) = role.as_object_mut() {
+                            model.remove("thinkingLevel");
+                        }
+                    }
+                }
+            }
+        }
+        Some(serde_json::from_value(value).expect("stored settings match this version's model"))
+    }
     /// The current revision number, or 0 before the first save.
     pub fn revision(&self) -> u64 {
         self.0.get(REVISION).unwrap_or(0)
     }
     /// The current settings; the defaults before the first save.
     pub fn current(&self) -> Settings {
-        self.0.get::<SettingsVersion>(&format!("{VERSION}{}", self.revision())).map(|version| version.settings).unwrap_or_default()
+        self.read(&format!("{VERSION}{}", self.revision())).map(|version| version.settings).unwrap_or_default()
     }
     /// Save validated settings as the next revision, which becomes current.
     pub fn save(&self, settings: &Settings, source: &str, policy_version: &str, saved_at: &str) -> Result<SettingsVersion, String> {
@@ -483,7 +466,7 @@ impl SettingsStore<'_> {
     }
     /// Saved revisions, newest first.
     pub fn history(&self, limit: usize) -> Vec<SettingsVersion> {
-        let mut versions: Vec<SettingsVersion> = self.0.keys(VERSION).iter().filter_map(|key| self.0.get(key)).collect();
+        let mut versions: Vec<SettingsVersion> = self.0.keys(VERSION).iter().filter_map(|key| self.read(key)).collect();
         versions.sort_by_key(|version| std::cmp::Reverse(version.revision));
         versions.truncate(limit);
         versions
@@ -500,7 +483,7 @@ mod tests {
         let settings = Settings::parse(json!({})).unwrap();
         assert_eq!(settings, Settings::default());
         assert!(!settings.paused);
-        assert_eq!(settings.kernel, Kernel::Omp);
+        assert_eq!(settings.kernel, Kernel::Antigravity);
         assert_eq!(settings.eval, EvalConfig { mode: AcceptMode::Observe, timeout_seconds: 120 });
         assert_eq!(settings.executor.max_workers, 3);
         assert_eq!(settings.policy.rules.iter().map(|rule| rule.id.as_str()).collect::<Vec<_>>(), vec!["copy", "visual"]);
@@ -529,28 +512,30 @@ mod tests {
         assert!(refused(json!({"policy": {"sources": {"Chat": {}}}})).contains("lowercase"));
         assert!(refused(json!({"policy": {"sources": {"chat": {"admission": {"row": {"listedUnaddressed": "explicit"}}}}}}))
             .contains("cannot be an explicit request"));
-        assert!(refused(json!({"models": {"omp": {"eval": {"provider": "p", "model": "m", "thinkingLevel": "huge"}}}})).contains("thinking level"));
-        assert!(refused(json!({"models": {"omp": {"eval": {"provider": " ", "model": "m"}}}})).contains("provider"));
-        assert!(refused(json!({"models": {"omp": {"eval": {"provider": "p", "model": "m", "reasoningEffort": "high"}}}})).contains("unknown field"));
+        assert!(refused(json!({"models": {"antigravity": {"eval": {"provider": " ", "model": "m"}}}})).contains("provider"));
+        assert!(
+            refused(json!({"models": {"antigravity": {"eval": {"provider": "antigravity", "model": "m", "thinkingLevel": "high"}}}})).contains("unknown field")
+        );
         assert!(refused(json!({"kernel": "gpt"})).contains("Invalid settings"));
+        assert!(refused(json!({"workerKernel": "antigravity"})).contains("unknown field"));
     }
 
     #[test]
-    fn keeps_each_kernels_models_apart_and_trims_what_people_type() {
+    fn keeps_models_and_trims_what_people_type() {
         let settings = Settings::parse(json!({
-            "kernel": "claude",
+            "kernel": "antigravity",
             "models": {
-                "omp": {"executor": {"provider": " fixture ", "model": " big ", "thinkingLevel": "high"}},
-                "claude": {"eval": {"provider": "anthropic", "model": "sonnet"}}
+                "antigravity": {
+                    "eval": {"provider": " antigravity ", "model": " gemini-3.8-flash-low "},
+                    "executor": {"provider": " antigravity ", "model": " gemini-3.8-pro-high "}
+                }
             },
             "executor": {"directory": "  ", "prepareShell": " pwsh ", "blockedCommands": ["docker", "kubectl.exe"]},
             "policy": {"sources": {"chat": {"allowed": [{"id": " web:local ", "name": "  "}, {"id": "wechat:abc@im.wechat", "name": " Me "}]}}}
         }))
         .unwrap();
-        assert_eq!(settings.role_models().eval.map(|model| model.model), Some("sonnet".into()));
-        assert_eq!(settings.role_models().executor, None);
-        let omp = &settings.models[&Kernel::Omp];
-        assert_eq!(omp.executor.as_ref().map(|model| (model.provider.as_str(), model.model.as_str())), Some(("fixture", "big")));
+        assert_eq!(settings.role_models().eval.map(|model| model.model), Some("gemini-3.8-flash-low".into()));
+        assert_eq!(settings.role_models().executor.map(|model| model.model), Some("gemini-3.8-pro-high".into()));
         assert_eq!((settings.executor.directory.as_str(), settings.executor.prepare_shell.as_deref()), ("", Some("pwsh")));
         let allowed = &settings.policy.sources[CHAT_SOURCE].allowed;
         assert_eq!(allowed[0], Allowed { id: "web:local".into(), name: None });
@@ -561,13 +546,16 @@ mod tests {
 
     #[test]
     fn reads_settings_saved_with_an_advisor_model_and_drops_it() {
-        let saved = json!({"models": {"omp": {"eval": null, "executor": {"provider": "p", "model": "m"}, "advisor": {"provider": "p", "model": "big"}}}});
+        let saved = json!({"models": {"antigravity": {"eval": null, "executor": {"provider": "antigravity", "model": "m"}, "advisor": {"provider": "antigravity", "model": "big"}}}});
         let settings = Settings::parse(saved).unwrap();
         assert_eq!(
-            settings.models[&Kernel::Omp],
-            RoleModels { eval: None, executor: Some(RoleModel { provider: "p".into(), model: "m".into(), thinking_level: None }) }
+            settings.models[&Kernel::Antigravity],
+            RoleModels { eval: None, executor: Some(RoleModel { provider: "antigravity".into(), model: "m".into() }) }
         );
-        assert_eq!(serde_json::to_value(&settings.models[&Kernel::Omp]).unwrap(), json!({"eval": null, "executor": {"provider": "p", "model": "m"}}));
+        assert_eq!(
+            serde_json::to_value(&settings.models[&Kernel::Antigravity]).unwrap(),
+            json!({"eval": null, "executor": {"provider": "antigravity", "model": "m"}})
+        );
     }
 
     #[test]
@@ -601,5 +589,48 @@ mod tests {
         assert!(stored.save(&settings, "app", "v1", "t").is_err());
         assert_eq!(stored.revision(), 2);
         assert_eq!(stored.current().executor.max_workers, 5);
+    }
+
+    #[test]
+    fn reads_legacy_stored_settings_with_removed_kernels_and_fields() {
+        let store = Store::memory();
+        store.set(REVISION, &1u64);
+        store.set(
+            &format!("{VERSION}1"),
+            &json!({
+                "revision": 1,
+                "savedAt": "2026-11-20T00:00:00.000Z",
+                "source": "app",
+                "policyVersion": "v1",
+                "settings": {
+                    "paused": false,
+                    "kernel": "omp",
+                    "workerKernel": "claude",
+                    "providers": [{"id": "p", "name": "P", "api": "openai-completions", "baseUrl": "https://example.test", "models": []}],
+                    "executor": {"maxWorkers": 5},
+                    "models": {
+                        "omp": {"eval": {"provider": "p", "model": "m1", "thinkingLevel": "high"}},
+                        "claude": {"executor": {"provider": "anthropic", "model": "sonnet"}},
+                        "hermes": {"eval": {"provider": "hermes", "model": "m2"}},
+                        "antigravity": {
+                            "eval": {"provider": "antigravity", "model": "gemini-3.8-flash-low", "thinkingLevel": "low"},
+                            "executor": {"provider": "antigravity", "model": "gemini-3.8-pro-high"},
+                            "advisor": {"provider": "antigravity", "model": "big"}
+                        }
+                    }
+                }
+            }),
+        );
+        let stored = SettingsStore(&store);
+        let current = stored.current();
+        assert_eq!(current.kernel, Kernel::Antigravity);
+        assert_eq!(current.executor.max_workers, 5);
+        assert_eq!(current.models.len(), 1);
+        assert_eq!(current.role_models().eval, Some(RoleModel { provider: "antigravity".into(), model: "gemini-3.8-flash-low".into() }));
+        assert_eq!(current.role_models().executor, Some(RoleModel { provider: "antigravity".into(), model: "gemini-3.8-pro-high".into() }));
+        assert!(current.validate().is_ok());
+        let history = stored.history(10);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].settings, current);
     }
 }

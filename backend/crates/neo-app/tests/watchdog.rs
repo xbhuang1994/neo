@@ -163,7 +163,7 @@ async fn wakes_a_worker_that_sits_idle_with_its_work_finished() {
     assert_eq!(refuse(json!({"action": "cancel_job", "ticket_id": ticket.id, "message": "x"})).await, "cancel_job requires job_id");
     assert_eq!(
         refuse(json!({"action": "restart", "ticket_id": ticket.id, "message": "x"})).await,
-        "action is wake_worker, cancel_job, retry_ticket or relay_report"
+        "action is wake_worker, cancel_job, interrupt_worker, retry_ticket or relay_report"
     );
     assert!(refuse(json!({"action": "wake_worker", "ticket_id": ticket.id, "message": "x", "force": true})).await.starts_with("Unknown argument force"));
     assert_eq!(refuse(json!({"action": "wake_worker", "ticket_id": ticket.id})).await, "message is required");
@@ -426,4 +426,277 @@ async fn gives_way_to_a_shutdown_in_the_middle_of_an_inspection() {
     assert_ne!(f.app.board.get("watchdog").map(|health| health.state), Some("error"));
     f.app.watchdog_tick().await;
     assert_eq!(f.ran(SessionRole::Watchdog).len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupts_a_stalled_worker_turn_and_resumes_it() {
+    let f = started().await;
+    f.script(model(|turn| {
+        Box::pin(async move {
+            match turn.role {
+                SessionRole::Worker if turn.has("[Watchdog]") => {
+                    turn.call("orchestrator_report", json!({"state": "ready", "summary": "Recovered after Watchdog interrupt."})).await?;
+                    Ok("Finished.".into())
+                }
+                // Hung mid-turn with no running_jobs (e.g. dead API stream or stuck synchronous command).
+                SessionRole::Worker => std::future::pending::<Said>().await,
+                SessionRole::Watchdog => {
+                    let patrol = turn.card("kind").expect("the patrol");
+                    let suspect = &patrol["suspects"][0];
+                    assert_eq!(suspect["kind"], "long_running_worker");
+                    assert_eq!(suspect["session"]["streaming"], true);
+                    let res = turn
+                        .call(
+                            "watchdog_intervene",
+                            json!({"action": "interrupt_worker", "ticket_id": suspect["ticket_id"], "message": "Turn stalled with zero progress."}),
+                        )
+                        .await?;
+                    assert_eq!(res["interrupted"], true);
+                    Ok("Interrupted the stalled worker.".into())
+                }
+                _ => orchestrate(&turn).await,
+            }
+        })
+    }));
+    f.app.receive_web("Run the stalled task.", vec![], None).await.unwrap();
+    f.until("the worker hung mid-turn", || f.ran(SessionRole::Worker).len() == 1).await;
+    f.app.watchdog_tick().await;
+    f.until("the resumed worker finished", || f.tickets()[0].ended.is_some()).await;
+    f.settle().await;
+    let worker_runs = f.ran(SessionRole::Worker);
+    assert_eq!(worker_runs.len(), 2);
+    assert!(worker_runs[1].text.starts_with("[Watchdog] Interrupted stalled turn: Turn stalled with zero progress."), "{}", worker_runs[1].text);
+    assert!(worker_runs[1].resumed.is_some(), "interrupted worker should resume its runtime conversation");
+    assert_eq!(replies(&f), vec!["On it.", "It is done."]);
+    // Audit history was persisted in SQLite kv.
+    let history: Vec<Value> = f.app.store.get("watchdog-history").expect("watchdog history persisted");
+    assert!(
+        history.iter().any(|ev| ev["kind"] == "intervene" && ev["detail"].as_str().unwrap_or("").contains("interrupt_worker interrupted=true")),
+        "{history:?}"
+    );
+    f.app.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn falls_back_to_interrupting_session_when_driver_cannot_cancel_single_job() {
+    let f = started().await;
+    f.kernels.refuse_cancel.store(true, Ordering::SeqCst);
+    f.script(model(|turn| {
+        Box::pin(async move {
+            match turn.role {
+                SessionRole::Worker if turn.has("[Watchdog]") => {
+                    turn.call("orchestrator_report", json!({"state": "ready", "summary": "Recovered from non-cancellable Antigravity job."})).await?;
+                    Ok("Finished.".into())
+                }
+                SessionRole::Worker => {
+                    turn.jobs.lock().unwrap().push(Fixture::job("conv-1/task-9", JobKind::Bash, "python hang.py"));
+                    Ok("Waiting on background job.".into())
+                }
+                SessionRole::Watchdog => {
+                    let patrol = turn.card("kind").expect("the patrol");
+                    let suspect = &patrol["suspects"][0];
+                    let res = turn
+                        .call(
+                            "watchdog_intervene",
+                            json!({"action": "cancel_job", "ticket_id": suspect["ticket_id"], "job_id": "conv-1/task-9", "message": "Job hung with zero CPU."}),
+                        )
+                        .await?;
+                    assert_eq!(res["cancelled"], true);
+                    Ok("Interrupted session to cancel non-cancellable job.".into())
+                }
+                _ => orchestrate(&turn).await,
+            }
+        })
+    }));
+    f.app.receive_web("Run hanging job.", vec![], None).await.unwrap();
+    f.until("the job is running", || f.ran(SessionRole::Worker).len() == 1).await;
+    f.settle().await;
+    f.app.watchdog_tick().await;
+    f.until("the worker finished", || f.tickets()[0].ended.is_some()).await;
+    f.settle().await;
+    let woken = f.ran(SessionRole::Worker)[1].text.clone();
+    assert!(
+        woken.starts_with("[Watchdog] Interrupted stalled session to stop background job conv-1/task-9 (python hang.py): Job hung with zero CPU."),
+        "{woken}"
+    );
+    assert_eq!(replies(&f), vec!["On it.", "It is done."]);
+    f.app.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retries_patrolling_a_failed_ticket_after_a_transient_watchdog_error() {
+    let f = started().await;
+    let worker_calls = Arc::new(AtomicUsize::new(0));
+    let watchdog_calls = Arc::new(AtomicUsize::new(0));
+    let (wc, dc) = (worker_calls.clone(), watchdog_calls.clone());
+    f.script(model(move |turn| {
+        let (wc, dc) = (wc.clone(), dc.clone());
+        Box::pin(async move {
+            match turn.role {
+                SessionRole::Worker => {
+                    if wc.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err("API error: EOF".into())
+                    } else {
+                        turn.call("orchestrator_report", json!({"state": "ready", "summary": "Succeeded on retry."})).await?;
+                        Ok("Done.".into())
+                    }
+                }
+                SessionRole::Watchdog => {
+                    if dc.fetch_add(1, Ordering::SeqCst) == 0 {
+                        // First patrol itself fails transiently (same outage as the worker).
+                        Err("Watchdog upstream timeout".into())
+                    } else {
+                        let patrol = turn.card("kind").expect("the patrol");
+                        let suspect = &patrol["suspects"][0];
+                        assert_eq!(suspect["kind"], "delivery_or_transient_failure");
+                        let retried = turn
+                            .call("watchdog_intervene", json!({"action": "retry_ticket", "ticket_id": suspect["ticket_id"], "message": "Transient EOF."}))
+                            .await?;
+                        assert_eq!(retried["retried"], true);
+                        Ok("Retried.".into())
+                    }
+                }
+                _ => orchestrate(&turn).await,
+            }
+        })
+    }));
+    f.app.receive_web("Do work.", vec![], None).await.unwrap();
+    f.until("worker failed once", || f.tickets().first().and_then(|t| t.latest_report()).is_some_and(|r| r.state == ReportState::Failed)).await;
+    f.settle().await;
+    // Tick 1: Watchdog patrol errors out; failure_seen must NOT be permanently committed.
+    f.app.watchdog_tick().await;
+    assert_eq!(f.app.board.get("watchdog").map(|h| h.state), Some("error"));
+    assert_eq!(f.ran(SessionRole::Worker).len(), 1);
+    // Tick 2: Watchdog retries the patrol and recovers the failed ticket!
+    f.app.watchdog_tick().await;
+    f.until("worker recovered and completed", || f.tickets()[0].ended.is_some()).await;
+    f.settle().await;
+    assert_eq!(f.ran(SessionRole::Worker).len(), 2);
+    assert_eq!(f.ran(SessionRole::Watchdog).len(), 2);
+    assert_eq!(replies(&f), vec!["On it.", "It is done."]);
+    f.app.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn never_relays_progress_for_stale_answers_and_caps_manual_relay_escalations() {
+    let f = started().await;
+    // Main session never sends the final result, so we can verify manual escalation caps cleanly.
+    f.script(model(|turn| {
+        Box::pin(async move {
+            match turn.role {
+                SessionRole::Worker => {
+                    turn.call("orchestrator_report", json!({"state": "ready", "summary": "Result ready."})).await?;
+                    Ok("Done.".into())
+                }
+                SessionRole::Watchdog => {
+                    let patrol = turn.card("kind").expect("the patrol");
+                    let tid = patrol["suspects"][0]["ticket_id"].clone();
+                    turn.call("watchdog_intervene", json!({"action": "relay_report", "ticket_id": tid, "message": "Still missing."})).await?;
+                    Ok("Relayed.".into())
+                }
+                _ => {
+                    for message in messages(&turn.text) {
+                        if message["kind"] == "candidate" {
+                            turn.call(
+                                "orchestrator_route",
+                                json!({"decisions": [{"kind": "accept", "trigger_id": message["trigger_id"], "title": "Task", "worktree_name": "task-one", "acknowledgement": "On it."}]}),
+                            )
+                            .await?;
+                        }
+                    }
+                    Ok("Ignored.".into())
+                }
+            }
+        })
+    }));
+    f.app.receive_web("Do task.", vec![], None).await.unwrap();
+    f.until("ticket completed", || f.tickets().first().is_some_and(|t| t.ended.is_some())).await;
+    f.settle().await;
+
+    // 2 auto nudges + at most 2 manual Watchdog LLM escalations, then silence (not infinite 24h spam!).
+    for _ in 0..8 {
+        f.app.watchdog_tick().await;
+        f.settle().await;
+    }
+    assert_eq!(patrols(&f).len(), 2, "manual unreplied escalations must be capped at 2");
+    f.app.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ignores_progress_report_with_stale_answers_and_caps_auto_interrupts() {
+    let f = started().await;
+    f.script(model(|turn| {
+        Box::pin(async move {
+            match turn.role {
+                SessionRole::Worker => {
+                    turn.jobs.lock().unwrap().push(Fixture::job("bg_1", JobKind::Bash, "sleep 30"));
+                    turn.call("orchestrator_report", json!({"state": "progress", "summary": "Still working on phase 2."})).await?;
+                    Ok("Working.".into())
+                }
+                SessionRole::Watchdog => Ok("Healthy.".into()),
+                _ => orchestrate(&turn).await,
+            }
+        })
+    }));
+    f.app.receive_web("Start phase 2.", vec![], None).await.unwrap();
+    f.until("progress report saved", || f.tickets().first().and_then(|t| t.latest_report()).is_some_and(|r| r.state == ReportState::Progress)).await;
+    f.settle().await;
+
+    // Simulate a stale trigger id left behind in ticket.answers while a Progress report is active.
+    let mut ticket = f.ticket(0);
+    ticket.answers.push(ticket.origin.trigger_id.clone());
+    neo_core::ports::Repositories::save_ticket(f.app.store.as_ref(), &ticket);
+
+    let main_before = f.ran(SessionRole::Orchestrator).len();
+    for _ in 0..3 {
+        f.app.watchdog_tick().await;
+        f.settle().await;
+    }
+    assert_eq!(f.ran(SessionRole::Orchestrator).len(), main_before, "Watchdog must never relay routine Progress reports as missing answers");
+
+    // Verify auto-interrupt limit caps at 2 per ticket.
+    let tid = ticket.id.clone();
+    assert_eq!(f.app.watchdog_intervene(json!({"action": "interrupt_worker", "ticket_id": tid, "message": "hang 1"})).await.unwrap()["interrupted"], true);
+    f.until("second worker turn started", || f.ran(SessionRole::Worker).len() >= 2).await;
+    assert_eq!(f.app.watchdog_intervene(json!({"action": "interrupt_worker", "ticket_id": tid, "message": "hang 2"})).await.unwrap()["interrupted"], true);
+    f.until("third worker turn started", || f.ran(SessionRole::Worker).len() >= 3).await;
+    assert_eq!(
+        f.app.watchdog_intervene(json!({"action": "interrupt_worker", "ticket_id": tid, "message": "hang 3"})).await.unwrap(),
+        json!({"action": "interrupt_worker", "ticket_id": tid, "interrupted": false, "reason": "Auto-interrupt limit reached"})
+    );
+    f.app.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn heals_lost_launch_even_when_watchdog_kernel_is_unavailable() {
+    let f = started().await;
+    let mut settings = (*f.app.settings()).clone();
+    settings.executor.max_workers = 1;
+    f.app.save_settings(settings, "app", "executor").unwrap();
+    f.script(model(|turn| {
+        Box::pin(async move {
+            match turn.role {
+                SessionRole::Worker => {
+                    turn.jobs.lock().unwrap().push(Fixture::job("bg_1", JobKind::Bash, "sleep 10"));
+                    Ok("Working.".into())
+                }
+                _ => orchestrate(&turn).await,
+            }
+        })
+    }));
+    f.app.receive_web("First.", vec![], None).await.unwrap();
+    f.until("first holds slot", || f.app.active_workers() == 1 && !f.ran(SessionRole::Worker).is_empty()).await;
+    f.settle().await;
+    f.app.receive_web("Second.", vec![], None).await.unwrap();
+    f.until("second waits", || f.tickets().len() == 2).await;
+    f.settle().await;
+    let assignment = f.ticket(1).latest().unwrap().clone();
+    f.app.effects.cancel(effects::LAUNCH, &assignment.id);
+    assert!(!f.app.effects.pending(effects::LAUNCH, Some(&assignment.id)));
+    // Even if the LLM kernel is temporarily unavailable, zero-model queue healing must still run!
+    *f.kernels.unavailable.lock().unwrap() = Some("CLI missing".into());
+    f.app.watchdog_tick().await;
+    assert!(f.app.effects.pending(effects::LAUNCH, Some(&assignment.id)));
+    assert!(patrols(&f).is_empty());
+    f.app.stop().await;
 }

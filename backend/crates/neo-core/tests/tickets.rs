@@ -774,6 +774,16 @@ fn sends_an_answer_only_after_the_worker_reported_it_a_result_only_when_ready_an
     // The same result in other words is refused: the person has it.
     assert_eq!(Harness::code(h.engine.reply(result(&ticket_id, "It is done, in other words."))), "resultSent");
     assert_eq!(h.outbox().iter().filter(|message| message.kind == MessageKind::Reply && message.channel == channel("1")).count(), 1);
+
+    // Delivering a ready result also clears any pending answers carried on that ready report.
+    let ticket_id = h.accepted_on("19", "t19");
+    h.receive(on(by(trigger("20"), guest()), "t19"));
+    let mut ready_with_answer = report(ReportState::Ready, "All finished.");
+    ready_with_answer.answers = Some("20".into());
+    h.engine.report(&ticket_id, ready_with_answer).unwrap();
+    assert_eq!(h.ticket(&ticket_id).answers, ids(&["20"]));
+    h.engine.reply(result(&ticket_id, "All finished.")).unwrap();
+    assert!(h.ticket(&ticket_id).answers.is_empty());
 }
 
 #[test]
@@ -788,4 +798,36 @@ fn answers_a_human_trigger_after_its_tickets_worker_handed_it_back() {
     let last = h.outbox().pop().unwrap();
     assert_eq!((last.channel, last.text.as_str(), last.ticket_id), (channel("2"), "成都现在 16℃。", None));
     assert_eq!(Harness::code(h.engine.reply(answer("missing", "x"))), "unknownTrigger");
+}
+
+#[test]
+fn clears_pending_answers_attention_delivery_and_undelivered_when_human_stops_a_ticket() {
+    let h = harness();
+    let ticket_id = h.accepted();
+    h.receive(on(by(trigger("2"), guest()), "t1"));
+    h.settle();
+    let mut answered = report(ReportState::Progress, "Answering soon.");
+    answered.answers = Some("2".into());
+    h.engine.report(&ticket_id, answered).unwrap();
+    h.tick(1);
+    let mut asking = report(ReportState::Progress, "Need input.");
+    asking.question = Question::Ask("Confirm?".into());
+    asking.asked_by = Some("2".into());
+    h.engine.report(&ticket_id, asking).unwrap();
+    h.receive(on(by(trigger("3"), guest()), "t1"));
+    let running_id = h.ticket(&ticket_id).running().unwrap().id.clone();
+    h.engine.delivery_failed(&ticket_id, &running_id, "transient error").unwrap();
+    assert!(!h.ticket(&ticket_id).answers.is_empty());
+    assert!(h.ticket(&ticket_id).attention.is_some());
+    assert!(h.ticket(&ticket_id).delivery.is_some());
+    assert!(!h.ticket(&ticket_id).undelivered.is_empty());
+
+    let stopped = h.engine.stop_ticket(&ticket_id, Some("Stopped by user")).unwrap();
+    let ended = stopped.ended.as_ref().unwrap();
+    assert_eq!((ended.by, ended.outcome), (TicketEndBy::Human, TicketOutcome::Stopped));
+    assert!(stopped.answers.is_empty());
+    assert!(stopped.attention.is_none());
+    assert!(stopped.delivery.is_none());
+    assert!(stopped.undelivered.is_empty());
+    assert!(stopped.assignments.iter().all(|assignment| assignment.state == AssignmentState::Ended));
 }

@@ -18,6 +18,26 @@ const List<String> monospace = ['SF Mono', 'Menlo', 'Consolas', 'DejaVu Sans Mon
 /// The font that carries Chinese where the system's own cannot be reached: the web build.
 const String cjkFont = 'NotoSansSC';
 
+/// Invisible variation selectors (`U+FE01`–`U+FE0F`) so CanvasKit does not report `U+FE0E`/`U+FE0F` as missing.
+const String variationSelectorFont = 'VariationSelectors';
+
+/// Color emoji slices preloaded on web so emoji clusters (including `U+FE0F`) resolve on the first frame.
+const List<String> emojiFonts = [
+  'Noto Color Emoji 0',
+  'Noto Color Emoji 1',
+  'Noto Color Emoji 2',
+  'Noto Color Emoji 3',
+  'Noto Color Emoji 4',
+  'Noto Color Emoji 5',
+  'Noto Color Emoji 6',
+  'Noto Color Emoji 7',
+  'Noto Color Emoji 8',
+  'Noto Color Emoji 9',
+];
+
+/// The fallback font chain used by the web build.
+const List<String> webFallbackFonts = [cjkFont, ...emojiFonts, variationSelectorFont];
+
 /// The colours of the current appearance.
 class Palette {
   Palette.of(BuildContext context)
@@ -77,7 +97,7 @@ class Typo {
   TextStyle get caption => _base.copyWith(fontSize: 12, color: _palette.secondary, letterSpacing: 0);
   TextStyle get footnote => _base.copyWith(fontSize: 13, color: _palette.secondary, height: 1.35, letterSpacing: -0.05);
   TextStyle get section => _base.copyWith(fontSize: 13, color: _palette.secondary, fontWeight: FontWeight.w500, letterSpacing: 0);
-  TextStyle get mono => _base.copyWith(fontSize: 12.5, height: 1.45, fontFamily: monospace.first, fontFamilyFallback: [...monospace.skip(1), cjkFont], letterSpacing: 0);
+  TextStyle get mono => _base.copyWith(fontSize: 12.5, height: 1.45, fontFamily: monospace.first, fontFamilyFallback: [...monospace.skip(1), ...(_base.fontFamilyFallback ?? const [cjkFont])], letterSpacing: 0);
 }
 
 /// The theme's fallback fonts alone, for texts in widgets that set their own font instead of the theme's.
@@ -88,6 +108,6 @@ TextStyle fallbackFonts(BuildContext context) => TextStyle(fontFamilyFallback: C
 
 /// The app's theme: the system's blue, and the system's appearance unless [brightness] is given.
 CupertinoThemeData appTheme({Brightness? brightness, bool bundledCjk = false}) {
-  final text = const CupertinoTextThemeData().textStyle.copyWith(fontFamilyFallback: bundledCjk ? const [cjkFont] : null);
+  final text = const CupertinoTextThemeData().textStyle.copyWith(fontFamilyFallback: bundledCjk ? webFallbackFonts : null);
   return CupertinoThemeData(brightness: brightness, primaryColor: CupertinoColors.systemBlue, textTheme: CupertinoTextThemeData(textStyle: text));
 }

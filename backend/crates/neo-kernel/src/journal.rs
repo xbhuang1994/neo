@@ -1,4 +1,4 @@
-//! The file-backed transcript of one Session, for either kernel: what people see, what the model was or will be
+//! The file-backed transcript of one Session: what people see, what the model was or will be
 //! shown, and the idempotency record of every delivery.
 //!
 //! One JSON value per line. An entry is visible once appended and durable after [`Journal::flush`]. A delivery meant
@@ -422,9 +422,9 @@ mod tests {
         let path = {
             let journal = Journal::create(&dir, Path::new("/work")).unwrap();
             journal.set_name("Fix typo");
-            journal.set_kernel_session("claude", "c-1");
-            journal.set_kernel_session("omp", "/sessions/o.jsonl");
-            journal.set_kernel_session("claude", "c-2");
+            journal.set_kernel_session("antigravity", "c-1");
+            journal.set_kernel_session("other", "/sessions/o.jsonl");
+            journal.set_kernel_session("antigravity", "c-2");
             let chat = journal.append_custom(vec![Block::text("hello")], true, Some(json!({"requestId": "chat:1", "source": "web-panel"})), Some("user"), None);
             let relay = journal.append_custom(
                 vec![Block::text("candidate")],
@@ -449,7 +449,7 @@ mod tests {
         assert_eq!(journal.len(), 4);
         assert_eq!(journal.name().as_deref(), Some("Fix typo"));
         assert_eq!(
-            (journal.kernel_session("claude").as_deref(), journal.kernel_session("omp").as_deref(), journal.kernel_session("x")),
+            (journal.kernel_session("antigravity").as_deref(), journal.kernel_session("other").as_deref(), journal.kernel_session("x")),
             (Some("c-2"), Some("/sessions/o.jsonl"), None)
         );
         assert!(journal.has_request("chat:1") && journal.has_request("r1") && !journal.has_request("missing"));

@@ -134,10 +134,9 @@ fn changes_the_policy_version_for_authorization_rules_and_mode_only() {
     let version = policy_version(&base);
     let mut other = base.clone();
     other.paused = true;
-    other.kernel = Kernel::Claude;
     other.executor.max_workers = 9;
     other.eval.timeout_seconds = 300;
-    other.models.insert(Kernel::Claude, RoleModels::default());
+    other.models.insert(Kernel::Antigravity, RoleModels::default());
     assert_eq!(policy_version(&other), version);
     let mut mode = base.clone();
     mode.eval.mode = AcceptMode::Auto;

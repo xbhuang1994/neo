@@ -102,6 +102,10 @@ class ApiClient {
 
   Future<Worker> worker(String ticketId) async => Worker.fromJson(await _object('GET', '/api/workers/${Uri.encodeComponent(ticketId)}'));
 
+  /// Stop a worker and all of its subtasks, marking the task ended.
+  Future<Worker> stopWorker(String ticketId) async =>
+      Worker.fromJson(await _object('POST', '/api/workers/${Uri.encodeComponent(ticketId)}/stop', timeout: const Duration(seconds: 60)));
+
   /// Send a chat message; the same [messageId] is the same message however often it is sent.
   Future<void> chat(String text, List<OutgoingFile> files, String messageId) async {
     await _object(
@@ -118,25 +122,20 @@ class ApiClient {
 
   Future<ModelSettings> models() async => ModelSettings.fromJson(await _object('GET', '/api/settings/models', timeout: const Duration(seconds: 30)));
 
-  /// Save the kernels and models as one: the main session's kernel and model, and the workers' kernel (`null` follows
-  /// the main session's) and model. A new main kernel reopens the main session on it.
-  Future<ModelSettings> saveModels({required String kernel, required String? workerKernel, RoleModel? eval, RoleModel? executor}) async =>
+  /// Save the orchestrator and worker model choices for Antigravity.
+  Future<ModelSettings> saveModels({RoleModel? eval, RoleModel? executor}) async =>
       ModelSettings.fromJson(
         await _object(
           'PUT',
           '/api/settings/models',
-          body: {'kernel': kernel, 'workerKernel': workerKernel, 'eval': eval?.toJson(), 'executor': executor?.toJson()},
-          timeout: const Duration(seconds: 90),
+          body: {'eval': eval?.toJson(), 'executor': executor?.toJson()},
+          timeout: const Duration(seconds: 60),
         ),
       );
 
-  Future<ModelSettings> setKernel(String kernel) async =>
-      ModelSettings.fromJson(await _object('PUT', '/api/settings/kernel', body: {'kernel': kernel}, timeout: const Duration(seconds: 60)));
-
-  /// Install a kernel's program on the backend's machine with its official installer; that can take minutes, and
-  /// Hermes Agent's up to two hours on a slow link to GitHub. [models] says how far it has come meanwhile.
-  Future<ModelSettings> installKernel(String kernel) async =>
-      ModelSettings.fromJson(await _object('POST', '/api/settings/kernel/install', body: {'kernel': kernel}, timeout: const Duration(minutes: 121)));
+  /// Install the Antigravity CLI on the backend's machine with its official installer; [models] reports progress meanwhile.
+  Future<ModelSettings> installKernel() async =>
+      ModelSettings.fromJson(await _object('POST', '/api/settings/kernel/install', body: {'kernel': 'antigravity'}, timeout: const Duration(minutes: 11)));
 
   Future<GeneralSettings> general() async => GeneralSettings.fromJson(await _object('GET', '/api/settings/general'));
 
@@ -152,24 +151,11 @@ class ApiClient {
 
   Future<WeChatStatus> wechatVerify(String code) async => WeChatStatus.fromJson(await _object('POST', '/api/wechat/verify', body: {'code': code}));
 
-  Future<ProvidersView> providers() async => ProvidersView.fromJson(await _object('GET', '/api/settings/providers'));
-
-  /// Replace the custom providers. Each may carry `apiKey` (a key, a variable's name, or null for none; absent keeps
-  /// its key) and `previousName` when renamed.
-  Future<ProvidersView> saveProviders(List<Map<String, dynamic>> providers) async =>
-      ProvidersView.fromJson(await _object('PUT', '/api/settings/providers', body: {'providers': providers}, timeout: const Duration(seconds: 60)));
-
-  /// Ask every provider for its models again.
-  Future<ProvidersView> refreshProviders() async => ProvidersView.fromJson(await _object('POST', '/api/settings/providers/refresh', timeout: const Duration(seconds: 60)));
-
-  /// Add Oh My Pi's custom providers that are not listed yet.
-  Future<ProvidersView> importProviders() async => ProvidersView.fromJson(await _object('POST', '/api/settings/providers/import'));
-
   Future<AccountsView> accounts() async => AccountsView.fromJson(await _object('GET', '/api/settings/accounts', timeout: const Duration(seconds: 90)));
 
-  /// Start logging a kernel in to a provider on the backend's machine.
-  Future<LoginRun?> startLogin(String kernel, String provider) async =>
-      LoginRun.maybe((await _object('POST', '/api/settings/accounts/login', body: {'kernel': kernel, 'provider': provider}, timeout: const Duration(seconds: 30)))['login']);
+  /// Start logging Antigravity in on the backend's machine.
+  Future<LoginRun?> startLogin() async =>
+      LoginRun.maybe((await _object('POST', '/api/settings/accounts/login', body: const <String, dynamic>{}, timeout: const Duration(seconds: 30)))['login']);
 
   Future<LoginRun?> login() async => LoginRun.maybe((await _object('GET', '/api/settings/accounts/login'))['login']);
 
@@ -178,9 +164,6 @@ class ApiClient {
 
   Future<LoginRun?> cancelLogin() async => LoginRun.maybe((await _object('POST', '/api/settings/accounts/login/cancel'))['login']);
 
-  Future<AccountsView> logout(String kernel, String account) async =>
-      AccountsView.fromJson(await _object('POST', '/api/settings/accounts/logout', body: {'kernel': kernel, 'account': account}, timeout: const Duration(seconds: 90)));
-
-  Future<AccountsView> addApiKey(String kernel, String provider, String key) async =>
-      AccountsView.fromJson(await _object('POST', '/api/settings/accounts/key', body: {'kernel': kernel, 'provider': provider, 'key': key}, timeout: const Duration(seconds: 90)));
+  Future<AccountsView> logout() async =>
+      AccountsView.fromJson(await _object('POST', '/api/settings/accounts/logout', body: const <String, dynamic>{}, timeout: const Duration(seconds: 90)));
 }

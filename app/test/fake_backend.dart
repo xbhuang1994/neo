@@ -28,11 +28,9 @@ class FakeBackend {
   Map<String, dynamic>? activity = {'router': false, 'workers': <Map<String, dynamic>>[]};
   final List<Map<String, dynamic>> chats = [];
   final List<String> calls = [];
+  final List<String> stopped = [];
+  String? stopError;
   int resets = 0;
-  String kernel = 'omp';
-
-  /// The workers' kernel; null follows [kernel].
-  String? workerKernel;
 
   /// Antigravity is still listing its models; the page asks again until it is done.
   bool antigravityListing = false;
@@ -40,21 +38,16 @@ class FakeBackend {
   /// How many times the models were asked for.
   int modelReads = 0;
 
-  /// Why Claude Code cannot run; set, its program is not installed until the app installs it.
-  String? claudeProblem;
+  /// Why Antigravity cannot run; set, its program is not installed until the app installs it.
+  String? antigravityProblem;
   final List<String> installed = [];
 
-  /// Set, an install answers only once it completes; meanwhile the kernel is being installed, as far as
+  /// Set, an install answers only once it completes; meanwhile Antigravity is being installed, as far as
   /// [installProgress] says.
   Completer<void>? installGate;
   String? installProgress;
-  String? _installingNow;
-  Map<String, Map<String, dynamic>> models = {
-    'omp': {'eval': null, 'executor': null},
-    'claude': {'eval': null, 'executor': null},
-    'antigravity': {'eval': null, 'executor': null},
-    'hermes': {'eval': null, 'executor': null},
-  };
+  bool _installingNow = false;
+  Map<String, dynamic> models = {'eval': null, 'executor': null};
   Map<String, dynamic> general = {
     'paused': false,
     'eval': {'mode': 'observe', 'timeoutSeconds': 120},
@@ -113,93 +106,35 @@ class FakeBackend {
     details[id] = {...card, 'inputs': <dynamic>[], 'recent': recent};
   }
 
-  List<String> _levels(String kernel) => switch (kernel) {
-    'omp' || 'hermes' => ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
-    'antigravity' => <String>[],
-    _ => ['auto', 'off', 'low', 'medium', 'high', 'xhigh', 'max'],
+  List<Map<String, dynamic>> _available() => antigravityListing
+      ? <Map<String, dynamic>>[]
+      : [
+          {'id': 'gemini-3.8-flash-low', 'provider': 'antigravity', 'name': 'Gemini 3.8 Flash (Low)'},
+          {'id': 'gemini-3.8-pro-high', 'provider': 'antigravity', 'name': 'Gemini 3.8 Pro (High)'},
+        ];
+
+  Map<String, dynamic> _modelsView() => {
+    'kernel': 'antigravity',
+    'installed': antigravityProblem == null,
+    'installing': _installingNow,
+    'installProgress': _installingNow ? installProgress : null,
+    'problem': antigravityProblem,
+    'listProblem': antigravityProblem,
+    'loading': antigravityListing,
+    'current': {'eval': models['eval'], 'executor': models['executor']},
+    'available': _available(),
   };
-
-  List<Map<String, dynamic>> _available(String kernel) => switch (kernel) {
-    'omp' => [
-      {'id': 'big', 'provider': 'fixture', 'name': 'Big'},
-      {'id': 'small', 'provider': 'fixture', 'name': 'Small'},
-    ],
-    'antigravity' =>
-      antigravityListing
-          ? <Map<String, dynamic>>[]
-          : [
-              {'id': 'gemini-3.8-flash-low', 'provider': 'antigravity', 'name': 'Gemini 3.8 Flash (Low)'},
-            ],
-    'hermes' => [
-      {'id': 'anthropic/claude-sonnet-4.6', 'provider': 'openrouter', 'name': 'Claude Sonnet 4.6'},
-    ],
-    _ => [
-      {'id': 'opus', 'provider': 'anthropic', 'name': 'Opus'},
-    ],
-  };
-
-  Map<String, dynamic> _modelsView() {
-    final workers = workerKernel ?? kernel;
-    return {
-      'kernel': kernel,
-      'workerKernel': workers,
-      'workerKernelFollows': workerKernel == null,
-      'loading': antigravityListing,
-      'kernels': [
-        for (final id in const ['omp', 'claude', 'antigravity', 'hermes'])
-          {
-            'id': id,
-            'problem': id == 'claude' ? claudeProblem : null,
-            'installed': id != 'claude' || claudeProblem == null,
-            'installing': id == _installingNow,
-            'installProgress': id == _installingNow ? installProgress : null,
-            'supports': {'thinkingLevels': _levels(id)},
-            'available': _available(id),
-            'listProblem': id == 'claude' ? claudeProblem : null,
-            'loading': id == 'antigravity' && antigravityListing,
-            'models': models[id],
-          },
-      ],
-      'supports': {'thinkingLevels': _levels(kernel)},
-      'workerSupports': {'thinkingLevels': _levels(workers)},
-      'current': {'eval': models[kernel]!['eval'], 'executor': models[workers]!['executor']},
-      'available': _available(kernel),
-      'problem': null,
-    };
-  }
-
-  /// The custom providers, as saved; keys only as hints.
-  List<Map<String, dynamic>> providers = [
-    {'name': 'magpie', 'api': 'openai-completions', 'baseUrl': 'http://127.0.0.1:3425/v1', 'models': [{'id': 'big', 'contextWindow': 1000}], 'kernels': ['omp', 'hermes'], 'key': null},
-  ];
-  final List<Object?> savedProviders = [];
 
   /// The login in progress, and what was pasted into it.
   Map<String, dynamic>? login;
   final List<String> pasted = [];
-
-  Map<String, dynamic> _providersView() => {
-    'providers': providers,
-    'apis': ['openai-completions', 'openai-responses', 'anthropic-messages'],
-    'serves': {'omp': '*', 'claude': ['anthropic-messages'], 'antigravity': [], 'hermes': ['openai-completions', 'openai-responses', 'anthropic-messages']},
-  };
+  Map<String, dynamic>? account;
 
   Map<String, dynamic> _accountsView() => {
-    'kernels': [
-      {
-        'id': 'omp',
-        'installed': true,
-        'accounts': {
-          'accounts': [{'id': '1', 'provider': 'openai-codex', 'kind': 'oauth', 'label': 'me@example.com', 'removable': true}],
-          'login': [{'id': 'anthropic', 'name': 'Anthropic'}],
-          'anyProvider': true,
-          'apiKeys': true,
-        },
-      },
-      {'id': 'claude', 'installed': false},
-      {'id': 'antigravity', 'installed': true, 'accounts': {'accounts': [], 'login': [{'id': 'google', 'name': 'Google'}]}},
-      {'id': 'hermes', 'installed': true, 'accounts': {'accounts': [], 'login': [], 'apiKeys': true}},
-    ],
+    'installed': antigravityProblem == null,
+    'problem': null,
+    'account': account,
+    'note': account == null ? 'No login file found. A login kept in the system keyring does not show here.' : null,
     'login': login,
   };
 
@@ -227,12 +162,12 @@ class FakeBackend {
         return _json(200, {
           'ready': true,
           'version': '0.2.0',
-          'kernel': kernel,
+          'kernel': 'antigravity',
           'paused': general['paused'],
           'activeWorkers': 0,
           'components': {
             'runtime': {'state': 'ready', 'detail': 'Ready'},
-            'kernel': kernelProblem == null ? {'state': 'ready', 'detail': 'Running on $kernel'} : {'state': 'error', 'detail': kernelProblem},
+            'kernel': kernelProblem == null ? {'state': 'ready', 'detail': 'Running on antigravity'} : {'state': 'error', 'detail': kernelProblem},
           },
         });
       case ('GET', '/api/messages'):
@@ -264,33 +199,19 @@ class FakeBackend {
         return _json(200, _modelsView());
       case ('PUT', '/api/settings/models'):
         final chosen = (body as Map).cast<String, dynamic>();
-        if ((chosen['eval'] as Map?)?['model'] == 'broken') return _json(400, {'error': 'Unknown OMP model: fixture/broken'});
-        final main = chosen['kernel'] as String? ?? kernel;
-        final workers = chosen.containsKey('workerKernel') ? chosen['workerKernel'] as String? : workerKernel;
-        for (final each in [main, workers]) {
-          if (each == 'claude' && claudeProblem != null) return _json(400, {'error': claudeProblem});
-        }
-        kernel = main;
-        workerKernel = workers;
-        models[main]!['eval'] = chosen['eval'];
-        models[workers ?? main]!['executor'] = chosen['executor'];
-        return _json(200, _modelsView());
-      case ('PUT', '/api/settings/kernel'):
-        final next = (body as Map)['kernel'] as String;
-        if (next == 'claude' && claudeProblem != null) return _json(400, {'error': claudeProblem});
-        kernel = next;
+        if ((chosen['eval'] as Map?)?['model'] == 'broken') return _json(400, {'error': 'Unknown Antigravity model: broken'});
+        models['eval'] = chosen['eval'];
+        models['executor'] = chosen['executor'];
         return _json(200, _modelsView());
       case ('POST', '/api/settings/kernel/install'):
-        final which = (body as Map)['kernel'] as String;
+        final which = (body as Map)['kernel'] as String? ?? 'antigravity';
         if (installGate case final gate?) {
-          _installingNow = which;
+          _installingNow = true;
           await gate.future;
-          _installingNow = null;
+          _installingNow = false;
         }
         installed.add(which);
-        if (which == 'claude') {
-          claudeProblem = null;
-        }
+        antigravityProblem = null;
         return _json(200, _modelsView());
       case ('GET', '/api/settings/general'):
         return _json(200, _generalView());
@@ -299,31 +220,21 @@ class FakeBackend {
         if (((blocks['executor'] as Map?)?['blockedCommands'] as List?)?.contains('rm -rf') ?? false) return _json(400, {'error': '"rm -rf" is not a command name'});
         general = {...general, ...blocks};
         return _json(200, _generalView());
-      case ('GET', '/api/settings/providers'):
-        return _json(200, _providersView());
-      case ('PUT', '/api/settings/providers'):
-        final list = ((body as Map)['providers'] as List).cast<Map>();
-        savedProviders.add(body);
-        providers = [
-          for (final item in list)
-            {...(Map<String, dynamic>.of(item.cast<String, dynamic>())..remove('apiKey')..remove('previousName')), 'key': item.containsKey('apiKey') && item['apiKey'] != null ? '…abcd' : null},
-        ];
-        return _json(200, _providersView());
-      case ('POST', '/api/settings/providers/refresh'):
-        providers = [for (final provider in providers) {...provider, 'modelsProblem': '${provider['name']}: cannot list models: refused'}];
-        return _json(200, _providersView());
       case ('GET', '/api/settings/accounts'):
         return _json(200, _accountsView());
       case ('POST', '/api/settings/accounts/login'):
-        final ask = (body as Map).cast<String, dynamic>();
-        login = {'id': 1, 'kernel': ask['kernel'], 'provider': ask['provider'], 'state': 'running', 'links': ['https://auth.example/authorize?x=1'], 'output': 'Open this URL in your browser:\nhttps://auth.example/authorize?x=1\nPaste the authorization code:'};
+        login = {'id': 1, 'state': 'running', 'links': ['https://auth.example/authorize?x=1'], 'output': 'Open this URL in your browser:\nhttps://auth.example/authorize?x=1\nPaste the authorization code:'};
         return _json(200, {'login': login});
       case ('GET', '/api/settings/accounts/login'):
         return _json(200, {'login': login});
       case ('POST', '/api/settings/accounts/login/input'):
         pasted.add((body as Map)['text'] as String);
-        login = {...login!, 'state': 'done', 'output': 'Logged in to Anthropic as me@example.com'};
+        account = {'email': 'me@example.com', 'removable': true};
+        login = {...login!, 'state': 'done', 'output': 'Logged in to Google as me@example.com'};
         return _json(200, {'login': login});
+      case ('POST', '/api/settings/accounts/logout'):
+        account = null;
+        return _json(200, _accountsView());
       case ('GET', '/api/wechat'):
         return _json(200, wechat);
       case ('POST', '/api/wechat/connect'):
@@ -336,6 +247,37 @@ class FakeBackend {
       case ('POST', '/api/wechat/disconnect'):
         wechat = {'state': 'disconnected', 'message': '微信已断开，orchestrator 对话记录保留。'};
         return _json(200, wechat);
+    }
+    if (request.method == 'POST' && path.startsWith('/api/workers/') && path.endsWith('/stop') && path.length > '/api/workers//stop'.length) {
+      final id = Uri.decodeComponent(path.substring('/api/workers/'.length, path.length - '/stop'.length));
+      final detail = details[id];
+      if (detail == null) return _json(404, {'error': 'Worker not found'});
+      if (stopError != null) {
+        final error = stopError!;
+        stopError = null;
+        return _json(400, {'error': error});
+      }
+      if ((detail['stage'] as Map)['stage'] == 'ended') {
+        return _json(400, {'error': 'Task has already ended'});
+      }
+      final updatedAssignment = {...(detail['assignment'] as Map).cast<String, dynamic>(), 'state': 'ended'};
+      final updates = <String, dynamic>{
+        'stage': {'stage': 'ended'},
+        'outcome': 'stopped',
+        'session': {'loaded': false, 'streaming': false},
+        'background': <Map<String, dynamic>>[],
+        'assignment': updatedAssignment,
+        'attention': null,
+        'delivery': null,
+        'pendingInputs': 0,
+      };
+      detail.addAll(updates);
+      final index = workers.indexWhere((worker) => worker['ticketId'] == id);
+      if (index != -1) {
+        workers[index].addAll(updates);
+      }
+      stopped.add(id);
+      return _json(200, detail);
     }
     if (request.method == 'GET' && path.startsWith('/api/workers/')) {
       final detail = details[Uri.decodeComponent(path.substring('/api/workers/'.length))];

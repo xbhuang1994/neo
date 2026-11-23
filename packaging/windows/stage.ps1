@@ -1,6 +1,5 @@
-# Put together what the Windows installer installs: the Flutter app, the backend beside it and the Oh My Pi
-# extension. The agent runtimes are not in it: the backend finds them on the machine, and the app installs them with
-# their official installers.
+# Put together what the Windows installer installs: the Flutter app and the backend beside it. The Antigravity CLI is
+# not in it: the backend finds it on the machine, and the app installs it with its official installer.
 #
 # Usage: pwsh packaging\windows\stage.ps1
 # Needs: cargo, flutter.  Output: dist\windows-stage, ready for neo-agent.iss.
@@ -21,7 +20,5 @@ Pop-Location
 
 Copy-Item -Recurse (Join-Path $root "app\build\windows\x64\runner\Release\*") $stage
 Copy-Item (Join-Path $root "backend\target\release\neo-agent.exe") $stage
-New-Item -ItemType Directory -Force (Join-Path $stage "shim") | Out-Null
-Copy-Item (Join-Path $root "shim\neo-omp-shim.ts") (Join-Path $stage "shim")
 Copy-Item (Join-Path $root "LICENSE") $stage
 Write-Output $stage
