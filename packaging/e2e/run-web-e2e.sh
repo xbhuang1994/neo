@@ -1,9 +1,9 @@
 #!/bin/sh
-# Run the browser test of the web app: the real backend with the pure-Rust `fixture-agy` stand-in, and Chromium.
+# Run the browser test of the web app: the real backend with the pure-TypeScript `fixture-agy` stand-in, and Chromium.
 #
 # Usage: packaging/e2e/run-web-e2e.sh [screenshot-dir]
 # With NEO_E2E_PACKAGE=<unpacked package folder>, the packaged program is tested instead, with the web app it bundles.
-# Needs: cargo build -p neo-agent -p neo-testkit, flutter build web (see docs),
+# Needs: (cd backend && bun run build), flutter build web (see docs),
 #        and the `playwright` package where node finds it (NODE_PATH) with its Chromium installed.
 set -eu
 root=$(cd "$(dirname "$0")/../.." && pwd)
@@ -25,11 +25,11 @@ if [ -n "${NEO_E2E_PACKAGE:-}" ]; then
   program=$NEO_E2E_PACKAGE/neo-agent
   set --
 else
-  program=$root/backend/target/debug/neo-agent
+  program=$root/backend/dist/neo-agent
   set -- --web-dir "$root/app/build/web"
 fi
 unset NEO_TOKEN NEO_DATA_DIR
-export NEO_AGY_BIN="${NEO_AGY_BIN:-$root/backend/target/debug/fixture-agy}"
+export NEO_AGY_BIN="${NEO_AGY_BIN:-$root/backend/dist/fixture-agy}"
 HOME="$work/home" NEO_RUNTIME_DIR="$work/run" \
   "$program" serve --port 0 --data-dir "$work/data" --init-settings "$work/settings.json" "$@" \
   > "$work/agent.out" 2> "$work/agent.log" &

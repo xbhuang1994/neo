@@ -115,9 +115,9 @@ void main() {
   });
 
   test('runs the real backend and talks to it', () async {
-    final program = File('../backend/target/debug/neo-agent');
+    final program = File('../backend/dist/neo-agent');
     if (!program.existsSync()) {
-      markTestSkipped('build the backend first: cargo build -p neo-agent');
+      markTestSkipped('build the backend first: cd backend && bun run build:agent');
       return;
     }
     final environment = {

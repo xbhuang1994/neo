@@ -1,5 +1,6 @@
 .artifacts/
 .env
 dist/
-backend/target/
+backend/dist/
+backend/node_modules/
 service-restart.log

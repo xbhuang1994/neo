@@ -4,7 +4,7 @@
 # finds them on the Mac, and the app installs them with their official installers.
 #
 # Usage: packaging/macos/build-dmg.sh [--arch arm64|x64]
-# Needs: Xcode, cargo, flutter.  Output: dist/Neo-<version>-macos-<arch>.dmg
+# Needs: Xcode, bun, flutter.  Output: dist/Neo-<version>-macos-<arch>.dmg
 #
 # Signing: with MACOS_SIGN_IDENTITY set (a "Developer ID Application: …" identity in the keychain) the app is signed
 # with it and the hardened runtime; otherwise it is signed ad hoc, which Apple silicon needs to run it at all, and
@@ -20,21 +20,20 @@ while [ $# -gt 0 ]; do
   shift
 done
 case "$arch" in
-  arm64 | aarch64) arch=arm64; target=aarch64-apple-darwin ;;
-  x64 | x86_64) arch=x64; target=x86_64-apple-darwin ;;
+  arm64 | aarch64) arch=arm64; target=bun-darwin-arm64 ;;
+  x64 | x86_64) arch=x64; target=bun-darwin-x64 ;;
   *) echo "unsupported architecture $arch" >&2; exit 1 ;;
 esac
-version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/backend/Cargo.toml" | head -1)
+version=$(sed -n 's/.*"version": "\(.*\)".*/\1/p' "$root/backend/package.json" | head -1)
 
-rustup target add "$target" >/dev/null 2>&1 || true
-(cd "$root/backend" && cargo build --release -p neo-agent --target "$target")
+(cd "$root/backend" && bun install --frozen-lockfile && bun build --compile --minify --bytecode --target="$target" src/main.ts --outfile "dist/neo-agent-$arch")
 (cd "$root/app" && flutter build macos --release)
 
 app="$root/app/build/macos/Build/Products/Release/Neo.app"
 [ -d "$app" ] || { echo "the app was not built at $app" >&2; exit 1; }
 # One architecture per image: the backend is built for one.
 mkdir -p "$app/Contents/Helpers"
-cp "$root/backend/target/$target/release/neo-agent" "$app/Contents/Helpers/neo-agent"
+cp "$root/backend/dist/neo-agent-$arch" "$app/Contents/Helpers/neo-agent"
 
 identity=${MACOS_SIGN_IDENTITY:--}
 options=""

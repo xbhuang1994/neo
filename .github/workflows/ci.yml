@@ -2,13 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, feat/pure-ts-backend]
   pull_request:
 
 env:
   FLUTTER_VERSION: "3.50.0"
-  # Pinned so a new Rust release cannot turn fresh lints into a red build; bump on purpose.
-  RUST_VERSION: "1.100.0"
+  BUN_VERSION: "1.4.4"
 
 jobs:
   backend:
@@ -23,47 +22,37 @@ jobs:
         working-directory: backend
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
+      - uses: oven-sh/setup-bun@v2
         with:
-          toolchain: ${{ env.RUST_VERSION }}
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: backend
-      - name: Format
-        if: runner.os == 'Linux'
-        run: cargo fmt --all --check
-      - name: Lint
-        run: cargo clippy --workspace --all-targets -- -D warnings
+          bun-version: ${{ env.BUN_VERSION }}
+      - name: Install devDependencies
+        run: bun install --frozen-lockfile
+      - name: Typecheck
+        run: bun run check
+      - name: Build
+        run: bun run build
       - name: Test
         if: runner.os != 'Windows'
-        run: cargo test --workspace
-      # The process-level tests drive the product with shell scripts and signals, which Windows has not: there the
-      # program is built whole and the domain and storage tests run.
-      - name: Build and test (Windows)
+        run: bun test
+      - name: Test (Windows)
         if: runner.os == 'Windows'
-        run: |
-          cargo build --workspace
-          cargo test -p neo-core -p neo-store
+        run: bun test tests/core tests/store
 
   app:
     name: App
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
+      - uses: oven-sh/setup-bun@v2
         with:
-          toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: backend
+          bun-version: ${{ env.BUN_VERSION }}
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
       - name: Build the backend the app's tests start
-        run: cargo build -p neo-agent
+        run: bun install --frozen-lockfile && bun run build:agent
         working-directory: backend
       - run: flutter pub get
         working-directory: app

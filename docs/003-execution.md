@@ -52,7 +52,7 @@ The pause in the settings holds everything: nothing is assessed, launched, deliv
 
 ## Execution kernel
 
-Every Session runs on the **Antigravity CLI (`agy`)**, driven as a child process by the pure-Rust backend:
+Every Session runs on the **Antigravity CLI (`agy`)**, driven as a child process by the pure TypeScript (Bun) backend:
 
 | Aspect | Antigravity CLI (`agy`) |
 | --- | --- |

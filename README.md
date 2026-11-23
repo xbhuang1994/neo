@@ -8,9 +8,9 @@
 
 | 部分 | 技术 | 说明 |
 | --- | --- | --- |
-| 后端 `neo-agent` | Rust | 一个可执行文件：领域引擎、SQLite 存储、HTTP API、看护与微信桥 |
+| 后端 `neo-agent` | TypeScript (Bun) | 零运行时三方依赖，可编译为单个可执行文件：领域引擎、SQLite 存储、HTTP API、看护与微信桥 |
 | 界面 | Flutter | 同一套代码出桌面应用（macOS / Windows / Linux）和网页版，苹果风格，跟随系统明暗 |
-| 执行内核 | Antigravity CLI (`agy`) | 真正调用模型干活的代理运行时，作为子进程由纯 Rust 后端驱动 |
+| 执行内核 | Antigravity CLI (`agy`) | 真正调用模型干活的代理运行时，作为子进程由纯 TypeScript 后端驱动 |
 
 两种用法：
 
@@ -46,25 +46,26 @@
 
 ## 从源码运行
 
-需要 Rust 1.89+ 和 Flutter 3.50。
+需要 Bun 1.4+ 和 Flutter 3.50。
 
 ```sh
-cd backend && cargo build -p neo-agent
+cd backend && bun install && bun run build
 cd ../app && flutter pub get && flutter build web --release --no-web-resources-cdn --csp --no-source-maps
-cd .. && backend/target/debug/neo-agent doctor                 # 看这台机器具备什么
-backend/target/debug/neo-agent serve --web-dir app/build/web   # 打开 http://127.0.0.1:3082/
+cd .. && backend/dist/neo-agent doctor                 # 看这台机器具备什么
+backend/dist/neo-agent serve --web-dir app/build/web   # 打开 http://127.0.0.1:3082/
 ```
 
-桌面应用：`cd app && NEO_AGENT_BIN=../backend/target/debug/neo-agent flutter run -d macos`（或 `windows`、`linux`）。
+桌面应用：`cd app && NEO_AGENT_BIN=../backend/dist/neo-agent flutter run -d macos`（或 `windows`、`linux`）。
 
-测试：
+测试与性能基准：
 
 ```sh
-cd backend && cargo test --workspace     # 不需要模型、网络或运行时
+cd backend && bun run check && bun test                # 不需要模型、网络或运行时
+cd backend && bun run bench                            # 后端核心热路径性能基准
 cd ../app && flutter analyze && flutter test
 ```
 
-用真实 `agy` 运行时的端到端测试、纯 Rust 模拟运行时的浏览器测试见 [docs/008-cookbook.md](docs/008-cookbook.md)。
+用真实 `agy` 运行时的端到端测试、纯 TypeScript 模拟运行时的浏览器测试见 [docs/008-cookbook.md](docs/008-cookbook.md)。
 
 ## 文档
 
