@@ -3,4 +3,5 @@
 dist/
 backend/dist/
 backend/node_modules/
+backend/target/
 service-restart.log
