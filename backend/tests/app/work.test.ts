@@ -10,8 +10,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import {
   SIDECAR,
+  SIDECAR_SLOW_HINT_EN,
+  SIDECAR_SLOW_HINT_ZH,
   StopWorkerError,
   cloneSettings,
+  slowHintText,
   type ChatAttachment,
   type StopWorkerErrorKind,
 } from "../../src/app/index.ts";
@@ -1057,6 +1060,87 @@ describe("work", () => {
           f.tickets().find((ticket) => ticket.id === completedId)!.ended!.outcome,
         ).toBe("completed");
         await expectStopWorkerError(f.app.stopWorkerTicket("missing"), "not_found");
+      } finally {
+        await f.cleanup();
+      }
+    },
+    20_000,
+  );
+
+  test(
+    "sends_slow_query_hint_once_across_sidecar_retries_and_skips_retry_after_reply_sent",
+    async () => {
+      expect(slowHintText("在哪里能看到 A股策略ETF 标普和黄金的分配比例？")).toBe(
+        SIDECAR_SLOW_HINT_ZH,
+      );
+      expect(slowHintText("V4F1?")).toBe(SIDECAR_SLOW_HINT_ZH);
+      expect(slowHintText("How is the build going?")).toBe(SIDECAR_SLOW_HINT_EN);
+
+      const f = await started({ sidecarSlowHintMs: 60 });
+      try {
+        let sidecarAttempt = 0;
+        const failedCards: Record<string, unknown>[] = [];
+        f.script(async (turn) => {
+          if (turn.role === "worker") {
+            await turn.call("orchestrator_report", {
+              state: "progress",
+              summary: "Epoch 5 running.",
+              topic: "Training",
+            });
+            return "Running.";
+          }
+          if (turn.role === "sidecar") {
+            sidecarAttempt += 1;
+            // Attempt 1 takes longer than slowHintMs (triggers the hint once), then fails before replying.
+            if (sidecarAttempt === 1) {
+              await Bun.sleep(120);
+              throw new Error("transient lookup failure");
+            }
+            // Attempt 2 also takes longer than slowHintMs (must NOT duplicate the hint), replies, then throws during wrap-up.
+            await Bun.sleep(120);
+            await turn.call("sidecar_reply", { text: "Epoch 5 is running cleanly." });
+            throw new Error("wrap-up timeout after reply");
+          }
+          for (const msg of messages(turn.text)) {
+            if (msg.kind === "candidate" && msg.text === "How is it going?") {
+              const related = msg.related_tickets as Record<string, unknown>[];
+              await turn.call("orchestrator_route", {
+                decisions: [
+                  {
+                    kind: "sidecar",
+                    trigger_id: msg.trigger_id,
+                    ticket_id: related[0]!.ticket_id,
+                  },
+                ],
+              });
+              return "Done.";
+            }
+            if (msg.kind === "sidecar_failed") {
+              failedCards.push({ ...msg });
+              return "Done.";
+            }
+          }
+          return await orchestrate(turn);
+        });
+
+        await f.app.receiveWeb("Train it.", []);
+        await f.until("worker reported progress", () => {
+          const first = f.tickets()[0];
+          return first !== undefined && latestReport(first) !== undefined;
+        });
+        await f.settle();
+
+        await f.app.receiveWeb("How is it going?", []);
+        await f.until("sidecar slow hint and final reply delivered", () => {
+          return replies(f).length === 3 && !f.app.effects.pending(SIDECAR);
+        });
+        await f.settle();
+
+        // Hint sent exactly once (in English matching the question), followed by the real answer;
+        // attempt 2 throwing after sidecar_reply must NOT trigger attempt 3 or sidecar_failed.
+        expect(sidecarAttempt).toBe(2);
+        expect(failedCards).toEqual([]);
+        expect(replies(f)).toEqual([ACCEPT, SIDECAR_SLOW_HINT_EN, "Epoch 5 is running cleanly."]);
       } finally {
         await f.cleanup();
       }

@@ -31,6 +31,7 @@ import * as blockedMod from "./blocked.ts";
 import * as chatMod from "./chat.ts";
 import {
   Args,
+  DEFAULT_SIDECAR_SLOW_HINT_MS,
   defaultTimings,
   type AppContext,
   type ChatAttachment,
@@ -92,6 +93,7 @@ export class App implements AppContext {
   readonly modelLists = new Map<Kernel, ModelListEntry>();
   readonly accounts: AccountsState;
   readonly stopController = new AbortController();
+  readonly sidecarSlowHintMs: number;
 
   private currentSettings: Settings;
   private currentPolicy: Policy;
@@ -122,6 +124,7 @@ export class App implements AppContext {
     this.board = board;
     this.kernels = kernels;
     this.masterId = masterId;
+    this.sidecarSlowHintMs = timings.sidecarSlowHintMs ?? DEFAULT_SIDECAR_SLOW_HINT_MS;
     this.currentSettings = initialSettings;
     this.currentPolicy = new SettingsPolicy(initialSettings, this.sources);
     this.liveTickets = new Set(store.openTickets().map((t) => t.id));

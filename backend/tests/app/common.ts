@@ -14,6 +14,7 @@ import {
   type ModelOption,
   type SessionRole,
   type SessionSpec,
+  type Timings,
   type WatchdogTimings,
 } from "../../src/app/index.ts";
 import type { Kernel } from "../../src/app/settings.ts";
@@ -537,7 +538,7 @@ export class Fixture {
   }
 }
 
-export function openIn(dir: TempDir, kernels: Scripted): Fixture {
+export function openIn(dir: TempDir, kernels: Scripted, timings?: Partial<Timings>): Fixture {
   const app = App.open(
     {
       stateDir: dir.join("state"),
@@ -548,19 +549,20 @@ export function openIn(dir: TempDir, kernels: Scripted): Fixture {
       wechatBurstMs: 60,
       webBurstMs: 0,
       watchdog: watchdogTimings(),
+      ...timings,
     },
   );
   return new Fixture(dir, kernels, app);
 }
 
-export function fixture(): Fixture {
+export function fixture(timings?: Partial<Timings>): Fixture {
   const kernels = new Scripted();
   kernels.model = coreModel();
-  return openIn(new TempDir("app"), kernels);
+  return openIn(new TempDir("app"), kernels, timings);
 }
 
-export async function started(): Promise<Fixture> {
-  const f = fixture();
+export async function started(timings?: Partial<Timings>): Promise<Fixture> {
+  const f = fixture(timings);
   await f.app.start();
   return f;
 }

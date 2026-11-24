@@ -1,10 +1,12 @@
 /**
  * The WeChat typing indicator: a plain local loop beside the long poll, with no model in it,
- * that makes "正在输入" blink in the bound user's chat while the main Session thinks or a worker
- * is at work, so the person sees the work is alive, and takes it away once neither is.
+ * that makes "正在输入" blink in the bound user's chat while the main Session thinks, a worker
+ * is at work, or a read-only sidecar is answering, so the person sees the work is alive, and
+ * takes it away once none of them is.
  */
 
 import type { AppContext } from "./context.ts";
+import { SIDECAR } from "./effects.ts";
 import { WeChatProtocolError, type Account, type Protocol } from "./wechat_protocol.ts";
 
 /** How long a typing ticket is used before a new one is asked for (30 minutes, in ms). */
@@ -77,9 +79,9 @@ export function routerThinking(app: AppContext): boolean {
   return !session.isDisposed() && (session.isStreaming() || session.hasAdmittedSubmission());
 }
 
-/** Whether the main Session is thinking or a worker is at work. */
+/** Whether the main Session is thinking, a worker is at work, or a read-only sidecar is answering. */
 export function agentsBusy(app: AppContext): boolean {
-  return routerThinking(app) || app.workersBusy();
+  return routerThinking(app) || app.workersBusy() || app.effects.isRunning(SIDECAR);
 }
 
 async function typingStep(

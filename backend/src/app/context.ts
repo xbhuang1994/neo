@@ -149,6 +149,9 @@ export function defaultWatchdogTimings(): WatchdogTimings {
   };
 }
 
+/** Default wait before a read-only sidecar query sends a brief progress hint (ms). */
+export const DEFAULT_SIDECAR_SLOW_HINT_MS = 6_000;
+
 /** How long to wait for more chat messages before routing a burst. */
 export interface Timings {
   /** After a WeChat message (ms). */
@@ -157,6 +160,8 @@ export interface Timings {
   webBurstMs: number;
   /** The Watchdog's pace. */
   watchdog: WatchdogTimings;
+  /** How long a read-only sidecar query may run before sending a brief progress hint (ms); 0 disables. */
+  sidecarSlowHintMs?: number;
 }
 
 export function defaultTimings(): Timings {
@@ -164,6 +169,7 @@ export function defaultTimings(): Timings {
     wechatBurstMs: 0,
     webBurstMs: 0,
     watchdog: defaultWatchdogTimings(),
+    sidecarSlowHintMs: DEFAULT_SIDECAR_SLOW_HINT_MS,
   };
 }
 
@@ -306,6 +312,7 @@ export interface AppContext {
   readonly modelLists: Map<Kernel, ModelListEntry>;
   readonly accounts: AccountsState;
   readonly stopSignal: AbortSignal;
+  readonly sidecarSlowHintMs: number;
 
   // Core App methods
   settings(): Settings;

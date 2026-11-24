@@ -15,6 +15,9 @@ import {
   CHAT_SOURCE,
   mainSpecs,
   Protocol,
+  SIDECAR,
+  SIDECAR_SLOW_HINT_ZH,
+  type Timings,
   type WeChatStateName,
 } from "../../src/app/index.ts";
 import { decrypt, encrypt, hex } from "../../src/app/wechat_protocol.ts";
@@ -374,7 +377,12 @@ async function boundTo(wechat: WeChat): Promise<Fixture> {
 }
 
 /** The same, holding bursts for `quietMs` after words and files alone for `fileWaitMs`. */
-async function boundWith(wechat: WeChat, quietMs: number, fileWaitMs: number): Promise<Fixture> {
+async function boundWith(
+  wechat: WeChat,
+  quietMs: number,
+  fileWaitMs: number,
+  timings?: Partial<Timings>,
+): Promise<Fixture> {
   const kernels = new Scripted();
   kernels.wechat = Protocol.at(wechat.server.url, `${wechat.server.url}/cdn`, {
     paceMs: 20,
@@ -402,7 +410,7 @@ async function boundWith(wechat: WeChat, quietMs: number, fileWaitMs: number): P
     }
     return "Done.";
   };
-  const f = openIn(new TempDir("wechat"), kernels);
+  const f = openIn(new TempDir("wechat"), kernels, timings);
   try {
     await f.app.start();
     return f;
@@ -441,11 +449,15 @@ function fromBound(id: string, items: unknown[]): Record<string, unknown> {
 }
 
 /** Bound, with the first poll's messages already taken, so only the batches given later arrive. */
-async function quietlyBound(quietMs: number, fileWaitMs: number): Promise<[WeChat, Fixture]> {
+async function quietlyBound(
+  quietMs: number,
+  fileWaitMs: number,
+  timings?: Partial<Timings>,
+): Promise<[WeChat, Fixture]> {
   const wechat = await startWeChat("need_verifycode");
   try {
     wechat.seen.delivered = true;
-    const f = await boundWith(wechat, quietMs, fileWaitMs);
+    const f = await boundWith(wechat, quietMs, fileWaitMs, timings);
     try {
       await f.app.wechatConnect();
       await f.until("the code is asked for", () => state(f) === "verify");
@@ -1003,6 +1015,137 @@ describe("wechat bridge integration (ported from neo-app/tests/wechat.rs)", () =
         expect(wechat.seen.handlerErrors).toEqual([]);
       } finally {
         held = false;
+        try {
+          await f.cleanup();
+        } finally {
+          await wechat.close();
+        }
+      }
+    },
+    20_000,
+  );
+
+  test(
+    "keeps_typing_blinking_and_sends_slow_hint_while_sidecar_runs_after_orchestrator_finishes",
+    async () => {
+      const [wechat, f] = await quietlyBound(0, 10_000, { sidecarSlowHintMs: 80 });
+      let holdSidecar = true;
+      try {
+        f.script(async (turn) => {
+          if (turn.role === "worker") {
+            await turn.call("orchestrator_report", {
+              state: "ready",
+              summary: "控制台已部署。",
+              direct_reply: "已完成部署。",
+              topic: "部署控制台",
+            });
+            return "Done.";
+          }
+          if (turn.role === "sidecar") {
+            while (holdSidecar) {
+              await Bun.sleep(10);
+            }
+            await turn.call("sidecar_reply", { text: "在首页驾驶舱可以看到各资产分配比例。" });
+            return "Done.";
+          }
+          for (const msg of messages(turn.text)) {
+            if (msg.kind === "candidate" && msg.text === "先帮我部署控制台") {
+              await turn.call("orchestrator_route", {
+                decisions: [
+                  {
+                    kind: "accept",
+                    trigger_id: msg.trigger_id,
+                    title: "部署控制台",
+                    worktree_name: "deploy-console",
+                    acknowledgement: "收到：部署控制台。",
+                  },
+                ],
+              });
+              return "Done.";
+            }
+            if (msg.kind === "candidate" && msg.text === "在哪里看分配比例？") {
+              const related = msg.related_tickets as Record<string, unknown>[];
+              await turn.call("orchestrator_route", {
+                decisions: [
+                  {
+                    kind: "sidecar",
+                    trigger_id: msg.trigger_id,
+                    ticket_id: related[0]!.ticket_id,
+                    note: "Read-only UI lookup",
+                  },
+                ],
+              });
+              return "Done.";
+            }
+          }
+          return "Done.";
+        });
+
+        // First create and finish a ticket so no worker is active during the follow-up sidecar query.
+        wechat.seen.batches.push([
+          fromBound("setup-1", [{ type: 1, text_item: { text: "先帮我部署控制台" } }]),
+        ]);
+        await f.until("setup ticket completed", () => f.tickets()[0]?.ended !== undefined);
+        await f.settle();
+        await f.until(
+          "typing cleared after setup",
+          () =>
+            wechat.seen.typing.length === 0 ||
+            wechat.seen.typing[wechat.seen.typing.length - 1] === 2,
+        );
+
+        const sentBefore = wechat.seen.sent.length;
+        wechat.seen.batches.push([
+          fromBound("ask-1", [{ type: 1, text_item: { text: "在哪里看分配比例？" } }]),
+        ]);
+
+        // Wait until the orchestrator finished routing and only the sidecar effect is running.
+        await f.until(
+          "sidecar running with router and workers idle",
+          () =>
+            f.app.effects.isRunning(SIDECAR) && !f.app.routerThinking() && !f.app.workersBusy(),
+        );
+        expect(f.app.agentsBusy()).toBe(true);
+
+        // Typing must continue blinking while only the sidecar runs.
+        const typingAtRouterIdle = wechat.seen.typing.length;
+        await f.until(
+          "typing keeps blinking during sidecar",
+          () => wechat.seen.typing.length >= typingAtRouterIdle + 3,
+        );
+
+        // Slow-query hint must be delivered to WeChat before the sidecar finishes.
+        await f.until(
+          "slow-query hint sent on WeChat",
+          () =>
+            wechat.seen.sent
+              .slice(sentBefore)
+              .some((item) => sentFirstText(item) === SIDECAR_SLOW_HINT_ZH),
+        );
+
+        // Release the sidecar and verify the real answer follows the hint and typing stops cleanly.
+        holdSidecar = false;
+        await f.until(
+          "sidecar answer sent on WeChat",
+          () => wechat.seen.sent.length >= sentBefore + 2,
+        );
+        await f.settle();
+        expect(wechat.seen.sent.slice(sentBefore).map((item) => sentFirstText(item))).toEqual([
+          SIDECAR_SLOW_HINT_ZH,
+          "在首页驾驶舱可以看到各资产分配比例。",
+        ]);
+        await f.until(
+          "typing cleared after sidecar finishes",
+          () => wechat.seen.typing[wechat.seen.typing.length - 1] === 2,
+        );
+        const finalTypingCount = wechat.seen.typing.length;
+        await Bun.sleep(200);
+        expect(wechat.seen.typing.length).toBe(finalTypingCount);
+        expect(f.app.agentsBusy()).toBe(false);
+        await f.app.stop();
+        expect(wechat.seen.handlerErrors).toEqual([]);
+      } finally {
+        holdSidecar = false;
         try {
           await f.cleanup();
         } finally {
