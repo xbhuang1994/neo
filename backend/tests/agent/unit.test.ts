@@ -24,6 +24,7 @@ import {
   runtimeDir,
 } from "../../src/agent/paths.ts";
 import { VERSION } from "../../src/version.ts";
+import { extractCliArgs, isBunVirtualEntry } from "../../src/main.ts";
 
 function makeTempDir(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `neo-${prefix}-`));
@@ -59,6 +60,19 @@ describe("version", () => {
     const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8")) as { version: string };
     expect(VERSION).toBe(pkg.version);
     expect(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(VERSION)).toBe(true);
+  });
+
+  test("extractCliArgs strips Bun virtual entrypoints across Linux, macOS, and Windows", () => {
+    expect(isBunVirtualEntry("/$bunfs/root/neo-agent")).toBe(true);
+    expect(isBunVirtualEntry("B:/~BUN/root/neo-agent.exe")).toBe(true);
+    expect(isBunVirtualEntry("B:\\~BUN\\root\\neo-agent.exe")).toBe(true);
+    expect(isBunVirtualEntry("version")).toBe(false);
+
+    expect(extractCliArgs(["bun", "B:/~BUN/root/neo-agent.exe", "version"], "C:\\Neo\\neo-agent.exe")).toEqual(["version"]);
+    expect(extractCliArgs(["C:\\Neo\\neo-agent.exe", "B:\\~BUN\\root\\neo-agent.exe", "serve", "--port", "0"], "C:\\Neo\\neo-agent.exe")).toEqual(["serve", "--port", "0"]);
+    expect(extractCliArgs(["bun", "/$bunfs/root/neo-agent", "doctor"], "/opt/neo/neo-agent")).toEqual(["doctor"]);
+    expect(extractCliArgs(["/opt/neo/neo-agent", "version"], "/opt/neo/neo-agent")).toEqual(["version"]);
+    expect(extractCliArgs(["/usr/bin/bun", "src/main.ts", "version"], "/usr/bin/bun")).toEqual(["version"]);
   });
 });
 

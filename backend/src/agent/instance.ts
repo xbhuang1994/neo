@@ -138,7 +138,83 @@ function tryFlockExclusive(fd: number): TryLockOutcome {
   }
 }
 
-function lockDir(dir: string): { ok: true; fd: number } | { ok: false; error: Refused } {
+function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    return code === "EPERM";
+  }
+}
+
+interface LockHandle {
+  fd?: number;
+  winLockPath?: string;
+}
+
+function lockDirWindows(dir: string, lockPath: string): { ok: true; handle: LockHandle } | { ok: false; error: Refused } {
+  const failed = (message: string): { ok: false; error: Refused } => ({
+    ok: false,
+    error: { kind: "failed", reason: `Cannot lock ${lockPath}: ${message}` },
+  });
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = fs.openSync(lockPath, "wx");
+      try {
+        fs.writeFileSync(fd, JSON.stringify({ pid: process.pid }), "utf8");
+      } finally {
+        fs.closeSync(fd);
+      }
+      return { ok: true, handle: { winLockPath: lockPath } };
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException)?.code;
+      if (code !== "EEXIST") {
+        return failed(errorMessage(error));
+      }
+      try {
+        const raw = JSON.parse(fs.readFileSync(lockPath, "utf8")) as { pid?: unknown };
+        if (typeof raw.pid === "number" && raw.pid !== process.pid && isPidAlive(raw.pid)) {
+          return { ok: false, error: { kind: "running", info: readInstanceInfo(dir) } };
+        }
+      } catch {
+        // Stale or unreadable lockfile: remove and retry once.
+      }
+      try {
+        fs.unlinkSync(lockPath);
+      } catch (unlinkErr) {
+        if ((unlinkErr as NodeJS.ErrnoException)?.code !== "ENOENT") {
+          return { ok: false, error: { kind: "running", info: readInstanceInfo(dir) } };
+        }
+      }
+    }
+  }
+  return { ok: false, error: { kind: "running", info: readInstanceInfo(dir) } };
+}
+
+function releaseLockHandle(handle: LockHandle): void {
+  if (handle.fd !== undefined) {
+    try {
+      fs.closeSync(handle.fd);
+    } catch {
+      // Ignore close errors.
+    }
+  }
+  if (handle.winLockPath) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(handle.winLockPath, "utf8")) as { pid?: unknown };
+      if (raw.pid === process.pid) {
+        fs.unlinkSync(handle.winLockPath);
+      }
+    } catch {
+      // Ignore best-effort cleanup errors.
+    }
+  }
+}
+
+function lockDir(dir: string): { ok: true; handle: LockHandle } | { ok: false; error: Refused } {
   const lockPath = path.join(dir, "instance.lock");
   const failed = (message: string): { ok: false; error: Refused } => ({
     ok: false,
@@ -151,6 +227,10 @@ function lockDir(dir: string): { ok: true; fd: number } | { ok: false; error: Re
     return failed(errorMessage(error));
   }
 
+  if (process.platform === "win32") {
+    return lockDirWindows(dir, lockPath);
+  }
+
   let fd: number;
   try {
     fd = fs.openSync(lockPath, "a+");
@@ -160,7 +240,7 @@ function lockDir(dir: string): { ok: true; fd: number } | { ok: false; error: Re
 
   const outcome = tryFlockExclusive(fd);
   if (outcome.kind === "locked") {
-    return { ok: true, fd };
+    return { ok: true, handle: { fd } };
   }
 
   try {
@@ -177,38 +257,34 @@ function lockDir(dir: string): { ok: true; fd: number } | { ok: false; error: Re
 
 /** The locks of the running instance; they are released when `release()` is called or the process ends. */
 export class Instance {
-  private readonly locks: number[];
+  private readonly locks: LockHandle[];
   private readonly infoPath: string;
   private released = false;
 
-  private constructor(locks: number[], infoPath: string) {
+  private constructor(locks: LockHandle[], infoPath: string) {
     this.locks = locks;
     this.infoPath = infoPath;
   }
 
   /** Become the running instance: of this user, unless several are allowed, and of this data directory always. */
   static acquire(perUser: string | null | undefined, dataDir: string): AcquireResult {
-    const locks: number[] = [];
+    const locks: LockHandle[] = [];
     if (perUser !== undefined && perUser !== null) {
       const first = lockDir(perUser);
       if (!first.ok) {
         return first;
       }
-      locks.push(first.fd);
+      locks.push(first.handle);
     }
 
     const second = lockDir(dataDir);
     if (!second.ok) {
-      for (const fd of locks) {
-        try {
-          fs.closeSync(fd);
-        } catch {
-          // Ignore close errors while unwinding.
-        }
+      for (const handle of locks) {
+        releaseLockHandle(handle);
       }
       return second;
     }
-    locks.push(second.fd);
+    locks.push(second.handle);
 
     const infoDir = perUser !== undefined && perUser !== null ? perUser : dataDir;
     return { ok: true, value: new Instance(locks, path.join(infoDir, "instance.json")) };
@@ -229,7 +305,7 @@ export class Instance {
     }
   }
 
-  /** Remove published instance metadata while holding locks, then close all lock descriptors. */
+  /** Remove published instance metadata while holding locks, then release all lock handles. */
   release(): void {
     if (this.released) {
       return;
@@ -241,12 +317,8 @@ export class Instance {
     } catch {
       // Ignore if not published or already removed.
     }
-    for (const fd of this.locks) {
-      try {
-        fs.closeSync(fd);
-      } catch {
-        // Ignore close errors.
-      }
+    for (const handle of this.locks) {
+      releaseLockHandle(handle);
     }
     this.locks.length = 0;
   }

@@ -28,18 +28,31 @@ function refusalMessage(command: string): string {
   return `${command} is blocked in this installation by the Neo settings; do the work without it.`;
 }
 
-function cliArgs(): string[] {
-  const argv = process.argv;
-  const execBase = path.basename(process.execPath).toLowerCase();
-  // Compiled Bun binary: argv = [exe, ...userArgs] or [exe, "/$bunfs/...", ...userArgs]
+export function isBunVirtualEntry(arg: string | undefined): boolean {
+  if (!arg) return false;
+  const normalized = arg.replaceAll("\\", "/").toLowerCase();
+  return (
+    normalized.startsWith("/$bunfs/") ||
+    /^(?:\/\/\?\/)?[a-z]:\/~bun\//.test(normalized) ||
+    normalized.startsWith("~bun/")
+  );
+}
+
+export function extractCliArgs(argv: readonly string[], execPath: string): string[] {
+  const execBase = path.basename(execPath.replaceAll("\\", "/")).toLowerCase();
+  // Compiled Bun binary: argv = [exe|"bun", "/$bunfs/..."|"B:/~BUN/...", ...userArgs] or [exe, ...userArgs]
   if (execBase !== "bun" && execBase !== "bun.exe") {
-    if (argv.length >= 2 && (argv[1]?.startsWith("/$bunfs/") || argv[1]?.startsWith("B:\\~BUN\\"))) {
+    if (argv.length >= 2 && isBunVirtualEntry(argv[1])) {
       return argv.slice(2);
     }
     return argv.slice(1);
   }
   // `bun run src/main.ts ...`: argv = [bun, script, ...userArgs]
   return argv.slice(2);
+}
+
+function cliArgs(): string[] {
+  return extractCliArgs(process.argv, process.execPath);
 }
 
 async function main(): Promise<void> {

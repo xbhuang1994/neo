@@ -62,12 +62,18 @@ function selfExecutable(): string {
 }
 
 function isCompiledStandalone(): boolean {
-  const execBase = path.basename(process.execPath).toLowerCase();
+  const execBase = path.basename(process.execPath.replaceAll("\\", "/")).toLowerCase();
   if (execBase !== "bun" && execBase !== "bun.exe") {
     return true;
   }
   const arg1 = process.argv[1];
-  return !arg1 || arg1.startsWith("/$bunfs/") || arg1.startsWith("B:\\~BUN\\");
+  if (!arg1) return true;
+  const normalized = arg1.replaceAll("\\", "/").toLowerCase();
+  return (
+    normalized.startsWith("/$bunfs/") ||
+    /^(?:\/\/\?\/)?[a-z]:\/~bun\//.test(normalized) ||
+    normalized.startsWith("~bun/")
+  );
 }
 
 function selfHookRelay(): string[] {

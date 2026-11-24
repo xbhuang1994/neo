@@ -20,16 +20,23 @@ $stage = Join-Path $distDir "windows-stage"
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force $stage | Out-Null
 
+Write-Host "[1/4] Building Windows backend binary (neo-agent.exe)..."
 Push-Location (Join-Path $root "backend")
 try {
   bun install --frozen-lockfile
   if ($LASTEXITCODE -ne 0) { throw "bun install failed" }
-  bun build --compile --minify --bytecode --target=bun-windows-x64 src/main.ts --outfile dist/neo-agent.exe
+  $hostArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+  if ($hostArch -eq [System.Runtime.InteropServices.Architecture]::X64) {
+    bun build --compile --minify --bytecode src/main.ts --outfile dist/neo-agent.exe
+  } else {
+    bun build --compile --minify --bytecode --target=bun-windows-x64 src/main.ts --outfile dist/neo-agent.exe
+  }
   if ($LASTEXITCODE -ne 0) { throw "the backend did not build" }
 } finally {
   Pop-Location
 }
 
+Write-Host "[2/4] Building Flutter Windows desktop app..."
 Push-Location (Join-Path $root "app")
 try {
   flutter pub get
@@ -40,21 +47,28 @@ try {
   Pop-Location
 }
 
+Write-Host "[3/4] Staging desktop bundle and smoke-testing neo-agent.exe..."
 Copy-Item -Recurse (Join-Path $root "app\build\windows\x64\runner\Release\*") $stage
 Copy-Item (Join-Path $root "backend\dist\neo-agent.exe") $stage
 Copy-Item (Join-Path $root "LICENSE") $stage
 
-# Smoke-test the staged Windows backend binary.
 $stagedExe = Join-Path $stage "neo-agent.exe"
 $stagedApp = Join-Path $stage "neo_agent.exe"
 if (-not (Test-Path $stagedApp)) { throw "missing staged desktop app at $stagedApp" }
-$reportedVersion = (& $stagedExe version).Trim()
-if ($LASTEXITCODE -ne 0) { throw "staged neo-agent.exe version failed" }
-if ($reportedVersion -notmatch [regex]::Escape($version)) {
-  throw "staged neo-agent.exe reported '$reportedVersion', expected '$version'"
+if (-not (Test-Path $stagedExe)) { throw "missing staged backend at $stagedExe" }
+
+$versionOutput = (& $stagedExe version 2>&1 | Out-String).Trim()
+if ($LASTEXITCODE -ne 0) {
+  throw "staged neo-agent.exe version failed (exit $LASTEXITCODE): $versionOutput"
 }
+if ($versionOutput -notmatch [regex]::Escape($version)) {
+  throw "staged neo-agent.exe reported '$versionOutput', expected '$version'"
+}
+Write-Host "Verified staged backend: $versionOutput"
 
 if (-not $SkipPortableZip) {
+  Write-Host "[4/4] Creating portable ZIP archive..."
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
   $portableName = "Neo-$version-windows-x64"
   $portableTemp = Join-Path $distDir "$portableName-zip-stage"
   $portableRoot = Join-Path $portableTemp $portableName
@@ -64,7 +78,12 @@ if (-not $SkipPortableZip) {
   New-Item -ItemType Directory -Force $portableRoot | Out-Null
   try {
     Copy-Item -Recurse (Join-Path $stage "*") $portableRoot
-    Compress-Archive -Path $portableRoot -DestinationPath $portableZip -CompressionLevel Optimal -Force
+    [System.IO.Compression.ZipFile]::CreateFromDirectory(
+      $portableTemp,
+      $portableZip,
+      [System.IO.Compression.CompressionLevel]::Optimal,
+      $false
+    )
   } finally {
     if (Test-Path $portableTemp) { Remove-Item -Recurse -Force $portableTemp }
   }

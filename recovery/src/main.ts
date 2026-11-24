@@ -10,11 +10,21 @@ import { parseCli, USAGE, VERSION, type DaemonConfig } from "./config.ts";
 import { RecoverySupervisor } from "./supervisor.ts";
 import { resolveWorkerConfig } from "./worker-config.ts";
 
+function isBunVirtualEntry(arg: string | undefined): boolean {
+  if (!arg) return false;
+  const normalized = arg.replaceAll("\\", "/").toLowerCase();
+  return (
+    normalized.startsWith("/$bunfs/") ||
+    /^(?:\/\/\?\/)?[a-z]:\/~bun\//.test(normalized) ||
+    normalized.startsWith("~bun/")
+  );
+}
+
 function cliArgs(): string[] {
   const argv = process.argv;
-  const execBase = path.basename(process.execPath).toLowerCase();
+  const execBase = path.basename(process.execPath.replaceAll("\\", "/")).toLowerCase();
   if (execBase !== "bun" && execBase !== "bun.exe") {
-    if (argv.length >= 2 && (argv[1]?.startsWith("/$bunfs/") || argv[1]?.startsWith("B:\\~BUN\\"))) {
+    if (argv.length >= 2 && isBunVirtualEntry(argv[1])) {
       return argv.slice(2);
     }
     return argv.slice(1);

@@ -46,7 +46,9 @@ jobs:
         run: bun test
       - name: Test (Windows)
         if: runner.os == 'Windows'
-        run: bun test tests/core tests/store
+        run: |
+          ./dist/neo-agent.exe version
+          bun test tests/core tests/store
 
   recovery:
     name: Recovery (${{ matrix.os }})
