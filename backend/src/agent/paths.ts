@@ -13,7 +13,19 @@ function envVar(name: string): string | undefined {
 }
 
 function home(): string {
-  return envVar("HOME") ?? envVar("USERPROFILE") ?? os.tmpdir();
+  if (process.platform === "win32") {
+    return envVar("USERPROFILE") ?? envVar("HOME") ?? safeHomedir() ?? os.tmpdir();
+  }
+  return envVar("HOME") ?? envVar("USERPROFILE") ?? safeHomedir() ?? os.tmpdir();
+}
+
+function safeHomedir(): string | undefined {
+  try {
+    const dir = os.homedir();
+    return dir.length > 0 ? dir : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**

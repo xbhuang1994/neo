@@ -76,12 +76,12 @@ JSON over HTTP, as [006 Deployment](006-deployment.md) says who may call. Errors
 | `GET /api/settings/models` | `{kernel, installed, installing, installProgress, problem, listProblem, loading, current: {eval, executor}, available}`. It never waits for Antigravity to list its models: the last list is answered and renewed in the background once a minute old, and `loading` is true while listing them the first time; `installProgress` is the last line the installer printed while it runs |
 | `PUT /api/settings/models` | `{eval, executor}`: the models, each `{provider, model}` or `null`, applied to open Sessions from their next turn |
 | `POST /api/settings/kernel/install` | `{kernel?: "antigravity"}`: runs the Antigravity CLI's official installer on the backend's machine and answers when it ends, with the models view; nothing is run when `agy` is there already. The installer runs on when the request goes away, for up to ten minutes |
-| `GET /api/settings/accounts` | `{installed, problem, account, note, login}`: Antigravity's signed-in Google account (`{email, removable}` or `null`, read from the Antigravity CLI's login file), an optional `note`, and `login` for the login in progress or the last one |
+| `GET /api/settings/accounts` | `{installed, problem, account, note, login}`: Antigravity's signed-in Google account (`{email, removable}` or `null`, read from the OS keyring, Antigravity CLI's login file, or CLI auth probe fallback), an optional `note`, and `login` for the login in progress or the last one |
 | `POST /api/settings/accounts/login` | `{}` (or empty body): runs the Antigravity CLI's login flow (`acp --login`) over pipes, one at a time, and answers `{login}`: `{id, state, links, output}` with `state` `running`, `done` or `failed`, the links to open and what the program printed. A login ends after ten minutes |
 | `GET /api/settings/accounts/login` | `{login}`, to follow a login |
 | `POST /api/settings/accounts/login/input` | `{text}`: passes one line to the login, such as the code a page shows or the address the browser landed on (for a callback to the backend's own machine) |
 | `POST /api/settings/accounts/login/cancel` | Ends the login in progress |
-| `POST /api/settings/accounts/logout` | `{}` (or empty body): logs out by deleting the Antigravity CLI's login file |
+| `POST /api/settings/accounts/logout` | `{}` (or empty body): logs out by removing Antigravity CLI's login from both the OS keyring and its login file |
 | `GET /api/settings/general` | `{paused, recoveryMode, eval, executor, policy, defaults, limits}` |
 | `PUT /api/settings/general` | Any of `paused`, `recoveryMode`, `eval`, `executor`, `policy`; each block sent replaces that block whole |
 | `GET /api/wechat` | `{state, message, qrContent?, senderId?}`; `state` is `disconnected`, `waiting`, `scaned`, `verify`, `connected` or `error` |

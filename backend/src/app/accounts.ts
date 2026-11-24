@@ -7,10 +7,23 @@
 import { spawn, spawnSync } from "node:child_process";
 import type { ChildProcessByStdio } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { errorMessage, isRecord } from "../kernel/types.ts";
+import {
+  AGY_KEYRING_SERVICE,
+  AGY_KEYRING_USER,
+  createSystemKeyringBackend,
+  isForceFileTokenStorage,
+} from "./keyring.ts";
+import type {
+  KeyringBackend,
+  KeyringDeleteResult,
+  KeyringReadResult,
+  SyncKeyringBackend,
+} from "./keyring.ts";
 import type { Kernel } from "./kernel-types.ts";
 
 /** The Google account Antigravity is signed in with. */
@@ -104,12 +117,68 @@ export const DEFAULT_LINK_WAIT_MS = 3000;
 /** Default wait in `loginInput` after sending a pasted line to stdin (1.5 seconds). */
 export const DEFAULT_INPUT_WAIT_MS = 1500;
 
-/** Note shown when the OAuth token file is absent. */
+/** Note shown when the OAuth token file is absent and the OS keyring could not be inspected. */
 export const NO_LOGIN_FILE_NOTE =
   "No login file found. A login kept in the system keyring does not show here.";
 
+/** Note shown when `agy` is authenticated through an external/unreadable store (e.g. ADC, API key, or unreadable keyring). */
+export const EXTERNAL_LOGIN_NOTE =
+  "Signed in via Antigravity CLI. This login is managed outside Neo and cannot be signed out from here.";
+
 /** Output marker indicating `agy acp --login` failed even if the process keeps running. */
 export const LOGIN_FAILS_ON = "couldn't log in";
+
+/** Parsed Antigravity OAuth token payload from either the OS keyring or token file. */
+export interface ParsedAntigravityToken {
+  /** Whether the payload carries an active credential (not empty or signed-out metadata). */
+  hasToken: boolean;
+  /** Extracted email address (`id_token_email` or JWT `id_token` email), or `""`. */
+  email: string;
+  /** True when the payload explicitly records `"token": null` (signed-out metadata). */
+  explicitlySignedOut: boolean;
+}
+
+/** Result of probing `agy` directly when neither keyring nor token file holds a credential. */
+export interface CliAuthProbeResult {
+  signedIn: boolean;
+  confirmedUnauthenticated?: boolean;
+}
+
+/** Options for synchronous `inspectAntigravityAccount`. */
+export interface InspectAccountOptions {
+  env?: Record<string, string | undefined>;
+  platform?: NodeJS.Platform;
+  /** Explicit keyring backend, or `null` to skip keyring inspection. */
+  keyring?: SyncKeyringBackend | null;
+}
+
+/** Options for asynchronous `inspectAntigravityAccountAsync`. */
+export interface InspectAccountAsyncOptions {
+  homeDir?: string;
+  env?: Record<string, string | undefined>;
+  platform?: NodeJS.Platform;
+  /** Explicit keyring backend, or `null` to skip keyring inspection. */
+  keyring?: KeyringBackend | null;
+  /** Optional fallback probe (such as `agy models`) when keyring and token file yield no login. */
+  probeSignedIn?: () => Promise<CliAuthProbeResult>;
+}
+
+/** Options for synchronous `logoutAntigravity`. */
+export interface LogoutAccountOptions {
+  env?: Record<string, string | undefined>;
+  platform?: NodeJS.Platform;
+  /** Explicit keyring backend, or `null` to skip keyring deletion. */
+  keyring?: SyncKeyringBackend | null;
+}
+
+/** Options for asynchronous `logoutAntigravityAsync`. */
+export interface LogoutAccountAsyncOptions {
+  homeDir?: string;
+  env?: Record<string, string | undefined>;
+  platform?: NodeJS.Platform;
+  /** Explicit keyring backend, or `null` to skip keyring deletion. */
+  keyring?: KeyringBackend | null;
+}
 
 /** Maximum raw buffer retained before rolling old lines into archived links (64 KiB). */
 const MAX_RAW_CHARS = 65_536;
@@ -131,19 +200,67 @@ function isControlCodePoint(cp: number): boolean {
   return (cp >= 0x00 && cp <= 0x1f) || (cp >= 0x7f && cp <= 0x9f);
 }
 
-function resolveHome(): string {
-  if (process.env.HOME !== undefined) {
-    return process.env.HOME;
+function nonEmptyEnv(
+  env: Record<string, string | undefined>,
+  name: string,
+  platform: NodeJS.Platform = process.platform,
+): string | undefined {
+  const direct = env[name];
+  if (typeof direct === "string" && direct.length > 0) {
+    return direct;
   }
-  if (process.env.USERPROFILE !== undefined) {
-    return process.env.USERPROFILE;
+  if (platform === "win32") {
+    const lower = name.toLowerCase();
+    for (const key of Object.keys(env)) {
+      if (key.toLowerCase() === lower) {
+        const value = env[key];
+        if (typeof value === "string" && value.length > 0) {
+          return value;
+        }
+      }
+    }
   }
-  return "";
+  return undefined;
+}
+
+function safeOsHomedir(): string {
+  try {
+    return os.homedir();
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Resolve the user's home directory matching Go's `os.UserHomeDir()` (which `agy` uses):
+ * on Windows, `USERPROFILE` takes precedence over `HOME`; elsewhere, `HOME` takes precedence.
+ * Empty environment variables are ignored and `os.homedir()` is used as fallback.
+ */
+export function resolveHome(
+  env: Record<string, string | undefined> = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  if (platform === "win32") {
+    return (
+      nonEmptyEnv(env, "USERPROFILE", platform) ??
+      nonEmptyEnv(env, "HOME", platform) ??
+      safeOsHomedir()
+    );
+  }
+  return (
+    nonEmptyEnv(env, "HOME", platform) ??
+    nonEmptyEnv(env, "USERPROFILE", platform) ??
+    safeOsHomedir()
+  );
 }
 
 /** Antigravity's login token file (`~/.gemini/antigravity-cli/antigravity-oauth-token`). */
-export function agyTokenFile(homeDir?: string): string {
-  const base = homeDir !== undefined ? homeDir : resolveHome();
+export function agyTokenFile(
+  homeDir?: string,
+  env: Record<string, string | undefined> = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const base = homeDir !== undefined ? homeDir : resolveHome(env, platform);
   return path.join(base, ".gemini", "antigravity-cli", "antigravity-oauth-token");
 }
 
@@ -277,31 +394,211 @@ export function emptyObject(value: unknown): void {
   }
 }
 
-/** Inspect Antigravity's OAuth token file and return the current account status. */
-export function inspectAntigravityAccount(homeDir?: string): AccountStatus {
-  const tokenPath = agyTokenFile(homeDir);
-  let text: string;
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function emailFromJwt(jwt: unknown): string {
+  if (!nonEmptyString(jwt)) {
+    return "";
+  }
+  const parts = jwt.split(".");
+  if (parts.length < 2 || !parts[1]) {
+    return "";
+  }
   try {
-    text = fs.readFileSync(tokenPath, "utf8");
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as unknown;
+    return isRecord(payload) && nonEmptyString(payload.email) ? payload.email.trim() : "";
   } catch {
-    return {
-      account: null,
-      note: NO_LOGIN_FILE_NOTE,
-    };
+    return "";
+  }
+}
+
+/**
+ * Parse an Antigravity CLI token payload (`StoredToken` JSON or legacy flat `oauth2.Token` JSON).
+ * Distinguishes active logins from empty payloads or signed-out metadata records (`"token": null`).
+ */
+export function parseAntigravityToken(text: string): ParsedAntigravityToken {
+  if (text.trim().length === 0) {
+    return { hasToken: false, email: "", explicitlySignedOut: false };
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    parsed = undefined;
+    // Malformed non-empty token file/entry: treat as present with unknown email so it remains visible & removable.
+    return { hasToken: true, email: "", explicitlySignedOut: false };
   }
+  if (!isRecord(parsed)) {
+    return { hasToken: false, email: "", explicitlySignedOut: false };
+  }
+
+  const nested = isRecord(parsed.token) ? parsed.token : null;
   const email =
-    isRecord(parsed) && typeof parsed.id_token_email === "string"
-      ? parsed.id_token_email
-      : "";
+    nonEmptyString(parsed.id_token_email)
+      ? parsed.id_token_email.trim()
+      : emailFromJwt(nested?.id_token) || emailFromJwt(parsed.id_token);
+
+  const hasNestedToken =
+    nested !== null &&
+    (nonEmptyString(nested.access_token) ||
+      nonEmptyString(nested.refresh_token) ||
+      Object.keys(nested).length > 0);
+  const hasFlatToken =
+    nonEmptyString(parsed.access_token) || nonEmptyString(parsed.refresh_token);
+
+  if (Object.prototype.hasOwnProperty.call(parsed, "token")) {
+    const explicitlySignedOut = parsed.token === null && !hasFlatToken;
+    return {
+      hasToken: hasNestedToken || hasFlatToken,
+      email,
+      explicitlySignedOut,
+    };
+  }
+
   return {
-    account: { email, removable: true },
+    hasToken: hasFlatToken || email.length > 0,
+    email,
+    explicitlySignedOut: false,
   };
+}
+
+/** Whether an `agy models` error message clearly indicates the CLI is not signed in. */
+export function isUnauthenticatedModelError(message: string): boolean {
+  return /please sign in|not signed in|not logged in|unauthenticated|login required|authentication required/i.test(
+    message,
+  );
+}
+
+function readTokenFileParsed(tokenPath: string): ParsedAntigravityToken | null {
+  try {
+    const text = fs.readFileSync(tokenPath, "utf8");
+    return parseAntigravityToken(text);
+  } catch {
+    return null;
+  }
+}
+
+function resolveAccountFromStores(
+  keyringResult: KeyringReadResult | null,
+  fileParsed: ParsedAntigravityToken | null,
+): { status: AccountStatus | null; keyringCheckedCleanly: boolean } {
+  const keyringParsed =
+    keyringResult !== null && keyringResult.kind === "found"
+      ? parseAntigravityToken(keyringResult.value)
+      : null;
+
+  // Match `agy`'s `compositeTokenStorage`: prefer an active keyring token, falling back to file,
+  // and fill missing email from the companion store when that store is not signed-out metadata.
+  if (keyringParsed !== null && keyringParsed.hasToken) {
+    const email =
+      keyringParsed.email.length > 0
+        ? keyringParsed.email
+        : fileParsed !== null && !fileParsed.explicitlySignedOut
+          ? fileParsed.email
+          : "";
+    return {
+      status: { account: { email, removable: true } },
+      keyringCheckedCleanly: true,
+    };
+  }
+
+  if (fileParsed !== null && fileParsed.hasToken) {
+    const email =
+      fileParsed.email.length > 0
+        ? fileParsed.email
+        : keyringParsed !== null && !keyringParsed.explicitlySignedOut
+          ? keyringParsed.email
+          : "";
+    return {
+      status: { account: { email, removable: true } },
+      keyringCheckedCleanly: keyringResult !== null && keyringResult.kind !== "unavailable",
+    };
+  }
+
+  const keyringCheckedCleanly =
+    keyringResult !== null && keyringResult.kind !== "unavailable";
+  return { status: null, keyringCheckedCleanly };
+}
+
+/**
+ * Synchronously inspect Antigravity's OAuth credentials (OS keyring and/or token file).
+ * When `homeDir` is explicitly provided without a `keyring` override, only the file under
+ * `homeDir` is inspected so tests stay isolated from the host OS keyring.
+ */
+export function inspectAntigravityAccount(
+  homeDir?: string,
+  options: InspectAccountOptions = {},
+): AccountStatus {
+  const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
+  const forceFile = isForceFileTokenStorage(env, platform);
+  const keyringBackend: SyncKeyringBackend | null = forceFile
+    ? null
+    : options.keyring !== undefined
+      ? options.keyring
+      : homeDir === undefined
+        ? createSystemKeyringBackend(platform, env)
+        : null;
+
+  const keyringResult =
+    keyringBackend !== null
+      ? keyringBackend.readSync(AGY_KEYRING_SERVICE, AGY_KEYRING_USER)
+      : null;
+  const fileParsed = readTokenFileParsed(agyTokenFile(homeDir, env, platform));
+  const { status, keyringCheckedCleanly } = resolveAccountFromStores(keyringResult, fileParsed);
+  if (status !== null) {
+    return status;
+  }
+  return keyringCheckedCleanly
+    ? { account: null }
+    : { account: null, note: NO_LOGIN_FILE_NOTE };
+}
+
+/**
+ * Asynchronously inspect Antigravity's OAuth credentials across OS keyring, login token file,
+ * and an optional CLI probe fallback (e.g. `agy models`).
+ */
+export async function inspectAntigravityAccountAsync(
+  options: InspectAccountAsyncOptions = {},
+): Promise<AccountStatus> {
+  const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
+  const forceFile = isForceFileTokenStorage(env, platform);
+  const keyringBackend: KeyringBackend | null = forceFile
+    ? null
+    : options.keyring !== undefined
+      ? options.keyring
+      : options.homeDir === undefined
+        ? createSystemKeyringBackend(platform, env)
+        : null;
+
+  const keyringResult =
+    keyringBackend !== null
+      ? await keyringBackend.read(AGY_KEYRING_SERVICE, AGY_KEYRING_USER)
+      : null;
+  const fileParsed = readTokenFileParsed(agyTokenFile(options.homeDir, env, platform));
+  const { status, keyringCheckedCleanly } = resolveAccountFromStores(keyringResult, fileParsed);
+  if (status !== null) {
+    return status;
+  }
+
+  if (options.probeSignedIn !== undefined) {
+    const probe = await options.probeSignedIn();
+    if (probe.signedIn) {
+      return {
+        account: { email: "", removable: false },
+        note: EXTERNAL_LOGIN_NOTE,
+      };
+    }
+    if (probe.confirmedUnauthenticated) {
+      return { account: null };
+    }
+  }
+
+  return keyringCheckedCleanly
+    ? { account: null }
+    : { account: null, note: NO_LOGIN_FILE_NOTE };
 }
 
 /** Build the command that logs Antigravity in with Google over pipes. */
@@ -317,17 +614,80 @@ export function antigravityLoginCommand(
   };
 }
 
-/** Log Antigravity out by deleting its login token file. Succeeds if the file is already absent. */
-export function logoutAntigravity(homeDir?: string): void {
-  const tokenPath = agyTokenFile(homeDir);
+function unlinkTokenFile(tokenPath: string): Error | null {
   try {
     fs.unlinkSync(tokenPath);
+    return null;
   } catch (err) {
     if (isErrnoException(err) && err.code === "ENOENT") {
-      return;
+      return null;
     }
-    throw new Error(`Cannot remove the Antigravity login: ${errorMessage(err)}`);
+    return new Error(`Cannot remove the Antigravity login: ${errorMessage(err)}`);
   }
+}
+
+function finalizeLogoutErrors(fileErr: Error | null, keyringResult: KeyringDeleteResult | null): void {
+  if (fileErr !== null) {
+    throw fileErr;
+  }
+  if (keyringResult !== null && keyringResult.kind === "error") {
+    throw new Error(
+      `Cannot remove the Antigravity login from the system keyring: ${keyringResult.reason}`,
+    );
+  }
+}
+
+/**
+ * Synchronously log Antigravity out by removing its login token file and (when not isolated to a
+ * specific `homeDir`) its OS keyring entry. Succeeds if already logged out.
+ */
+export function logoutAntigravity(
+  homeDir?: string,
+  options: LogoutAccountOptions = {},
+): void {
+  const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
+  const tokenPath = agyTokenFile(homeDir, env, platform);
+  const fileErr = unlinkTokenFile(tokenPath);
+
+  const keyringBackend: SyncKeyringBackend | null =
+    options.keyring !== undefined
+      ? options.keyring
+      : homeDir === undefined
+        ? createSystemKeyringBackend(platform, env)
+        : null;
+  const keyringResult =
+    keyringBackend !== null
+      ? keyringBackend.deleteSync(AGY_KEYRING_SERVICE, AGY_KEYRING_USER)
+      : null;
+
+  finalizeLogoutErrors(fileErr, keyringResult);
+}
+
+/**
+ * Asynchronously log Antigravity out by removing both its login token file and its OS keyring entry.
+ * Succeeds if already logged out.
+ */
+export async function logoutAntigravityAsync(
+  options: LogoutAccountAsyncOptions = {},
+): Promise<void> {
+  const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
+  const tokenPath = agyTokenFile(options.homeDir, env, platform);
+  const fileErr = unlinkTokenFile(tokenPath);
+
+  const keyringBackend: KeyringBackend | null =
+    options.keyring !== undefined
+      ? options.keyring
+      : options.homeDir === undefined
+        ? createSystemKeyringBackend(platform, env)
+        : null;
+  const keyringResult =
+    keyringBackend !== null
+      ? await keyringBackend.delete(AGY_KEYRING_SERVICE, AGY_KEYRING_USER)
+      : null;
+
+  finalizeLogoutErrors(fileErr, keyringResult);
 }
 
 /** Terminate a spawned child process (and its process group on Unix / process tree on Windows). */

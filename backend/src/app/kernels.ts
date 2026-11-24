@@ -22,10 +22,12 @@ import type {
 import { errorMessage } from "../kernel/types.ts";
 import {
   antigravityLoginCommand,
-  inspectAntigravityAccount,
-  logoutAntigravity,
+  inspectAntigravityAccountAsync,
+  isUnauthenticatedModelError,
+  logoutAntigravityAsync,
 } from "./accounts.ts";
-import type { AccountStatus, LoginCommand } from "./accounts.ts";
+import type { AccountStatus, CliAuthProbeResult, LoginCommand } from "./accounts.ts";
+import type { KeyringBackend } from "./keyring.ts";
 import type { Kernel, RoleModel } from "./kernel-types.ts";
 
 /** What a Session is for. */
@@ -36,6 +38,9 @@ export const MAX_SUBAGENTS = 8;
 
 /** How long the installer may run (10 minutes). */
 export const INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
+
+/** Timeout for the fallback CLI auth probe (`agy models`) when keyring & file have no token. */
+export const AUTH_PROBE_TIMEOUT_MS = 15_000;
 
 /** What a Session needs from its runtime. */
 export interface SessionSpec {
@@ -434,6 +439,12 @@ export interface RealKernelsOptions {
   hookRelay?: string[];
   /** Override home directory used for Antigravity OAuth token inspection/logout (defaults to HOME/USERPROFILE). */
   homeDir?: string;
+  /** Override OS keyring backend (pass `null` to disable keyring access; primarily for testing). */
+  keyring?: KeyringBackend | null;
+  /** Override fallback CLI authentication probe (primarily for testing). */
+  probeSignedIn?: () => Promise<CliAuthProbeResult>;
+  /** Override timeout in milliseconds for the fallback CLI authentication probe (default: 15 seconds). */
+  authProbeTimeoutMs?: number;
   /** Override installer command builder (primarily for testing). */
   installerCommand?: (kernel: Kernel) => [string, string[]];
   /** Override installer timeout in milliseconds (defaults to 10 minutes). */
@@ -480,6 +491,9 @@ export class RealKernels implements Kernels {
   readonly hookRelay: string[];
 
   private readonly homeDir?: string;
+  private readonly keyring?: KeyringBackend | null;
+  private readonly probeSignedIn?: () => Promise<CliAuthProbeResult>;
+  private readonly authProbeTimeoutMs?: number;
   private readonly installerCommand?: (kernel: Kernel) => [string, string[]];
   private readonly installerTimeoutMs?: number;
 
@@ -488,6 +502,9 @@ export class RealKernels implements Kernels {
     this.env = { ...(options.env ?? {}) };
     this.hookRelay = [...(options.hookRelay ?? [])];
     this.homeDir = options.homeDir;
+    this.keyring = options.keyring;
+    this.probeSignedIn = options.probeSignedIn;
+    this.authProbeTimeoutMs = options.authProbeTimeoutMs;
     this.installerCommand = options.installerCommand;
     this.installerTimeoutMs = options.installerTimeoutMs;
   }
@@ -613,8 +630,33 @@ export class RealKernels implements Kernels {
   }
 
   async account(): Promise<AccountStatus> {
-    this.require("antigravity");
-    return inspectAntigravityAccount(this.homeDir);
+    const program = this.require("antigravity");
+    const mergedEnv: Record<string, string | undefined> = { ...process.env, ...this.env };
+    const probeSignedIn =
+      this.probeSignedIn ??
+      (this.homeDir === undefined && this.keyring === undefined
+        ? async (): Promise<CliAuthProbeResult> => {
+            try {
+              const models = await kernelListModels(
+                program,
+                this.env,
+                this.authProbeTimeoutMs ?? AUTH_PROBE_TIMEOUT_MS,
+              );
+              return { signedIn: models.length > 0 };
+            } catch (err) {
+              return {
+                signedIn: false,
+                confirmedUnauthenticated: isUnauthenticatedModelError(errorMessage(err)),
+              };
+            }
+          }
+        : undefined);
+    return await inspectAntigravityAccountAsync({
+      homeDir: this.homeDir,
+      env: mergedEnv,
+      keyring: this.keyring,
+      probeSignedIn,
+    });
   }
 
   /** Alias of `account()`. */
@@ -634,7 +676,12 @@ export class RealKernels implements Kernels {
 
   async logout(): Promise<void> {
     this.require("antigravity");
-    logoutAntigravity(this.homeDir);
+    const mergedEnv: Record<string, string | undefined> = { ...process.env, ...this.env };
+    await logoutAntigravityAsync({
+      homeDir: this.homeDir,
+      env: mergedEnv,
+      keyring: this.keyring,
+    });
   }
 
   private async runInstaller(kernel: Kernel): Promise<string> {

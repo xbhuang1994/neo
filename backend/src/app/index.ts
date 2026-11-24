@@ -3,6 +3,7 @@
 export { App, defaultTimings } from "./app.ts";
 export type { Machine, Timings } from "./app.ts";
 export * from "./accounts.ts";
+export * from "./keyring.ts";
 export * from "./access.ts";
 export * from "./artifacts.ts";
 export * from "./assess.ts";

@@ -316,6 +316,7 @@ export function parseModels(text: string): Array<[string, string]> {
 export async function listModels(
   program: string,
   env?: Record<string, string>,
+  timeoutMs = 60_000,
 ): Promise<Array<[string, string]>> {
   const childEnv: Record<string, string | undefined> = { ...process.env, ...(env ?? {}) };
   return await new Promise<Array<[string, string]>>((resolve, reject) => {
@@ -338,8 +339,9 @@ export async function listModels(
       } catch {
         // ignore
       }
-      reject(new Error("Antigravity did not list its models within 60 seconds"));
-    }, 60_000);
+      const seconds = Math.max(1, Math.round(timeoutMs / 1000));
+      reject(new Error(`Antigravity did not list its models within ${seconds} seconds`));
+    }, timeoutMs);
     if (typeof timer.unref === "function") {
       timer.unref();
     }

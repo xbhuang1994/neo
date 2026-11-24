@@ -64,7 +64,7 @@ The app depends on: `cupertino_ui` (Flutter's Cupertino widgets), `cupertino_ico
 | `backend/src/app/effects.ts`, `passes.ts`, `outbox.ts`, `notices.ts` | Event-driven effect queue, orchestration passes, outbound messages, notices and relays to the main Session |
 | `backend/src/app/kernels.ts`, `sessions.ts`, `prompts.ts`, `tools.ts`, `resources.ts`, `cards.ts`, `assess.ts` | Launching Antigravity per role, Sessions and per-session locks, embedded prompts, JSON-Schema tools, readable resources, cards, candidate delivery and assessment |
 | `backend/src/app/recall.ts`, `artifacts.ts`, `clarification.ts`, `access.ts` | Historical ticket anti-noise retrieval index (CJK 2-gram + `Intl.Segmenter` + atomic numerals + IDF), deliverable artifact collector, pre-route clarification state, and cross-surface/sidecar access control |
-| `backend/src/app/accounts.ts` | Antigravity's Google account status, piped `acp --login` flow, and logout |
+| `backend/src/app/accounts.ts`, `keyring.ts` | Antigravity's Google account status (OS keyring, login file, CLI fallback), piped `acp --login` flow, and logout |
 | `backend/src/app/executor.ts`, `blocked.ts`, `sidecar.ts`, `watchdog.ts`, `procinfo.ts` | The Executor, blocked command stand-ins, Sidecar, Watchdog, and direct `/proc` process sampling |
 | `backend/src/app/chat.ts`, `wechat.ts`, `wechat_protocol.ts`, `wechat_typing.ts`, `views.ts` | The chat Source, WeChat iLink bridge, AES-128-ECB CDN protocol, idle-skipping typing loop, and cached API views |
 | `backend/src/http/index.ts`, `server.ts`, `api.ts` | Raw `node:net` HTTP/1.1 keep-alive server with `TCP_NODELAY`, API routes, constant-time token & origin control, CSP static web serving |

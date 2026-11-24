@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { ptr } from "bun:ffi";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
   AccountManager,
   AccountsState,
+  EXTERNAL_LOGIN_NOTE,
   KEEP_OUTPUT,
   LOGIN_FAILS_ON,
   LOGIN_TIMEOUT_MS,
@@ -14,12 +16,36 @@ import {
   clean,
   emptyObject,
   inspectAntigravityAccount,
+  inspectAntigravityAccountAsync,
+  isUnauthenticatedModelError,
   links,
   loginEnv,
   logoutAntigravity,
+  logoutAntigravityAsync,
+  parseAntigravityToken,
+  resolveHome,
   tail,
 } from "../../src/app/accounts.ts";
 import type { AccountKernels, LoginCommand } from "../../src/app/accounts.ts";
+import {
+  AGY_FORCE_FILE_ENV,
+  AGY_KEYRING_SERVICE,
+  AGY_KEYRING_USER,
+  GO_KEYRING_BASE64_PREFIX,
+  GO_KEYRING_ENCODED_PREFIX,
+  createSystemKeyringBackend,
+  decodeGoKeyringSecret,
+  decodeWinCredBlob,
+  hasLinuxSecretServiceEnv,
+  isForceFileTokenStorage,
+  parseDarwinDeleteResult,
+  parseDarwinSecurityResult,
+  parseLinuxSecretToolDeleteResult,
+  parseLinuxSecretToolResult,
+  readWinCredBlobFromStruct,
+  winCredTargetName,
+} from "../../src/app/keyring.ts";
+import type { KeyringBackend, SyncKeyringBackend } from "../../src/app/keyring.ts";
 import {
   BaseKernels,
   INSTALL_TIMEOUT_MS,
@@ -940,5 +966,416 @@ exit 1
     );
     expect(() => kernelLogin(bare)).toThrow("Antigravity CLI cannot log in from here");
     await expect(kernelLogout(bare)).rejects.toThrow("Antigravity CLI cannot log out from here");
+  });
+});
+
+describe("accounts: cross-platform OS keyring, Windows home resolution, and CLI probe fallback", () => {
+  test("resolveHome matches Go os.UserHomeDir across Windows and Unix, ignoring empty values", () => {
+    // Windows prefers USERPROFILE even when HOME is set (e.g. Git Bash / MSYS).
+    expect(
+      resolveHome({ HOME: "/c/Users/gitbash", USERPROFILE: "C:\\Users\\Alice" }, "win32"),
+    ).toBe("C:\\Users\\Alice");
+    // Windows case-insensitive lookup after env spread.
+    expect(resolveHome({ UserProfile: "C:\\Users\\Mixed", HOME: "" }, "win32")).toBe(
+      "C:\\Users\\Mixed",
+    );
+    // Windows falls back to HOME if USERPROFILE is empty/absent.
+    expect(resolveHome({ USERPROFILE: "", HOME: "C:\\Users\\Fallback" }, "win32")).toBe(
+      "C:\\Users\\Fallback",
+    );
+
+    // Unix prefers HOME over USERPROFILE and skips empty strings.
+    expect(resolveHome({ HOME: "/home/alice", USERPROFILE: "/ignored" }, "linux")).toBe(
+      "/home/alice",
+    );
+    expect(resolveHome({ HOME: "", USERPROFILE: "/home/bob" }, "darwin")).toBe("/home/bob");
+  });
+
+  test("decodes zalando/go-keyring macOS base64, legacy hex, raw security hex, and Windows blobs", () => {
+    const payload = JSON.stringify({
+      token: { access_token: "ya29.tok", refresh_token: "1//ref" },
+      id_token_email: "alice@example.com",
+    });
+
+    // macOS go-keyring-base64: prefix
+    const b64 = `${GO_KEYRING_BASE64_PREFIX}${Buffer.from(payload, "utf8").toString("base64")}\n`;
+    expect(decodeGoKeyringSecret(b64)).toBe(payload);
+
+    // Legacy go-keyring-encoded: hex prefix
+    const hexPrefixed = `${GO_KEYRING_ENCODED_PREFIX}${Buffer.from(payload, "utf8").toString("hex")}`;
+    expect(decodeGoKeyringSecret(hexPrefixed)).toBe(payload);
+
+    // Raw hex output from macOS `security -w` (both direct JSON and wrapped base64)
+    expect(decodeGoKeyringSecret(Buffer.from(payload, "utf8").toString("hex"))).toBe(payload);
+    expect(decodeGoKeyringSecret(Buffer.from(b64.trim(), "utf8").toString("hex"))).toBe(payload);
+
+    // Plain JSON passthrough
+    expect(decodeGoKeyringSecret(`  ${payload}  `)).toBe(payload);
+
+    // Windows target name and UTF-8 / UTF-16LE blob decoding
+    expect(winCredTargetName(AGY_KEYRING_SERVICE, AGY_KEYRING_USER)).toBe("antigravity:gemini");
+    expect(decodeWinCredBlob(Buffer.from(payload, "utf8"))).toBe(payload);
+    expect(decodeWinCredBlob(Buffer.from(`${payload}\0`, "utf16le"))).toBe(payload);
+
+    // Force-file env parsing (including Windows case-insensitive keys)
+    expect(isForceFileTokenStorage({ [AGY_FORCE_FILE_ENV]: "true" }, "linux")).toBe(true);
+    expect(isForceFileTokenStorage({ [AGY_FORCE_FILE_ENV]: " TRUE " }, "darwin")).toBe(true);
+    expect(isForceFileTokenStorage({ agy_cli_force_file_token_storage: "true" }, "win32")).toBe(
+      true,
+    );
+    expect(isForceFileTokenStorage({ [AGY_FORCE_FILE_ENV]: "false" }, "linux")).toBe(false);
+  });
+
+  test("readWinCredBlobFromStruct reads 64-bit Win32 CREDENTIALW offsets (+32 size, +40 blobPtr)", () => {
+    const payload = JSON.stringify({
+      token: { access_token: "win-tok" },
+      id_token_email: "winuser@example.com",
+    });
+    const blob = Buffer.from(payload, "utf8");
+    const credStruct = new ArrayBuffer(80);
+    const view = new DataView(credStruct);
+    view.setUint32(32, blob.length, true);
+    view.setBigUint64(40, BigInt(ptr(blob)), true);
+
+    expect(readWinCredBlobFromStruct(BigInt(ptr(credStruct)))).toEqual({
+      kind: "found",
+      value: payload,
+    });
+
+    // Zero-size blob or null address returns notFound cleanly
+    view.setUint32(32, 0, true);
+    expect(readWinCredBlobFromStruct(BigInt(ptr(credStruct)))).toEqual({ kind: "notFound" });
+    expect(readWinCredBlobFromStruct(0n)).toEqual({ kind: "notFound" });
+  });
+
+  test("parses macOS security and Linux secret-tool exit codes and outputs accurately", () => {
+    const payload = JSON.stringify({
+      token: { access_token: "tok" },
+      id_token_email: "mac@example.com",
+    });
+    const encoded = `${GO_KEYRING_BASE64_PREFIX}${Buffer.from(payload, "utf8").toString("base64")}\n`;
+
+    expect(
+      parseDarwinSecurityResult({ status: 0, stdout: encoded, stderr: "", timedOut: false }),
+    ).toEqual({ kind: "found", value: payload });
+    expect(
+      parseDarwinSecurityResult({
+        status: 44,
+        stdout: "",
+        stderr: "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.",
+        timedOut: false,
+      }),
+    ).toEqual({ kind: "notFound" });
+    expect(
+      parseDarwinSecurityResult({ status: null, stdout: "", stderr: "", timedOut: true }),
+    ).toEqual({ kind: "unavailable", reason: "macOS Keychain lookup timed out" });
+
+    expect(
+      parseDarwinDeleteResult({ status: 0, stdout: "", stderr: "", timedOut: false }),
+    ).toEqual({ kind: "deleted" });
+    expect(
+      parseDarwinDeleteResult({
+        status: 44,
+        stdout: "",
+        stderr: "The specified item could not be found in the keychain.",
+        timedOut: false,
+      }),
+    ).toEqual({ kind: "notFound" });
+    expect(
+      parseDarwinDeleteResult({ status: 1, stdout: "", stderr: "User canceled", timedOut: false }),
+    ).toEqual({ kind: "error", reason: "User canceled" });
+
+    expect(
+      parseLinuxSecretToolResult({ status: 0, stdout: payload, stderr: "", timedOut: false }),
+    ).toEqual({ kind: "found", value: payload });
+    expect(
+      parseLinuxSecretToolResult({ status: 1, stdout: "", stderr: "", timedOut: false }),
+    ).toEqual({ kind: "notFound" });
+    expect(
+      parseLinuxSecretToolResult({
+        status: null,
+        stdout: "",
+        stderr: "",
+        error: Object.assign(new Error("spawn secret-tool ENOENT"), { code: "ENOENT" }),
+        timedOut: false,
+      }).kind,
+    ).toBe("unavailable");
+
+    expect(
+      parseLinuxSecretToolDeleteResult({ status: 0, stdout: "", stderr: "", timedOut: false }),
+    ).toEqual({ kind: "deleted" });
+    expect(
+      parseLinuxSecretToolDeleteResult({ status: 1, stdout: "", stderr: "", timedOut: false }),
+    ).toEqual({ kind: "notFound" });
+    expect(
+      parseLinuxSecretToolDeleteResult({ status: 1, stdout: "", stderr: "dbus denied", timedOut: false }),
+    ).toEqual({ kind: "error", reason: "dbus denied" });
+
+    expect(hasLinuxSecretServiceEnv({ DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus" })).toBe(true);
+    expect(hasLinuxSecretServiceEnv({ XDG_RUNTIME_DIR: "/run/user/1000" }, () => true)).toBe(true);
+    expect(hasLinuxSecretServiceEnv({}, () => false)).toBe(false);
+  });
+
+  test("parseAntigravityToken distinguishes active StoredToken, JWT id_token email, and signed-out token:null", () => {
+    expect(
+      parseAntigravityToken(
+        JSON.stringify({
+          token: { access_token: "a", refresh_token: "r" },
+          id_token_email: "active@example.com",
+        }),
+      ),
+    ).toEqual({ hasToken: true, email: "active@example.com", explicitlySignedOut: false });
+
+    // Signed-out StoredToken with retained metadata must NOT count as logged in
+    expect(
+      parseAntigravityToken(
+        JSON.stringify({
+          token: null,
+          id_token_email: "old@example.com",
+          saved_wif_provider: "wif",
+        }),
+      ),
+    ).toEqual({ hasToken: false, email: "old@example.com", explicitlySignedOut: true });
+
+    // Metadata-only object without token or credentials
+    expect(
+      parseAntigravityToken(JSON.stringify({ saved_wif_provider: "wif", user_tier: "standard" })),
+    ).toEqual({ hasToken: false, email: "", explicitlySignedOut: false });
+
+    // JWT id_token email fallback when id_token_email is missing
+    const jwtHeader = Buffer.from(JSON.stringify({ alg: "RS256" })).toString("base64url");
+    const jwtPayload = Buffer.from(JSON.stringify({ email: "jwt@example.com" })).toString(
+      "base64url",
+    );
+    expect(
+      parseAntigravityToken(
+        JSON.stringify({
+          token: { access_token: "a", id_token: `${jwtHeader}.${jwtPayload}.sig` },
+        }),
+      ),
+    ).toEqual({ hasToken: true, email: "jwt@example.com", explicitlySignedOut: false });
+
+    expect(parseAntigravityToken("   ")).toEqual({
+      hasToken: false,
+      email: "",
+      explicitlySignedOut: false,
+    });
+    expect(isUnauthenticatedModelError("Error: Please sign in to view available models.")).toBe(
+      true,
+    );
+    expect(isUnauthenticatedModelError("network timeout")).toBe(false);
+  });
+
+  test("detects and removes keyring-only logins on macOS/Windows/Linux and handles composite edge cases", async () => {
+    const dir = makeTempDir();
+    let storedSecret: string | null = JSON.stringify({
+      token: { access_token: "kr-tok", refresh_token: "kr-ref" },
+      id_token_email: "keyring-user@example.com",
+    });
+
+    const mockKeyring: KeyringBackend & SyncKeyringBackend = {
+      async read(service, username) {
+        expect(service).toBe("antigravity");
+        expect(username).toBe("gemini");
+        return storedSecret !== null ? { kind: "found", value: storedSecret } : { kind: "notFound" };
+      },
+      async delete(service, username) {
+        expect(service).toBe("antigravity");
+        expect(username).toBe("gemini");
+        if (storedSecret === null) return { kind: "notFound" };
+        storedSecret = null;
+        return { kind: "deleted" };
+      },
+      readSync(service, username) {
+        expect(service).toBe("antigravity");
+        expect(username).toBe("gemini");
+        return storedSecret !== null ? { kind: "found", value: storedSecret } : { kind: "notFound" };
+      },
+      deleteSync(service, username) {
+        expect(service).toBe("antigravity");
+        expect(username).toBe("gemini");
+        if (storedSecret === null) return { kind: "notFound" };
+        storedSecret = null;
+        return { kind: "deleted" };
+      },
+    };
+
+    // No login file on disk at all — token lives exclusively in OS keyring.
+    const kernels = new RealKernels({
+      find: () => "/bin/agy",
+      homeDir: dir,
+      keyring: mockKeyring,
+    });
+    const accounts = new AccountsState();
+
+    expect(await accounts.accountsView(kernels)).toEqual({
+      installed: true,
+      problem: null,
+      account: { email: "keyring-user@example.com", removable: true },
+      note: null,
+      login: null,
+    });
+
+    // Sync inspection also finds the keyring login.
+    expect(inspectAntigravityAccount(dir, { keyring: mockKeyring })).toEqual({
+      account: { email: "keyring-user@example.com", removable: true },
+    });
+
+    // AGY_CLI_FORCE_FILE_TOKEN_STORAGE=true bypasses keyring and relies on file only.
+    expect(
+      await inspectAntigravityAccountAsync({
+        homeDir: dir,
+        keyring: mockKeyring,
+        env: { [AGY_FORCE_FILE_ENV]: "true" },
+      }),
+    ).toEqual({
+      account: null,
+      note: NO_LOGIN_FILE_NOTE,
+    });
+
+    // Logout removes the keyring entry and updates view cleanly (no misleading keyring note).
+    const afterLogout = await accounts.logout(kernels, {});
+    expect(storedSecret).toBeNull();
+    expect(afterLogout).toEqual({
+      installed: true,
+      problem: null,
+      account: null,
+      note: null,
+      login: null,
+    });
+
+    // Signed-out keyring metadata (`token: null`) falls back to active file token.
+    storedSecret = JSON.stringify({ token: null, saved_wif_provider: "x" });
+    const tokenPath = agyTokenFile(dir);
+    fs.mkdirSync(path.dirname(tokenPath), { recursive: true });
+    fs.writeFileSync(
+      tokenPath,
+      JSON.stringify({ token: { access_token: "file-tok" }, id_token_email: "file@example.com" }),
+    );
+    expect(await inspectAntigravityAccountAsync({ homeDir: dir, keyring: mockKeyring })).toEqual({
+      account: { email: "file@example.com", removable: true },
+    });
+
+    // Keyring active token without email merges email from file, and logout clears both.
+    storedSecret = JSON.stringify({ token: { access_token: "kr-only" } });
+    expect(await inspectAntigravityAccountAsync({ homeDir: dir, keyring: mockKeyring })).toEqual({
+      account: { email: "file@example.com", removable: true },
+    });
+    await logoutAntigravityAsync({ homeDir: dir, keyring: mockKeyring });
+    expect(storedSecret).toBeNull();
+    expect(fs.existsSync(tokenPath)).toBe(false);
+  });
+
+  test("falls back to CLI auth probe when OS keyring is unavailable and distinguishes signed-in vs signed-out", async () => {
+    const dir = makeTempDir();
+    const unavailableKeyring: KeyringBackend = {
+      async read() {
+        return { kind: "unavailable", reason: "secret-tool not installed" };
+      },
+      async delete() {
+        return { kind: "unavailable", reason: "secret-tool not installed" };
+      },
+    };
+
+    // CLI probe succeeds (e.g. Linux desktop without secret-tool, or ADC/GEMINI_API_KEY)
+    const signedInKernels = new RealKernels({
+      find: () => "/bin/agy",
+      homeDir: dir,
+      keyring: unavailableKeyring,
+      probeSignedIn: async () => ({ signedIn: true }),
+    });
+    expect(await signedInKernels.account()).toEqual({
+      account: { email: "", removable: false },
+      note: EXTERNAL_LOGIN_NOTE,
+    });
+
+    // CLI probe explicitly confirms unauthenticated
+    const signedOutKernels = new RealKernels({
+      find: () => "/bin/agy",
+      homeDir: dir,
+      keyring: unavailableKeyring,
+      probeSignedIn: async () => ({ signedIn: false, confirmedUnauthenticated: true }),
+    });
+    expect(await signedOutKernels.account()).toEqual({
+      account: null,
+    });
+
+    // CLI probe fails due to transient error -> preserves honest note
+    const offlineKernels = new RealKernels({
+      find: () => "/bin/agy",
+      homeDir: dir,
+      keyring: unavailableKeyring,
+      probeSignedIn: async () => ({ signedIn: false, confirmedUnauthenticated: false }),
+    });
+    expect(await offlineKernels.account()).toEqual({
+      account: null,
+      note: NO_LOGIN_FILE_NOTE,
+    });
+
+    // Real keyring delete error propagates on logout
+    const failingDeleteKeyring: KeyringBackend = {
+      async read() {
+        return { kind: "notFound" };
+      },
+      async delete() {
+        return { kind: "error", reason: "access denied" };
+      },
+    };
+    await expect(
+      logoutAntigravityAsync({ homeDir: dir, keyring: failingDeleteKeyring }),
+    ).rejects.toThrow("Cannot remove the Antigravity login from the system keyring: access denied");
+  });
+
+  test("createSystemKeyringBackend on Linux invokes secret-tool with exact service/username attributes", async () => {
+    if (process.platform === "win32") return;
+    const dir = makeTempDir();
+    const stateFile = path.join(dir, "secret.json");
+    const initial = JSON.stringify({
+      token: { access_token: "dbus-tok" },
+      id_token_email: "linux-desktop@example.com",
+    });
+    fs.writeFileSync(stateFile, initial);
+
+    writeExecutableScript(
+      dir,
+      "secret-tool",
+      `#!/usr/bin/env bash
+if [ "$1" = "lookup" ] && [ "$2" = "service" ] && [ "$3" = "antigravity" ] && [ "$4" = "username" ] && [ "$5" = "gemini" ]; then
+  if [ -f "${stateFile}" ]; then
+    cat "${stateFile}"
+    exit 0
+  fi
+  exit 1
+fi
+if [ "$1" = "clear" ] && [ "$2" = "service" ] && [ "$3" = "antigravity" ] && [ "$4" = "username" ] && [ "$5" = "gemini" ]; then
+  if [ -f "${stateFile}" ]; then
+    rm -f "${stateFile}"
+    exit 0
+  fi
+  exit 1
+fi
+echo "unexpected args: $*" >&2
+exit 2
+`,
+    );
+
+    const env = {
+      PATH: `${dir}:${process.env.PATH ?? ""}`,
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/tmp/fake-bus",
+    };
+    const backend = createSystemKeyringBackend("linux", env);
+    expect(await backend.read(AGY_KEYRING_SERVICE, AGY_KEYRING_USER)).toEqual({
+      kind: "found",
+      value: initial,
+    });
+    expect(await inspectAntigravityAccountAsync({ homeDir: dir, keyring: backend, env })).toEqual({
+      account: { email: "linux-desktop@example.com", removable: true },
+    });
+
+    await logoutAntigravityAsync({ homeDir: dir, keyring: backend, env });
+    expect(fs.existsSync(stateFile)).toBe(false);
+    expect(await backend.read(AGY_KEYRING_SERVICE, AGY_KEYRING_USER)).toEqual({
+      kind: "notFound",
+    });
   });
 });
