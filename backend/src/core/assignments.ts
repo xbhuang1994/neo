@@ -40,6 +40,8 @@ export interface WorkerReport {
   answers?: string;
   /** What the ticket is about now, in a sentence or two; replaces the ticket's digest. */
   topic?: string;
+  /** Sanitized deliverable filenames or relative paths recorded on completion or progress for historical recall. */
+  artifacts?: string[];
 }
 
 /** Construct a `WorkerReport` with state, summary, and optional fields. */
@@ -53,6 +55,8 @@ export function workerReport(
 
 const RECOVERY_NOTE =
   "The host restarted during this ticket. Inspect the current working directory and its history before continuing. Do not repeat an already completed external operation. Background jobs and subagents of the previous run stopped with it; rerun what you still need. Finish the original assignment and report its status.";
+
+const MAX_TICKET_ARTIFACTS = 20;
 
 /** Truncates `text` to at most `maxChars` Unicode scalar values (matching Rust `chars().take(n)`). */
 function truncateChars(text: string, maxChars: number): string {
@@ -295,6 +299,29 @@ export function assignmentsReport(
   // A drop only hands a message back or says nothing is left; it never says what the ticket is about now.
   if (report.topic !== undefined && report.topic.length > 0 && report.state !== "dropped") {
     ticket.digest = report.topic;
+  }
+  if (report.artifacts !== undefined && report.artifacts.length > 0 && report.state !== "dropped") {
+    const merged: string[] = [];
+    const seen = new Set<string>();
+    for (const item of report.artifacts) {
+      const trimmed = item.trim();
+      if (trimmed.length === 0 || seen.has(trimmed)) continue;
+      seen.add(trimmed);
+      merged.push(trimmed);
+      if (merged.length >= MAX_TICKET_ARTIFACTS) break;
+    }
+    if (merged.length < MAX_TICKET_ARTIFACTS && ticket.artifacts !== undefined) {
+      for (const item of ticket.artifacts) {
+        const trimmed = item.trim();
+        if (trimmed.length === 0 || seen.has(trimmed)) continue;
+        seen.add(trimmed);
+        merged.push(trimmed);
+        if (merged.length >= MAX_TICKET_ARTIFACTS) break;
+      }
+    }
+    if (merged.length > 0) {
+      ticket.artifacts = merged;
+    }
   }
   ticket.updatedAt = at;
 

@@ -24,6 +24,7 @@ import type { Kernels, ModelOption, SessionRole } from "./kernels.ts";
 import type { Notice, Relay } from "./notices.ts";
 import type { Outbox, Sent } from "./outbox.ts";
 import type { Passes } from "./passes.ts";
+import type { TicketSearchIndex } from "./recall.ts";
 import type { Kernel, Settings } from "./settings.ts";
 import type { Account, ChatAttachment, Protocol } from "./wechat_protocol.ts";
 
@@ -389,6 +390,7 @@ export interface AppContext {
   executorResume(): void;
 
   // Resources, Assess, Sidecar
+  ensureSearchIndex(): TicketSearchIndex;
   readResource(resource: string, offset: number, limit?: number, ticketId?: string): unknown;
   candidateCard(candidate: Candidate): unknown;
   assessmentQueued(payload: unknown, evalId: string): Promise<void>;

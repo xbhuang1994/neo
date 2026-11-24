@@ -46,9 +46,13 @@ import {
   getNeighbours,
   getRecentDecisions,
   getRecentTriggers,
+  getSentFilesByTicket,
   getSubscribedThreads,
   getThreadPage,
   getThreadTriggers,
+  getTicketCount,
+  getTicketPage,
+  getTriggersByIds,
   searchTriggers,
   type FailingReply,
   type Place,
@@ -272,6 +276,8 @@ export class Store implements Repositories {
   private readonly db: Database;
   private depth = 0;
   private readonly committed: Array<Array<() => void>> = [];
+  private readonly ticketSavedListeners = new Set<(ticket: Ticket) => void>();
+  private readonly threadSavedListeners = new Set<(thread: Thread) => void>();
   private closed = false;
 
   private constructor(db: Database) {
@@ -452,6 +458,28 @@ export class Store implements Repositories {
     }
   }
 
+  /**
+   * Subscribe to committed `saveTicket` writes (dispatched via `afterCommit`, never on rollback).
+   * Returns an idempotent unsubscribe function.
+   */
+  onTicketSaved(listener: (ticket: Ticket) => void): () => void {
+    this.ticketSavedListeners.add(listener);
+    return () => {
+      this.ticketSavedListeners.delete(listener);
+    };
+  }
+
+  /**
+   * Subscribe to committed `saveThread` writes (dispatched via `afterCommit`, never on rollback).
+   * Returns an idempotent unsubscribe function.
+   */
+  onThreadSaved(listener: (thread: Thread) => void): () => void {
+    this.threadSavedListeners.add(listener);
+    return () => {
+      this.threadSavedListeners.delete(listener);
+    };
+  }
+
   // Key-value records
 
   /** A typed KV record. */
@@ -544,7 +572,16 @@ export class Store implements Repositories {
   }
 
   saveThread(thread: Thread): void {
-    this.db.query(SQL_THREAD_UPSERT).run(thread.key, JSON.stringify(thread));
+    const json = JSON.stringify(thread);
+    this.db.query(SQL_THREAD_UPSERT).run(thread.key, json);
+    if (this.threadSavedListeners.size > 0) {
+      this.afterCommit(() => {
+        if (this.threadSavedListeners.size === 0) return;
+        for (const listener of [...this.threadSavedListeners]) {
+          listener(JSON.parse(json) as Thread);
+        }
+      });
+    }
   }
 
   threads(): Thread[] {
@@ -561,7 +598,16 @@ export class Store implements Repositories {
   }
 
   saveTicket(ticket: Ticket): void {
-    this.db.query(SQL_TICKET_UPSERT).run(ticket.id, JSON.stringify(ticket));
+    const json = JSON.stringify(ticket);
+    this.db.query(SQL_TICKET_UPSERT).run(ticket.id, json);
+    if (this.ticketSavedListeners.size > 0) {
+      this.afterCommit(() => {
+        if (this.ticketSavedListeners.size === 0) return;
+        for (const listener of [...this.ticketSavedListeners]) {
+          listener(JSON.parse(json) as Ticket);
+        }
+      });
+    }
   }
 
   tickets(): Ticket[] {
@@ -649,6 +695,26 @@ export class Store implements Repositories {
   /** The threads tickets subscribe to, of one Source or of all. */
   subscribedThreads(source?: string): Thread[] {
     return getSubscribedThreads(this.db, source);
+  }
+
+  /** One page of tickets, newest first. */
+  ticketPage(offset: number, limit: number): Ticket[] {
+    return getTicketPage(this.db, offset, limit);
+  }
+
+  /** Total number of stored tickets. */
+  ticketCount(): number {
+    return getTicketCount(this.db);
+  }
+
+  /** Batch-fetch triggers by id in chunks, avoiding SQLite bind-parameter limits and N+1 queries. */
+  triggersByIds(ids: readonly string[]): Map<string, Trigger> {
+    return getTriggersByIds(this.db, ids);
+  }
+
+  /** Best-effort map of `ticketId -> sent deliverable filenames` mined from sent outbox receipts. */
+  sentFilesByTicket(): Map<string, string[]> {
+    return getSentFilesByTicket(this.db);
   }
 
   // Receipts (receipts.ts)

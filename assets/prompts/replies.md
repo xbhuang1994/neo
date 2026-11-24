@@ -4,4 +4,6 @@ Workers deliver human-facing replies by default via `orchestrator_report` `direc
 
 Before substantial work on a human request or follow-up, if the trigger card does not already have `"acknowledged": true`, the worker calls `orchestrator_ack` with that `trigger_id` and one specific sentence naming the concrete object and intended result (not quoting the message). Skip `orchestrator_ack` for worker reports, automated messages, thanks, ordinary discussion, quick questions, and old history. The host deduplicates acknowledgements across accept, workers, and restarts; never duplicate a pending or dropped acknowledgement through `orchestrator_reply` (report missing confirmation in `summary` only if it matters).
 
-The 100-word limit is a hard ceiling enforced by transport: each Chinese character counts as one word (100 Chinese characters max), and Markdown link labels and destinations count. Never evade it with bullet lists, semicolon chains, or consecutive messages.
+The 100-word limit is a hard ceiling enforced by transport and tool checks (including `clarify` questions): each Chinese character counts as one word (100 Chinese characters max), and Markdown link labels and destinations count.
+Never evade it with bullet lists, semicolon chains, or consecutive messages.
+Only `sidecar_reply` relaxes this ceiling to 500 words (500 Chinese characters max) for read-only queries that explicitly request a list, itemization, or detailed comparison.

@@ -55,6 +55,7 @@ import { changedPaths, eventNotice, followupRelay, settingsNotice, type Notice, 
 import { Outbox, type Channels, type Sent } from "./outbox.ts";
 import { Passes } from "./passes.ts";
 import { policyEffects, policyVersion, SettingsPolicy, Sources } from "./policy.ts";
+import { TicketSearchIndex, type TicketIndexInput } from "./recall.ts";
 import * as resourcesMod from "./resources.ts";
 import * as sessionsMod from "./sessions.ts";
 import { SessionsState } from "./sessions.ts";
@@ -100,6 +101,9 @@ export class App implements AppContext {
   private readonly sources = new Sources();
   private isClosing = false;
   private quietDepth = 0;
+  private recallIndex: TicketSearchIndex | null = null;
+  private readonly threadTicketMap = new Map<string, Set<string>>();
+  private readonly ticketThreadMap = new Map<string, Set<string>>();
 
   readonly sessionsState: SessionsState;
   readonly executorState: ExecutorState;
@@ -627,6 +631,125 @@ export class App implements AppContext {
   }
 
   // ---- Resources, Assess, Sidecar ----
+
+  ensureSearchIndex(): TicketSearchIndex {
+    if (this.recallIndex !== null) {
+      return this.recallIndex;
+    }
+    const index = new TicketSearchIndex();
+    const tickets = this.store.tickets();
+    const threads = this.store.threads();
+    this.threadTicketMap.clear();
+    this.ticketThreadMap.clear();
+    for (let i = 0; i < threads.length; i++) {
+      const thread = threads[i];
+      const set = new Set<string>(thread.subscriptions);
+      this.threadTicketMap.set(thread.key, set);
+      for (const tid of set) {
+        let byTicket = this.ticketThreadMap.get(tid);
+        if (byTicket === undefined) {
+          byTicket = new Set<string>();
+          this.ticketThreadMap.set(tid, byTicket);
+        }
+        byTicket.add(thread.key);
+      }
+    }
+    const originIds = tickets.map((t) => t.origin.triggerId);
+    const triggers = this.store.triggersByIds(originIds);
+    const sentFiles = this.store.sentFilesByTicket();
+    for (let i = 0; i < tickets.length; i++) {
+      const ticket = tickets[i];
+      const origin = triggers.get(ticket.origin.triggerId);
+      const asked =
+        typeof origin?.meta.originalText === "string" ? origin.meta.originalText : origin?.text;
+      const subscribed = this.ticketThreadMap.get(ticket.id);
+      const ticketThreads =
+        subscribed !== undefined && subscribed.size > 0
+          ? Array.from(subscribed)
+          : origin !== undefined
+            ? origin.threads.map((ref) => `${ref.source}:${ref.id}`)
+            : [];
+      const mergedArtifacts = new Set<string>(ticket.artifacts ?? []);
+      const historicalSent = sentFiles.get(ticket.id);
+      if (historicalSent !== undefined) {
+        for (const name of historicalSent) {
+          mergedArtifacts.add(name);
+        }
+      }
+      const entry: TicketIndexInput = {
+        ticket,
+        ...(asked !== undefined ? { asked } : {}),
+        threads: ticketThreads,
+        ...(mergedArtifacts.size > 0 ? { artifacts: Array.from(mergedArtifacts) } : {}),
+      };
+      index.upsert(entry);
+    }
+
+    this.store.onTicketSaved((ticket) => {
+      const origin = this.store.trigger(ticket.origin.triggerId);
+      const asked =
+        typeof origin?.meta.originalText === "string" ? origin.meta.originalText : origin?.text;
+      const subscribed = this.ticketThreadMap.get(ticket.id);
+      const ticketThreads =
+        subscribed !== undefined && subscribed.size > 0
+          ? Array.from(subscribed)
+          : origin !== undefined
+            ? origin.threads.map((ref) => `${ref.source}:${ref.id}`)
+            : [];
+      index.upsert({
+        ticket,
+        ...(asked !== undefined ? { asked } : {}),
+        threads: ticketThreads,
+        ...(ticket.artifacts !== undefined && ticket.artifacts.length > 0
+          ? { artifacts: ticket.artifacts }
+          : {}),
+      });
+    });
+
+    this.store.onThreadSaved((thread) => {
+      const prev = this.threadTicketMap.get(thread.key) ?? new Set<string>();
+      const next = new Set<string>(thread.subscriptions);
+      const changed = new Set<string>();
+      for (const tid of prev) {
+        if (!next.has(tid)) changed.add(tid);
+      }
+      for (const tid of next) {
+        if (!prev.has(tid)) changed.add(tid);
+      }
+      this.threadTicketMap.set(thread.key, next);
+      for (const tid of changed) {
+        let set = this.ticketThreadMap.get(tid);
+        if (set === undefined) {
+          set = new Set<string>();
+          this.ticketThreadMap.set(tid, set);
+        }
+        if (next.has(tid)) {
+          set.add(thread.key);
+        } else {
+          set.delete(thread.key);
+        }
+        if (!index.updateThreads(tid, Array.from(set))) {
+          const ticket = this.store.ticket(tid);
+          if (ticket !== null && ticket !== undefined) {
+            const origin = this.store.trigger(ticket.origin.triggerId);
+            const asked =
+              typeof origin?.meta.originalText === "string" ? origin.meta.originalText : origin?.text;
+            index.upsert({
+              ticket,
+              ...(asked !== undefined ? { asked } : {}),
+              threads: Array.from(set),
+              ...(ticket.artifacts !== undefined && ticket.artifacts.length > 0
+                ? { artifacts: ticket.artifacts }
+                : {}),
+            });
+          }
+        }
+      }
+    });
+
+    this.recallIndex = index;
+    return index;
+  }
 
   readResource(resource: string, offset: number, limit?: number, ticketId?: string): unknown {
     return resourcesMod.readResource(this, resource, offset, limit, ticketId);

@@ -19,7 +19,7 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { relayHook } from "../src/agent/hook-fast.ts";
-import { App, defaultTimings, RealKernels } from "../src/app/index.ts";
+import { App, defaultTimings, RealKernels, TicketSearchIndex } from "../src/app/index.ts";
 import * as procinfo from "../src/app/procinfo.ts";
 import { wordCount } from "../src/app/text.ts";
 import { Protocol } from "../src/app/wechat_protocol.ts";
@@ -915,6 +915,78 @@ function printMarkdownTable(results: readonly BenchResult[]): void {
   console.log("");
 }
 
+function benchRecall(): BenchResult[] {
+  const index = new TicketSearchIndex();
+  const thread = "chat:wechat:bench-user";
+  const allowedThreads = new Set([thread]);
+  for (let i = 0; i < 1000; i++) {
+    const at = formatIso(BASE_MS + i * 60_000);
+    const isTarget = i === 350;
+    const title = isTarget
+      ? "二十万人民币一年游历五大洲旅居漫游计划"
+      : `历史任务归档记录 #${i} 模块性能与界面巡检`;
+    const ticket: Ticket = {
+      id: `tk-bench-${i}`,
+      title,
+      decisionId: `dec-${i}`,
+      mandate: {
+        strength: "explicit",
+        policyVersion: "v1",
+        basis: mandateBasisVia({ via: "addressed", addressed: "direct" }, { source: "chat" }),
+        actor: { source: "chat", id: "wechat:bench-user" },
+        scope: title,
+      },
+      channels: [],
+      assignments: [],
+      inputs: [],
+      undelivered: [],
+      createdAt: at,
+      updatedAt: at,
+      origin: { triggerId: `tr-${i}`, triggerIds: [`tr-${i}`] },
+      ended: { at, by: "executor", outcome: "completed" },
+      ...(isTarget ? { artifacts: ["二十万人民币一年游历五大洲旅居漫游计划.pdf"] } : {}),
+    };
+    index.upsert({
+      ticket,
+      asked: isTarget ? "出发地成都，假期一年，预算二十万，五大洲慢游路线" : `执行例行巡检任务 ${i}`,
+      threads: [thread],
+    });
+  }
+  const queries = [
+    "二十万五大洲计划 包含哪些国家？给我一个列表。",
+    "帮我新做一个十万四大洲半年穷游计划",
+    "修改按钮",
+    "20万游历五大洲pdf",
+  ];
+  const passive = measureSync(
+    "Recall",
+    "recallForCandidate (1,000 tickets)",
+    200,
+    20,
+    (iter) => {
+      index.recallForCandidate({
+        queryTexts: [queries[Math.abs(iter) % queries.length]!],
+        currentThread: thread,
+        allowedThreads,
+      });
+    },
+  );
+  const active = measureSync(
+    "Recall",
+    "search (1,000 tickets)",
+    200,
+    20,
+    (iter) => {
+      index.search({
+        query: queries[Math.abs(iter) % queries.length]!,
+        currentThread: thread,
+        allowedThreads,
+      });
+    },
+  );
+  return [passive, active];
+}
+
 async function main(): Promise<void> {
   if (!fs.existsSync(NEO_AGENT_BIN)) {
     throw new Error(`Compiled neo-agent binary not found at ${NEO_AGENT_BIN}; run \`bun run build\` first.`);
@@ -933,6 +1005,7 @@ async function main(): Promise<void> {
     allResults.push(...(await benchWorkerBin(tmp)));
     allResults.push(...benchProcinfo(tmp));
     allResults.push(...benchText());
+    allResults.push(...benchRecall());
   } finally {
     tmp.cleanup();
   }

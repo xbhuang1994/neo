@@ -873,3 +873,206 @@ describe("effect rows", () => {
     store.close();
   });
 });
+
+// --- pagination, batch lookup, sent files, and commit hooks ---
+
+describe("pagination, batch lookup, sent files, and commit hooks", () => {
+  test("pages tickets newest first and reports total ticketCount", () => {
+    const store = Store.memory();
+    expect(store.ticketCount()).toBe(0);
+    expect(store.ticketPage(0, 10)).toEqual([]);
+
+    for (let i = 1; i <= 5; i++) {
+      store.saveTicket(makeTicket(`t${i}`));
+    }
+    expect(store.ticketCount()).toBe(5);
+    expect(store.ticketPage(0, 2).map((t) => t.id)).toEqual(["t5", "t4"]);
+    expect(store.ticketPage(2, 2).map((t) => t.id)).toEqual(["t3", "t2"]);
+    expect(store.ticketPage(4, 2).map((t) => t.id)).toEqual(["t1"]);
+    expect(store.ticketPage(5, 2)).toEqual([]);
+    expect(store.ticketPage(0, 0)).toEqual([]);
+
+    // Updating an existing ticket does not change ticketCount or its rowid order.
+    const updated = makeTicket("t2");
+    updated.title = "Updated t2";
+    store.saveTicket(updated);
+    expect(store.ticketCount()).toBe(5);
+    expect(store.ticketPage(0, 5).map((t) => t.id)).toEqual(["t5", "t4", "t3", "t2", "t1"]);
+    expect(store.ticket("t2")?.title).toBe("Updated t2");
+    store.close();
+  });
+
+  test("batch-fetches triggersByIds across empty, missing, duplicate, and >250 batches", () => {
+    const store = Store.memory();
+    expect(store.triggersByIds([]).size).toBe(0);
+    expect(store.triggersByIds(["missing-1", "missing-2"]).size).toBe(0);
+
+    const total = 265;
+    const allIds: string[] = [];
+    store.atomic(() => {
+      for (let i = 0; i < total; i++) {
+        const id = `trig-${String(i).padStart(3, "0")}`;
+        allIds.push(id);
+        store.saveTrigger(makeTrigger(id, "t1", `2026-01-01T00:00:${String(i % 60).padStart(2, "0")}.000Z`));
+      }
+    });
+
+    // Include duplicates and missing IDs alongside all 265 stored IDs (>200 chunk boundary).
+    const queriedIds = [...allIds, "trig-000", "trig-264", "not-found"];
+    const fetched = store.triggersByIds(queriedIds);
+    expect(fetched.size).toBe(total);
+    expect(fetched.get("trig-000")?.text).toBe("message trig-000");
+    expect(fetched.get("trig-199")?.text).toBe("message trig-199");
+    expect(fetched.get("trig-200")?.text).toBe("message trig-200");
+    expect(fetched.get("trig-264")?.text).toBe("message trig-264");
+    expect(fetched.has("not-found")).toBe(false);
+    store.close();
+  });
+
+  test("extracts sentFilesByTicket from sent outbox receipts fault-tolerantly", () => {
+    withTempDir("sent-files", (dir) => {
+      const dbPath = path.join(dir, "sent-files.sqlite");
+      const store = Store.open(dbPath);
+      const sendFileReceipt = (id: string, ticketId: string | undefined, text: string, kind: "reply" | "acknowledgement" = "reply") => {
+        store.recordSentReceipt(
+          {
+            id,
+            channel: {
+              source: "chat",
+              thread: "wechat:u1",
+              address: { surface: "wechat", conversation: "wechat:u1", sender: "wechat:u1" },
+            },
+            text,
+            kind,
+            ...(ticketId !== undefined ? { ticketId } : {}),
+          },
+          "2026-01-01T00:00:00.000Z",
+        );
+      };
+
+      // Standalone filenames (ASCII & Chinese) and captions mentioning deliverable files.
+      sendFileReceipt("f1", "t1", "report.docx");
+      sendFileReceipt("f2", "t1", "2026年市场调研报告.pdf");
+      sendFileReceipt("f3", "t1", "已更新，请查收 summary.xlsx 和 report.docx");
+      // Normal prose, URLs, acknowledgements, pending, dropped, and no-ticketId rows are ignored.
+      sendFileReceipt("f4", "t1", "任务已完成，没有附件。");
+      sendFileReceipt("f5", "t1", "请访问 https://example.com/hidden.pdf 查看");
+      sendFileReceipt("f6", "t1", "收到，开始准备 ack-ignored.pdf", "acknowledgement");
+      sendFileReceipt("f7", undefined, "orphan.pdf");
+      store.addReceipt({ ...makeMessage("f8", "t2", "wechat:u1"), text: "pending-only.pdf" });
+      store.addReceipt({ ...makeMessage("f9", "t2", "wechat:u1"), text: "dropped-only.pdf" });
+      store.settleReceipt({ ...makeMessage("f9", "t2", "wechat:u1"), text: "dropped-only.pdf" }, settledDropped("channelGone"));
+      sendFileReceipt("f10", "t3", "Q1 Sales Report.pdf");
+      store.close();
+
+      // Inject unexpected JSON shapes directly to verify fault-tolerance (never throws).
+      const rawDb = new Database(dbPath, { readwrite: true });
+      rawDb
+        .query("INSERT INTO outbox (id, value) VALUES (?1, ?2)")
+        .run("weird-1", JSON.stringify({ status: "sent", ticketId: "t1", kind: "reply", text: 12345 }));
+      rawDb
+        .query("INSERT INTO outbox (id, value) VALUES (?1, ?2)")
+        .run("weird-2", JSON.stringify({ status: "sent", ticketId: "", kind: "reply", text: "empty.pdf" }));
+      rawDb
+        .query("INSERT INTO outbox (id, value) VALUES (?1, ?2)")
+        .run("weird-3", JSON.stringify({ status: "sent", ticketId: "t4", kind: "reply", message: { text: "nested.pdf" } }));
+      rawDb.close();
+
+      const reopened = Store.open(dbPath);
+      try {
+        const files = reopened.sentFilesByTicket();
+        expect(files.get("t1")).toEqual(["summary.xlsx", "report.docx", "2026年市场调研报告.pdf"]);
+        expect(files.has("t2")).toBe(false);
+        expect(files.get("t3")).toEqual(["Q1 Sales Report.pdf"]);
+        expect(files.get("t4")).toEqual(["nested.pdf"]);
+      } finally {
+        reopened.close();
+      }
+    });
+  });
+
+  test("fires onTicketSaved and onThreadSaved only after outermost commit and never on rollback", () => {
+    const store = Store.memory();
+    const savedTickets: Array<{ id: string; title: string }> = [];
+    const savedThreads: Array<{ key: string; pending: string[] }> = [];
+
+    const unsubTicket = store.onTicketSaved((ticket) => {
+      savedTickets.push({ id: ticket.id, title: ticket.title });
+      // Mutating the delivered snapshot does not affect stored state or other listeners.
+      ticket.title = "mutated-by-listener";
+    });
+    const unsubThread = store.onThreadSaved((thread) => {
+      savedThreads.push({ key: thread.key, pending: [...thread.pending] });
+    });
+
+    // Outside a transaction, hooks fire immediately.
+    store.saveTicket(makeTicket("t-direct"));
+    store.saveThread(makeThread("th-direct"));
+    expect(savedTickets).toEqual([{ id: "t-direct", title: "Ticket t-direct" }]);
+    expect(savedThreads).toEqual([{ key: "chat:th-direct", pending: [] }]);
+    expect(store.ticket("t-direct")?.title).toBe("Ticket t-direct");
+
+    // Inside a transaction: deferred until outermost commit; rolled-back inner savepoints never notify.
+    store.atomic(() => {
+      const outerTicket = makeTicket("t-outer");
+      store.saveTicket(outerTicket);
+      const outerThread = makeThread("th-outer");
+      outerThread.pending = ["g1"];
+      store.saveThread(outerThread);
+
+      // Inner committed savepoint merges into outer commit.
+      store.atomic(() => {
+        store.saveTicket(makeTicket("t-inner-ok"));
+      });
+
+      // Inner rolled-back savepoint discards its notifications.
+      expect(() =>
+        store.atomic(() => {
+          store.saveTicket(makeTicket("t-inner-fail"));
+          store.saveThread(makeThread("th-inner-fail"));
+          throw new Error("inner rollback");
+        }),
+      ).toThrow("inner rollback");
+
+      // Nothing fired yet before outer commit.
+      expect(savedTickets.length).toBe(1);
+      expect(savedThreads.length).toBe(1);
+    });
+
+    expect(savedTickets).toEqual([
+      { id: "t-direct", title: "Ticket t-direct" },
+      { id: "t-outer", title: "Ticket t-outer" },
+      { id: "t-inner-ok", title: "Ticket t-inner-ok" },
+    ]);
+    expect(savedThreads).toEqual([
+      { key: "chat:th-direct", pending: [] },
+      { key: "chat:th-outer", pending: ["g1"] },
+    ]);
+
+    // Outer rollback discards all notifications (including committed nested savepoints).
+    expect(() =>
+      store.atomic(() => {
+        store.saveTicket(makeTicket("t-outer-fail"));
+        store.saveThread(makeThread("th-outer-fail"));
+        store.atomic(() => {
+          store.saveTicket(makeTicket("t-nested-under-failed-outer"));
+          store.saveThread(makeThread("th-nested-under-failed-outer"));
+        });
+        throw new Error("outer rollback");
+      }),
+    ).toThrow("outer rollback");
+    expect(savedTickets.length).toBe(3);
+    expect(savedThreads.length).toBe(2);
+
+    // Unsubscribe is idempotent and stops further notifications.
+    unsubTicket();
+    unsubTicket();
+    unsubThread();
+    unsubThread();
+    store.saveTicket(makeTicket("t-after-unsub"));
+    store.saveThread(makeThread("th-after-unsub"));
+    expect(savedTickets.length).toBe(3);
+    expect(savedThreads.length).toBe(2);
+    store.close();
+  });
+});

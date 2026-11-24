@@ -17,6 +17,7 @@ import {
   type TriggerDisposition,
 } from "../core/index.ts";
 import { isRecord } from "../kernel/types.ts";
+import { sanitizeCardText } from "./recall.ts";
 import { clip } from "./text.ts";
 
 const WHITESPACE_RUN = /\p{White_Space}+/gu;
@@ -158,6 +159,22 @@ export function briefCard(ticket: Ticket): Record<string, unknown> {
   return card;
 }
 
+/** A richer ticket list card for `orchestrator_read("tickets")`, leaving `ticketCard`/`briefCard` compact. */
+export function ticketListCard(ticket: Ticket, asked?: string | null): Record<string, unknown> {
+  const card = ticketCard(ticket);
+  card.updated = clip(ticket.updatedAt, 16);
+  if (asked !== undefined && asked !== null) {
+    const cleaned = sanitizeCardText(asked, 80);
+    if (cleaned.length > 0) {
+      card.asked = cleaned;
+    }
+  }
+  if (ticket.artifacts !== undefined && ticket.artifacts.length > 0) {
+    card.artifacts = ticket.artifacts.slice(0, 5);
+  }
+  return card;
+}
+
 /**
  * A chat candidate's compact ticket card: what routing a message needs. `asked` is the start of the request it was
  * accepted from, which holds the names a title leaves out.
@@ -182,7 +199,10 @@ export function routingCard(ticket: Ticket, asked?: string | null): Record<strin
   return card;
 }
 
-/** The tickets a candidate may belong to: open ones first, then newest first, with how many there are in all. */
+/**
+ * The tickets a candidate may belong to: open ones first, then ended non-dropped before dropped,
+ * each group ordered by `updatedAt DESC` with `createdAt DESC` as tie-breaker, plus total count.
+ */
 export function relatedTickets<R = Record<string, unknown>>(
   tickets: readonly Ticket[],
   limit: number,
@@ -195,6 +215,15 @@ export function relatedTickets<R = Record<string, unknown>>(
     if (aEnded !== bEnded) {
       return aEnded - bEnded;
     }
+    if (aEnded === 1) {
+      const aDropped = a.ended?.outcome === "dropped" ? 1 : 0;
+      const bDropped = b.ended?.outcome === "dropped" ? 1 : 0;
+      if (aDropped !== bDropped) {
+        return aDropped - bDropped;
+      }
+    }
+    if (b.updatedAt < a.updatedAt) return -1;
+    if (b.updatedAt > a.updatedAt) return 1;
     if (b.createdAt < a.createdAt) return -1;
     if (b.createdAt > a.createdAt) return 1;
     return 0;

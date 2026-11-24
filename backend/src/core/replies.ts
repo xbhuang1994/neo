@@ -145,6 +145,7 @@ function answer(ctx: EngineContext, request: ReplyRequest): Reply {
       .tickets()
       .find(
         (item) =>
+          item.ended?.outcome !== "dropped" &&
           !returned(item.id) &&
           (item.origin.triggerIds.includes(trigId) || hasTriggerInput(item, trigId)),
       );
@@ -204,7 +205,9 @@ function answer(ctx: EngineContext, request: ReplyRequest): Reply {
   const channel =
     request.purpose === "answer"
       ? trigger?.channel
-      : (asker?.channel ?? (ticket !== undefined ? sourceChannel(ctx, ticket) : undefined));
+      : request.purpose === "result"
+        ? (asker?.channel ?? (ticket !== undefined ? resultChannel(ctx, ticket) : undefined))
+        : (asker?.channel ?? (ticket !== undefined ? sourceChannel(ctx, ticket) : undefined));
   if (channel === undefined) {
     throw UserError.create("noChannel");
   }
@@ -244,6 +247,84 @@ function answer(ctx: EngineContext, request: ReplyRequest): Reply {
     status: ctx.o.outbox.status(id) ?? "pending",
     reused: existing !== undefined,
   };
+}
+
+/**
+ * Where a ticket's result goes: the latest non-context human trigger input's Channel when it arrived from a
+ * different conversation in the current round or resume (such as a Web ticket resumed via WeChat `attach`),
+ * otherwise the ticket's starting conversation (`sourceChannel`).
+ */
+function resultChannel(ctx: EngineContext, ticket: Ticket): ChannelRef | undefined {
+  const origin = sourceChannel(ctx, ticket);
+
+  // Locate the latest report index so only a *prior* completed result establishes the previous-round boundary.
+  let latestReportIndex = -1;
+  for (let i = ticket.assignments.length - 1; i >= 0; i--) {
+    if (ticket.assignments[i].report !== undefined) {
+      latestReportIndex = i;
+      break;
+    }
+  }
+  const currentReportAt =
+    latestReportIndex >= 0 ? ticket.assignments[latestReportIndex].report?.at : undefined;
+
+  let priorResultAt: string | undefined;
+  if (ticket.resultSent !== undefined && ticket.resultSent !== currentReportAt) {
+    priorResultAt = ticket.resultSent;
+  }
+  for (let i = latestReportIndex - 1; i >= 0; i--) {
+    const report = ticket.assignments[i].report;
+    if (report !== undefined && report.state === "ready") {
+      if (priorResultAt === undefined || report.at > priorResultAt) {
+        priorResultAt = report.at;
+      }
+      break;
+    }
+  }
+
+  for (let i = ticket.inputs.length - 1; i >= 0; i--) {
+    const input = ticket.inputs[i];
+    if (input.kind !== "trigger" || input.human !== true || input.context === true) {
+      continue;
+    }
+    const trigger = ctx.repo().trigger(input.triggerId);
+    if (trigger === undefined) {
+      continue;
+    }
+    const disp = ctx.repo().disposition(trigger.id);
+    if (disp !== undefined && handedBackBy(disp, ticket.id)) {
+      continue;
+    }
+    if (trigger.channel === undefined) {
+      return origin;
+    }
+    if (origin === undefined) {
+      return trigger.channel;
+    }
+    const sameConversation =
+      trigger.channel.source === origin.source && trigger.channel.thread === origin.thread;
+    if (sameConversation) {
+      return origin;
+    }
+    if (priorResultAt === undefined) {
+      return input.at >= ticket.createdAt ? trigger.channel : origin;
+    }
+    if (input.at > priorResultAt) {
+      return trigger.channel;
+    }
+    // Same-timestamp resume under fast/mocked clocks: confirm a `resumed` input follows for this trigger.
+    if (input.at === priorResultAt) {
+      for (let j = i + 1; j < ticket.inputs.length; j++) {
+        const later = ticket.inputs[j];
+        if (later.kind === "resumed" && later.triggerId === input.triggerId) {
+          return trigger.channel;
+        }
+      }
+    }
+    return origin;
+  }
+
+  return origin;
 }
 
 /** The conversation a ticket started in: its origin Trigger's Channel, else its first Channel. */

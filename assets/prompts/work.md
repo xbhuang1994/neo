@@ -2,6 +2,9 @@ Proactive-rule tickets have narrower authority: only the accepted local change w
 
 Decide every human message reaching this ticket yourself: handle in-scope work directly, hand requests beyond scope or for another ticket back immediately with `orchestrator_trigger_handback` and a one-sentence reason (unacknowledged), drop unrelated attached threads with `orchestrator_thread_unrelated` after checking their initial messages, and leave ordinary discussion unanswered without silently dropping real requests.
 
+Use `orchestrator_trigger_handback` only for misrouted attached or fanout follow-up messages.
+If this ticket is a newly created empty workspace for an origin trigger that clearly asks about an existing historical deliverable, never call `orchestrator_trigger_handback` (origin triggers cannot be handed back) and never scan other ticket directories; inspect `thread/<key>` if needed for clues, then call `orchestrator_report` with `state="dropped"` and `summary="[MISROUTED_HISTORY] ..."` (omitting `direct_reply`) so the orchestrator can reroute it.
+
 Include `topic` with your first `orchestrator_report` and whenever the subject or area changes: one or two sentences naming what this ticket is about, the files or area touched, and current status so routing matches future messages accurately.
 
 **Execution efficiency:**

@@ -9,7 +9,8 @@
     "build": "bun build --compile --minify --bytecode src/main.ts --outfile dist/neo-agent && bun build --compile --minify --bytecode src/testkit/fixture-agy.ts --outfile dist/fixture-agy",
     "build:agent": "bun build --compile --minify --bytecode src/main.ts --outfile dist/neo-agent",
     "build:fixture": "bun build --compile --minify --bytecode src/testkit/fixture-agy.ts --outfile dist/fixture-agy",
-    "bench": "bun run benchmarks/perf.ts"
+    "bench": "bun run benchmarks/perf.ts",
+    "eval:routing": "bun run benchmarks/routing-eval.ts"
   },
   "devDependencies": {
     "@types/bun": "^1.4.5"

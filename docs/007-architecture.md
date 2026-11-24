@@ -63,13 +63,14 @@ The app depends on: `cupertino_ui` (Flutter's Cupertino widgets), `cupertino_ico
 | `backend/src/app/index.ts`, `app.ts`, `context.ts`, `kernel-types.ts`, `settings.ts`, `policy.ts`, `health.ts`, `text.ts`, `http.ts` | The application value and its wiring, shared context contract, settings, Policy, component health, Unicode word limits, outbound HTTP client |
 | `backend/src/app/effects.ts`, `passes.ts`, `outbox.ts`, `notices.ts` | Event-driven effect queue, orchestration passes, outbound messages, notices and relays to the main Session |
 | `backend/src/app/kernels.ts`, `sessions.ts`, `prompts.ts`, `tools.ts`, `resources.ts`, `cards.ts`, `assess.ts` | Launching Antigravity per role, Sessions and per-session locks, embedded prompts, JSON-Schema tools, readable resources, cards, candidate delivery and assessment |
+| `backend/src/app/recall.ts`, `artifacts.ts`, `clarification.ts`, `access.ts` | Historical ticket anti-noise retrieval index (CJK 2-gram + `Intl.Segmenter` + atomic numerals + IDF), deliverable artifact collector, pre-route clarification state, and cross-surface/sidecar access control |
 | `backend/src/app/accounts.ts` | Antigravity's Google account status, piped `acp --login` flow, and logout |
 | `backend/src/app/executor.ts`, `blocked.ts`, `sidecar.ts`, `watchdog.ts`, `procinfo.ts` | The Executor, blocked command stand-ins, Sidecar, Watchdog, and direct `/proc` process sampling |
 | `backend/src/app/chat.ts`, `wechat.ts`, `wechat_protocol.ts`, `wechat_typing.ts`, `views.ts` | The chat Source, WeChat iLink bridge, AES-128-ECB CDN protocol, idle-skipping typing loop, and cached API views |
 | `backend/src/http/index.ts`, `server.ts`, `api.ts` | Raw `node:net` HTTP/1.1 keep-alive server with `TCP_NODELAY`, API routes, constant-time token & origin control, CSP static web serving |
 | `backend/src/agent/cli.ts`, `paths.ts`, `instance.ts`, `hook-fast.ts`, `runner.ts` | Command-line parser, machine paths, OS `flock` single-instance lock, zero-import `agy-hook` relay, lazy-loaded CLI runner |
 | `backend/src/testkit/index.ts`, `fixture-agy.ts` | Test support: temporary directories, mock loopback HTTP server, scripted kernel, and standalone pure-TS `fixture-agy` stand-in |
-| `backend/benchmarks/perf.ts` | Reproducible latency and throughput benchmark suite for Store, Engine, Journal, HTTP API, `agy-hook`, `worker-bin`, `/proc`, and text utilities |
+| `backend/benchmarks/perf.ts`, `routing-eval.ts` | Reproducible latency/throughput benchmarks (Store, Engine, Journal, HTTP, `agy-hook`, `worker-bin`, `/proc`, text, recall index) and L3 real-LLM routing evaluation sandbox |
 | `app/lib/main.dart` | The app's entry and root widget |
 | `app/lib/src/api/client.dart`, `models.dart` | The API client and what it carries |
 | `app/lib/src/state/app_state.dart` | Connection and polled state |
@@ -83,10 +84,10 @@ The app depends on: `cupertino_ui` (Flutter's Cupertino widgets), `cupertino_ico
 | Files | Coverage |
 | --- | --- |
 | `backend/tests/core/engine.test.ts`, `tickets.test.ts`, `lifecycle.test.ts` | The Engine over the in-memory repository |
-| `backend/tests/store/core_engine.test.ts`, `store.test.ts` | The same Engine tests over SQLite; savepoints, receipts, generated columns, read models, effect rows, schema version |
+| `backend/tests/store/core_engine.test.ts`, `store.test.ts`, `search.test.ts` | The same Engine tests over SQLite; savepoints, receipts, generated columns, read models, effect rows, schema version, and L1 historical recall/adversarial gates |
 | `backend/tests/kernel/session.test.ts`, `antigravity_lifecycle.test.ts` | The Session, O(1) journal, process groups, and Antigravity driver lifecycle with a pure-TS stand-in and real `relayHook` |
-| `backend/tests/app/utils.test.ts`, `cards_notices.test.ts`, `kernels_accounts.test.ts`, `policy.test.ts`, `effects.test.ts`, `wechat_protocol.test.ts` | Utilities, prompts, blocked commands, `/proc`, cards/notices, kernels/accounts, gate & Policy, effect queue & Outbox, WeChat crypto/protocol |
-| `backend/tests/app/flow.test.ts`, `work.test.ts`, `watchdog.test.ts`, `views.test.ts`, `wechat.test.ts` | Full application over a scripted kernel: end-to-end request flows, workers, Watchdog, API views, WeChat bridge |
+| `backend/tests/app/utils.test.ts`, `cards_notices.test.ts`, `kernels_accounts.test.ts`, `policy.test.ts`, `effects.test.ts`, `wechat_protocol.test.ts`, `clarification_access.test.ts` | Utilities, prompts, blocked commands, `/proc`, cards/notices, kernels/accounts, gate & Policy, effect queue & Outbox, WeChat crypto/protocol, pre-route clarification & access control |
+| `backend/tests/app/flow.test.ts`, `work.test.ts`, `watchdog.test.ts`, `views.test.ts`, `wechat.test.ts`, `recall_routing.test.ts` | Full application over a scripted kernel: end-to-end request flows, workers, Watchdog, API views, WeChat bridge, and L2 historical recall/clarify/security integration flows |
 | `backend/tests/http/server.test.ts`, `api_unit.test.ts`, `api.test.ts` | HTTP/1.1 framing edge cases, access control, static files, and all API routes against a real `App` |
 | `backend/tests/agent/unit.test.ts`, `process.test.ts`, `docs.test.ts` | CLI/paths/OS-lock/fast-hook units, compiled `dist/neo-agent` + `dist/fixture-agy` process tests, and documentation invariants |
 | `app/test/qr_code_test.dart`, `logic_test.dart`, `app_test.dart`, `host_io_test.dart`, `fake_backend.dart` | The QR encoder, formatting, models, client and state, every page over a fake backend, and desktop host with the real compiled backend |

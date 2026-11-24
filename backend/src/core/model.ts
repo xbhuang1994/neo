@@ -550,6 +550,8 @@ export interface Ticket {
   delivery?: DeliveryFailure;
   /** When the report was made whose result a person was sent: that report's result is not sent a second time. */
   resultSent?: string;
+  /** Sanitized deliverable filenames/relative paths recorded on completion or file delivery, for historical recall; omitted when empty. */
+  artifacts?: string[];
 }
 
 /** Whether the ticket is open: it has not ended. */

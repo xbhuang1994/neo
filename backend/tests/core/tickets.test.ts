@@ -11,11 +11,13 @@ import {
   parseIso,
   reasonCode,
   reasonOf,
+  reasonText,
   reasonWith,
   runningAssignment,
   ticketInputTriggerId,
   ticketStage,
   waitsForPerson,
+  type ChannelRef,
   type PolicyEffect,
   type ReplyRequest,
   type ReportState,
@@ -539,6 +541,59 @@ describe("worker reports", () => {
     expect([end.by, end.outcome, end.reason]).toEqual(["human", "stopped", "Human asked to stop"]);
     expect(ticketStage(h.ticket(ticketId))).toEqual({ kind: "ended" });
   });
+
+  test("merges and deduplicates report artifacts new-first up to 20 and ignores dropped reports", () => {
+    const h = harness();
+    const ticketId = h.accepted();
+
+    // Whitespace-only artifacts are omitted; valid artifacts are deduplicated preserving order.
+    const first = h.engine.report(ticketId, {
+      ...report("progress", "drafted"),
+      artifacts: ["  ", "report.docx", "chart.png", "report.docx"],
+    });
+    expect(first.artifacts).toEqual(["report.docx", "chart.png"]);
+
+    // Subsequent reports place newly passed artifacts first and deduplicate against existing ones.
+    h.tick(1);
+    const second = h.engine.report(ticketId, {
+      ...report("progress", "updated"),
+      artifacts: ["summary.pdf", "report.docx", "appendix.xlsx"],
+    });
+    expect(second.artifacts).toEqual(["summary.pdf", "report.docx", "appendix.xlsx", "chart.png"]);
+
+    // Cap at 20 artifacts, prioritizing newest items.
+    h.tick(1);
+    const many = Array.from({ length: 19 }, (_, idx) => `file-${idx + 1}.pdf`);
+    const capped = h.engine.report(ticketId, {
+      ...report("progress", "many deliverables"),
+      artifacts: many,
+    });
+    expect(capped.artifacts?.length).toBe(20);
+    expect(capped.artifacts?.slice(0, 19)).toEqual(many);
+    expect(capped.artifacts?.[19]).toBe("summary.pdf");
+
+    // A dropped report never overwrites or adds artifacts.
+    h.tick(1);
+    const dropped = h.engine.report(ticketId, {
+      ...report("dropped", "nothing left"),
+      artifacts: ["should-not-appear.pdf"],
+    });
+    expect(dropped.artifacts).toEqual(capped.artifacts);
+
+    // On a ticket with no prior artifacts, a dropped report keeps artifacts omitted.
+    const other = h.acceptedOn("2", "t2");
+    const droppedEmpty = h.engine.report(other, {
+      ...report("dropped", "duplicate"),
+      artifacts: ["nope.pdf"],
+    });
+    expect(droppedEmpty.artifacts).toBeUndefined();
+
+    // New structured reason codes format cleanly.
+    expect(reasonText([reasonCode("clarificationRequested")])).toBe(
+      "Clarification requested from the person",
+    );
+    expect(reasonText([reasonCode("sidecarRouted")])).toBe("Answered via read-only sidecar");
+  });
 });
 
 // --- attach ---
@@ -930,5 +985,109 @@ describe("replies", () => {
     expect(stopped.delivery).toBeUndefined();
     expect(stopped.undelivered).toEqual([]);
     expect(stopped.assignments.every((a) => a.state === "ended")).toBe(true);
+  });
+
+  test("unlocks answer replies after an accidental ticket reports dropped while keeping live and completed tickets guarded", () => {
+    const h = harness();
+    const droppedTicketId = h.accepted();
+
+    // While live and unanswered, answering the origin trigger is refused.
+    expect(errorCode(() => h.engine.reply(answer("1", "Direct answer")))).toBe("noAnswer");
+
+    // Once the accidental ticket ends with outcome "dropped", answering/sidecar on trigger "1" succeeds.
+    h.report(droppedTicketId, "dropped", "accidental empty ticket");
+    const sent = h.engine.reply(answer("1", "Here is the sidecar answer."));
+    expect([sent.status, sent.reused]).toEqual(["pending", false]);
+    const queued = h.outbox().pop()!;
+    expect([queued.channel, queued.text, queued.ticketId]).toEqual([
+      channel("1"),
+      "Here is the sidecar answer.",
+      undefined,
+    ]);
+
+    // A live ticket or a completed ticket that did not report `answers` still strictly refuses `answer`.
+    const completedTicketId = h.acceptedOn("10", "t10");
+    h.tick(1);
+    h.receive(on(by(trigger("11"), guest()), "t10"));
+    h.settle();
+    expect(errorCode(() => h.engine.reply(answer("10", "Steal live origin")))).toBe("noAnswer");
+    expect(errorCode(() => h.engine.reply(answer("11", "Steal live follow-up")))).toBe("noAnswer");
+
+    h.tick(1);
+    h.report(completedTicketId, "ready", "Finished without marking answers");
+    expect(errorCode(() => h.engine.reply(answer("10", "Steal completed origin")))).toBe("noAnswer");
+    expect(errorCode(() => h.engine.reply(answer("11", "Steal completed follow-up")))).toBe("noAnswer");
+  });
+
+  test("routes cross-channel attach continuation results to the resuming channel while preserving same-thread routing", () => {
+    const h = harness();
+    const webChannel: ChannelRef = {
+      source: "chat",
+      thread: "web",
+      address: { surface: "web", conversation: "web", sender: "web:local" },
+    };
+    const wechatChannel: ChannelRef = {
+      source: "chat",
+      thread: "wechat:u1",
+      address: { surface: "wechat", conversation: "wechat:u1", sender: "wechat:u1" },
+    };
+
+    // 1. Ticket created on Web completes Round 1 -> result goes to Web.
+    h.receive({ ...on(trigger("w1"), "web"), channel: webChannel });
+    h.pump();
+    const ticketId = h.decide(h.lastRequest(), acceptPlain("Market report")).ticketId!;
+    h.settle();
+    h.tick(5);
+    h.report(ticketId, "ready", "v1 ready");
+    expect(h.engine.reply(result(ticketId, "v1 done")).reused).toBe(false);
+    expect(h.outbox().pop()!.channel).toEqual(webChannel);
+
+    // 2. User continues from WeChat via `attach` -> worker reports `ready` without `answers` -> result goes to WeChat.
+    h.tick(5);
+    h.receive({ ...on(trigger("wx1"), "wechat:u1"), channel: wechatChannel });
+    h.pump();
+    h.engine.attach(ticketId, "wx1", "Continue on WeChat");
+    h.settle();
+    h.tick(5);
+    h.report(ticketId, "ready", "v2 ready");
+    const v2Reply = h.engine.reply(result(ticketId, "v2 done"));
+    expect([v2Reply.status, v2Reply.reused]).toEqual(["pending", false]);
+    expect(h.outbox().pop()!.channel).toEqual(wechatChannel);
+    // Idempotent reuse of the same result still succeeds.
+    expect(h.engine.reply(result(ticketId, "v2 done")).reused).toBe(true);
+
+    // 3. Round 3 resumed back from Web -> result returns to Web.
+    h.tick(5);
+    h.receive({ ...on(trigger("w2"), "web"), channel: webChannel });
+    h.settle();
+    h.tick(5);
+    h.report(ticketId, "ready", "v3 ready");
+    expect(h.engine.reply(result(ticketId, "v3 done")).reused).toBe(false);
+    expect(h.outbox().pop()!.channel).toEqual(webChannel);
+
+    // 4. Context-only threads and handed-back cross-channel messages do NOT hijack the origin Web channel.
+    const guarded = h.acceptedOn("g1", "web-guarded");
+    h.engine.followForContext(guarded, thread("wechat:ctx"));
+    h.tick(5);
+    h.receive({ ...on(trigger("wx-ctx"), "wechat:ctx"), channel: wechatChannel });
+    h.receive({ ...on(trigger("wx-hb"), "wechat:hb"), channel: wechatChannel });
+    h.pump();
+    h.engine.attach(guarded, "wx-hb");
+    h.settle();
+    h.engine.handback(guarded, "wx-hb", "unrelated to this ticket");
+    h.tick(5);
+    h.report(guarded, "ready", "guarded done");
+    h.engine.reply(result(guarded, "guarded done"));
+    expect(h.outbox().pop()!.channel).toEqual(channel("g1"));
+
+    // 5. Same-thread follow-ups (even later in time with a different message address) keep the origin channel.
+    const sameThread = h.acceptedOn("s1", "t-same");
+    h.tick(10);
+    h.receive(on(by(trigger("s2"), guest()), "t-same"));
+    h.settle();
+    h.tick(5);
+    h.report(sameThread, "ready", "same-thread done");
+    h.engine.reply(result(sameThread, "same-thread done"));
+    expect(h.outbox().pop()!.channel).toEqual(channel("s1"));
   });
 });

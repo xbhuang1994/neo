@@ -3,7 +3,7 @@
  */
 
 import type { Database } from "bun:sqlite";
-import type { Decision, Thread, Trigger } from "../core/index.ts";
+import type { Decision, Thread, Ticket, Trigger } from "../core/index.ts";
 import type { Receipt } from "./receipts.ts";
 
 /** A Trigger's position on its thread timeline, ordered by timestamp and then id. */
@@ -25,6 +25,11 @@ export interface FailingReply {
 }
 
 interface ValueRow {
+  value: string;
+}
+
+interface IdValueRow {
+  id: string;
   value: string;
 }
 
@@ -92,6 +97,49 @@ const SQL_DROPPED_SINCE = "SELECT COUNT(*) AS count FROM outbox WHERE dropped >=
 const SQL_SUBSCRIBED_BY_SOURCE = "SELECT value FROM thread WHERE subscribed = ?1 ORDER BY rowid";
 const SQL_SUBSCRIBED_ALL =
   "SELECT value FROM thread INDEXED BY thread_subscribed WHERE subscribed IS NOT NULL ORDER BY rowid";
+const SQL_TICKET_PAGE = "SELECT value FROM ticket ORDER BY rowid DESC LIMIT ?1 OFFSET ?2";
+const SQL_TICKET_COUNT = "SELECT COUNT(*) AS count FROM ticket";
+const SQL_SENT_TICKET_OUTBOX =
+  "SELECT value FROM outbox WHERE value ->> '$.status' = 'sent' AND value ->> '$.ticketId' IS NOT NULL AND value ->> '$.kind' = 'reply' ORDER BY rowid DESC";
+
+const TRIGGER_BATCH_SIZE = 200;
+const MAX_SENT_FILES_PER_TICKET = 20;
+const DELIVERABLE_EXTENSIONS =
+  "pdf|docx?|xlsx?|pptx?|csv|tsv|md|txt|json|jsonl|html?|png|jpe?g|webp|gif|svg|zip|tar|gz|tgz|rar|7z|mp3|mp4|wav|mov|epub|rtf|odt|ods|odp|xml|ya?ml|bin";
+const STANDALONE_FILENAME_RE = new RegExp(
+  `^[^\\r\\n<>:"|?*\\\\/:!！?？。，；,;]+\\.(?:${DELIVERABLE_EXTENSIONS}|py|ts|tsx|js|jsx|sql|sh|patch|diff|log)$`,
+  "iu",
+);
+const INLINE_FILENAME_RE = new RegExp(
+  `(?<![\\p{L}\\p{N}_.-])([\\p{L}\\p{N}][\\p{L}\\p{N}._-]{0,120}\\.(?:${DELIVERABLE_EXTENSIONS}))(?!(?:[\\p{L}\\p{N}_-]|\\.[a-zA-Z0-9]))`,
+  "giu",
+);
+const URL_RE = /https?:\/\/\S+/gi;
+
+function extractReceiptFileNames(rawText: string): string[] {
+  const trimmed = rawText.trim();
+  if (trimmed.length === 0) return [];
+  if (
+    trimmed.length <= 180 &&
+    !trimmed.includes("://") &&
+    STANDALONE_FILENAME_RE.test(trimmed)
+  ) {
+    return [trimmed];
+  }
+  const withoutUrls = trimmed.replace(URL_RE, " ");
+  const found: string[] = [];
+  const seen = new Set<string>();
+  INLINE_FILENAME_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = INLINE_FILENAME_RE.exec(withoutUrls)) !== null) {
+    const candidate = match[1];
+    if (!seen.has(candidate)) {
+      seen.add(candidate);
+      found.push(candidate);
+    }
+  }
+  return found;
+}
 
 /** Triggers newest first by arrival order rather than by their own timestamp. */
 export function getRecentTriggers(db: Database, offset: number, limit: number): Trigger[] {
@@ -210,4 +258,87 @@ export function getSubscribedThreads(db: Database, source?: string): Thread[] {
       ? db.query<ValueRow, [string]>(SQL_SUBSCRIBED_BY_SOURCE).all(source)
       : db.query<ValueRow, []>(SQL_SUBSCRIBED_ALL).all();
   return parseRows<Thread>(rows);
+}
+
+/** One page of tickets, newest first. */
+export function getTicketPage(db: Database, offset: number, limit: number): Ticket[] {
+  return parseRows<Ticket>(db.query<ValueRow, [number, number]>(SQL_TICKET_PAGE).all(limit, offset));
+}
+
+/** Total number of stored tickets. */
+export function getTicketCount(db: Database): number {
+  const row = db.query<CountRow, []>(SQL_TICKET_COUNT).get();
+  return row?.count ?? 0;
+}
+
+/** Batch-fetch triggers by id in chunks of at most 200 placeholders to stay well under SQLite's bind limit. */
+export function getTriggersByIds(db: Database, ids: readonly string[]): Map<string, Trigger> {
+  const out = new Map<string, Trigger>();
+  if (ids.length === 0) return out;
+  const unique = [...new Set(ids)];
+  for (let start = 0; start < unique.length; start += TRIGGER_BATCH_SIZE) {
+    const batch = unique.slice(start, start + TRIGGER_BATCH_SIZE);
+    const placeholders = batch.map(() => "?").join(", ");
+    const stmt = db.prepare<IdValueRow, string[]>(
+      `SELECT id, value FROM trigger WHERE id IN (${placeholders})`,
+    );
+    try {
+      const rows = stmt.all(...batch);
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        out.set(row.id, JSON.parse(row.value) as Trigger);
+      }
+    } finally {
+      stmt.finalize();
+    }
+  }
+  return out;
+}
+
+/**
+ * Best-effort map of `ticketId -> sent deliverable filenames` mined from sent outbox receipts, for historical
+ * backfill; fault-tolerant and never throws.
+ */
+export function getSentFilesByTicket(db: Database): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  try {
+    const rows = db.query<ValueRow, []>(SQL_SENT_TICKET_OUTBOX).all();
+    for (let i = 0; i < rows.length; i++) {
+      let parsed: Record<string, unknown>;
+      try {
+        const raw: unknown = JSON.parse(rows[i].value);
+        if (typeof raw !== "object" || raw === null) continue;
+        parsed = raw as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      const ticketId = typeof parsed.ticketId === "string" ? parsed.ticketId : undefined;
+      if (ticketId === undefined || ticketId.length === 0) continue;
+      const rawText =
+        typeof parsed.text === "string"
+          ? parsed.text
+          : typeof parsed.message === "object" &&
+              parsed.message !== null &&
+              typeof (parsed.message as Record<string, unknown>).text === "string"
+            ? ((parsed.message as Record<string, unknown>).text as string)
+            : undefined;
+      if (rawText === undefined || rawText.length === 0) continue;
+      const names = extractReceiptFileNames(rawText);
+      if (names.length === 0) continue;
+      let list = out.get(ticketId);
+      if (list === undefined) {
+        list = [];
+        out.set(ticketId, list);
+      }
+      for (const name of names) {
+        if (list.length >= MAX_SENT_FILES_PER_TICKET) break;
+        if (!list.includes(name)) {
+          list.push(name);
+        }
+      }
+    }
+  } catch {
+    // Fault-tolerant helper: return whatever was collected without throwing.
+  }
+  return out;
 }

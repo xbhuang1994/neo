@@ -5,19 +5,37 @@ import { readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { key, latestReport } from "../core/index.ts";
 import { isRecord } from "../kernel/index.ts";
+import { canAccessTicket } from "./access.ts";
 import { charCount, ticketCard } from "./cards.ts";
 import type { AppContext, OnceTools } from "./context.ts";
 import { Failure, REPLY, SIDECAR } from "./effects.ts";
 import { receiptNotice } from "./notices.ts";
 import { sidecarPrompt } from "./prompts.ts";
-import { IM_WORDS, checkedImText, clip, isIdeograph, wordCount } from "./text.ts";
+import { clip, isIdeograph, wordCount } from "./text.ts";
 
+export const SIDECAR_WORDS = 500;
 export const REPORT_EXCERPT_CHARS = 4000;
+export const RELATED_REPORT_EXCERPT_CHARS = 1500;
 export const SUBDIRS_TO_LIST: readonly string[] = ["docs", "results", "out", "run"];
 export const SIDECAR_MAX_ATTEMPTS = 3;
 export const SIDECAR_SLOW_HINT_ZH = "正在核对相关资料细节，稍等马上回复你。";
 export const SIDECAR_SLOW_HINT_EN = "Still checking the relevant details; I'll reply shortly.";
 
+export interface SidecarClarificationContext {
+  question: string;
+  answerTriggerId?: string;
+}
+
+export interface SidecarPayload {
+  ticketId: string;
+  triggerId: string;
+  batchIds?: string[];
+  note?: string;
+  relatedTicketIds?: string[];
+  clarificationContext?: SidecarClarificationContext;
+}
+
+const MAX_RELATED_TICKETS = 3;
 const SIDECAR_TIMEOUT_MS = 90_000;
 const SLOW_HINT_WAIT_MS = 5_000;
 const WHITESPACE_RUN = /\p{White_Space}+/gu;
@@ -151,14 +169,40 @@ export function fallbackReply(raw: string): string {
   if (cleaned.length === 0) {
     return "当前工单暂无更多补充结论，请稍后再试。";
   }
-  if (wordCount(cleaned) <= IM_WORDS) {
+  if (wordCount(cleaned) <= SIDECAR_WORDS) {
     return cleaned;
   }
-  let keep = 240;
-  while (keep > 20 && wordCount(`${clip(cleaned, keep)}…`) > IM_WORDS) {
-    keep -= 10;
+  let lo = 1;
+  let hi = Math.max(1, charCount(cleaned) - 1);
+  let best = 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    if (wordCount(`${clip(cleaned, mid)}…`) <= SIDECAR_WORDS) {
+      best = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
   }
-  return `${clip(cleaned, keep)}…`;
+  return `${clip(cleaned, best)}…`;
+}
+
+function subscribedThreadsByTicket(app: AppContext): Map<string, string[]> {
+  const byTicket = new Map<string, string[]>();
+  const threads = app.store.subscribedThreads(undefined);
+  for (let i = 0; i < threads.length; i++) {
+    const thread = threads[i];
+    for (let j = 0; j < thread.subscriptions.length; j++) {
+      const subId = thread.subscriptions[j];
+      const existing = byTicket.get(subId);
+      if (existing !== undefined) {
+        existing.push(thread.key);
+      } else {
+        byTicket.set(subId, [thread.key]);
+      }
+    }
+  }
+  return byTicket;
 }
 
 /** Answer a person's read-only question about a ticket, straight to their conversation. */
@@ -180,6 +224,13 @@ export async function sidecarQueued(app: AppContext, payload: unknown): Promise<
     return;
   }
   if (!trigger.human || trigger.channel === undefined) {
+    return;
+  }
+  const threadsByTicket = subscribedThreadsByTicket(app);
+  if (!canAccessTicket(app, trigger, ticket, threadsByTicket.get(ticket.id) ?? [])) {
+    console.error(
+      `[neo-agent] sidecar refused unauthorized ticket ${ticket.id} for trigger ${trigger.id} (${trigger.actor.source}:${trigger.actor.id})`,
+    );
     return;
   }
   const attempts = app.store.effectAttempts(SIDECAR, triggerId) ?? 0;
@@ -222,6 +273,74 @@ export async function sidecarQueued(app: AppContext, payload: unknown): Promise<
     packet.routing_note = payload.note;
   }
 
+  if (Array.isArray(payload.relatedTicketIds)) {
+    const relatedIds: string[] = [];
+    const seen = new Set<string>([ticketId]);
+    for (let i = 0; i < payload.relatedTicketIds.length && relatedIds.length < MAX_RELATED_TICKETS; i++) {
+      const rawId = payload.relatedTicketIds[i];
+      if (typeof rawId !== "string") {
+        continue;
+      }
+      const trimmed = rawId.trim();
+      if (trimmed.length === 0 || seen.has(trimmed)) {
+        continue;
+      }
+      seen.add(trimmed);
+      relatedIds.push(trimmed);
+    }
+    const relatedPackets: Array<Record<string, unknown>> = [];
+    for (let i = 0; i < relatedIds.length; i++) {
+      const relId = relatedIds[i];
+      const relTicket = app.storeTicket(relId);
+      if (relTicket === null) {
+        continue;
+      }
+      if (!canAccessTicket(app, trigger, relTicket, threadsByTicket.get(relTicket.id) ?? [])) {
+        console.error(
+          `[neo-agent] sidecar filtered unauthorized related ticket ${relTicket.id} for trigger ${trigger.id}`,
+        );
+        continue;
+      }
+      const relRawDir = relTicket.execution?.directory;
+      const relDirectory = relRawDir !== undefined && isDirectory(relRawDir) ? relRawDir : undefined;
+      const relReport = latestReport(relTicket);
+      relatedPackets.push({
+        ticket: ticketCard(relTicket),
+        directory: relDirectory ?? null,
+        latest_report:
+          relReport !== undefined
+            ? {
+                state: relReport.state,
+                at: relReport.at,
+                summary: clip(relReport.summary, RELATED_REPORT_EXCERPT_CHARS),
+                truncated: charCount(relReport.summary) > RELATED_REPORT_EXCERPT_CHARS,
+              }
+            : null,
+        workspace_files: relDirectory !== undefined ? deliverables(relDirectory) : [],
+      });
+    }
+    if (relatedPackets.length > 0) {
+      packet.related_tickets = relatedPackets;
+    }
+  }
+
+  if (isRecord(payload.clarificationContext)) {
+    const question =
+      typeof payload.clarificationContext.question === "string"
+        ? payload.clarificationContext.question.trim()
+        : "";
+    if (question.length > 0) {
+      const clarificationContext: Record<string, unknown> = { question };
+      if (
+        typeof payload.clarificationContext.answerTriggerId === "string" &&
+        payload.clarificationContext.answerTriggerId.trim().length > 0
+      ) {
+        clarificationContext.answer_trigger_id = payload.clarificationContext.answerTriggerId.trim();
+      }
+      packet.clarification_context = clarificationContext;
+    }
+  }
+
   const hintId = key(["sidecar-slow-hint", triggerId]);
   const slowHintMs = app.sidecarSlowHintMs;
   let slowHintTimer: ReturnType<typeof setTimeout> | undefined;
@@ -258,7 +377,7 @@ export async function sidecarQueued(app: AppContext, payload: unknown): Promise<
     specs: [
       {
         name: "sidecar_reply",
-        description: `Send the concise read-only answer (at most ${IM_WORDS} words; each Chinese character counts as one word, max ${IM_WORDS} characters) directly to the person's conversation.`,
+        description: `Send the concise read-only answer (at most ${SIDECAR_WORDS} words; each Chinese character counts as one word, max ${SIDECAR_WORDS} characters) directly to the person's conversation.`,
         schema: {
           type: "object",
           additionalProperties: false,
@@ -266,7 +385,7 @@ export async function sidecarQueued(app: AppContext, payload: unknown): Promise<
           properties: {
             text: {
               type: "string",
-              description: `At most ${IM_WORDS} words (each Chinese character counts as one word); Markdown is supported.`,
+              description: `At most ${SIDECAR_WORDS} words (each Chinese character counts as one word); Markdown is supported.`,
             },
           },
         },
@@ -283,9 +402,11 @@ export async function sidecarQueued(app: AppContext, payload: unknown): Promise<
       if (rawText.length === 0) {
         throw new Error("text is required");
       }
-      const checked = checkedImText(rawText);
-      if (!checked.ok) {
-        throw new Error(checked.error);
+      const count = wordCount(rawText);
+      if (count > SIDECAR_WORDS) {
+        throw new Error(
+          `Sidecar reply has ${count} words; maximum is ${SIDECAR_WORDS}. Rewrite concisely without splitting into multiple messages.`,
+        );
       }
       return { sent: true, id: await answer(rawText) };
     },

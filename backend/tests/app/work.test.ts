@@ -12,6 +12,7 @@ import {
   SIDECAR,
   SIDECAR_SLOW_HINT_EN,
   SIDECAR_SLOW_HINT_ZH,
+  SIDECAR_WORDS,
   StopWorkerError,
   cloneSettings,
   slowHintText,
@@ -507,8 +508,8 @@ describe("work", () => {
           expect(turn.toolNames()).toEqual(["sidecar_reply"]);
           packet = JSON.parse(turn.text) as Record<string, unknown>;
           await expect(
-            turn.call("sidecar_reply", { text: "字".repeat(101) }),
-          ).rejects.toThrow("101 words");
+            turn.call("sidecar_reply", { text: "字".repeat(SIDECAR_WORDS + 1) }),
+          ).rejects.toThrow(`${SIDECAR_WORDS + 1} words`);
           await turn.call("sidecar_reply", { text: "Epoch 3 of 10, loss 0.12." });
           return "Done.";
         }

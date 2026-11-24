@@ -9,6 +9,7 @@ import {
   type Trigger,
 } from "../core/index.ts";
 import { isRecord, textBlock } from "../kernel/index.ts";
+import { accessibleThreads, canAccessTicket } from "./access.ts";
 import {
   capped,
   charCount,
@@ -19,6 +20,7 @@ import {
   triggerCard,
   triggerMessage,
 } from "./cards.ts";
+import { isShortConfirmation, loadClarification } from "./clarification.ts";
 import {
   WORKTREE_NAME_RULE,
   validWorktreeName,
@@ -27,6 +29,7 @@ import {
 } from "./context.ts";
 import { Failure } from "./effects.ts";
 import { assessmentOutcome, directionAllowed, parseAssessment } from "./policy.ts";
+import { recallConfig } from "./recall.ts";
 import { CHAT_SOURCE } from "./settings.ts";
 import { IM_WORDS, checkedImText, clip, wordCount } from "./text.ts";
 
@@ -132,7 +135,128 @@ export function candidateCard(
         routingCard(ticket, app.store.trigger(ticket.origin.triggerId)?.text),
       )
     : relatedTickets(candidate.tickets, limit, ticketCard);
+
+  const cfg = recallConfig();
+  const pendingClarification =
+    chat && cfg.clarify ? loadClarification(app.store, candidate.thread.key) : undefined;
+
+  if (pendingClarification !== undefined) {
+    card.pending_clarification = {
+      id: pendingClarification.id,
+      origin_text: pendingClarification.originText,
+      question_asked: pendingClarification.question,
+      options: pendingClarification.options.map((opt) => ({
+        key: opt.key,
+        label: opt.label,
+        action: opt.action,
+        ...(opt.ticketId !== undefined ? { ticket_id: opt.ticketId } : {}),
+      })),
+    };
+    const listedIds = new Set<string>(
+      related.related_tickets
+        .map((item) => (typeof item.ticket_id === "string" ? item.ticket_id : ""))
+        .filter((id) => id.length > 0),
+    );
+    const candidateTicketIds = new Set(candidate.tickets.map((t) => t.id));
+    const pinnedSame: Record<string, unknown>[] = [];
+    const pinnedCross: Record<string, unknown>[] = [];
+    for (let i = 0; i < pendingClarification.options.length; i++) {
+      const optId = pendingClarification.options[i].ticketId;
+      if (optId === undefined || listedIds.has(optId)) {
+        continue;
+      }
+      const optTicket = app.storeTicket(optId);
+      if (optTicket !== null && canAccessTicket(app, primary, optTicket, undefined, cfg.crossSurface)) {
+        listedIds.add(optId);
+        const rc = routingCard(optTicket, app.store.trigger(optTicket.origin.triggerId)?.text);
+        if (candidateTicketIds.has(optId)) {
+          pinnedSame.push(rc);
+        } else {
+          pinnedCross.push({ ...rc, other_thread: true });
+        }
+      }
+    }
+    if (pinnedSame.length > 0) {
+      related.related_tickets = [...pinnedSame, ...related.related_tickets];
+    }
+    if (pinnedCross.length > 0) {
+      card.other_thread_tickets = pinnedCross;
+    }
+  }
+
   Object.assign(card, related);
+
+  if (chat && cfg.candidateRelevance && candidate.strength === "explicit" && !missed) {
+    const t0 = performance.now();
+    const queryTexts: string[] = [];
+    for (let i = 0; i < candidate.triggers.length; i++) {
+      const item = candidate.triggers[i];
+      if (item.human) {
+        const raw =
+          typeof item.meta.originalText === "string" ? item.meta.originalText : item.text;
+        if (raw.trim().length > 0) {
+          queryTexts.push(raw);
+        }
+      }
+    }
+    const mergedQuery = queryTexts.join(" ").trim();
+    if (pendingClarification === undefined && isShortConfirmation(mergedQuery)) {
+      const recent = app.store.threadPage(candidate.thread.key, 0, 6);
+      const currentIds = new Set(candidate.triggers.map((t) => t.id));
+      for (let i = 0; i < recent.length; i++) {
+        const prev = recent[i];
+        if (prev.human && !currentIds.has(prev.id)) {
+          const prevText =
+            typeof prev.meta.originalText === "string" ? prev.meta.originalText : prev.text;
+          if (prevText.trim().length > 0) {
+            queryTexts.unshift(prevText);
+            break;
+          }
+        }
+      }
+    }
+    const excludeTicketIds = new Set<string>(
+      related.related_tickets
+        .map((item) => (typeof item.ticket_id === "string" ? item.ticket_id : ""))
+        .filter((id) => id.length > 0),
+    );
+    const handedBackIds = new Set<string>(handedBack.map((item) => item.ticket_id));
+    const scope = accessibleThreads(app, primary, cfg.crossSurface);
+    const recalled = app.ensureSearchIndex().recallForCandidate({
+      queryTexts,
+      currentThread: scope.primaryThread,
+      allowedThreads: scope.threads,
+      excludeTicketIds,
+      handedBackIds,
+      allowCrossThread: scope.crossSurfaceAllowed,
+      revalidate: (ticketId) => {
+        const stored = app.storeTicket(ticketId);
+        return stored !== null && canAccessTicket(app, primary, stored, undefined, cfg.crossSurface);
+      },
+      minScoreSame: cfg.minScoreSame,
+      minScoreCross: cfg.minScoreCross,
+    });
+    if (recalled.sameThread.length > 0) {
+      card.recalled_tickets = recalled.sameThread;
+      card.recall_confidence = recalled.confidence;
+    }
+    if (recalled.crossThread.length > 0) {
+      const existingCross = Array.isArray(card.other_thread_tickets)
+        ? (card.other_thread_tickets as Record<string, unknown>[])
+        : [];
+      const existingCrossIds = new Set(
+        existingCross.map((item) => (typeof item.ticket_id === "string" ? item.ticket_id : "")),
+      );
+      const extraCross = recalled.crossThread.filter((item) => !existingCrossIds.has(item.ticket_id));
+      card.other_thread_tickets = [...existingCross, ...extraCross];
+    }
+    if (process.env.NEO_RECALL_LOG === "1") {
+      const elapsedMs = (performance.now() - t0).toFixed(2);
+      console.error(
+        `[neo-agent] recall ms=${elapsedMs} same=${recalled.sameThread.length} cross=${recalled.crossThread.length} confidence=${recalled.confidence}`,
+      );
+    }
+  }
 
   const delivered = app.store.disposition(primary.id)?.fanout;
   if (delivered !== undefined && delivered.length > 0) {
@@ -140,10 +264,14 @@ export function candidateCard(
   }
 
   if (missed) {
-    card.next_action = `${MISS_LIMIT} handbacks: route with orchestrator_route kind=accept (never attach), or kind=ignore with answer if chat only.`;
+    card.next_action = `${MISS_LIMIT} handbacks: route with orchestrator_route kind=accept (never attach), kind=sidecar (after orchestrator_search if read-only historical lookup), or kind=ignore with answer if chat only.`;
   } else if (candidate.strength === "explicit") {
+    const baseAction =
+      "Route via orchestrator_route (accept, attach, sidecar, clarify, stop, ignore); for plain chat, use ignore with answer in user's language.";
     card.next_action =
-      "Route via orchestrator_route (accept, attach, sidecar, stop, ignore); for plain chat, use ignore with answer in user's language.";
+      pendingClarification !== undefined
+        ? `${baseAction} If this message answers pending_clarification, pass clarification_id with matching kind/ticket_id; otherwise route normally without clarification_id.`
+        : baseAction;
   } else {
     card.next_action =
       "Ignore with orchestrator_route if no rule applies; else run orchestrator_eval, orchestrator_eval_read, orchestrator_eval_decide.";

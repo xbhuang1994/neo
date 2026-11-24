@@ -24,6 +24,7 @@ import {
   textPage,
   ticketCard,
   ticketDetails,
+  ticketListCard,
   triggerCard,
   triggerMessage,
 } from "./cards.ts";
@@ -102,10 +103,12 @@ function listPage(
   items: unknown[],
   offset: number,
   size: number,
-): { items: unknown[]; next_offset: number | null } {
+  total?: number,
+): { items: unknown[]; total?: number; next_offset: number | null } {
   const more = items.length > size;
   return {
     items: more ? items.slice(0, size) : items,
+    ...(total !== undefined ? { total } : {}),
     next_offset: more ? offset + size : null,
   };
 }
@@ -170,9 +173,17 @@ export function readResource(
   switch (resource) {
     case "tickets": {
       mainOnly();
-      const tickets = app.store.tickets();
-      const items = tickets.slice(safeOffset, safeOffset + size + 1).map(ticketCard);
-      return listPage(items, safeOffset, size);
+      const total = app.store.ticketCount();
+      const pageTickets = app.store.ticketPage(safeOffset, size + 1);
+      const originIds = pageTickets.map((ticket) => ticket.origin.triggerId);
+      const triggers = app.store.triggersByIds(originIds);
+      const items = pageTickets.map((ticket) => {
+        const origin = triggers.get(ticket.origin.triggerId);
+        const asked =
+          typeof origin?.meta.originalText === "string" ? origin.meta.originalText : origin?.text;
+        return ticketListCard(ticket, asked);
+      });
+      return listPage(items, safeOffset, size, total);
     }
     case "triggers": {
       mainOnly();

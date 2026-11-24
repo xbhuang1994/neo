@@ -5,9 +5,14 @@ import {
   UserError,
   createOutcome,
   followupOwners,
+  formatIso,
   isTicketLive,
+  key,
+  nowIso,
+  nowMs,
   reasonCode,
   reasonText,
+  threadKey,
   whyCode,
   whySaid,
   type Accept,
@@ -21,13 +26,25 @@ import {
   type WorkerReport,
 } from "../core/index.ts";
 import { errorMessage, isRecord, type ToolSpec } from "../kernel/types.ts";
+import { accessibleThreads, canAccessTicket } from "./access.ts";
+import { collectArtifacts } from "./artifacts.ts";
 import { charCount, ticketCard } from "./cards.ts";
+import {
+  CLARIFICATION_TTL_MS,
+  bumpClarificationTurn,
+  clearClarification,
+  consumeClarification,
+  saveClarification,
+  type ClarificationOption,
+  type PendingClarification,
+} from "./clarification.ts";
 import { Args, WORKTREE_NAME_RULE, validWorktreeName, type AppContext } from "./context.ts";
 import { SIDECAR } from "./effects.ts";
 import { receiptNotice, reportRelay, threadFollowedNotice } from "./notices.ts";
+import { recallConfig, sanitizeCardText } from "./recall.ts";
 import { grammar } from "./resources.ts";
 import { CHAT_SOURCE } from "./settings.ts";
-import { IM_WORDS, clip, languageMismatch, wordCount } from "./text.ts";
+import { IM_WORDS, checkedImText, clip, languageMismatch, wordCount } from "./text.ts";
 
 export { Args } from "./context.ts";
 
@@ -43,6 +60,7 @@ const READ_LIMIT =
   "Characters of a text, 4000 by default and 8000 at most, or items of a list, 20 by default and 50 at most.";
 
 const ALLOWED_READ: readonly string[] = ["resource", "offset", "limit"];
+const ALLOWED_SEARCH: readonly string[] = ["query", "trigger_id", "limit", "include_ended"];
 const ALLOWED_ROUTE: readonly string[] = ["decisions"];
 const ROUTE_ITEM_FIELDS: readonly string[] = [
   "kind",
@@ -54,6 +72,10 @@ const ROUTE_ITEM_FIELDS: readonly string[] = [
   "note",
   "reason",
   "answer",
+  "question",
+  "options",
+  "clarification_id",
+  "related_ticket_ids",
 ];
 const ALLOWED_TICKET_ID: readonly string[] = ["ticket_id"];
 const ALLOWED_TICKET_NOTE: readonly string[] = ["ticket_id", "text"];
@@ -91,7 +113,15 @@ const ROUTE_KINDS: ReadonlySet<string> = new Set([
   "accept",
   "attach",
   "sidecar",
+  "clarify",
   "ignore",
+  "stop",
+]);
+
+const CLARIFY_OPTION_ACTIONS: ReadonlySet<string> = new Set([
+  "sidecar",
+  "attach",
+  "accept",
   "stop",
 ]);
 
@@ -103,11 +133,13 @@ const ITEM_CHECKS: ReadonlyArray<
   ["worktree_name", new Set(["accept"]), new Set(["accept"])],
   ["acknowledgement", new Set(["accept", "attach"]), new Set(["accept"])],
   ["note", new Set(["accept", "attach", "sidecar"]), new Set()],
-  ["reason", new Set(["ignore", "stop"]), new Set(["ignore"])],
+  ["reason", new Set(["ignore", "stop", "clarify"]), new Set(["ignore", "clarify"])],
   ["answer", new Set(["ignore"]), new Set()],
+  ["question", new Set(["clarify"]), new Set(["clarify"])],
+  ["clarification_id", new Set(["accept", "attach", "sidecar", "stop"]), new Set()],
 ];
 
-const LANGUAGE_FIELDS: readonly string[] = ["acknowledgement", "answer"];
+const LANGUAGE_FIELDS: readonly string[] = ["acknowledgement", "answer", "question"];
 
 const REPORT_STATES: ReadonlySet<ReportState> = new Set([
   "progress",
@@ -180,22 +212,57 @@ function readSpec(description: string, worker: boolean): ToolSpec {
   );
 }
 
-let cachedMainSpecs: ToolSpec[] | null = null;
+const cachedMainSpecsByFlag = new Map<string, ToolSpec[]>();
 let cachedWorkerSpecs: ToolSpec[] | null = null;
 
 /** The main Session's tools. */
 export function mainSpecs(): ToolSpec[] {
-  if (cachedMainSpecs !== null) {
-    return cachedMainSpecs;
+  const cfg = recallConfig();
+  const cacheKey = `${cfg.searchTool ? 1 : 0}:${cfg.clarify ? 1 : 0}`;
+  const cached = cachedMainSpecsByFlag.get(cacheKey);
+  if (cached !== undefined) {
+    return cached;
   }
-  cachedMainSpecs = [
+  const routeKinds = cfg.clarify
+    ? ["accept", "attach", "sidecar", "clarify", "ignore", "stop"]
+    : ["accept", "attach", "sidecar", "ignore", "stop"];
+  const specs: ToolSpec[] = [
     readSpec(
       "Read one page of a resource, such as the ticket list or a ticket. Follow next_offset, and next_resource where a page names one.",
       false,
     ),
+    ...(cfg.searchTool
+      ? [
+          spec(
+            "orchestrator_search",
+            "Search historical tickets across titles, digests, origin requests, worktree names, deliverables, and report summaries (supports Chinese abbreviations and numeral disambiguation). Use only when a message references an older unlisted ticket or deliverable; pass trigger_id so access scope is enforced.",
+            {
+              query: {
+                type: "string",
+                description: "Core entity keywords or short phrase to search for.",
+              },
+              trigger_id: {
+                type: ["string", "null"],
+                description: "Current candidate trigger_id to enforce conversation access scope.",
+              },
+              limit: {
+                type: "integer",
+                minimum: 1,
+                maximum: 20,
+                description: "Maximum hits to return (default 8, max 20).",
+              },
+              include_ended: {
+                type: "boolean",
+                description: "Include ended historical tickets (default true).",
+              },
+            },
+            ["query"],
+          ),
+        ]
+      : []),
     spec(
       "orchestrator_route",
-      "Route candidates, one item each by the card's trigger_id, in one call: accept an explicit request as a new ticket, attach follow-on work to an existing ticket (with an immediate acknowledgement), sidecar a read-only progress, summary or comparison question on a ticket without waking its worker, stop a ticket on a person's stop message, or ignore a candidate that needs no ticket or stop, as dispatch says. Items run in order and each is answered on its own; a refused item leaves the others. An inferred candidate may be ignored here; accepting one goes through orchestrator_eval_decide.",
+      "Route candidates, one item each by the card's trigger_id, in one call: accept an explicit request as a new ticket, attach follow-on work to an existing ticket (with an immediate acknowledgement), sidecar a read-only progress, summary or comparison question on a ticket (optionally with related_ticket_ids) without waking its worker, clarify an ambiguous explicit request with a short numbered choice (saving pending state for seamless follow-up), stop a ticket on a person's stop message, or ignore a candidate that needs no ticket or stop, as dispatch says. Items run in order and each is answered on its own; a refused item leaves the others. An inferred candidate may be ignored here; accepting one goes through orchestrator_eval_decide.",
       {
         decisions: {
           type: "array",
@@ -206,7 +273,7 @@ export function mainSpecs(): ToolSpec[] {
             additionalProperties: false,
             required: ["kind", "trigger_id"],
             properties: {
-              kind: { type: "string", enum: ["accept", "attach", "sidecar", "ignore", "stop"] },
+              kind: { type: "string", enum: routeKinds },
               trigger_id: {
                 type: "string",
                 description: "The candidate card's trigger_id; deciding it decides its batch.",
@@ -214,6 +281,13 @@ export function mainSpecs(): ToolSpec[] {
               ticket_id: {
                 type: ["string", "null"],
                 description: "attach, sidecar and stop: the ticket.",
+              },
+              related_ticket_ids: {
+                type: ["array", "null"],
+                maxItems: 3,
+                items: { type: "string" },
+                description:
+                  "sidecar only: up to 3 additional related ticket ids from the same topic/split deliverables to inspect together read-only.",
               },
               title: {
                 type: ["string", "null"],
@@ -235,12 +309,38 @@ export function mainSpecs(): ToolSpec[] {
               },
               reason: {
                 type: ["string", "null"],
-                description: "ignore and stop: why, at most 500 characters; an ignore needs it.",
+                description: "ignore, clarify and stop: why, at most 500 characters; ignore and clarify require it.",
               },
               answer: {
                 type: ["string", "null"],
                 description:
                   "ignore only: for ordinary conversation that needs no ticket, the natural answer to send at once, in the language the person wrote in. Avoids another turn.",
+              },
+              question: {
+                type: ["string", "null"],
+                description: `clarify only (required): concise numbered disambiguation question of at most ${IM_WORDS} words (target 35-60 Chinese characters, never expose internal ticket_ids) in the person's language.`,
+              },
+              options: {
+                type: ["array", "null"],
+                maxItems: 4,
+                description:
+                  "clarify only: 0-4 structured candidate options saved for carry-over when the person replies with a number or confirmation.",
+                items: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["key", "label", "action"],
+                  properties: {
+                    key: { type: "string", description: 'Short option key such as "1", "2", "3", or "new".' },
+                    label: { type: "string", description: "Short human label (e.g. MM-DD + short title)." },
+                    action: { type: "string", enum: ["sidecar", "attach", "accept", "stop"] },
+                    ticket_id: { type: ["string", "null"], description: "Target ticket_id when action is not accept." },
+                  },
+                },
+              },
+              clarification_id: {
+                type: ["string", "null"],
+                description:
+                  "accept, attach, sidecar and stop: pass pending_clarification.id when the message answers an open clarification so the original request and attachments are carried over losslessly.",
               },
             },
           },
@@ -397,7 +497,8 @@ export function mainSpecs(): ToolSpec[] {
       ["path"],
     ),
   ];
-  return cachedMainSpecs;
+  cachedMainSpecsByFlag.set(cacheKey, specs);
+  return specs;
 }
 
 /** A worker Session's tools. */
@@ -564,6 +665,18 @@ function invalidItem(item: Args, kind: string): string | null {
           problem = "at most 20000 characters";
         }
         break;
+      case "question": {
+        const checked = checkedImText(value);
+        if (!checked.ok) {
+          problem = checked.error;
+        }
+        break;
+      }
+      case "clarification_id":
+        if (charCount(value) > 200) {
+          problem = "at most 200 characters";
+        }
+        break;
     }
     if (problem !== null) {
       return `${field}: ${problem}`;
@@ -571,6 +684,57 @@ function invalidItem(item: Args, kind: string): string | null {
   }
   if (item.text("answer") !== undefined && kind !== "ignore") {
     return "answer is only valid with ignore";
+  }
+  if (item.text("question") !== undefined && kind !== "clarify") {
+    return "question is only valid with clarify";
+  }
+  const rawOptions = item.get("options");
+  if (rawOptions !== undefined && rawOptions !== null) {
+    if (kind !== "clarify") {
+      return "options is only valid with clarify";
+    }
+    if (!Array.isArray(rawOptions) || rawOptions.length > 4) {
+      return "options must be an array of at most 4 items";
+    }
+    for (let i = 0; i < rawOptions.length; i++) {
+      const entry = rawOptions[i];
+      if (!isRecord(entry)) {
+        return `options[${i}] must be an object`;
+      }
+      const keyVal = typeof entry.key === "string" ? entry.key.trim() : "";
+      const labelVal = typeof entry.label === "string" ? entry.label.trim() : "";
+      const actionVal = typeof entry.action === "string" ? entry.action : "";
+      if (keyVal.length === 0 || charCount(keyVal) > 16) {
+        return `options[${i}].key must be 1 to 16 characters`;
+      }
+      if (labelVal.length === 0 || charCount(labelVal) > 80) {
+        return `options[${i}].label must be 1 to 80 characters`;
+      }
+      if (!CLARIFY_OPTION_ACTIONS.has(actionVal)) {
+        return `options[${i}].action must be sidecar, attach, accept, or stop`;
+      }
+      const tid = entry.ticket_id;
+      if (tid !== undefined && tid !== null && (typeof tid !== "string" || tid.trim().length === 0)) {
+        return `options[${i}].ticket_id must be a non-empty string`;
+      }
+      if (actionVal !== "accept" && (typeof tid !== "string" || tid.trim().length === 0)) {
+        return `options[${i}].ticket_id is required when action is ${actionVal}`;
+      }
+    }
+  }
+  const rawRelated = item.get("related_ticket_ids");
+  if (rawRelated !== undefined && rawRelated !== null) {
+    if (kind !== "sidecar") {
+      return "related_ticket_ids is only valid with sidecar";
+    }
+    if (!Array.isArray(rawRelated) || rawRelated.length > 3) {
+      return "related_ticket_ids must be an array of at most 3 ticket ids";
+    }
+    for (let i = 0; i < rawRelated.length; i++) {
+      if (typeof rawRelated[i] !== "string" || rawRelated[i].trim().length === 0) {
+        return `related_ticket_ids[${i}] must be a non-empty string`;
+      }
+    }
   }
   return null;
 }
@@ -599,6 +763,51 @@ function fromDecision(decision: Decision): Routed {
   };
 }
 
+function mergeUniqueIds(first: readonly string[], second: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (let i = 0; i < first.length; i++) {
+    const id = first[i];
+    if (!seen.has(id)) {
+      seen.add(id);
+      out.push(id);
+    }
+  }
+  for (let i = 0; i < second.length; i++) {
+    const id = second[i];
+    if (!seen.has(id)) {
+      seen.add(id);
+      out.push(id);
+    }
+  }
+  return out;
+}
+
+function parseClarificationOptions(raw: unknown): ClarificationOption[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const out: ClarificationOption[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const entry = raw[i];
+    if (!isRecord(entry)) continue;
+    const keyVal = typeof entry.key === "string" ? entry.key.trim() : "";
+    const labelVal = typeof entry.label === "string" ? entry.label.trim() : "";
+    const actionVal = entry.action as ClarificationOption["action"];
+    const ticketId =
+      typeof entry.ticket_id === "string" && entry.ticket_id.trim().length > 0
+        ? entry.ticket_id.trim()
+        : undefined;
+    out.push({
+      key: keyVal,
+      label: sanitizeCardText(labelVal, 80),
+      action: actionVal,
+      ...(ticketId !== undefined ? { ticketId } : {}),
+    });
+  }
+  return out;
+}
+
 /**
  * Carry out one routing decision as its Engine command. `decided` holds the Triggers this call's earlier items
  * decided, with their batches.
@@ -611,7 +820,13 @@ function routeOne(
   decided: ReadonlyMap<string, string>,
 ): RouteOutcome {
   const note = item.text("note");
-  if (kind === "ignore" || kind === "sidecar") {
+  const clarificationId = item.text("clarification_id");
+  const cfg = recallConfig();
+  const primary = app.store.trigger(triggerId);
+  const primaryThread =
+    primary !== undefined && primary.threads.length > 0 ? threadKey(primary.threads[0]) : undefined;
+
+  if (kind === "ignore" || kind === "sidecar" || kind === "clarify") {
     const earlier = decided.get(triggerId);
     if (earlier !== undefined) {
       return {
@@ -623,6 +838,10 @@ function routeOne(
   switch (kind) {
     case "accept": {
       const before = app.store.disposition(triggerId)?.decisionId;
+      const clarification: PendingClarification | undefined =
+        clarificationId !== undefined && primaryThread !== undefined
+          ? consumeClarification(app.store, primaryThread, clarificationId)
+          : undefined;
       const title = item.text("title") ?? "";
       const ack = item.text("acknowledgement");
       const name = item.text("worktree_name");
@@ -645,6 +864,19 @@ function routeOne(
           refused: `Ticket was not created: ${reasonText(decision.reason)}`,
         };
       }
+      if (clarification !== undefined) {
+        const originSet = new Set(decision.triggerIds);
+        for (let i = 0; i < clarification.originBatchIds.length; i++) {
+          const origId = clarification.originBatchIds[i];
+          if (!originSet.has(origId)) {
+            app.quietly(() => {
+              app.engine.attach(ticketId, origId, "Original request carried over from clarification");
+            });
+          }
+        }
+      } else if (primaryThread !== undefined) {
+        clearClarification(app.store, primaryThread);
+      }
       if (before !== undefined && decision.id === before) {
         return {
           ok: true,
@@ -660,8 +892,11 @@ function routeOne(
     }
     case "attach": {
       const ticketId = item.text("ticket_id") ?? "";
+      const clarification: PendingClarification | undefined =
+        clarificationId !== undefined && primaryThread !== undefined
+          ? consumeClarification(app.store, primaryThread, clarificationId)
+          : undefined;
       // A person's burst of chat messages held in one Eval goes to the ticket together.
-      const primary = app.store.trigger(triggerId);
       const candidate = app.engine.candidate(triggerId);
       let burst: string[];
       if (primary !== undefined && candidate !== undefined && primary.source === CHAT_SOURCE) {
@@ -675,13 +910,20 @@ function routeOne(
       } else {
         burst = [triggerId];
       }
-      const targets = burst.includes(triggerId) ? burst : [triggerId];
+      const currentTargets = burst.includes(triggerId) ? burst : [triggerId];
+      const targets =
+        clarification !== undefined
+          ? mergeUniqueIds(clarification.originBatchIds, currentTargets)
+          : currentTargets;
       let ticket: Ticket | undefined;
       for (let i = 0; i < targets.length; i++) {
         const id = targets[i];
         ticket = app.quietly(() =>
           app.engine.attach(ticketId, id, id === triggerId ? note : undefined),
         );
+      }
+      if (clarification === undefined && primaryThread !== undefined) {
+        clearClarification(app.store, primaryThread);
       }
       const attached = ticket!;
       const ack = item.text("acknowledgement");
@@ -704,20 +946,67 @@ function routeOne(
     }
     case "sidecar": {
       const ticketId = item.text("ticket_id") ?? "";
-      if (app.storeTicket(ticketId) === null) {
+      const ticket = app.storeTicket(ticketId);
+      if (ticket === null) {
         return { ok: false, refused: `Unknown ticket: ${ticketId}` };
       }
+      if (primary === undefined) {
+        return { ok: false, refused: `Unknown trigger: ${triggerId}` };
+      }
+      if (!canAccessTicket(app, primary, ticket, undefined, cfg.crossSurface)) {
+        return { ok: false, refused: `Ticket ${ticketId} is not accessible from this conversation` };
+      }
+      const rawRelated = item.get("related_ticket_ids");
+      const relatedIds: string[] = [];
+      if (Array.isArray(rawRelated)) {
+        const seen = new Set<string>([ticketId]);
+        for (let i = 0; i < rawRelated.length && relatedIds.length < 3; i++) {
+          const rid = typeof rawRelated[i] === "string" ? rawRelated[i].trim() : "";
+          if (rid.length === 0 || seen.has(rid)) continue;
+          const relTicket = app.storeTicket(rid);
+          if (relTicket === null) {
+            return { ok: false, refused: `Unknown related ticket: ${rid}` };
+          }
+          if (!canAccessTicket(app, primary, relTicket, undefined, cfg.crossSurface)) {
+            return {
+              ok: false,
+              refused: `Related ticket ${rid} is not accessible from this conversation`,
+            };
+          }
+          seen.add(rid);
+          relatedIds.push(rid);
+        }
+      }
+      const clarification: PendingClarification | undefined =
+        clarificationId !== undefined && primaryThread !== undefined
+          ? consumeClarification(app.store, primaryThread, clarificationId)
+          : undefined;
       const decision = app.engine.decide(
         triggerId,
-        createOutcome({ kind: "ignore" }, note ?? "Answered via read-only sidecar"),
+        createOutcome({ kind: "ignore" }, whyCode(reasonCode("sidecarRouted"))),
       );
+      const batchIds =
+        clarification !== undefined
+          ? mergeUniqueIds(clarification.originBatchIds, decision.triggerIds)
+          : decision.triggerIds;
       const payload: Record<string, unknown> = {
         ticketId,
         triggerId,
-        batchIds: decision.triggerIds,
+        batchIds,
       };
       if (note !== undefined) {
         payload.note = note;
+      }
+      if (relatedIds.length > 0) {
+        payload.relatedTicketIds = relatedIds;
+      }
+      if (clarification !== undefined) {
+        payload.clarificationContext = {
+          question: clarification.question,
+          answerTriggerId: triggerId,
+        };
+      } else if (primaryThread !== undefined) {
+        bumpClarificationTurn(app.store, primaryThread);
       }
       app.effects.enqueue(SIDECAR, triggerId, payload);
       return {
@@ -726,6 +1015,72 @@ function routeOne(
           decision: "ignore",
           reason: "Dispatched to read-only sidecar for immediate reply",
           ticketId,
+          triggerIds: decision.triggerIds,
+        },
+      };
+    }
+    case "clarify": {
+      if (!cfg.clarify) {
+        return { ok: false, refused: "clarify routing is disabled by configuration" };
+      }
+      if (primary === undefined || primaryThread === undefined) {
+        return { ok: false, refused: `Unknown trigger: ${triggerId}` };
+      }
+      const candidate = app.engine.candidate(triggerId);
+      if (candidate !== undefined && candidate.strength !== "explicit") {
+        return { ok: false, refused: "clarify is only allowed for explicit human requests" };
+      }
+      if (candidate === undefined && (!primary.human || primary.addressed === undefined)) {
+        return { ok: false, refused: "clarify is only allowed for explicit human requests" };
+      }
+      const options = parseClarificationOptions(item.get("options"));
+      for (let i = 0; i < options.length; i++) {
+        const opt = options[i];
+        if (opt.ticketId !== undefined) {
+          const target = app.storeTicket(opt.ticketId);
+          if (target === null) {
+            return { ok: false, refused: `Unknown option ticket_id: ${opt.ticketId}` };
+          }
+          if (!canAccessTicket(app, primary, target, undefined, cfg.crossSurface)) {
+            return {
+              ok: false,
+              refused: `Option ticket ${opt.ticketId} is not accessible from this conversation`,
+            };
+          }
+        }
+      }
+      const question = (item.text("question") ?? "").trim();
+      const decision = app.engine.decide(
+        triggerId,
+        createOutcome({ kind: "ignore" }, whyCode(reasonCode("clarificationRequested"))),
+      );
+      const createdAt = nowIso();
+      const expiresAt = formatIso(nowMs() + CLARIFICATION_TTL_MS);
+      const rawOrigin =
+        typeof primary.meta.originalText === "string" ? primary.meta.originalText : primary.text;
+      const record: PendingClarification = {
+        id: key(["clarify", primaryThread, triggerId, createdAt]),
+        threadKey: primaryThread,
+        originTriggerId: triggerId,
+        originBatchIds: [...decision.triggerIds],
+        originText: sanitizeCardText(rawOrigin, 600),
+        question,
+        options,
+        createdAt,
+        expiresAt,
+        turnsSeen: 0,
+      };
+      saveClarification(app.store, record);
+      app.engine.reply({
+        purpose: "answer",
+        triggerId,
+        text: question,
+      });
+      return {
+        ok: true,
+        routed: {
+          decision: "ignore",
+          reason: `Clarification sent (${record.id})`,
           triggerIds: decision.triggerIds,
         },
       };
@@ -739,6 +1094,11 @@ function routeOne(
         triggerId,
         createOutcome({ kind: "stop", ticketId }, why),
       );
+      if (clarificationId !== undefined && primaryThread !== undefined) {
+        consumeClarification(app.store, primaryThread, clarificationId);
+      } else if (primaryThread !== undefined) {
+        bumpClarificationTurn(app.store, primaryThread);
+      }
       return { ok: true, routed: fromDecision(decision) };
     }
     default: {
@@ -746,6 +1106,9 @@ function routeOne(
         triggerId,
         createOutcome({ kind: "ignore" }, item.text("reason") ?? ""),
       );
+      if (primaryThread !== undefined) {
+        bumpClarificationTurn(app.store, primaryThread);
+      }
       const answer = item.text("answer");
       if (answer !== undefined) {
         app.engine.reply({
@@ -789,7 +1152,7 @@ function routeAll(app: AppContext, argumentsValue: unknown): Record<string, unkn
     if (parseError !== undefined) {
       outcome = { ok: false, refused: parseError };
     } else if (!ROUTE_KINDS.has(kind)) {
-      outcome = { ok: false, refused: "kind is accept, attach, sidecar, ignore or stop" };
+      outcome = { ok: false, refused: "kind is accept, attach, sidecar, clarify, ignore or stop" };
     } else if (triggerId.length === 0) {
       outcome = { ok: false, refused: "trigger_id is required" };
     } else {
@@ -862,6 +1225,58 @@ export async function mainTool(
         readLimit(args),
         undefined,
       );
+    }
+    case "orchestrator_search": {
+      const cfg = recallConfig();
+      if (!cfg.searchTool) {
+        throw new Error("orchestrator_search is disabled by configuration");
+      }
+      const args = Args.of(argumentsValue, ALLOWED_SEARCH);
+      const query = args.required("query").trim();
+      const limit = args.number("limit", 8, 20);
+      const rawIncludeEnded = args.get("include_ended");
+      if (rawIncludeEnded !== undefined && typeof rawIncludeEnded !== "boolean") {
+        throw new Error("include_ended must be a boolean");
+      }
+      const includeEnded = rawIncludeEnded ?? true;
+      const triggerId = args.text("trigger_id");
+      let allowedThreads: Set<string>;
+      let currentThread: string | undefined;
+      let revalidate: (ticketId: string) => boolean;
+      if (triggerId !== undefined) {
+        const trigger = app.store.trigger(triggerId);
+        if (trigger === undefined) {
+          throw new Error(`Unknown trigger: ${triggerId}`);
+        }
+        const scope = accessibleThreads(app, trigger, cfg.crossSurface);
+        allowedThreads = scope.threads;
+        currentThread = scope.primaryThread;
+        revalidate = (ticketId: string) => {
+          const stored = app.storeTicket(ticketId);
+          return stored !== null && canAccessTicket(app, trigger, stored, undefined, cfg.crossSurface);
+        };
+      } else {
+        allowedThreads = new Set(app.store.threads().map((t) => t.key));
+        revalidate = (ticketId: string) => {
+          const stored = app.storeTicket(ticketId);
+          return stored !== null && app.policy().revalidate(stored.mandate);
+        };
+      }
+      const states = includeEnded ? undefined : ["working", "working/queued", "idle", "person/answer", "person/retry"];
+      const result = app.ensureSearchIndex().search({
+        query,
+        allowedThreads,
+        ...(currentThread !== undefined ? { currentThread } : {}),
+        ...(states !== undefined ? { states } : {}),
+        revalidate,
+        limit: Math.max(1, limit),
+      });
+      return {
+        query,
+        hits: result.hits,
+        total: result.total,
+        confidence: result.confidence,
+      };
     }
     case "orchestrator_route":
       return routeAll(app, argumentsValue);
@@ -1102,6 +1517,12 @@ async function workerReport(
     }
   }
 
+  // Scan deliverable artifacts outside the SQLite atomic transaction to avoid holding locks during filesystem I/O.
+  const artifacts =
+    state === "ready" && ticket.execution?.directory !== undefined
+      ? collectArtifacts(ticket.execution.directory)
+      : undefined;
+
   const askedBy = args.text("question_for_trigger_id");
   const answers = args.text("reply_to_trigger_id");
   const rawTopic = args.text("topic");
@@ -1113,6 +1534,7 @@ async function workerReport(
     ...(answers !== undefined ? { answers } : {}),
     // A long topic is cut, never a reason to refuse a report that may carry an answer.
     ...(rawTopic !== undefined ? { topic: clip(rawTopic.trim(), TOPIC_CHARS) } : {}),
+    ...(artifacts !== undefined && artifacts.length > 0 ? { artifacts } : {}),
   };
 
   // The report, and either the direct reply or the relay to the main Session, are recorded together.

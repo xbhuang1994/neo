@@ -7,6 +7,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { formatIso, key, latestReport, nowMs, type Ticket } from "../core/index.ts";
+import { recordTicketArtifact } from "./access.ts";
 import type { AppContext, ChatAttachment, WeChatStateName, WeChatStatus } from "./context.ts";
 import type { Sent } from "./outbox.ts";
 import {
@@ -1132,6 +1133,10 @@ export async function wechatSendTicketFile(
     caption ?? "",
     receipt?.id,
   );
+
+  if (ticket !== null) {
+    recordTicketArtifact(app.store, ticket.id, name);
+  }
 
   if (receipt !== undefined) {
     const party = `wechat:${account.userId}`;

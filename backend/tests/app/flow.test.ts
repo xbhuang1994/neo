@@ -216,7 +216,7 @@ describe("flow", () => {
       expect(refused[1]!.startsWith("worktree_name: Use 1–4 short English words")).toBe(true);
       expect(refused[2]).toBe("Unknown ticket");
       expect(refused[3]).toBe("Unknown trigger");
-      expect(refused[4]).toBe("kind is accept, attach, sidecar, ignore or stop");
+      expect(refused[4]).toBe("kind is accept, attach, sidecar, clarify, ignore or stop");
       expect(refused[5]).toBe("ignore needs reason");
       expect(refused[6]!.startsWith("Unknown argument extra")).toBe(true);
       // The eighth item is the one that decided it; the ninth finds it decided in this call.

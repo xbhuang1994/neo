@@ -27,6 +27,8 @@ export const REASONS: readonly (readonly [string, string])[] = [
   ["noRuleMatched", "No enabled admission rule matched"],
   ["ignoredFromCard", "Ignored from its card, without a rule assessment"],
   ["observed", "Observe mode: would accept ({text})"],
+  ["clarificationRequested", "Clarification requested from the person"],
+  ["sidecarRouted", "Answered via read-only sidecar"],
 ];
 
 const REASON_MAP = new Map<string, string>(REASONS);
