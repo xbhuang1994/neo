@@ -7,6 +7,7 @@
 
 import { Buffer } from "node:buffer";
 import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from "node:crypto";
+import { VERSION } from "../version.ts";
 
 /** The API's address. */
 export const API_URL = "https://ilinkai.weixin.qq.com";
@@ -17,7 +18,7 @@ export const CHANNEL_VERSION = "2.4.10";
 /** Client version reported in `iLink-App-ClientVersion`. */
 export const CLIENT_VERSION = (2 << 16) | (4 << 8) | 10;
 /** Bot agent string reported in `base_info`. */
-export const BOT_AGENT = "neo-agent/0.6.0";
+export const BOT_AGENT = `neo-agent/${VERSION}`;
 /** The largest media file sent or received (100 MiB). */
 export const MAX_MEDIA_BYTES = 100 * 1024 * 1024;
 /** The most one call about the typing indicator waits, so that stopping never waits long on it. */

@@ -43,6 +43,7 @@ import type {
   ToolSpec,
   UnboundedChannel,
 } from "./types.ts";
+import { VERSION } from "../version.ts";
 
 /** The plugin that carries the host's MCP server and hooks. */
 export const PLUGIN = "neo";
@@ -54,7 +55,7 @@ export const MCP_SERVER = "neo";
 export const AGENT = "neo-session";
 
 /** Package version reported in MCP serverInfo and plugin manifest. */
-export const PKG_VERSION = "0.6.0";
+export const PKG_VERSION = VERSION;
 
 /** The name the model gives the host's MCP server when it calls `call_mcp_tool`: plugin + server. */
 export function mcpServerName(): string {
