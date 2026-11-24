@@ -18,21 +18,41 @@ Data is kept in `~/Library/Application Support/neo-agent`.
 
 ### Windows
 
-1. Run `Neo-<version>-windows-x64-setup.exe`. It installs for the current user and needs no administrator rights.
+1. Run `Neo-<version>-windows-x64-setup.exe` (installs for the current user, no administrator rights required), or extract `Neo-<version>-windows-x64-portable.zip` and run `neo_agent.exe` directly.
 2. An installer that is not signed makes SmartScreen ask: choose More info → Run anyway.
-3. Start **Neo** from the Start menu.
+3. Start **Neo** from the Start menu (or the extracted folder for the portable build).
 
 Data is kept in `%LOCALAPPDATA%\neo-agent`.
 
-### Linux server
+### Linux desktop
+
+Debian / Ubuntu:
+
+```sh
+sudo apt install ./Neo-<version>-linux-x64.deb
+neo
+```
+
+Or use the portable archive on any Linux x64 distribution with GTK 3:
+
+```sh
+tar -xzf Neo-<version>-linux-x64.tar.gz
+./Neo-<version>-linux-x64/install-desktop.sh   # optional: add launcher to app menu
+./Neo-<version>-linux-x64/neo_agent
+```
+
+Data is kept in `~/.local/state/neo-agent`.
+
+### Linux server (`x64` / `arm64`)
 
 ```sh
 tar -xzf neo-agent-<version>-linux-x64.tar.gz -C /opt && mv /opt/neo-agent-<version>-linux-x64 /opt/neo-agent
+# On ARM64 servers, use neo-agent-<version>-linux-arm64.tar.gz instead.
 /opt/neo-agent/neo-agent doctor      # what this machine provides
 /opt/neo-agent/neo-agent serve       # http://127.0.0.1:3082/, this machine only
 ```
 
-The package holds the backend and the web app, and runs from wherever it is unpacked. Data is kept in `~/.local/state/neo-agent`, or where `--data-dir` says.
+The package holds `neo-agent`, the independent recovery daemon `neo-recovery`, the web app (`web/`), and systemd unit files (`neo-agent.service`, `neo-agent-user.service`, `neo-recovery-user.service`), and runs from wherever it is unpacked. Data is kept in `~/.local/state/neo-agent`, or where `--data-dir` says.
 
 ## 2. Give it a model
 

@@ -1,0 +1,22 @@
+# Neo Independent Recovery Daemon as a systemd user service (supervises Neo server).
+# Copy to ~/.config/systemd/user/neo-recovery.service, put NEO_TOKEN and PATH in
+# ~/.config/neo-agent/neo-agent.env, then: systemctl --user enable --now neo-recovery
+# With linger on (loginctl enable-linger), it starts at boot and automatically recovers Neo on outage.
+[Unit]
+Description=Neo Independent Recovery Daemon
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/neo-agent
+EnvironmentFile=%h/.config/neo-agent/neo-agent.env
+ExecStart=/opt/neo-agent/neo-recovery start --mode proxy --host 0.0.0.0 --port 3082 --internal-port 13082 --target-bin /opt/neo-agent/neo-agent --web-dir /opt/neo-agent/web --data-dir %h/.local/state/neo-agent --state-dir %h/.local/state/neo-recovery --unhealthy-after 60
+Restart=always
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=35
+
+[Install]
+WantedBy=default.target

@@ -30,15 +30,16 @@
 
 ## 安装
 
-发行页提供三种安装包，都自带后端；执行内核 Antigravity CLI（`agy`）不随包附带：
+发行页通过 GitHub Actions 自动构建并发布多平台安装包（附 `SHA256SUMS.txt` 校验文件），均自带后端；执行内核 Antigravity CLI（`agy`）不随包附带：
 
 | 系统 | 安装包 |
 | --- | --- |
-| macOS（Apple 芯片 / Intel 各一个） | `Neo-<版本>-macos-arm64.dmg` / `-x64.dmg` |
-| Windows x64 | `Neo-<版本>-windows-x64-setup.exe` |
-| Linux 服务器 | `neo-agent-<版本>-linux-x64.tar.gz` |
+| macOS（Apple 芯片 / Intel） | `Neo-<版本>-macos-arm64.dmg` / `Neo-<版本>-macos-x64.dmg` |
+| Windows x64（安装版 / 便携版） | `Neo-<版本>-windows-x64-setup.exe` / `Neo-<版本>-windows-x64-portable.zip` |
+| Linux 桌面 x64（Debian/Ubuntu / 便携包） | `Neo-<版本>-linux-x64.deb` / `Neo-<版本>-linux-x64.tar.gz` |
+| Linux 服务器（x64 / arm64，含 `neo-recovery`） | `neo-agent-<版本>-linux-x64.tar.gz` / `neo-agent-<版本>-linux-arm64.tar.gz` |
 
-安装步骤、模型接入、服务器部署见 **[SETUP.md](SETUP.md)**。
+安装步骤、模型接入、服务器部署见 **[SETUP.md](SETUP.md)**；版本发布流程见 **[docs/010-packaging.md](docs/010-packaging.md)**。
 
 执行内核：Neo 会自动发现本机已装的 `agy`（`PATH` 或官方安装器的默认目录）。没装的话，在 设置 → 内核与模型 里点「安装」，Neo 会运行 Antigravity CLI 的官方安装脚本，装好即可使用，不用重启。
 

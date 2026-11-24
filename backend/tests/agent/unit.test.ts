@@ -54,8 +54,11 @@ function makeExecutable(filePath: string): void {
 }
 
 describe("version", () => {
-  test("matches backend version 0.6.0", () => {
-    expect(VERSION).toBe("0.6.0");
+  test("matches backend/package.json version", () => {
+    const pkgPath = path.resolve(import.meta.dir, "../../package.json");
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8")) as { version: string };
+    expect(VERSION).toBe(pkg.version);
+    expect(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(VERSION)).toBe(true);
   });
 });
 

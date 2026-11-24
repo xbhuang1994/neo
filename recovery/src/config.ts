@@ -168,19 +168,26 @@ export function isLoopbackHost(host: string): boolean {
 }
 
 function discoverDefaultTargetBin(): string {
+  const execBase = path.basename(process.execPath).toLowerCase();
+  const exeName = process.platform === "win32" ? "neo-agent.exe" : "neo-agent";
+  const siblingTarget =
+    execBase !== "bun" && execBase !== "bun.exe"
+      ? path.join(path.dirname(process.execPath), exeName)
+      : undefined;
   const candidates = [
     envStr("NEO_AGENT_BIN"),
+    siblingTarget,
     "/nvme/workspace/neo/backend/dist/neo-agent",
     "/opt/neo-agent/neo-agent",
-    path.join(homeDir(), ".local", "bin", "neo-agent"),
-    path.resolve("neo-agent"),
+    path.join(homeDir(), ".local", "bin", exeName),
+    path.resolve(exeName),
   ];
   for (const candidate of candidates) {
     if (candidate && isFile(candidate)) {
       return candidate;
     }
   }
-  return "neo-agent";
+  return exeName;
 }
 
 function inferRepoDir(targetBin: string): string {

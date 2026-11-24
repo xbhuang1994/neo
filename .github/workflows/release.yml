@@ -1,19 +1,139 @@
 name: Release
 
-# Builds the installers: a disk image for each Mac architecture, a Windows setup program and a Linux server tarball,
-# each with the pure-TypeScript (Bun-compiled) backend inside. The agent runtimes are not bundled: the app installs them.
+# Multi-platform release pipeline for Neo:
+#   - macOS Desktop:      Neo-<version>-macos-arm64.dmg, Neo-<version>-macos-x64.dmg
+#   - Windows Desktop:    Neo-<version>-windows-x64-setup.exe, Neo-<version>-windows-x64-portable.zip
+#   - Linux Desktop:      Neo-<version>-linux-x64.deb, Neo-<version>-linux-x64.tar.gz
+#   - Linux Server:       neo-agent-<version>-linux-x64.tar.gz, neo-agent-<version>-linux-arm64.tar.gz
+#   - Checksums:          SHA256SUMS.txt
+#
+# Each package bundles the pure-TypeScript (Bun-compiled) neo-agent backend (and neo-recovery on Linux server).
+# Antigravity CLI (agy) is not bundled: the app discovers or installs it with the official installer.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.7.0). Leave empty for a dry-run build without creating a GitHub Release."
+        required: false
+        type: string
+        default: ""
+      draft:
+        description: "Create the GitHub Release as a draft"
+        required: false
+        type: boolean
+        default: true
+      prerelease:
+        description: "Mark as prerelease (auto-enabled for semver prerelease tags like v0.7.0-rc.1)"
+        required: false
+        type: boolean
+        default: false
+      skip_tests:
+        description: "Skip pre-release tests (workflow_dispatch only; never skipped on tag pushes)"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 env:
   FLUTTER_VERSION: "3.50.0"
   BUN_VERSION: "1.4.4"
 
 jobs:
+  prepare:
+    name: Validate version & run pre-release checks
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      should_publish: ${{ steps.meta.outputs.should_publish }}
+      is_draft: ${{ steps.meta.outputs.is_draft }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Validate release metadata and manifest versions
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_DRAFT: ${{ inputs.draft }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          if [ "$EVENT_NAME" = "push" ] && [ "${REF#refs/tags/v}" != "$REF" ]; then
+            bun packaging/release.ts check --tag "$REF_NAME" --github-output
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            echo "is_draft=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "$INPUT_TAG" ]; then
+            if [ "$INPUT_PRERELEASE" = "true" ]; then
+              bun packaging/release.ts check --tag "$INPUT_TAG" --prerelease --github-output
+            else
+              bun packaging/release.ts check --tag "$INPUT_TAG" --github-output
+            fi
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            if [ "$INPUT_DRAFT" = "false" ]; then
+              echo "is_draft=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "is_draft=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            bun packaging/release.ts check --github-output
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            echo "is_draft=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run packaging checks
+        if: github.event_name != 'workflow_dispatch' || !inputs.skip_tests
+        run: bun test packaging/release.test.ts
+
+      - name: Check & test backend
+        if: github.event_name != 'workflow_dispatch' || !inputs.skip_tests
+        working-directory: backend
+        run: |
+          bun install --frozen-lockfile
+          bun run check
+          bun run build
+          bun test
+
+      - name: Check & test recovery daemon
+        if: github.event_name != 'workflow_dispatch' || !inputs.skip_tests
+        working-directory: recovery
+        run: |
+          bun install --frozen-lockfile
+          bun run check
+          bun test
+
+      - name: Set up Flutter for app tests
+        if: github.event_name != 'workflow_dispatch' || !inputs.skip_tests
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Analyze & test Flutter app
+        if: github.event_name != 'workflow_dispatch' || !inputs.skip_tests
+        working-directory: app
+        run: |
+          flutter pub get
+          flutter analyze
+          flutter test
+
   macos:
     name: macOS ${{ matrix.arch }}
+    needs: [prepare]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -32,6 +152,7 @@ jobs:
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
+          cache: true
       - name: Import the signing certificate
         if: env.CERTIFICATE != ''
         env:
@@ -59,14 +180,20 @@ jobs:
         run: |
           xcrun notarytool submit dist/*.dmg --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
           xcrun stapler staple dist/*.dmg
+      - name: Clean up signing keychain
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/build.keychain" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/certificate.p12"
       - uses: actions/upload-artifact@v4
         with:
           name: macos-${{ matrix.arch }}
-          path: dist/*.dmg
+          path: dist/Neo-*-macos-${{ matrix.arch }}.dmg
           if-no-files-found: error
 
   windows:
     name: Windows x64
+    needs: [prepare]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
@@ -77,25 +204,34 @@ jobs:
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
-      - name: Put the app together
+          cache: true
+      - name: Stage desktop app and build portable archive
         shell: pwsh
         run: |
           ./packaging/windows/stage.ps1
-      - name: Build the installer
+      - name: Build Inno Setup installer
         shell: pwsh
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          $version = (Get-Content backend/package.json -Raw | ConvertFrom-Json).version
-          choco install innosetup --no-progress -y
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" "/DStage=$PWD\dist\windows-stage" packaging\windows\neo-agent.iss
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+            if ($LASTEXITCODE -ne 0) { throw "failed to install Inno Setup" }
+          }
+          & $iscc "/DAppVersion=$env:APP_VERSION" "/DStage=$PWD\dist\windows-stage" packaging\windows\neo-agent.iss
           if ($LASTEXITCODE -ne 0) { throw "the installer did not build" }
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64
-          path: dist/*-setup.exe
+          path: |
+            dist/Neo-*-windows-x64-setup.exe
+            dist/Neo-*-windows-x64-portable.zip
           if-no-files-found: error
 
-  linux:
-    name: Linux server x64
+  linux-desktop:
+    name: Linux desktop x64
+    needs: [prepare]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -106,30 +242,98 @@ jobs:
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
-      - name: Build the tarball
+          cache: true
+      - name: Install Linux desktop build dependencies
         run: |
-          packaging/linux/build-server.sh
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libgtk-3-dev pkg-config
+      - name: Build Linux desktop tarball and .deb package
+        run: |
+          packaging/linux/build-desktop.sh --arch x64
       - uses: actions/upload-artifact@v4
         with:
-          name: linux-x64
-          path: dist/*.tar.gz
+          name: linux-desktop-x64
+          path: |
+            dist/Neo-*-linux-x64.tar.gz
+            dist/Neo-*-linux-x64.deb
+          if-no-files-found: error
+
+  linux-server:
+    name: Linux server (x64 & arm64)
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: Build and smoke-test Linux server x64 tarball
+        run: |
+          packaging/linux/build-server.sh --arch x64
+      - name: Cross-compile and package Linux server arm64 tarball
+        run: |
+          packaging/linux/build-server.sh --arch arm64 --skip-web-build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-server
+          path: |
+            dist/neo-agent-*-linux-x64.tar.gz
+            dist/neo-agent-*-linux-arm64.tar.gz
           if-no-files-found: error
 
   publish:
-    name: Publish the release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [macos, windows, linux]
+    name: Publish release
+    if: needs.prepare.outputs.should_publish == 'true'
+    needs: [prepare, macos, windows, linux-desktop, linux-server]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: Checksums
-        run: cd dist && sha256sum * > SHA256SUMS.txt
+      - name: Verify complete multi-platform artifact set
+        run: |
+          bun packaging/release.ts verify-dist "${{ needs.prepare.outputs.version }}" dist
+      - name: Generate and verify SHA-256 checksums
+        run: |
+          (
+            cd dist
+            find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -printf '%f\n' \
+              | LC_ALL=C sort \
+              | xargs sha256sum
+          ) > SHA256SUMS.txt
+          mv SHA256SUMS.txt dist/SHA256SUMS.txt
+          (cd dist && sha256sum -c SHA256SUMS.txt)
+      - name: Generate release notes and workflow summary
+        run: |
+          bun packaging/release.ts notes "${{ needs.prepare.outputs.version }}" --dist dist --out release-notes.md
+          {
+            cat release-notes.md
+            echo "### SHA256SUMS.txt"
+            echo ""
+            echo '```text'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Neo ${{ needs.prepare.outputs.tag }}
+          body_path: release-notes.md
+          generate_release_notes: true
+          draft: ${{ needs.prepare.outputs.is_draft == 'true' }}
+          prerelease: ${{ needs.prepare.outputs.is_prerelease == 'true' }}
           files: dist/*
-          draft: true
+          fail_on_unmatched_files: true
