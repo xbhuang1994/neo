@@ -795,11 +795,14 @@ export class LoginSession {
 
     let child: ChildProcessByStdio<Writable, Readable, Readable>;
     try {
+      const needsWinShell =
+        process.platform === "win32" && /\.(?:cmd|bat)$/i.test(command.program);
       child = spawn(command.program, command.args, {
         env: childEnv,
         stdio: ["pipe", "pipe", "pipe"],
         detached: process.platform !== "win32",
         windowsHide: true,
+        shell: needsWinShell,
       });
     } catch (err) {
       throw new Error(`Cannot run ${command.program}: ${errorMessage(err)}`);

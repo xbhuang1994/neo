@@ -40,7 +40,7 @@ export const MAX_SUBAGENTS = 8;
 export const INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
 
 /** Timeout for the fallback CLI auth probe (`agy models`) when keyring & file have no token. */
-export const AUTH_PROBE_TIMEOUT_MS = 15_000;
+export const AUTH_PROBE_TIMEOUT_MS = 30_000;
 
 /** What a Session needs from its runtime. */
 export interface SessionSpec {

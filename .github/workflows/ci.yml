@@ -48,7 +48,7 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           ./dist/neo-agent.exe version
-          bun test tests/core tests/store
+          bun test tests/core tests/store tests/app/keyring.test.ts
 
   recovery:
     name: Recovery (${{ matrix.os }})

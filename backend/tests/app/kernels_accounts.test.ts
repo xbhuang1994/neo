@@ -42,6 +42,8 @@ import {
   parseDarwinSecurityResult,
   parseLinuxSecretToolDeleteResult,
   parseLinuxSecretToolResult,
+  parseWinPowerShellDeleteResult,
+  parseWinPowerShellReadResult,
   readWinCredBlobFromStruct,
   winCredTargetName,
 } from "../../src/app/keyring.ts";
@@ -1012,8 +1014,10 @@ describe("accounts: cross-platform OS keyring, Windows home resolution, and CLI 
     // Plain JSON passthrough
     expect(decodeGoKeyringSecret(`  ${payload}  `)).toBe(payload);
 
-    // Windows target name and UTF-8 / UTF-16LE blob decoding
-    expect(winCredTargetName(AGY_KEYRING_SERVICE, AGY_KEYRING_USER)).toBe("antigravity:gemini");
+    // Windows target name (`service:username` = `gemini:antigravity`) and UTF-8 / UTF-16LE blob decoding
+    expect(AGY_KEYRING_SERVICE).toBe("gemini");
+    expect(AGY_KEYRING_USER).toBe("antigravity");
+    expect(winCredTargetName(AGY_KEYRING_SERVICE, AGY_KEYRING_USER)).toBe("gemini:antigravity");
     expect(decodeWinCredBlob(Buffer.from(payload, "utf8"))).toBe(payload);
     expect(decodeWinCredBlob(Buffer.from(`${payload}\0`, "utf16le"))).toBe(payload);
 
@@ -1026,7 +1030,7 @@ describe("accounts: cross-platform OS keyring, Windows home resolution, and CLI 
     expect(isForceFileTokenStorage({ [AGY_FORCE_FILE_ENV]: "false" }, "linux")).toBe(false);
   });
 
-  test("readWinCredBlobFromStruct reads 64-bit Win32 CREDENTIALW offsets (+32 size, +40 blobPtr)", () => {
+  test("readWinCredBlobFromStruct reads 64-bit Win32 CREDENTIALW offsets (+32 size, +40 blobPtr) for Pointer and bigint", () => {
     const payload = JSON.stringify({
       token: { access_token: "win-tok" },
       id_token_email: "winuser@example.com",
@@ -1037,15 +1041,118 @@ describe("accounts: cross-platform OS keyring, Windows home resolution, and CLI 
     view.setUint32(32, blob.length, true);
     view.setBigUint64(40, BigInt(ptr(blob)), true);
 
-    expect(readWinCredBlobFromStruct(BigInt(ptr(credStruct)))).toEqual({
+    // Accepts both Pointer (number) and bigint struct addresses
+    expect(readWinCredBlobFromStruct(ptr(credStruct))).toEqual({
+      kind: "found",
+      value: payload,
+    });
+    const bigintRes = readWinCredBlobFromStruct(BigInt(ptr(credStruct)));
+    expect(bigintRes).toEqual({
       kind: "found",
       value: payload,
     });
 
-    // Zero-size blob or null address returns notFound cleanly
+    // Mutating the underlying blob after read must not affect the returned string (safe before CredFree)
+    blob.fill(0);
+    expect(bigintRes).toEqual({
+      kind: "found",
+      value: payload,
+    });
+
+    // UTF-16LE credential blob decoding through CREDENTIALW
+    const utf16Blob = Buffer.from(`${payload}\0`, "utf16le");
+    view.setUint32(32, utf16Blob.length, true);
+    view.setBigUint64(40, BigInt(ptr(utf16Blob)), true);
+    expect(readWinCredBlobFromStruct(ptr(credStruct))).toEqual({
+      kind: "found",
+      value: payload,
+    });
+
+    // Null blobPtr, zero-size blob, or null struct address returns notFound cleanly
+    view.setBigUint64(40, 0n, true);
+    expect(readWinCredBlobFromStruct(ptr(credStruct))).toEqual({ kind: "notFound" });
+    view.setBigUint64(40, BigInt(ptr(utf16Blob)), true);
     view.setUint32(32, 0, true);
     expect(readWinCredBlobFromStruct(BigInt(ptr(credStruct)))).toEqual({ kind: "notFound" });
     expect(readWinCredBlobFromStruct(0n)).toEqual({ kind: "notFound" });
+  });
+
+  test("parses Windows PowerShell CredReadW/CredDeleteW fallback outputs accurately", () => {
+    const payload = JSON.stringify({
+      token: { access_token: "ps-tok" },
+      id_token_email: "pswin@example.com",
+    });
+    const b64Utf8 = Buffer.from(payload, "utf8").toString("base64");
+    const b64Utf16 = Buffer.from(`${payload}\0`, "utf16le").toString("base64");
+
+    expect(
+      parseWinPowerShellReadResult({
+        status: 0,
+        stdout: `FOUND:${b64Utf8}\r\n`,
+        stderr: "",
+        timedOut: false,
+      }),
+    ).toEqual({ kind: "found", value: payload });
+    expect(
+      parseWinPowerShellReadResult({
+        status: 0,
+        stdout: `FOUND:${b64Utf16}`,
+        stderr: "",
+        timedOut: false,
+      }),
+    ).toEqual({ kind: "found", value: payload });
+    expect(
+      parseWinPowerShellReadResult({
+        status: 0,
+        stdout: "NOT_FOUND\r\n",
+        stderr: "",
+        timedOut: false,
+      }),
+    ).toEqual({ kind: "notFound" });
+    expect(
+      parseWinPowerShellReadResult({
+        status: 0,
+        stdout: "ERROR:1312",
+        stderr: "",
+        timedOut: false,
+      }),
+    ).toEqual({ kind: "unavailable", reason: "Windows Credential Manager error 1312" });
+    expect(
+      parseWinPowerShellReadResult({
+        status: null,
+        stdout: "",
+        stderr: "",
+        timedOut: true,
+      }),
+    ).toEqual({ kind: "unavailable", reason: "Windows Credential Manager lookup timed out" });
+
+    expect(
+      parseWinPowerShellDeleteResult({
+        status: 0,
+        stdout: "DELETED\r\n",
+        stderr: "",
+        timedOut: false,
+      }),
+    ).toEqual({ kind: "deleted" });
+    expect(
+      parseWinPowerShellDeleteResult({
+        status: 0,
+        stdout: "NOT_FOUND",
+        stderr: "",
+        timedOut: false,
+      }),
+    ).toEqual({ kind: "notFound" });
+    expect(
+      parseWinPowerShellDeleteResult({
+        status: 0,
+        stdout: "ERROR:5",
+        stderr: "",
+        timedOut: false,
+      }),
+    ).toEqual({
+      kind: "error",
+      reason: "Windows Credential Manager delete failed (ERROR:5)",
+    });
   });
 
   test("parses macOS security and Linux secret-tool exit codes and outputs accurately", () => {
@@ -1175,25 +1282,25 @@ describe("accounts: cross-platform OS keyring, Windows home resolution, and CLI 
 
     const mockKeyring: KeyringBackend & SyncKeyringBackend = {
       async read(service, username) {
-        expect(service).toBe("antigravity");
-        expect(username).toBe("gemini");
+        expect(service).toBe("gemini");
+        expect(username).toBe("antigravity");
         return storedSecret !== null ? { kind: "found", value: storedSecret } : { kind: "notFound" };
       },
       async delete(service, username) {
-        expect(service).toBe("antigravity");
-        expect(username).toBe("gemini");
+        expect(service).toBe("gemini");
+        expect(username).toBe("antigravity");
         if (storedSecret === null) return { kind: "notFound" };
         storedSecret = null;
         return { kind: "deleted" };
       },
       readSync(service, username) {
-        expect(service).toBe("antigravity");
-        expect(username).toBe("gemini");
+        expect(service).toBe("gemini");
+        expect(username).toBe("antigravity");
         return storedSecret !== null ? { kind: "found", value: storedSecret } : { kind: "notFound" };
       },
       deleteSync(service, username) {
-        expect(service).toBe("antigravity");
-        expect(username).toBe("gemini");
+        expect(service).toBe("gemini");
+        expect(username).toBe("antigravity");
         if (storedSecret === null) return { kind: "notFound" };
         storedSecret = null;
         return { kind: "deleted" };
@@ -1340,14 +1447,14 @@ describe("accounts: cross-platform OS keyring, Windows home resolution, and CLI 
       dir,
       "secret-tool",
       `#!/usr/bin/env bash
-if [ "$1" = "lookup" ] && [ "$2" = "service" ] && [ "$3" = "antigravity" ] && [ "$4" = "username" ] && [ "$5" = "gemini" ]; then
+if [ "$1" = "lookup" ] && [ "$2" = "service" ] && [ "$3" = "gemini" ] && [ "$4" = "username" ] && [ "$5" = "antigravity" ]; then
   if [ -f "${stateFile}" ]; then
     cat "${stateFile}"
     exit 0
   fi
   exit 1
 fi
-if [ "$1" = "clear" ] && [ "$2" = "service" ] && [ "$3" = "antigravity" ] && [ "$4" = "username" ] && [ "$5" = "gemini" ]; then
+if [ "$1" = "clear" ] && [ "$2" = "service" ] && [ "$3" = "gemini" ] && [ "$4" = "username" ] && [ "$5" = "antigravity" ]; then
   if [ -f "${stateFile}" ]; then
     rm -f "${stateFile}"
     exit 0

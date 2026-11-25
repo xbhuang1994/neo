@@ -312,19 +312,48 @@ export function parseModels(text: string): Array<[string, string]> {
   return out;
 }
 
+/** Merge override variables on top of `baseEnv`, deduplicating case-insensitively on Windows. */
+function mergeChildEnv(
+  baseEnv: Record<string, string | undefined>,
+  overrides?: Record<string, string>,
+): Record<string, string | undefined> {
+  if (!overrides || Object.keys(overrides).length === 0) {
+    return { ...baseEnv };
+  }
+  const merged: Record<string, string | undefined> = { ...baseEnv };
+  if (process.platform === "win32") {
+    const existingByLower = new Map<string, string>();
+    for (const key of Object.keys(merged)) {
+      existingByLower.set(key.toLowerCase(), key);
+    }
+    for (const [key, value] of Object.entries(overrides)) {
+      const prior = existingByLower.get(key.toLowerCase());
+      if (prior !== undefined && prior !== key) {
+        delete merged[prior];
+      }
+      merged[key] = value;
+      existingByLower.set(key.toLowerCase(), key);
+    }
+    return merged;
+  }
+  return { ...merged, ...overrides };
+}
+
 /** The models `agy models` lists: `[id, displayName]` pairs. */
 export async function listModels(
   program: string,
   env?: Record<string, string>,
   timeoutMs = 60_000,
 ): Promise<Array<[string, string]>> {
-  const childEnv: Record<string, string | undefined> = { ...process.env, ...(env ?? {}) };
+  const childEnv = mergeChildEnv(process.env, env);
+  const needsWinShell = process.platform === "win32" && /\.(?:cmd|bat)$/i.test(program);
   return await new Promise<Array<[string, string]>>((resolve, reject) => {
     let settled = false;
     const child = spawn(program, ["models"], {
       env: childEnv,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
+      shell: needsWinShell,
     });
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
@@ -358,7 +387,9 @@ export async function listModels(
       settled = true;
       clearTimeout(timer);
       if (code !== 0 || signal !== null) {
-        const why = Buffer.concat(stderrChunks).toString("utf8").trim();
+        const stderrText = Buffer.concat(stderrChunks).toString("utf8").trim();
+        const stdoutText = Buffer.concat(stdoutChunks).toString("utf8").trim();
+        const why = stderrText.length > 0 ? stderrText : stdoutText;
         const statusDesc = code !== null ? `exit status: ${code}` : `signal: ${signal}`;
         reject(new Error(`Antigravity cannot list its models: ${why.length > 0 ? why : statusDesc}`));
         return;
