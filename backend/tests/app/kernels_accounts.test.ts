@@ -299,9 +299,7 @@ describe("accounts: AccountsState interactive login, cancellation, failsOn, time
       dir,
       "fake-login.sh",
       `#!/usr/bin/env bash
-printf 'Opening browser...\\r\\n'
-printf 'Visit: \\033]8;;https://accounts.google.com/o/oauth2/auth?state=abc\\007https://accounts.google.com/o/oauth2/auth?state=abc\\033]8;;\\007\\n'
-printf '\\033[1;32mPaste code\\033[0m > '
+printf 'Opening browser...\\r\\nVisit: \\033]8;;https://accounts.google.com/o/oauth2/auth?state=abc\\007https://accounts.google.com/o/oauth2/auth?state=abc\\033]8;;\\007\\n\\033[1;32mPaste code\\033[0m > '
 IFS= read -r code
 if [ "$code" = "AUTH-CODE-123" ]; then
   echo "Signed in as neo@example.com"
