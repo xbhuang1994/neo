@@ -1,7 +1,7 @@
 ; The Windows installer of Neo (Inno Setup 6): the app and its backend, installed for
 ; the current user without administrator rights.
 ;
-; Build: iscc /DAppVersion=0.9.2 /DStage=<folder> packaging\windows\neo-agent.iss
+; Build: iscc /DAppVersion=0.10.0 /DStage=<folder> packaging\windows\neo-agent.iss
 ; <folder> holds what packaging\windows\stage.ps1 put together: the Flutter app (neo_agent.exe, its DLLs and data)
 ; and neo-agent.exe. The Antigravity CLI is not bundled; the app installs it.
 
