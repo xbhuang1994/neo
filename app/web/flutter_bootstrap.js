@@ -2,10 +2,11 @@
 {{flutter_build_config}}
 
 (() => {
-  const fontManifestUrl = new URL('assets/FontManifest.json', document.baseURI).toString();
   const fallbackBase = new URL('fonts/fallback/', document.baseURI).toString();
   const emptyFontPath = '_empty.ttf';
   const cjkMonolithicPath = 'notosanssc/v40/k3kCo84MPvpLmixcA63oeAL7Iqp5IZJF9bmaG9_FnYlNbPzS5HE.woff2';
+  // Keep all 10 local Noto Color Emoji slices self-hosted and loaded on demand by Flutter's
+  // FontFallbackManager rather than eagerly blocking startup (~2.2 MB saved before first frame).
   const emojiFallbackFiles = [
     'notocoloremoji/v39/Yq6P-KqIXTD0t4D9z1ESnKM3-HpFabsE4tq3luCC7p-aXxcn.0.woff2',
     'notocoloremoji/v39/Yq6P-KqIXTD0t4D9z1ESnKM3-HpFabsE4tq3luCC7p-aXxcn.1.woff2',
@@ -37,6 +38,15 @@
   const origFetch = window.fetch.bind(window);
   let emptyFontBytesPromise = null;
   let cjkOwner = null;
+
+  const removeSplash = () => {
+    const splash = document.getElementById('neo-splash');
+    if (!splash || splash.dataset.removing) return;
+    splash.dataset.removing = '1';
+    splash.classList.add('neo-splash-hide');
+    setTimeout(() => splash.remove(), 180);
+  };
+  window.addEventListener('flutter-first-frame', removeSplash, { once: true });
 
   const loadEmptyFontBytes = () => {
     if (!emptyFontBytesPromise) {
@@ -73,29 +83,6 @@
       }
     }
 
-    if (resolvedUrl.split(/[?#]/, 1)[0] === fontManifestUrl) {
-      return origFetch(input, init).then(async (res) => {
-        if (!res.ok) return res;
-        try {
-          const manifest = await res.clone().json();
-          if (!Array.isArray(manifest)) return res;
-          const existing = new Set(manifest.map((entry) => entry && entry.family));
-          emojiFallbackFiles.forEach((rel, index) => {
-            const family = 'Noto Color Emoji ' + index;
-            if (!existing.has(family)) {
-              manifest.push({ family, fonts: [{ asset: fallbackBase + rel }] });
-            }
-          });
-          return new Response(JSON.stringify(manifest), {
-            status: 200,
-            headers: { 'Content-Type': 'application/json; charset=utf-8' },
-          });
-        } catch (_) {
-          return res;
-        }
-      });
-    }
-
     if (!resolvedUrl.startsWith(fallbackBase)) {
       return origFetch(input, init);
     }
@@ -129,10 +116,18 @@
   };
 
   // Keep every web resource on this server: never fall back to Google's CanvasKit or Fonts CDNs.
+  // Passing engineConfig to initializeEngine is required when using a custom onEntrypointLoaded hook.
+  const engineConfig = {
+    canvasKitBaseUrl: 'canvaskit/',
+    fontFallbackBaseUrl: fallbackBase,
+    suppressMultithreadingWarning: true,
+  };
   _flutter.loader.load({
-    config: {
-      canvasKitBaseUrl: 'canvaskit/',
-      fontFallbackBaseUrl: fallbackBase,
+    config: engineConfig,
+    onEntrypointLoaded: async (engineInitializer) => {
+      const appRunner = await engineInitializer.initializeEngine(engineConfig);
+      await appRunner.runApp();
+      removeSplash();
     },
   });
 })();

@@ -26,6 +26,53 @@ class ApiException implements Exception {
   String toString() => message;
 }
 
+/// Result of one conditional GET endpoint call.
+class ConditionalResult<T> {
+  const ConditionalResult.unchanged({required this.raw, this.etag}) : changed = false, value = null;
+  const ConditionalResult.changed({required this.value, required this.raw, this.etag}) : changed = true;
+
+  final bool changed;
+  final T? value;
+  final String raw;
+  final String? etag;
+}
+
+/// Result of one combined `GET /api/poll` call.
+class PollResult {
+  const PollResult({
+    this.unchanged = false,
+    this.etags = const {},
+    this.messages,
+    this.workers,
+    this.activity,
+    this.devices,
+    this.hasWorkerDetail = false,
+    this.workerDetail,
+    this.health,
+  });
+
+  const PollResult.unchanged()
+    : unchanged = true,
+      etags = const {},
+      messages = null,
+      workers = null,
+      activity = null,
+      devices = null,
+      hasWorkerDetail = false,
+      workerDetail = null,
+      health = null;
+
+  final bool unchanged;
+  final Map<String, String> etags;
+  final List<ChatMessage>? messages;
+  final List<Worker>? workers;
+  final Activity? activity;
+  final DevicesOverview? devices;
+  final bool hasWorkerDetail;
+  final Worker? workerDetail;
+  final Health? health;
+}
+
 /// Calls one backend.
 class ApiClient {
   ApiClient(this.base, {this.token, http.Client? client}) : _client = client ?? http.Client();
@@ -39,16 +86,22 @@ class ApiClient {
 
   void close() => _client.close();
 
-  Future<Object?> _call(String method, String path, {Object? body, Duration timeout = const Duration(seconds: 15)}) async {
+  Future<http.Response> _sendRaw(
+    String method,
+    String path, {
+    Object? body,
+    Map<String, String>? extraHeaders,
+    Duration timeout = const Duration(seconds: 15),
+  }) async {
     final request = http.Request(method, base.resolve(path));
     if (token != null && token!.isNotEmpty) request.headers['authorization'] = 'Bearer $token';
+    if (extraHeaders != null) request.headers.addAll(extraHeaders);
     if (body != null) {
       request.headers['content-type'] = 'application/json; charset=utf-8';
       request.bodyBytes = utf8.encode(jsonEncode(body));
     }
-    final http.Response response;
     try {
-      response = await http.Response.fromStream(await _client.send(request).timeout(timeout));
+      return await http.Response.fromStream(await _client.send(request).timeout(timeout));
     } on TimeoutException {
       throw ApiException(0, 'timeout');
     } on http.ClientException catch (error) {
@@ -56,6 +109,9 @@ class ApiClient {
     } on Exception catch (error) {
       throw ApiException(0, error.toString());
     }
+  }
+
+  Object? _decodeAndCheck(http.Response response) {
     Object? decoded;
     try {
       decoded = response.bodyBytes.isEmpty ? null : jsonDecode(utf8.decode(response.bodyBytes));
@@ -69,10 +125,122 @@ class ApiClient {
     return decoded;
   }
 
+  Future<Object?> _call(String method, String path, {Object? body, Duration timeout = const Duration(seconds: 15)}) async {
+    final response = await _sendRaw(method, path, body: body, timeout: timeout);
+    return _decodeAndCheck(response);
+  }
+
   Future<Map<String, dynamic>> _object(String method, String path, {Object? body, Duration timeout = const Duration(seconds: 15)}) async {
     final decoded = await _call(method, path, body: body, timeout: timeout);
     if (decoded is! Map) throw ApiException(0, 'The server answered something that is not Neo');
     return decoded.cast<String, dynamic>();
+  }
+
+  /// Fetches a JSON object only when the server's ETag or raw body differs from the previous response.
+  /// Avoids `jsonDecode`, model construction, and base64 decoding completely on unchanged polls.
+  Future<ConditionalResult<Map<String, dynamic>>> _conditionalObject(
+    String path, {
+    String? ifNoneMatch,
+    String? previousRaw,
+    Duration timeout = const Duration(seconds: 15),
+  }) async {
+    final response = await _sendRaw(
+      'GET',
+      path,
+      extraHeaders: ifNoneMatch != null && ifNoneMatch.isNotEmpty ? {'if-none-match': ifNoneMatch} : null,
+      timeout: timeout,
+    );
+    final etag = response.headers['etag'] ?? ifNoneMatch;
+    if (response.statusCode == 304) {
+      return ConditionalResult.unchanged(raw: previousRaw ?? '', etag: etag);
+    }
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      _decodeAndCheck(response);
+    }
+    final rawText = response.bodyBytes.isEmpty ? '' : utf8.decode(response.bodyBytes);
+    if (previousRaw != null && previousRaw.isNotEmpty && rawText == previousRaw) {
+      return ConditionalResult.unchanged(raw: rawText, etag: etag);
+    }
+    Object? decoded;
+    try {
+      decoded = rawText.isEmpty ? null : jsonDecode(rawText);
+    } on FormatException {
+      decoded = null;
+    }
+    if (decoded is! Map) throw ApiException(0, 'The server answered something that is not Neo');
+    return ConditionalResult.changed(value: decoded.cast<String, dynamic>(), raw: rawText, etag: etag);
+  }
+
+  /// Combined multi-slice conditional poll (`GET /api/poll`). Returns `null` when an older backend answers 404.
+  Future<PollResult?> poll({
+    required Set<String> include,
+    required Map<String, String> etags,
+    String? workerId,
+    bool wantHealth = false,
+    List<ChatMessage> previousMessages = const [],
+  }) async {
+    final query = <String, String>{
+      'include': include.join(','),
+      if (workerId != null && workerId.isNotEmpty) 'worker': workerId,
+      if (wantHealth) 'health': '1',
+      for (final key in include)
+        if (etags[key] case final tag?)
+          if (tag.isNotEmpty) key: tag,
+    };
+    final path = Uri(path: '/api/poll', queryParameters: query).toString();
+    final response = await _sendRaw('GET', path, timeout: const Duration(seconds: 15));
+    if (response.statusCode == 304) {
+      return const PollResult.unchanged();
+    }
+    if (response.statusCode == 404) {
+      return null;
+    }
+    final decoded = _decodeAndCheck(response);
+    if (decoded is! Map) throw ApiException(0, 'The server answered something that is not Neo');
+    final body = decoded.cast<String, dynamic>();
+    final changed = body['changed'] is Map ? (body['changed'] as Map).cast<String, dynamic>() : const <String, dynamic>{};
+    final nextEtags = <String, String>{};
+    if (body['etags'] is Map) {
+      for (final entry in (body['etags'] as Map).entries) {
+        if (entry.value is String) nextEtags[entry.key.toString()] = entry.value as String;
+      }
+    }
+    List<ChatMessage>? messages;
+    if (changed.containsKey('messages')) {
+      final list = changed['messages'] is List ? changed['messages'] as List<dynamic> : const <dynamic>[];
+      messages = ChatMessage.parseList(list, previous: previousMessages);
+    }
+    List<Worker>? workers;
+    if (changed.containsKey('workers')) {
+      final list = changed['workers'] is List ? changed['workers'] as List<dynamic> : const <dynamic>[];
+      workers = List<Worker>.unmodifiable([for (final item in list) Worker.fromJson((item as Map).cast<String, dynamic>())]);
+    }
+    Activity? activity;
+    if (changed.containsKey('activity') && changed['activity'] is Map) {
+      activity = Activity.fromJson((changed['activity'] as Map).cast<String, dynamic>());
+    }
+    DevicesOverview? devices;
+    if (changed.containsKey('devices') && changed['devices'] is Map) {
+      devices = DevicesOverview.fromJson((changed['devices'] as Map).cast<String, dynamic>());
+    }
+    final hasWorkerDetail = changed.containsKey('workerDetail');
+    final workerDetail = hasWorkerDetail && changed['workerDetail'] is Map
+        ? Worker.fromJson((changed['workerDetail'] as Map).cast<String, dynamic>())
+        : null;
+    Health? health;
+    if (changed.containsKey('health') && changed['health'] is Map) {
+      health = Health.fromJson((changed['health'] as Map).cast<String, dynamic>());
+    }
+    return PollResult(
+      etags: nextEtags,
+      messages: messages,
+      workers: workers,
+      activity: activity,
+      devices: devices,
+      hasWorkerDetail: hasWorkerDetail,
+      workerDetail: workerDetail,
+      health: health,
+    );
   }
 
   Future<Health> health() async => Health.fromJson(await _object('GET', '/api/health', timeout: const Duration(seconds: 5)));
@@ -81,13 +249,39 @@ class ApiClient {
   Future<(List<ChatMessage>, String)> messages() async {
     final body = await _object('GET', '/api/messages');
     final list = body['messages'] is List ? body['messages'] as List<dynamic> : const <dynamic>[];
-    return ([for (final message in list) ChatMessage.fromJson((message as Map).cast<String, dynamic>())], jsonEncode(list));
+    return (ChatMessage.parseList(list), jsonEncode(list));
+  }
+
+  Future<ConditionalResult<List<ChatMessage>>> messagesIfChanged({
+    String? ifNoneMatch,
+    String? previousRaw,
+    List<ChatMessage> previousMessages = const [],
+  }) async {
+    final res = await _conditionalObject('/api/messages', ifNoneMatch: ifNoneMatch, previousRaw: previousRaw);
+    if (!res.changed) return ConditionalResult.unchanged(raw: res.raw, etag: res.etag);
+    final list = res.value!['messages'] is List ? res.value!['messages'] as List<dynamic> : const <dynamic>[];
+    return ConditionalResult.changed(
+      value: ChatMessage.parseList(list, previous: previousMessages),
+      raw: res.raw,
+      etag: res.etag,
+    );
   }
 
   Future<List<Worker>> workers() async {
     final body = await _object('GET', '/api/workers');
     final list = body['workers'] is List ? body['workers'] as List<dynamic> : const <dynamic>[];
     return [for (final worker in list) Worker.fromJson((worker as Map).cast<String, dynamic>())];
+  }
+
+  Future<ConditionalResult<List<Worker>>> workersIfChanged({String? ifNoneMatch, String? previousRaw}) async {
+    final res = await _conditionalObject('/api/workers', ifNoneMatch: ifNoneMatch, previousRaw: previousRaw);
+    if (!res.changed) return ConditionalResult.unchanged(raw: res.raw, etag: res.etag);
+    final list = res.value!['workers'] is List ? res.value!['workers'] as List<dynamic> : const <dynamic>[];
+    return ConditionalResult.changed(
+      value: List<Worker>.unmodifiable([for (final worker in list) Worker.fromJson((worker as Map).cast<String, dynamic>())]),
+      raw: res.raw,
+      etag: res.etag,
+    );
   }
 
   /// What is at work now; idle from a backend too old to say.
@@ -100,7 +294,35 @@ class ApiClient {
     }
   }
 
+  Future<ConditionalResult<Activity>> activityIfChanged({String? ifNoneMatch, String? previousRaw}) async {
+    try {
+      final res = await _conditionalObject('/api/activity', ifNoneMatch: ifNoneMatch, previousRaw: previousRaw, timeout: const Duration(seconds: 5));
+      if (!res.changed) return ConditionalResult.unchanged(raw: res.raw, etag: res.etag);
+      return ConditionalResult.changed(value: Activity.fromJson(res.value!, raw: res.raw), raw: res.raw, etag: res.etag);
+    } on ApiException catch (error) {
+      if (error.status == 404) {
+        if (previousRaw == '__404__') return const ConditionalResult.unchanged(raw: '__404__');
+        return const ConditionalResult.changed(value: Activity.idle(), raw: '__404__');
+      }
+      rethrow;
+    }
+  }
+
   Future<Worker> worker(String ticketId) async => Worker.fromJson(await _object('GET', '/api/workers/${Uri.encodeComponent(ticketId)}'));
+
+  Future<ConditionalResult<Worker?>> workerIfChanged(String ticketId, {String? ifNoneMatch, String? previousRaw}) async {
+    try {
+      final res = await _conditionalObject('/api/workers/${Uri.encodeComponent(ticketId)}', ifNoneMatch: ifNoneMatch, previousRaw: previousRaw);
+      if (!res.changed) return ConditionalResult.unchanged(raw: res.raw, etag: res.etag);
+      return ConditionalResult.changed(value: Worker.fromJson(res.value!, raw: res.raw), raw: res.raw, etag: res.etag);
+    } on ApiException catch (error) {
+      if (error.status == 404) {
+        if (previousRaw == '__404__') return const ConditionalResult.unchanged(raw: '__404__');
+        return const ConditionalResult.changed(value: null, raw: '__404__');
+      }
+      rethrow;
+    }
+  }
 
   /// Stop a worker and all of its subtasks, marking the task ended.
   Future<Worker> stopWorker(String ticketId) async =>
@@ -170,6 +392,19 @@ class ApiClient {
   // Multi-Device Control Plane
 
   Future<DevicesOverview> devicesOverview() async => DevicesOverview.fromJson(await _object('GET', '/api/devices'));
+
+  Future<(ConditionalResult<DevicesOverview?>, bool)> devicesOverviewIfChanged({String? ifNoneMatch, String? previousRaw}) async {
+    try {
+      final res = await _conditionalObject('/api/devices', ifNoneMatch: ifNoneMatch, previousRaw: previousRaw);
+      if (!res.changed) return (ConditionalResult<DevicesOverview?>.unchanged(raw: res.raw, etag: res.etag), false);
+      return (ConditionalResult<DevicesOverview?>.changed(value: DevicesOverview.fromJson(res.value!, raw: res.raw), raw: res.raw, etag: res.etag), false);
+    } on ApiException catch (error) {
+      if (error.status == 404) {
+        return (const ConditionalResult<DevicesOverview?>.changed(value: null, raw: '__404__'), true);
+      }
+      rethrow;
+    }
+  }
 
   Future<DeviceControlConfig> deviceConfig() async {
     final body = await _object('GET', '/api/devices/config');

@@ -673,4 +673,21 @@ void main() {
 
     await app.close();
   });
+
+  testWidgets('mounts non-initial tabs lazily without eager Settings API calls on startup', (tester) async {
+    final backend = FakeBackend();
+    final app = await open(tester, backend);
+
+    // On initial Chat tab, Settings endpoints must NOT have been fetched eagerly.
+    expect(backend.calls.where((c) => c.contains('/api/settings/') || c.contains('/api/wechat')), isEmpty);
+
+    // Navigating to Settings mounts it on demand and fetches its sections.
+    await tester.tap(nav(3));
+    await settle(tester);
+    expect(backend.calls, contains('GET /api/settings/models'));
+    expect(backend.calls, contains('GET /api/settings/general'));
+    expect(backend.calls, contains('GET /api/wechat'));
+
+    await app.close();
+  });
 }

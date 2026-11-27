@@ -266,8 +266,8 @@ void main() {
       expect(bootstrap, contains('{{flutter_build_config}}'));
       expect(bootstrap, contains('canvasKitBaseUrl'));
       expect(bootstrap, contains('fontFallbackBaseUrl'));
-      expect(bootstrap, contains('assets/FontManifest.json'));
-      expect(bootstrap, contains('Noto Color Emoji '));
+      // Emoji slices stay self-hosted locally and load on demand via FontFallbackManager (never blocking FontManifest startup).
+      expect(bootstrap, isNot(contains('assets/FontManifest.json')));
       expect(bootstrap, isNot(contains('http://')));
       expect(bootstrap, isNot(contains('https://')));
 
@@ -304,6 +304,71 @@ void main() {
       final variationSelectors = File('fonts/VariationSelectors.ttf');
       expect(variationSelectors.existsSync(), isTrue);
       expect(variationSelectors.lengthSync(), greaterThan(0));
+    });
+  });
+
+  group('performance invariants', () {
+    test('formatMessage caches parsed segments and isLong matches edge cases', () {
+      const sample = 'Run:\n```dart\nprint(1);\n```\nDone.';
+      final first = formatMessage(sample);
+      final second = formatMessage(sample);
+      expect(identical(first, second), isTrue);
+      expect(isLong(List.filled(12, 'a').join('\n')), isFalse);
+      expect(isLong(List.filled(13, 'a').join('\n')), isTrue);
+    });
+
+    test('ChatMessage.parseList reuses unchanged messages and image buffers', () {
+      final raw1 = [
+        {
+          'id': 1,
+          'role': 'user',
+          'text': 'See shot',
+          'at': 1777626600000,
+          'source': 'web-panel',
+          'images': [
+            {'name': 'shot.png', 'mediaType': 'image/png', 'data': 'iVBORw=='},
+          ],
+        },
+      ];
+      final list1 = ChatMessage.parseList(raw1);
+      final raw2 = [
+        ...raw1,
+        {'id': 2, 'role': 'assistant', 'text': 'Done.', 'at': 1777626660000, 'source': 'chat-reply'},
+      ];
+      final list2 = ChatMessage.parseList(raw2, previous: list1);
+      expect(list2, hasLength(2));
+      expect(identical(list2[0], list1[0]), isTrue);
+      expect(identical(list2[0].images.single.bytes, list1[0].images.single.bytes), isTrue);
+    });
+
+    test('AppState bumps only changed aspect revisions and pauses polling when hidden', () async {
+      final backend = FakeBackend();
+      final state = stateOver(backend, pollEvery: const Duration(milliseconds: 50));
+      await state.start();
+      await state.refresh();
+
+      final msgRev0 = state.messagesRev;
+      final actRev0 = state.activityRev;
+      final devRev0 = state.devicesRev;
+
+      // Only activity changes -> only activityRev advances.
+      backend.activity = {'router': true, 'workers': <Map<String, dynamic>>[]};
+      await state.refresh();
+      expect(state.activityRev, greaterThan(actRev0));
+      expect(state.messagesRev, msgRev0);
+      expect(state.devicesRev, devRev0);
+
+      // Backgrounding pauses periodic polling; foregrounding resumes and refreshes.
+      state.setForeground(false);
+      final callsWhenHidden = backend.calls.length;
+      await Future<void>.delayed(const Duration(milliseconds: 160));
+      expect(backend.calls.length, callsWhenHidden);
+
+      state.setForeground(true);
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+      expect(backend.calls.length, greaterThan(callsWhenHidden));
+
+      state.dispose();
     });
   });
 }

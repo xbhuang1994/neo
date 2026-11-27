@@ -44,9 +44,55 @@ String formatRemainingTtl(DateTime? expiresAt, {DateTime? now}) {
   final hours = diff.inHours;
   final minutes = diff.inMinutes % 60;
   final seconds = diff.inSeconds % 60;
-  String two(int n) => n.toString().padLeft(2, '0');
+  String two(int n) => n < 10 ? '0$n' : '$n';
   if (hours > 0) return '${two(hours)}:${two(minutes)}:${two(seconds)}';
   return '${two(minutes)}:${two(seconds)}';
+}
+
+/// Rebuilds only its countdown child once per second while visible via [TickerMode],
+/// preventing full-page or full-sheet rebuilds every second when an enrollment is active.
+class EnrollmentTtlBuilder extends StatefulWidget {
+  const EnrollmentTtlBuilder({super.key, required this.expiresAt, required this.builder});
+
+  final DateTime? expiresAt;
+  final Widget Function(BuildContext context, String remaining) builder;
+
+  @override
+  State<EnrollmentTtlBuilder> createState() => _EnrollmentTtlBuilderState();
+}
+
+class _EnrollmentTtlBuilderState extends State<EnrollmentTtlBuilder> {
+  Timer? _timer;
+
+  void _syncTimer(bool active) {
+    if (active) {
+      _timer ??= Timer.periodic(const Duration(seconds: 1), (_) {
+        if (!mounted) return;
+        setState(() {});
+        if (widget.expiresAt == null || !widget.expiresAt!.isAfter(DateTime.now())) {
+          _timer?.cancel();
+          _timer = null;
+        }
+      });
+    } else {
+      _timer?.cancel();
+      _timer = null;
+    }
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = TickerMode.valuesOf(context).enabled;
+    final expiresAt = widget.expiresAt;
+    _syncTimer(enabled && expiresAt != null && expiresAt.isAfter(DateTime.now()));
+    return widget.builder(context, formatRemainingTtl(expiresAt));
+  }
 }
 
 /// Responsive modal sheet for Tier 1 one-click enrollment and Tier 2 MCU installation.
@@ -104,7 +150,6 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
   bool _revoking = false;
   String? _error;
   Timer? _pollTimer;
-  Timer? _countdownTimer;
   Timer? _copyResetTimer;
 
   // Tier 2 MCU form & result state.
@@ -204,16 +249,11 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
   void _stopTimers() {
     _pollTimer?.cancel();
     _pollTimer = null;
-    _countdownTimer?.cancel();
-    _countdownTimer = null;
   }
 
   void _startTracking(DeviceEnrollment enrollment) {
     _stopTimers();
     if (!enrollment.isActive) return;
-    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted) setState(() {});
-    });
     _pollTimer = Timer.periodic(const Duration(seconds: 2), (_) {
       unawaited(_pollEnrollment(enrollment.id));
     });
@@ -717,7 +757,6 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
     final palette = Palette.of(context);
     final typo = Typo.of(context);
     final command = enrollment.commands.forPlatform(enrollment.platform, linuxUseRoot: _linuxUseRoot);
-    final remaining = formatRemainingTtl(enrollment.expiresAt);
 
     final onboardedLabel = _onboardedDevices.isNotEmpty
         ? _onboardedDevices.map((d) => d.displayName).join(', ')
@@ -751,7 +790,10 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
             if (enrollment.requestedCustomName != null)
               Pill(enrollment.requestedCustomName!, color: palette.accent),
             if (enrollment.isActive)
-              Pill(strings.remainingTime(remaining), color: palette.orange, dot: true),
+              EnrollmentTtlBuilder(
+                expiresAt: enrollment.expiresAt,
+                builder: (context, remaining) => Pill(strings.remainingTime(remaining), color: palette.orange, dot: true),
+              ),
             if (enrollment.maxUses > 1)
               Pill(strings.usesCount(enrollment.usedCount, enrollment.maxUses), color: palette.secondary),
           ],

@@ -86,7 +86,7 @@ Neo 支持将控制范围从本机扩展到跨网络的个人电脑、服务器�
 
 ```sh
 cd backend && bun install && bun run build
-cd ../app && flutter pub get && flutter build web --release --no-web-resources-cdn --csp --no-source-maps
+cd ../app && flutter pub get && flutter build web --wasm --release --no-web-resources-cdn --csp --no-source-maps
 cd .. && backend/dist/neo-agent doctor                 # 看这台机器具备什么
 backend/dist/neo-agent serve --web-dir app/build/web   # 打开 http://127.0.0.1:3082/
 ```

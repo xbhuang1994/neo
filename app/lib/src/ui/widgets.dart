@@ -120,7 +120,7 @@ class _FoldableState extends State<Foldable> {
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
       children: [
-        if (_open) widget.child else ClipRect(child: ConstrainedBox(constraints: BoxConstraints(maxHeight: widget.height), child: SingleChildScrollView(physics: const NeverScrollableScrollPhysics(), child: widget.child))),
+        if (_open) widget.child else _ClippedMaxHeightBox(maxHeight: widget.height, child: widget.child),
         const SizedBox(height: 6),
         SelectionContainer.disabled(
           child: GestureDetector(
@@ -134,6 +134,77 @@ class _FoldableState extends State<Foldable> {
         ),
       ],
     );
+  }
+}
+
+/// Clips an overflowing child to [maxHeight] without constructing a nested Scrollable/Viewport.
+class _ClippedMaxHeightBox extends SingleChildRenderObjectWidget {
+  const _ClippedMaxHeightBox({required this.maxHeight, required super.child});
+
+  final double maxHeight;
+
+  @override
+  _RenderClippedMaxHeightBox createRenderObject(BuildContext context) => _RenderClippedMaxHeightBox(maxHeight);
+
+  @override
+  void updateRenderObject(BuildContext context, _RenderClippedMaxHeightBox renderObject) {
+    renderObject.maxHeight = maxHeight;
+  }
+}
+
+class _RenderClippedMaxHeightBox extends RenderShiftedBox {
+  _RenderClippedMaxHeightBox(this._maxHeight) : super(null);
+
+  double _maxHeight;
+  bool _clips = false;
+  final LayerHandle<ClipRectLayer> _clipLayer = LayerHandle<ClipRectLayer>();
+
+  set maxHeight(double value) {
+    if (_maxHeight == value) return;
+    _maxHeight = value;
+    markNeedsLayout();
+  }
+
+  @override
+  void performLayout() {
+    final child = this.child;
+    if (child == null) {
+      size = constraints.constrain(Size.zero);
+      _clips = false;
+      return;
+    }
+    child.layout(
+      BoxConstraints(minWidth: constraints.minWidth, maxWidth: constraints.maxWidth),
+      parentUsesSize: true,
+    );
+    final cappedHeight = child.size.height > _maxHeight ? _maxHeight : child.size.height;
+    size = constraints.constrain(Size(child.size.width, cappedHeight));
+    _clips = child.size.height > size.height;
+    (child.parentData! as BoxParentData).offset = Offset.zero;
+  }
+
+  @override
+  void paint(PaintingContext context, Offset offset) {
+    final child = this.child;
+    if (child == null) return;
+    if (_clips) {
+      _clipLayer.layer = context.pushClipRect(
+        needsCompositing,
+        offset,
+        Offset.zero & size,
+        super.paint,
+        oldLayer: _clipLayer.layer,
+      );
+    } else {
+      _clipLayer.layer = null;
+      super.paint(context, offset);
+    }
+  }
+
+  @override
+  void dispose() {
+    _clipLayer.layer = null;
+    super.dispose();
   }
 }
 
@@ -167,12 +238,19 @@ class _TappableState extends State<Tappable> {
         : _hover && enabled
         ? palette.fill
         : const Color(0x00000000);
-    final content = AnimatedContainer(
-      duration: const Duration(milliseconds: 90),
-      padding: widget.padding,
-      decoration: BoxDecoration(color: color, borderRadius: BorderRadius.circular(widget.borderRadius)),
-      child: Opacity(opacity: enabled ? 1 : 0.4, child: widget.child),
-    );
+    Widget inner = widget.child;
+    if (!enabled) {
+      inner = Opacity(opacity: 0.4, child: inner);
+    }
+    if (widget.padding != EdgeInsets.zero) {
+      inner = Padding(padding: widget.padding, child: inner);
+    }
+    final content = color.a == 0
+        ? inner
+        : DecoratedBox(
+            decoration: BoxDecoration(color: color, borderRadius: BorderRadius.circular(widget.borderRadius)),
+            child: inner,
+          );
     return Semantics(
       button: true,
       enabled: enabled,

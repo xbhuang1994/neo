@@ -33,7 +33,7 @@ rm -rf "$stage" && mkdir -p "$stage"
 (cd "$root/backend" && bun install --frozen-lockfile && bun build --compile --minify --bytecode --target="$target" src/main.ts --outfile "dist/neo-agent-$arch")
 (cd "$root/recovery" && bun install --frozen-lockfile && bun build --compile --minify --bytecode --target="$target" src/main.ts --outfile "dist/neo-recovery-$arch")
 if [ "$skip_web" = no ]; then
-  (cd "$root/app" && flutter pub get && flutter build web --release --no-web-resources-cdn --csp --no-source-maps)
+  (cd "$root/app" && flutter pub get && flutter build web --wasm --release --no-web-resources-cdn --csp --no-source-maps)
 fi
 [ -f "$root/app/build/web/index.html" ] || { echo "web app not built at $root/app/build/web/index.html" >&2; exit 1; }
 

@@ -6,7 +6,7 @@ How to build, run and test from a source checkout. It builds on [007 Architectur
 
 ```sh
 cd backend && bun install && bun run build        # compiles dist/neo-agent and dist/fixture-agy with --bytecode
-cd app && flutter pub get && flutter build web --release --no-web-resources-cdn --csp --no-source-maps
+cd app && flutter pub get && flutter build web --wasm --release --no-web-resources-cdn --csp --no-source-maps
 
 backend/dist/neo-agent doctor                     # what this machine provides
 backend/dist/neo-agent serve --web-dir app/build/web
