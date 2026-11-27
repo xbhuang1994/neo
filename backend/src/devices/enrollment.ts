@@ -1,6 +1,6 @@
 /**
  * Zero-Trust One-Click Agent Enrollment Manager:
- * - Renders immutable local TOML policy presets (`personal`, `corp`, `readonly`, `desktop`).
+ * - Renders local TOML policy presets (`readonly`, `corp`, `personal`, `desktop`, `unrestricted`).
  * - Generates `neo_enr_v1.<ticketId>.<ephemeralKey>` tickets and seals `EnrollPayload` with `0xE2` AES-256-GCM.
  * - Publishes opaque ciphertexts to `neo-relayd` (`/v1/enroll/tickets`) or serves Master Direct Mode (`/enroll/claim/:id`)
  *   with per-IP rate limiting (20 req/min/IP) and atomic burn-after-reading consumption.
@@ -10,22 +10,24 @@
 
 import type { Store } from "../store/index.ts";
 import { generateEnrollTicket, sealEnrollPayload } from "./protocol.ts";
-import type {
-  DeviceConfig,
-  DeviceMessage,
-  DeviceTwin,
-  DirectClaimResult,
-  EnrollPayload,
-  EnrollmentAuthMode,
-  EnrollmentCommands,
-  EnrollmentCreateInput,
-  EnrollmentInstallMode,
-  EnrollmentPlatform,
-  EnrollmentProfile,
-  EnrollmentStatus,
-  EnrollmentTransportMode,
-  EnrollmentView,
-  TokenTier,
+import {
+  SANDBOX_LEVELS,
+  isSandboxLevel,
+  type DeviceConfig,
+  type DeviceMessage,
+  type DeviceTwin,
+  type DirectClaimResult,
+  type EnrollPayload,
+  type EnrollmentAuthMode,
+  type EnrollmentCommands,
+  type EnrollmentCreateInput,
+  type EnrollmentInstallMode,
+  type EnrollmentPlatform,
+  type EnrollmentProfile,
+  type EnrollmentStatus,
+  type EnrollmentTransportMode,
+  type EnrollmentView,
+  type TokenTier,
 } from "./types.ts";
 
 export const ENROLL_KEY_PREFIX = "device-enroll:";
@@ -41,7 +43,7 @@ const RELAY_SYNC_TIMEOUT_MS = 3_000;
 const PERMANENT_TOKEN_TTL_SEC = 365 * 86_400;
 
 const VALID_PLATFORMS: ReadonlySet<string> = new Set(["linux", "macos", "windows", "docker"]);
-const VALID_PROFILES: ReadonlySet<string> = new Set(["personal", "corp", "readonly", "desktop"]);
+const VALID_PROFILES: ReadonlySet<string> = new Set(SANDBOX_LEVELS);
 const VALID_INSTALL_MODES: ReadonlySet<string> = new Set(["auto", "system", "user", "foreground"]);
 const VALID_TRANSPORT_MODES: ReadonlySet<string> = new Set(["relay", "direct"]);
 
@@ -167,6 +169,8 @@ interface PolicyPresetSpec {
   maxChildMemMb: number;
   maxExecTimeoutSec: number;
   maxOutputBytes: number;
+  unrestricted: boolean;
+  readOnly: boolean;
 }
 
 const POLICY_PRESETS: Readonly<Record<EnrollmentProfile, PolicyPresetSpec>> = {
@@ -177,6 +181,8 @@ const POLICY_PRESETS: Readonly<Record<EnrollmentProfile, PolicyPresetSpec>> = {
     maxChildMemMb: 2048,
     maxExecTimeoutSec: 120,
     maxOutputBytes: 1_048_576,
+    unrestricted: false,
+    readOnly: false,
   },
   corp: {
     comment: "Read-only local execution policy for a corporate Neo OS agent instance.",
@@ -185,6 +191,8 @@ const POLICY_PRESETS: Readonly<Record<EnrollmentProfile, PolicyPresetSpec>> = {
     maxChildMemMb: 4096,
     maxExecTimeoutSec: 90,
     maxOutputBytes: 1_048_576,
+    unrestricted: false,
+    readOnly: false,
   },
   readonly: {
     comment: "Read-only inspection policy for a Neo OS agent instance.",
@@ -193,6 +201,8 @@ const POLICY_PRESETS: Readonly<Record<EnrollmentProfile, PolicyPresetSpec>> = {
     maxChildMemMb: 1024,
     maxExecTimeoutSec: 60,
     maxOutputBytes: 1_048_576,
+    unrestricted: false,
+    readOnly: true,
   },
   desktop: {
     comment: "Read-only local execution policy for desktop development and UI testing.",
@@ -201,6 +211,19 @@ const POLICY_PRESETS: Readonly<Record<EnrollmentProfile, PolicyPresetSpec>> = {
     maxChildMemMb: 4096,
     maxExecTimeoutSec: 180,
     maxOutputBytes: 1_048_576,
+    unrestricted: false,
+    readOnly: false,
+  },
+  unrestricted: {
+    comment:
+      "Unrestricted execution policy for a trusted Neo OS agent instance (no workspace or command limits).",
+    allowedCommands: [],
+    deniedCommands: [],
+    maxChildMemMb: 0,
+    maxExecTimeoutSec: 0,
+    maxOutputBytes: 8_388_608,
+    unrestricted: true,
+    readOnly: false,
   },
 };
 
@@ -212,7 +235,14 @@ function formatTomlStringArray(items: readonly string[]): string {
   return items.map((item) => `  "${escapeTomlString(item)}",`).join("\n");
 }
 
-function validateWorkspacePath(raw: string): string {
+function renderTomlStringArrayField(key: string, items: readonly string[]): string[] {
+  if (items.length === 0) {
+    return [`${key} = []`];
+  }
+  return [`${key} = [`, formatTomlStringArray(items), "]"];
+}
+
+export function validateWorkspacePath(raw: string): string {
   const trimmed = raw.trim();
   if (!trimmed || trimmed.includes("\0") || trimmed.includes("\n") || trimmed.includes("\r")) {
     throw new Error(`Invalid workspace path: ${JSON.stringify(raw)}`);
@@ -225,12 +255,15 @@ function validateWorkspacePath(raw: string): string {
 }
 
 /**
- * Render an immutable TOML policy preset with `{{WORKSPACE_DIR}}` placeholder.
+ * Render a TOML sandbox policy preset with `{{WORKSPACE_DIR}}` placeholder.
  */
 export function renderPolicyPreset(
   profile: EnrollmentProfile,
   workspaces: readonly string[] = [],
 ): string {
+  if (!isSandboxLevel(profile)) {
+    throw new Error(`Invalid sandbox profile: ${String(profile)}`);
+  }
   const spec = POLICY_PRESETS[profile];
   const cleanedWorkspaces = workspaces.map(validateWorkspacePath);
   const wsEntries =
@@ -240,20 +273,18 @@ export function renderPolicyPreset(
 
   return [
     `# ${spec.comment}`,
-    "# The Master Neo control plane and neo-relay cannot modify this file at runtime.",
+    "# Sandbox level can be managed by Master Neo unless lock_sandbox = true is set locally.",
     "",
-    "allowed_workspaces = [",
-    formatTomlStringArray(wsEntries),
-    "]",
+    `sandbox_level = "${profile}"`,
+    `unrestricted = ${spec.unrestricted ? "true" : "false"}`,
+    `read_only = ${spec.readOnly ? "true" : "false"}`,
     "",
-    "allowed_commands = [",
-    formatTomlStringArray(spec.allowedCommands),
-    "]",
+    ...renderTomlStringArrayField("allowed_workspaces", wsEntries),
+    "",
+    ...renderTomlStringArrayField("allowed_commands", spec.allowedCommands),
     "",
     "# denied_commands always overrides allowed_commands.",
-    "denied_commands = [",
-    formatTomlStringArray(spec.deniedCommands),
-    "]",
+    ...renderTomlStringArrayField("denied_commands", spec.deniedCommands),
     "",
     `max_child_mem_mb = ${spec.maxChildMemMb}`,
     `max_exec_timeout_sec = ${spec.maxExecTimeoutSec}`,
@@ -804,7 +835,13 @@ export class EnrollmentManager {
         : null;
     const cudaDevices = input.cudaDevices?.trim() ?? "";
     const defaultMemoryMax =
-      profile === "corp" || profile === "desktop" ? "4G" : profile === "readonly" ? "1G" : "2G";
+      profile === "unrestricted"
+        ? "8G"
+        : profile === "corp" || profile === "desktop"
+          ? "4G"
+          : profile === "readonly"
+            ? "1G"
+            : "2G";
     const memoryMax = input.memoryMax?.trim() || defaultMemoryMax;
     if (!MEMORY_MAX_RE.test(memoryMax)) {
       throw new Error(`Invalid memoryMax '${memoryMax}'`);

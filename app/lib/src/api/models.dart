@@ -551,6 +551,9 @@ class DeviceActionSpec {
   final String? risk;
 }
 
+/// Ordered sandbox permission levels from most restrictive (`readonly`) to full host access (`unrestricted`).
+const List<String> sandboxLevels = ['readonly', 'corp', 'personal', 'desktop', 'unrestricted'];
+
 /// Hardware, sandbox, and capability manifest reported by a Tier 1 OS agent or Tier 2 MCU.
 class DeviceManifest {
   DeviceManifest.fromJson(Map<String, dynamic> json)
@@ -616,6 +619,25 @@ class DeviceManifest {
   }
 
   bool get hasGpu => gpus.isNotEmpty || capabilities.contains('gpu');
+
+  /// Sandbox permission level inferred from the reported sandbox policy fields.
+  String? get sandboxLevel {
+    final explicit = _text(sandbox['level']);
+    if (explicit != null && sandboxLevels.contains(explicit)) return explicit;
+    if (sandbox['unrestricted'] == true) return 'unrestricted';
+    if (sandbox['read_only'] == true) return 'readonly';
+    final mem = (sandbox['max_child_mem_mb'] as num?)?.toInt();
+    final timeout = (sandbox['max_exec_timeout_sec'] as num?)?.toInt();
+    if (mem == 0 && timeout == 0) return 'unrestricted';
+    if (mem == 1024 && timeout == 60) return 'readonly';
+    if (mem == 4096 && timeout == 90) return 'corp';
+    if (mem == 4096 && timeout == 180) return 'desktop';
+    if (sandbox.isNotEmpty) return 'personal';
+    return null;
+  }
+
+  bool get isUnrestricted => sandbox['unrestricted'] == true || sandboxLevel == 'unrestricted';
+  bool get isSandboxLocked => sandbox['locked'] == true;
 }
 
 /// A persisted Device Twin for a Tier 1 OS agent or Tier 2 MCU.
@@ -631,6 +653,10 @@ class DeviceTwin {
       backupRelayNodeIds = _strings(json['backupRelayNodeIds']),
       alertSuppressed = json['alertSuppressed'] == true,
       manifest = json['manifest'] is Map ? DeviceManifest.fromJson(_map(json['manifest'])) : null,
+      sandboxLevel = _text(json['sandboxLevel']),
+      desiredSandboxLevel = _text(json['desiredSandboxLevel']),
+      sandboxSyncState = _text(json['sandboxSyncState']),
+      sandboxSyncError = _text(json['sandboxSyncError']),
       capabilities = _strings(json['capabilities']),
       desiredState = _map(json['desiredState']),
       reportedState = _map(json['reportedState']),
@@ -657,6 +683,10 @@ class DeviceTwin {
   final List<String> backupRelayNodeIds;
   final bool alertSuppressed;
   final DeviceManifest? manifest;
+  final String? sandboxLevel;
+  final String? desiredSandboxLevel;
+  final String? sandboxSyncState;
+  final String? sandboxSyncError;
   final List<String> capabilities;
   final Map<String, dynamic> desiredState;
   final Map<String, dynamic> reportedState;
@@ -679,6 +709,14 @@ class DeviceTwin {
       capabilities.contains('relay') ||
       (mqttBind != null && mqttBind!.isNotEmpty) ||
       (uartDevice != null && uartDevice!.isNotEmpty);
+
+  String get effectiveSandboxLevel => manifest?.sandboxLevel ?? sandboxLevel ?? 'personal';
+  bool get isUnrestricted => effectiveSandboxLevel == 'unrestricted' || manifest?.isUnrestricted == true;
+  bool get isSandboxLocked => manifest?.isSandboxLocked == true || sandboxSyncState == 'locked';
+  bool get isSandboxSyncPending =>
+      desiredSandboxLevel != null &&
+      desiredSandboxLevel != effectiveSandboxLevel &&
+      (sandboxSyncState == 'pending' || sandboxSyncState == 'unsupported');
 }
 
 /// A risk-gated device invocation awaiting human approval.
@@ -788,7 +826,7 @@ class DeviceEnrollment {
   /// `linux`, `macos`, `windows`, or `docker`.
   final String platform;
 
-  /// `personal`, `corp`, `readonly`, or `desktop`.
+  /// `personal`, `corp`, `readonly`, `desktop`, or `unrestricted`.
   final String profile;
 
   /// `auto`, `system`, `user`, or `foreground`.
@@ -869,6 +907,26 @@ class DevicePingResult {
   final int latencyMs;
   final String status;
   final String route;
+  final String? error;
+}
+
+/// Result of `PUT /api/devices/:id/sandbox`.
+class DeviceSandboxUpdateResult {
+  DeviceSandboxUpdateResult.fromJson(Map<String, dynamic> json)
+    : device = DeviceTwin.fromJson(_map(json['device'])),
+      level = _text(json['level']) ?? 'personal',
+      applied = json['applied'] == true,
+      pending = json['pending'] == true,
+      persisted = json['persisted'] is bool ? json['persisted'] as bool : null,
+      warning = _text(json['warning']),
+      error = _text(json['error']);
+
+  final DeviceTwin device;
+  final String level;
+  final bool applied;
+  final bool pending;
+  final bool? persisted;
+  final String? warning;
   final String? error;
 }
 

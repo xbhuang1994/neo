@@ -2130,6 +2130,10 @@ pub async fn run_enroll(args: EnrollArgs) -> Result<EnrollOutcome, String> {
     let policy_path = config_dir.join(format!("policy-{}.toml", payload.cluster_id));
     let env_path = config_dir.join(format!("cluster-{}.env", payload.cluster_id));
     write_policy_file(&policy_path, &rendered_policy)?;
+    let sandbox_override_file = ota_cache_dir.join("sandbox-override.toml");
+    if sandbox_override_file.exists() {
+        let _ = std::fs::remove_file(&sandbox_override_file);
+    }
 
     let extra_args = build_extra_args(payload.relay_bridge.as_ref())?;
     let cuda_devices = payload
@@ -2150,7 +2154,7 @@ pub async fn run_enroll(args: EnrollArgs) -> Result<EnrollOutcome, String> {
     )?;
     write_secret_env_file(&env_path, &env_content)?;
 
-    let policy = Arc::new(Policy::from_file(&policy_path)?);
+    let policy = Policy::from_file(&policy_path)?;
     let bridge = payload.relay_bridge.as_ref();
     let relay_enabled = bridge.map(|b| b.enabled).unwrap_or(false);
     let mqtt_bind = bridge
@@ -2162,6 +2166,7 @@ pub async fn run_enroll(args: EnrollArgs) -> Result<EnrollOutcome, String> {
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from);
     let updater_state_path = Some(ota_cache_dir.join("updater-state.json"));
+    let sandbox_override_path = Some(sandbox_override_file);
 
     let cfg = AgentConfig {
         cluster_id: payload.cluster_id.clone(),
@@ -2176,6 +2181,8 @@ pub async fn run_enroll(args: EnrollArgs) -> Result<EnrollOutcome, String> {
         uart_device,
         ota_cache_dir: Some(ota_cache_dir.clone()),
         updater_state_path,
+        policy_path: Some(policy_path.clone()),
+        sandbox_override_path,
     };
 
     if mode == EffectiveMode::Foreground {
@@ -2191,8 +2198,9 @@ pub async fn run_enroll(args: EnrollArgs) -> Result<EnrollOutcome, String> {
             service_status: "running in foreground".to_string(),
         };
         print_enroll_summary(&outcome);
+        let shared_policy = Arc::new(std::sync::RwLock::new(policy));
         tokio::select! {
-            res = run_agent(cfg, policy) => res?,
+            res = run_agent(cfg, shared_policy) => res?,
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("[neo-agent-os] shutdown signal received");
             }
@@ -2796,5 +2804,82 @@ max_exec_timeout_sec = 60
 
         let plist = render_macos_plist("personal", exe, ws, env, pol, ota, log);
         assert!(plist.contains("<key>ProcessType</key>\n  <string>Background</string>"));
+    }
+
+    #[tokio::test]
+    async fn enroll_handles_unrestricted_policy_toml_cleanly() {
+        let tmp = std::env::temp_dir().join(format!(
+            "neo_enroll_unr_{}_{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let cfg_dir = tmp.join("cfg");
+        let ws_dir = tmp.join("work");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let relay_url = format!("http://{addr}");
+
+        let ticket = parse_ticket("neo_enr_v1.tkt_unr_01.ephemeralSecretUnr01").unwrap();
+        let mut payload = sample_payload(
+            &relay_url,
+            Some(ws_dir.to_string_lossy().into_owned()),
+            "direct",
+        );
+        payload.policy_profile = Some("unrestricted".to_string());
+        payload.policy_toml = r#"
+sandbox_level = "unrestricted"
+unrestricted = true
+read_only = false
+allowed_workspaces = []
+allowed_commands = []
+denied_commands = []
+max_child_mem_mb = 0
+max_exec_timeout_sec = 0
+max_output_bytes = 8388608
+"#
+        .to_string();
+        let ct_b64 = seal_enroll_payload(&ticket, &payload).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut sink = [0u8; 2048];
+            let _ = stream.read(&mut sink).await;
+            let body = serde_json::to_vec(&json!({
+                "ticket_id": "tkt_unr_01",
+                "ciphertext_b64": ct_b64,
+            }))
+            .unwrap();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+            let _ = stream.write_all(&body).await;
+        });
+
+        let outcome = run_enroll(EnrollArgs {
+            relay_url: Some(relay_url),
+            claim_url: None,
+            ticket: Some("neo_enr_v1.tkt_unr_01.ephemeralSecretUnr01".to_string()),
+            ticket_stdin: false,
+            mode: EnrollModeArg::User,
+            config_dir: Some(cfg_dir.clone()),
+            skip_service: true,
+            skip_check: true,
+        })
+        .await
+        .unwrap();
+
+        let loaded = Policy::from_file(&outcome.policy_path).unwrap();
+        assert!(loaded.is_unrestricted());
+        assert_eq!(loaded.effective_level(), crate::policy::SandboxLevel::Unrestricted);
+        assert_eq!(loaded.config().max_child_mem_mb, 0);
+        assert_eq!(loaded.config().max_exec_timeout_sec, 0);
+        assert_eq!(loaded.config().max_output_bytes, 8_388_608);
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

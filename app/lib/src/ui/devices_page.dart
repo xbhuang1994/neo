@@ -31,6 +31,16 @@ import 'widgets.dart';
   };
 }
 
+/// Sandbox permission level label and tint color shared across device rows and sheets.
+(String, Color) sandboxLevelAppearance(String level, Strings strings, Palette palette) => switch (level) {
+  'readonly' => (strings.sandboxLevelLabel('readonly'), palette.gray),
+  'corp' => (strings.sandboxLevelLabel('corp'), palette.accent),
+  'personal' => (strings.sandboxLevelLabel('personal'), palette.green),
+  'desktop' => (strings.sandboxLevelLabel('desktop'), palette.purple),
+  'unrestricted' => (strings.sandboxLevelLabel('unrestricted'), palette.red),
+  _ => (strings.sandboxLevelLabel(level), palette.gray),
+};
+
 /// The Devices tab: cluster initialization, live relay bar, approvals, active enrollment tickets, and fleet management.
 class DevicesPage extends StatefulWidget {
   const DevicesPage({super.key, required this.onOpenSettings});
@@ -159,6 +169,31 @@ class _DevicesPageState extends State<DevicesPage> {
         api: api,
         config: config,
         onSaved: () => unawaited(state.refresh()),
+      ),
+    );
+  }
+
+  Future<void> _openSandboxSheet(AppState state, DeviceTwin device) async {
+    final api = state.client;
+    if (api == null) return;
+    await showCupertinoModalPopup<void>(
+      context: context,
+      builder: (sheet) => _DeviceSandboxSheet(
+        api: api,
+        device: device,
+        onSaved: (result) {
+          unawaited(state.refresh());
+          if (!mounted) return;
+          final strings = Strings.read(context);
+          final levelLabel = strings.sandboxLevelLabel(result.level);
+          final good = result.applied && result.warning == null;
+          final message = result.applied
+              ? (result.warning != null ? '${strings.sandboxUpdated(device.deviceId, levelLabel)} (${result.warning})' : strings.sandboxUpdated(device.deviceId, levelLabel))
+              : result.pending
+              ? (result.warning ?? strings.sandboxQueuedNotice(device.deviceId, levelLabel))
+              : (result.error ?? result.warning ?? strings.sandboxUpdated(device.deviceId, levelLabel));
+          _showToast(message, good: good);
+        },
       ),
     );
   }
@@ -750,6 +785,7 @@ class _DevicesPageState extends State<DevicesPage> {
     final removing = _removingDevices.contains(device.deviceId);
     final pingResult = _pingResults[device.deviceId];
     final pingError = _pingErrors[device.deviceId];
+    final (sandboxLabel, sandboxColor) = sandboxLevelAppearance(device.effectiveSandboxLevel, strings, palette);
 
     return Padding(
       key: ValueKey('device-${device.deviceId}'),
@@ -779,8 +815,23 @@ class _DevicesPageState extends State<DevicesPage> {
                     Pill(routeLabel, color: routeColor),
                     if (device.isMcu)
                       Pill(strings.tier2Badge, color: palette.purple)
-                    else if (device.isRelayCapable)
-                      Pill(strings.relayBridgeBadge, color: palette.accent),
+                    else ...[
+                      Pill(
+                        sandboxLabel,
+                        key: ValueKey('sandbox-pill-${device.deviceId}'),
+                        color: sandboxColor,
+                        dot: device.isUnrestricted,
+                      ),
+                      if (device.isSandboxSyncPending)
+                        Pill(
+                          strings.sandboxPendingSync(strings.sandboxLevelLabel(device.desiredSandboxLevel!)),
+                          key: ValueKey('sandbox-pending-${device.deviceId}'),
+                          color: palette.orange,
+                          dot: true,
+                        ),
+                      if (device.isRelayCapable)
+                        Pill(strings.relayBridgeBadge, color: palette.accent),
+                    ],
                   ],
                 ),
               ),
@@ -790,7 +841,24 @@ class _DevicesPageState extends State<DevicesPage> {
             const SizedBox(height: 8),
             Wrap(spacing: 6, runSpacing: 6, children: [for (final c in chips) _chip(c)]),
           ],
-          if (device.workspaces.isNotEmpty) ...[
+          if (!device.isMcu && device.isUnrestricted) ...[
+            const SizedBox(height: 7),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.only(right: 6),
+                  child: Icon(CupertinoIcons.lock_open, size: 13, color: palette.red),
+                ),
+                Expanded(
+                  child: Text(
+                    strings.sandboxUnrestrictedAccess,
+                    style: typo.caption.copyWith(color: palette.red, fontWeight: FontWeight.w500),
+                  ),
+                ),
+              ],
+            ),
+          ] else if (device.workspaces.isNotEmpty) ...[
             const SizedBox(height: 7),
             Row(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -803,6 +871,14 @@ class _DevicesPageState extends State<DevicesPage> {
                   child: Text(device.workspaces.join(', '), style: typo.mono.copyWith(fontSize: 12, color: palette.secondary)),
                 ),
               ],
+            ),
+          ],
+          if (!device.isMcu && device.sandboxSyncError != null && device.sandboxSyncError!.isNotEmpty && device.sandboxSyncState != 'synced') ...[
+            const SizedBox(height: 5),
+            Text(
+              device.sandboxSyncError!,
+              key: ValueKey('sandbox-error-${device.deviceId}'),
+              style: typo.caption.copyWith(color: device.sandboxSyncState == 'locked' ? palette.red : palette.orange),
             ),
           ],
           const SizedBox(height: 8),
@@ -845,6 +921,13 @@ class _DevicesPageState extends State<DevicesPage> {
                 busy: pinging,
                 onPressed: pinging ? null : () => unawaited(_pingDevice(state, device)),
               ),
+              if (device.isTier1)
+                ActionButton(
+                  key: ValueKey('sandbox-${device.deviceId}'),
+                  label: strings.sandboxPermission,
+                  plain: true,
+                  onPressed: () => unawaited(_openSandboxSheet(state, device)),
+                ),
               ActionButton(
                 key: ValueKey('uninstall-${device.deviceId}'),
                 label: strings.uninstallCommand,
@@ -1081,6 +1164,293 @@ class _ClusterSettingsSheetState extends State<_ClusterSettingsSheet> {
                       ),
                     ],
                   ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Modal popup for switching a Tier 1 device's sandbox permission level across the 5 tiers.
+class _DeviceSandboxSheet extends StatefulWidget {
+  const _DeviceSandboxSheet({required this.api, required this.device, required this.onSaved});
+
+  final ApiClient api;
+  final DeviceTwin device;
+  final ValueChanged<DeviceSandboxUpdateResult> onSaved;
+
+  @override
+  State<_DeviceSandboxSheet> createState() => _DeviceSandboxSheetState();
+}
+
+class _DeviceSandboxSheetState extends State<_DeviceSandboxSheet> {
+  late String _selected;
+  bool _busy = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    final current = widget.device.effectiveSandboxLevel;
+    _selected = sandboxLevels.contains(current) ? current : 'personal';
+  }
+
+  Future<void> _apply() async {
+    final strings = Strings.read(context);
+    if (_selected == 'unrestricted' && !widget.device.isUnrestricted) {
+      final confirmed = await showCupertinoDialog<bool>(
+        context: context,
+        builder: (dialog) {
+          final fonts = fallbackFonts(dialog);
+          return CupertinoAlertDialog(
+            title: Text(strings.sandboxConfirmUnrestrictedTitle, style: fonts),
+            content: Text(strings.sandboxConfirmUnrestrictedBody(widget.device.deviceId), style: fonts),
+            actions: [
+              CupertinoDialogAction(
+                onPressed: () => Navigator.of(dialog).pop(false),
+                child: Text(strings.cancel, style: fonts),
+              ),
+              CupertinoDialogAction(
+                key: const ValueKey('confirm-unrestricted-btn'),
+                isDestructiveAction: true,
+                onPressed: () => Navigator.of(dialog).pop(true),
+                child: Text(strings.sandboxConfirmSwitch, style: fonts),
+              ),
+            ],
+          );
+        },
+      );
+      if (confirmed != true || !mounted) return;
+    }
+
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final result = await widget.api.updateDeviceSandbox(
+        widget.device.deviceId,
+        level: _selected,
+      );
+      widget.onSaved(result);
+      if (mounted) Navigator.of(context).pop();
+    } on ApiException catch (error) {
+      if (mounted) setState(() => _error = error.message);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Widget _buildLevelOption(String id, String title, String desc, {required bool disabled}) {
+    final strings = Strings.read(context);
+    final palette = Palette.of(context);
+    final typo = Typo.of(context);
+    final selected = _selected == id;
+    final isUnrestricted = id == 'unrestricted';
+    final (_, levelColor) = sandboxLevelAppearance(id, strings, palette);
+    final radioColor = selected ? (isUnrestricted ? palette.red : palette.accent) : palette.tertiary;
+
+    return Tappable(
+      key: ValueKey('sandbox-option-$id'),
+      borderRadius: 0,
+      selected: selected,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      onTap: disabled
+          ? null
+          : () => setState(() {
+              _selected = id;
+              _error = null;
+            }),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: const EdgeInsets.only(top: 1, right: 10),
+            child: Icon(
+              selected ? CupertinoIcons.checkmark_circle_fill : CupertinoIcons.circle,
+              size: 18,
+              color: radioColor,
+            ),
+          ),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 4,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    Pill(strings.sandboxLevelTier(id), color: levelColor),
+                    Text(
+                      title,
+                      style: typo.headline.copyWith(
+                        fontSize: 14,
+                        color: isUnrestricted && selected ? palette.red : palette.label,
+                      ),
+                    ),
+                    if (isUnrestricted) Pill(strings.sandboxHighestBadge, color: palette.red),
+                  ],
+                ),
+                const SizedBox(height: 3),
+                Text(desc, style: typo.caption),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = Strings.read(context);
+    final palette = Palette.of(context);
+    final typo = Typo.of(context);
+    final device = widget.device;
+    final (statusLabel, statusColor) = switch (device.status) {
+      'online' => (strings.deviceStatusOnline, palette.green),
+      'sleeping' => (strings.deviceStatusSleeping, palette.orange),
+      'unreachable_via_relay' => (strings.deviceStatusUnreachable, palette.red),
+      _ => (strings.deviceStatusOffline, palette.gray),
+    };
+    final (currentLabel, currentColor) = sandboxLevelAppearance(device.effectiveSandboxLevel, strings, palette);
+    final levels = <(String, String, String)>[
+      ('readonly', strings.profileReadonlyTitle, strings.profileReadonlyDesc),
+      ('corp', strings.profileCorpTitle, strings.profileCorpDesc),
+      ('personal', strings.profilePersonalTitle, strings.profilePersonalDesc),
+      ('desktop', strings.profileDesktopTitle, strings.profileDesktopDesc),
+      ('unrestricted', strings.profileUnrestrictedTitle, strings.profileUnrestrictedDesc),
+    ];
+    final canApply = !_busy &&
+        !device.isSandboxLocked &&
+        (_selected != device.effectiveSandboxLevel || device.isSandboxSyncPending);
+
+    return Center(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxWidth: 540, maxHeight: MediaQuery.sizeOf(context).height * 0.85),
+        child: Container(
+          margin: const EdgeInsets.all(grid * 2),
+          decoration: BoxDecoration(
+            color: palette.surface,
+            borderRadius: BorderRadius.circular(14),
+            boxShadow: const [BoxShadow(color: Color(0x33000000), blurRadius: 30, offset: Offset(0, 10))],
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 14, 8, 10),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        strings.sandboxSheetTitle(device.deviceId),
+                        style: typo.headline.copyWith(fontSize: 17),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    CupertinoButton(
+                      key: const ValueKey('sandbox-cancel-btn'),
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      minimumSize: const Size(0, 30),
+                      onPressed: _busy ? null : () => Navigator.of(context).pop(),
+                      child: Text(strings.cancel, style: typo.body.copyWith(color: palette.accent)),
+                    ),
+                  ],
+                ),
+              ),
+              Container(height: 0.5, color: palette.separator),
+              Flexible(
+                child: SingleChildScrollView(
+                  primary: false,
+                  padding: const EdgeInsets.all(14),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 6,
+                        crossAxisAlignment: WrapCrossAlignment.center,
+                        children: [
+                          Text(strings.sandboxCurrentLabel, style: typo.footnote),
+                          Pill(currentLabel, color: currentColor, dot: device.isUnrestricted),
+                          Pill(statusLabel, color: statusColor, dot: device.isOnline),
+                          if (device.isSandboxSyncPending)
+                            Pill(
+                              strings.sandboxPendingSync(strings.sandboxLevelLabel(device.desiredSandboxLevel!)),
+                              color: palette.orange,
+                              dot: true,
+                            ),
+                        ],
+                      ),
+                      if (device.isSandboxLocked) ...[
+                        const SizedBox(height: 10),
+                        Notice(strings.sandboxLockedHint),
+                      ] else if (!device.isOnline) ...[
+                        const SizedBox(height: 10),
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+                          decoration: BoxDecoration(
+                            color: palette.orange.withValues(alpha: 0.12),
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          child: Text(strings.sandboxOfflineHint, style: typo.footnote.copyWith(color: palette.orange)),
+                        ),
+                      ],
+                      const SizedBox(height: 12),
+                      Container(
+                        decoration: BoxDecoration(
+                          color: palette.grouped,
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(color: palette.separator.withValues(alpha: 0.4), width: 0.5),
+                        ),
+                        clipBehavior: Clip.antiAlias,
+                        child: Column(
+                          children: [
+                            for (final (index, (id, title, desc)) in levels.indexed) ...[
+                              if (index > 0)
+                                Padding(
+                                  padding: const EdgeInsets.only(left: 40),
+                                  child: Container(height: 0.5, color: palette.separator),
+                                ),
+                              _buildLevelOption(id, title, desc, disabled: device.isSandboxLocked || _busy),
+                            ],
+                          ],
+                        ),
+                      ),
+                      if (_selected == 'unrestricted') ...[
+                        const SizedBox(height: 12),
+                        Notice(strings.sandboxUnrestrictedWarning),
+                      ],
+                      if (_error != null) ...[
+                        const SizedBox(height: 10),
+                        Notice(_error!),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+              Container(height: 0.5, color: palette.separator),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(14, 10, 14, 12),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    ActionButton(
+                      key: const ValueKey('apply-sandbox-btn'),
+                      label: _busy ? strings.sandboxApplying : strings.sandboxApply,
+                      destructive: _selected == 'unrestricted',
+                      busy: _busy,
+                      onPressed: canApply ? () => unawaited(_apply()) : null,
+                    ),
+                  ],
                 ),
               ),
             ],

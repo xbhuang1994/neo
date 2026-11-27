@@ -40,6 +40,8 @@ pub struct AgentConfig {
     pub uart_device: Option<PathBuf>,
     pub ota_cache_dir: Option<PathBuf>,
     pub updater_state_path: Option<PathBuf>,
+    pub policy_path: Option<PathBuf>,
+    pub sandbox_override_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -378,14 +380,17 @@ pub async fn run_one_shot_check(cfg: &AgentConfig, policy: &Policy) -> Result<()
     Ok(())
 }
 
-pub async fn run_agent(cfg: AgentConfig, policy: Arc<Policy>) -> Result<(), String> {
+pub async fn run_agent(
+    cfg: AgentConfig,
+    policy: Arc<std::sync::RwLock<Policy>>,
+) -> Result<(), String> {
     let boot_started = Instant::now();
     let endpoints = derive_endpoints(&cfg.relay_url)?;
     let e2e_key = derive_e2e_key(&cfg.cluster_id, &cfg.e2e_secret);
-    let executor = Arc::new(Executor::new(
-        Arc::clone(&policy),
-        cfg.ota_cache_dir.clone(),
-    ));
+    let executor = Arc::new(
+        Executor::new(Arc::clone(&policy), cfg.ota_cache_dir.clone())
+            .with_policy_paths(cfg.policy_path.clone(), cfg.sandbox_override_path.clone()),
+    );
 
     let mut updater = cfg
         .updater_state_path
@@ -471,8 +476,9 @@ pub async fn run_agent(cfg: AgentConfig, policy: Arc<Policy>) -> Result<(), Stri
                 }
 
                 let (mut ws_sink, mut ws_stream) = ws.split();
+                let policy_snap = policy.read().unwrap_or_else(|e| e.into_inner()).clone();
                 let manifest = CapabilityProber::probe(
-                    &policy,
+                    &policy_snap,
                     &cfg.device_id,
                     cfg.relay_enabled,
                     Some(&cfg.mqtt_bind),
@@ -625,7 +631,7 @@ pub async fn run_agent(cfg: AgentConfig, policy: Arc<Policy>) -> Result<(), Stri
 
 async fn handle_device_message(
     cfg: &AgentConfig,
-    policy: &Arc<Policy>,
+    policy: &Arc<std::sync::RwLock<Policy>>,
     executor: &Arc<Executor>,
     relay_bridge: &Option<Arc<RelayBridge>>,
     outbound_tx: &mpsc::Sender<(String, DeviceMessage)>,
@@ -687,8 +693,9 @@ async fn handle_device_message(
             }
 
             if method == "probe" {
+                let policy_snap = policy.read().unwrap_or_else(|e| e.into_inner()).clone();
                 let manifest = CapabilityProber::probe(
-                    policy,
+                    &policy_snap,
                     &cfg.device_id,
                     cfg.relay_enabled,
                     Some(&cfg.mqtt_bind),
@@ -704,6 +711,63 @@ async fn handle_device_message(
                     body: json!({ "ok": true, "result": manifest }),
                 };
                 let _ = outbound_tx.send((src_node.to_string(), resp)).await;
+                return;
+            }
+
+            if method == "set_sandbox" || method == "sandbox.set" {
+                match executor.apply_sandbox_level(&params) {
+                    Ok(mut result_val) => {
+                        let policy_snap = executor.policy_snapshot();
+                        let manifest = CapabilityProber::probe(
+                            &policy_snap,
+                            &cfg.device_id,
+                            cfg.relay_enabled,
+                            Some(&cfg.mqtt_bind),
+                            cfg.uart_device.as_deref(),
+                        );
+                        if let Some(obj) = result_val.as_object_mut() {
+                            obj.insert(
+                                "manifest".to_string(),
+                                serde_json::to_value(&manifest).unwrap_or_else(|_| json!({})),
+                            );
+                        }
+                        let resp = DeviceMessage {
+                            v: 1,
+                            kind: "rpc_resp".to_string(),
+                            req_id: msg.req_id,
+                            cluster_id: cfg.cluster_id.clone(),
+                            device_id: cfg.device_id.clone(),
+                            ts_ms: now_ms(),
+                            body: json!({ "ok": true, "result": result_val }),
+                        };
+                        let _ = outbound_tx.send((src_node.to_string(), resp)).await;
+
+                        let manifest_msg = DeviceMessage {
+                            v: 1,
+                            kind: "manifest".to_string(),
+                            req_id: format!("manifest-{}", now_ms()),
+                            cluster_id: cfg.cluster_id.clone(),
+                            device_id: cfg.device_id.clone(),
+                            ts_ms: now_ms(),
+                            body: build_manifest_body(&manifest, cfg.enroll_id.as_deref()),
+                        };
+                        let _ = outbound_tx
+                            .send((src_node.to_string(), manifest_msg))
+                            .await;
+                    }
+                    Err(e) => {
+                        let resp = DeviceMessage {
+                            v: 1,
+                            kind: "rpc_resp".to_string(),
+                            req_id: msg.req_id,
+                            cluster_id: cfg.cluster_id.clone(),
+                            device_id: cfg.device_id.clone(),
+                            ts_ms: now_ms(),
+                            body: json!({ "ok": false, "error": e }),
+                        };
+                        let _ = outbound_tx.send((src_node.to_string(), resp)).await;
+                    }
+                }
                 return;
             }
 
@@ -890,13 +954,13 @@ mod tests {
         let ws_dir = std::env::temp_dir().join(format!("neo_transport_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&ws_dir);
         std::fs::create_dir_all(&ws_dir).unwrap();
-        let policy = Arc::new(
+        let policy = Arc::new(std::sync::RwLock::new(
             Policy::from_toml_str(&format!(
                 "allowed_workspaces = [\"{}\"]\nallowed_commands = [\"echo\"]\n",
                 ws_dir.display()
             ))
             .unwrap(),
-        );
+        ));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1014,6 +1078,8 @@ mod tests {
             uart_device: None,
             ota_cache_dir: None,
             updater_state_path: None,
+            policy_path: None,
+            sandbox_override_path: None,
         };
 
         let agent_task = tokio::spawn(async move {
@@ -1026,5 +1092,395 @@ mod tests {
             .unwrap();
         agent_task.abort();
         let _ = std::fs::remove_dir_all(&ws_dir);
+    }
+
+    #[tokio::test]
+    async fn live_set_sandbox_rpc_switches_level_persists_and_emits_updated_manifest() {
+        use crate::policy::SandboxLevel;
+
+        let root = std::env::temp_dir().join(format!(
+            "neo_transport_sandbox_{}_{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let ws_dir = root.join("work");
+        let ota_dir = root.join("ota");
+        let policy_path = root.join("policy-cluster.toml");
+        let override_path = ota_dir.join("sandbox-override.toml");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        std::fs::create_dir_all(&ota_dir).unwrap();
+
+        let initial_policy = Policy::from_preset(
+            SandboxLevel::Personal,
+            vec![ws_dir.to_string_lossy().into_owned()],
+            false,
+        )
+        .unwrap();
+        initial_policy.persist_to_file(&policy_path).unwrap();
+        let policy = Arc::new(std::sync::RwLock::new(initial_policy));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let e2e_secret = "sandbox-e2e-secret";
+        let cluster_id = "cluster-sbx";
+        let e2e_key = derive_e2e_key(cluster_id, e2e_secret);
+        let ws_file_str = ws_dir.join("ro-check.txt").to_string_lossy().into_owned();
+        let policy_path_check = policy_path.clone();
+
+        let server_task = tokio::spawn(async move {
+            let (tx_done, mut rx_done) = mpsc::channel::<()>(1);
+            loop {
+                tokio::select! {
+                    _ = rx_done.recv() => break,
+                    accept_res = listener.accept() => {
+                        let (mut stream, _) = accept_res.unwrap();
+                        let tx_done = tx_done.clone();
+                        let ws_file_str = ws_file_str.clone();
+                        let policy_path_check = policy_path_check.clone();
+                        tokio::spawn(async move {
+                            let mut peek_buf = [0u8; 512];
+                            let n = stream.peek(&mut peek_buf).await.unwrap_or(0);
+                            let head = String::from_utf8_lossy(&peek_buf[..n]);
+                            if head.starts_with("GET /v1/bootstrap ") {
+                                let mut sink = [0u8; 1024];
+                                let _ = stream.read(&mut sink).await;
+                                let body = br#"{"stun_servers":[]}"#;
+                                let resp = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(resp.as_bytes()).await;
+                                let _ = stream.write_all(body).await;
+                                return;
+                            }
+                            if head.starts_with("GET /v1/signal ") {
+                                if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
+                                    let _ = ws.next().await;
+                                }
+                                return;
+                            }
+                            if head.starts_with("GET /v1/relay ") {
+                                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                                async fn recv_non_hb(
+                                    ws: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
+                                    e2e_key: &[u8; 32],
+                                    cluster_id: &str,
+                                    src: &str,
+                                    dst: &str,
+                                ) -> DeviceMessage {
+                                    loop {
+                                        let bin = match ws.next().await.unwrap().unwrap() {
+                                            WsMessage::Binary(b) => b,
+                                            _ => continue,
+                                        };
+                                        let rf = RelayFrame::decode(&bin).unwrap();
+                                        if rf.flags != RelayFlags::Data {
+                                            continue;
+                                        }
+                                        let msg = open_device_message(
+                                            e2e_key,
+                                            cluster_id,
+                                            src,
+                                            dst,
+                                            &rf.payload,
+                                        )
+                                        .unwrap();
+                                        if msg.kind == "heartbeat" {
+                                            continue;
+                                        }
+                                        return msg;
+                                    }
+                                }
+                                let send_rpc = |req_id: &str, method: &str, params: serde_json::Value| -> Vec<u8> {
+                                    let req = DeviceMessage {
+                                        v: 1,
+                                        kind: "rpc_req".to_string(),
+                                        req_id: req_id.to_string(),
+                                        cluster_id: cluster_id.to_string(),
+                                        device_id: "os-sbx".to_string(),
+                                        ts_ms: now_ms(),
+                                        body: json!({ "method": method, "params": params }),
+                                    };
+                                    let sealed = seal_device_message(&e2e_key, "master-sbx", "os-sbx", &req).unwrap();
+                                    RelayFrame {
+                                        flags: RelayFlags::Data,
+                                        src: "master-sbx".to_string(),
+                                        dst: "os-sbx".to_string(),
+                                        payload: sealed,
+                                    }
+                                    .encode()
+                                    .unwrap()
+                                };
+
+                                // 1. Initial manifest -> personal
+                                let m0 = recv_non_hb(&mut ws, &e2e_key, cluster_id, "os-sbx", "master-sbx").await;
+                                assert_eq!(m0.kind, "manifest");
+                                assert_eq!(m0.body["sandbox"]["level"], "personal");
+                                assert_eq!(m0.body["sandbox"]["unrestricted"], false);
+                                assert_eq!(m0.body["sandbox"]["read_only"], false);
+
+                                // 2. Switch to unrestricted via set_sandbox
+                                ws.send(WsMessage::Binary(
+                                    send_rpc("req-sbx-1", "set_sandbox", json!({"level": "unrestricted"})).into(),
+                                ))
+                                .await
+                                .unwrap();
+
+                                let resp1 = recv_non_hb(&mut ws, &e2e_key, cluster_id, "os-sbx", "master-sbx").await;
+                                assert_eq!(resp1.kind, "rpc_resp");
+                                assert_eq!(resp1.req_id, "req-sbx-1");
+                                assert_eq!(resp1.body["ok"], true);
+                                assert_eq!(resp1.body["result"]["level"], "unrestricted");
+                                assert_eq!(resp1.body["result"]["persisted"], true);
+                                assert_eq!(resp1.body["result"]["manifest"]["sandbox"]["level"], "unrestricted");
+                                assert_eq!(resp1.body["result"]["manifest"]["sandbox"]["unrestricted"], true);
+
+                                // Expect fresh manifest emitted immediately after rpc_resp
+                                let m1 = recv_non_hb(&mut ws, &e2e_key, cluster_id, "os-sbx", "master-sbx").await;
+                                assert_eq!(m1.kind, "manifest");
+                                assert_eq!(m1.body["sandbox"]["level"], "unrestricted");
+                                assert_eq!(m1.body["sandbox"]["unrestricted"], true);
+                                assert!(!m1.body["sandbox"]["allowed_workspaces"].as_array().unwrap().is_empty());
+
+                                // Verify policy file updated on disk
+                                let disk = Policy::from_file(&policy_path_check).unwrap();
+                                assert!(disk.is_unrestricted());
+
+                                // 3. Probe reflects live unrestricted state
+                                ws.send(WsMessage::Binary(
+                                    send_rpc("req-probe-1", "probe", json!({})).into(),
+                                ))
+                                .await
+                                .unwrap();
+                                let probe_resp = recv_non_hb(&mut ws, &e2e_key, cluster_id, "os-sbx", "master-sbx").await;
+                                assert_eq!(probe_resp.kind, "rpc_resp");
+                                assert_eq!(probe_resp.req_id, "req-probe-1");
+                                assert_eq!(probe_resp.body["ok"], true);
+                                assert_eq!(probe_resp.body["result"]["sandbox"]["level"], "unrestricted");
+
+                                // 4. Switch to readonly via sandbox.set alias
+                                ws.send(WsMessage::Binary(
+                                    send_rpc("req-sbx-2", "sandbox.set", json!({"level": "readonly"})).into(),
+                                ))
+                                .await
+                                .unwrap();
+                                let resp2 = recv_non_hb(&mut ws, &e2e_key, cluster_id, "os-sbx", "master-sbx").await;
+                                assert_eq!(resp2.kind, "rpc_resp");
+                                assert_eq!(resp2.req_id, "req-sbx-2");
+                                assert_eq!(resp2.body["ok"], true);
+                                assert_eq!(resp2.body["result"]["level"], "readonly");
+
+                                let m2 = recv_non_hb(&mut ws, &e2e_key, cluster_id, "os-sbx", "master-sbx").await;
+                                assert_eq!(m2.kind, "manifest");
+                                assert_eq!(m2.body["sandbox"]["level"], "readonly");
+                                assert_eq!(m2.body["sandbox"]["read_only"], true);
+
+                                // 5. fs_write is now rejected by readonly policy
+                                ws.send(WsMessage::Binary(
+                                    send_rpc(
+                                        "req-write-ro",
+                                        "fs_write",
+                                        json!({"path": ws_file_str, "content": "denied"}),
+                                    )
+                                    .into(),
+                                ))
+                                .await
+                                .unwrap();
+                                let wr_resp = recv_non_hb(&mut ws, &e2e_key, cluster_id, "os-sbx", "master-sbx").await;
+                                assert_eq!(wr_resp.kind, "rpc_resp");
+                                assert_eq!(wr_resp.req_id, "req-write-ro");
+                                assert_eq!(wr_resp.body["ok"], false);
+                                assert!(wr_resp.body["error"].as_str().unwrap().contains("readonly"));
+
+                                let _ = tx_done.send(()).await;
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
+        let cfg = AgentConfig {
+            cluster_id: cluster_id.to_string(),
+            device_id: "os-sbx".to_string(),
+            master_id: "master-sbx".to_string(),
+            relay_url: format!("http://{addr}"),
+            token: "neo1.dummy.sig".to_string(),
+            e2e_secret: e2e_secret.to_string(),
+            enroll_id: None,
+            relay_enabled: false,
+            mqtt_bind: "127.0.0.1:0".to_string(),
+            uart_device: None,
+            ota_cache_dir: Some(ota_dir),
+            updater_state_path: None,
+            policy_path: Some(policy_path),
+            sandbox_override_path: Some(override_path),
+        };
+
+        let agent_task = tokio::spawn(async move {
+            let _ = run_agent(cfg, policy).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .unwrap()
+            .unwrap();
+        agent_task.abort();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn locked_sandbox_policy_rejects_set_sandbox_rpc_over_ws() {
+        use crate::policy::SandboxLevel;
+
+        let root = std::env::temp_dir().join(format!(
+            "neo_transport_locked_{}_{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let ws_dir = root.join("work");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let locked_policy = Policy::from_preset(
+            SandboxLevel::Personal,
+            vec![ws_dir.to_string_lossy().into_owned()],
+            true,
+        )
+        .unwrap();
+        let policy = Arc::new(std::sync::RwLock::new(locked_policy));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let e2e_secret = "locked-e2e-secret";
+        let cluster_id = "cluster-lock";
+        let e2e_key = derive_e2e_key(cluster_id, e2e_secret);
+
+        let server_task = tokio::spawn(async move {
+            let (tx_done, mut rx_done) = mpsc::channel::<()>(1);
+            loop {
+                tokio::select! {
+                    _ = rx_done.recv() => break,
+                    accept_res = listener.accept() => {
+                        let (mut stream, _) = accept_res.unwrap();
+                        let tx_done = tx_done.clone();
+                        tokio::spawn(async move {
+                            let mut peek_buf = [0u8; 512];
+                            let n = stream.peek(&mut peek_buf).await.unwrap_or(0);
+                            let head = String::from_utf8_lossy(&peek_buf[..n]);
+                            if head.starts_with("GET /v1/bootstrap ") {
+                                let mut sink = [0u8; 1024];
+                                let _ = stream.read(&mut sink).await;
+                                let body = br#"{"stun_servers":[]}"#;
+                                let resp = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(resp.as_bytes()).await;
+                                let _ = stream.write_all(body).await;
+                                return;
+                            }
+                            if head.starts_with("GET /v1/signal ") {
+                                if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
+                                    let _ = ws.next().await;
+                                }
+                                return;
+                            }
+                            if head.starts_with("GET /v1/relay ") {
+                                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                                async fn recv_non_hb(
+                                    ws: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
+                                    e2e_key: &[u8; 32],
+                                    cluster_id: &str,
+                                ) -> DeviceMessage {
+                                    loop {
+                                        let bin = match ws.next().await.unwrap().unwrap() {
+                                            WsMessage::Binary(b) => b,
+                                            _ => continue,
+                                        };
+                                        let rf = RelayFrame::decode(&bin).unwrap();
+                                        if rf.flags != RelayFlags::Data {
+                                            continue;
+                                        }
+                                        let msg = open_device_message(
+                                            e2e_key,
+                                            cluster_id,
+                                            "os-lock",
+                                            "master-lock",
+                                            &rf.payload,
+                                        )
+                                        .unwrap();
+                                        if msg.kind == "heartbeat" {
+                                            continue;
+                                        }
+                                        return msg;
+                                    }
+                                }
+                                // Initial manifest
+                                let m0 = recv_non_hb(&mut ws, &e2e_key, cluster_id).await;
+                                assert_eq!(m0.kind, "manifest");
+                                assert_eq!(m0.body["sandbox"]["locked"], true);
+
+                                // Attempt remote set_sandbox -> must be rejected
+                                let req = DeviceMessage {
+                                    v: 1,
+                                    kind: "rpc_req".to_string(),
+                                    req_id: "req-lock-1".to_string(),
+                                    cluster_id: cluster_id.to_string(),
+                                    device_id: "os-lock".to_string(),
+                                    ts_ms: now_ms(),
+                                    body: json!({
+                                        "method": "set_sandbox",
+                                        "params": { "level": "unrestricted" }
+                                    }),
+                                };
+                                let sealed = seal_device_message(&e2e_key, "master-lock", "os-lock", &req).unwrap();
+                                let rf = RelayFrame {
+                                    flags: RelayFlags::Data,
+                                    src: "master-lock".to_string(),
+                                    dst: "os-lock".to_string(),
+                                    payload: sealed,
+                                };
+                                ws.send(WsMessage::Binary(rf.encode().unwrap().into())).await.unwrap();
+
+                                let resp = recv_non_hb(&mut ws, &e2e_key, cluster_id).await;
+                                assert_eq!(resp.kind, "rpc_resp");
+                                assert_eq!(resp.req_id, "req-lock-1");
+                                assert_eq!(resp.body["ok"], false);
+                                assert!(resp.body["error"].as_str().unwrap().contains("lock_sandbox = true"));
+                                let _ = tx_done.send(()).await;
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
+        let cfg = AgentConfig {
+            cluster_id: cluster_id.to_string(),
+            device_id: "os-lock".to_string(),
+            master_id: "master-lock".to_string(),
+            relay_url: format!("http://{addr}"),
+            token: "neo1.dummy.sig".to_string(),
+            e2e_secret: e2e_secret.to_string(),
+            enroll_id: None,
+            relay_enabled: false,
+            mqtt_bind: "127.0.0.1:0".to_string(),
+            uart_device: None,
+            ota_cache_dir: None,
+            updater_state_path: None,
+            policy_path: None,
+            sandbox_override_path: None,
+        };
+
+        let agent_task = tokio::spawn(async move {
+            let _ = run_agent(cfg, policy).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .unwrap()
+            .unwrap();
+        agent_task.abort();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

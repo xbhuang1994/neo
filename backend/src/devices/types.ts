@@ -131,12 +131,44 @@ export type DeviceStatus = "online" | "offline" | "sleeping" | "unreachable_via_
 /** Action risk classification for the risk gate. */
 export type DeviceRiskLevel = "safe_auto" | "confirm_required" | "forbidden";
 
+/** 5-level per-device sandbox execution permission tiers (ordered from most restricted to unrestricted). */
+export type SandboxLevel = "readonly" | "corp" | "personal" | "desktop" | "unrestricted";
+
+/** Ordered list of valid sandbox levels. */
+export const SANDBOX_LEVELS: readonly SandboxLevel[] = [
+  "readonly",
+  "corp",
+  "personal",
+  "desktop",
+  "unrestricted",
+];
+
+/** Type guard for `SandboxLevel`. */
+export function isSandboxLevel(value: unknown): value is SandboxLevel {
+  return typeof value === "string" && (SANDBOX_LEVELS as readonly string[]).includes(value);
+}
+
+/** Sync state of a Tier 1 OS device's desired vs. reported sandbox policy. */
+export type SandboxSyncState = "synced" | "pending" | "unsupported" | "locked" | "error";
+
 /** Declared action metadata in a capability manifest. */
 export interface DeviceActionSpec {
   name: string;
   description?: string;
   risk?: DeviceRiskLevel;
   params?: Record<string, unknown>;
+}
+
+/** Reported sandbox policy summary inside a Tier 1 OS `CapabilityManifest`. */
+export interface SandboxSummary {
+  level?: SandboxLevel;
+  unrestricted?: boolean;
+  read_only?: boolean;
+  locked?: boolean;
+  allowed_workspaces?: string[];
+  max_child_mem_mb?: number;
+  max_exec_timeout_sec?: number;
+  [key: string]: unknown;
 }
 
 /** Tier 1 or Tier 2 capability manifest reported by an agent. */
@@ -150,7 +182,7 @@ export interface CapabilityManifest {
   ram_mb?: number;
   capabilities?: string[];
   actions?: DeviceActionSpec[];
-  sandbox?: Record<string, unknown>;
+  sandbox?: SandboxSummary;
   relay_config?: {
     enabled?: boolean;
     mqtt_bind?: string;
@@ -185,6 +217,11 @@ export interface DeviceTwin {
   alertSuppressed?: boolean;
   manifest?: CapabilityManifest;
   capabilities: string[];
+  sandboxLevel?: SandboxLevel;
+  desiredSandboxLevel?: SandboxLevel;
+  sandboxSyncState?: SandboxSyncState;
+  sandboxSyncError?: string;
+  sandboxUpdatedAt?: string;
   desiredState: Record<string, unknown>;
   reportedState: Record<string, unknown>;
   pendingQueue: PendingMcuCommand[];
@@ -194,6 +231,24 @@ export interface DeviceTwin {
   lastSeenAt?: string;
   lastSeenMs?: number;
   updatedAt: string;
+}
+
+/** Input to `DeviceManager.setDeviceSandboxLevel`. */
+export interface DeviceSandboxUpdateInput {
+  level: SandboxLevel;
+  workspaces?: string[];
+  timeoutMs?: number;
+}
+
+/** Outcome of `DeviceManager.setDeviceSandboxLevel`. */
+export interface DeviceSandboxUpdateResult {
+  device: DeviceTwin;
+  level: SandboxLevel;
+  applied: boolean;
+  pending: boolean;
+  persisted?: boolean;
+  warning?: string;
+  error?: string;
 }
 
 /** Approval status for `confirm_required` device invocations. */
@@ -367,8 +422,8 @@ export type S3PrefixValidation =
 /** Target OS / runtime platform for one-click agent enrollment. */
 export type EnrollmentPlatform = "linux" | "macos" | "windows" | "docker";
 
-/** Local read-only sandbox policy preset for enrolled Tier 1 OS agents. */
-export type EnrollmentProfile = "personal" | "corp" | "readonly" | "desktop";
+/** Sandbox policy preset for enrolled Tier 1 OS agents. */
+export type EnrollmentProfile = SandboxLevel;
 
 /** Installation privilege / service mode on the target host. */
 export type EnrollmentInstallMode = "auto" | "system" | "user" | "foreground";
