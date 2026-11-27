@@ -21,6 +21,7 @@ No package carries the agent runtime. The Antigravity CLI (`agy`) is a third-par
 | Platform | Command | Result |
 | --- | --- | --- |
 | Linux server (`x64` / `arm64`) | `packaging/linux/build-server.sh --arch x64` (or `arm64`, optional `--skip-web-build`) | `dist/neo-agent-<version>-linux-<arch>.tar.gz` with `neo-agent`, `neo-recovery`, `web/`, and systemd units (`neo-agent.service`, `neo-agent-user.service`, `neo-recovery-user.service`) |
+| Multi-device agents & relay (`x64` / `arm64` / C99 SDK) | `packaging/linux/build-multi-device.sh [--targets ...]` | `dist/neo-agent-os-<version>-linux-{x64,arm64}.tar.gz`, `dist/neo-relayd-<version>-linux-{x64,arm64}.tar.gz`, and `dist/neo-agent-mcu-<version>-sdk.tar.gz` |
 | Linux desktop (`x64`) | `packaging/linux/build-desktop.sh --arch x64` | `dist/Neo-<version>-linux-x64.tar.gz` (relocatable + `install-desktop.sh`) and `dist/Neo-<version>-linux-x64.deb` (`/opt/neo`, `/usr/bin/neo`, desktop entry & icon) |
 | macOS (`arm64` / `x64`) | `packaging/macos/build-dmg.sh --arch arm64` (or `x64`) | `dist/Neo-<version>-macos-<arch>.dmg` |
 | Windows (`x64`) | `pwsh packaging\windows\stage.ps1`, then Inno Setup with `packaging\windows\neo-agent.iss` | `dist\Neo-<version>-windows-x64-portable.zip` and `dist\Neo-<version>-windows-x64-setup.exe` |
@@ -46,7 +47,8 @@ git push origin main --tags
 3. **`windows` (`windows-latest`)**: compiles `neo-agent.exe` and Flutter Windows release, smoke-tests `neo-agent.exe version`, builds `Neo-<version>-windows-x64-portable.zip` and Inno Setup `Neo-<version>-windows-x64-setup.exe`.
 4. **`linux-desktop` (`ubuntu-latest`)**: builds Flutter Linux release + `neo-agent`, packages and verifies both `Neo-<version>-linux-x64.tar.gz` and `Neo-<version>-linux-x64.deb`.
 5. **`linux-server` (`ubuntu-latest`)**: builds the web app once, compiles `neo-agent` and `neo-recovery` for both `x64` and `arm64`, smoke-tests the unpacked `x64` server (including live `/api/health` and `/` web serving), and verifies `arm64` ELF binaries.
-6. **`publish` (`ubuntu-latest`)**: verifies all 8 artifacts exist and are non-empty, computes and self-checks sorted `SHA256SUMS.txt`, generates structured release notes alongside GitHub's changelog, and publishes a GitHub Release (`draft: true` by default; semver prereleases like `v0.7.0-rc.1` are marked `prerelease: true` automatically).
+6. **`multi-device` (`ubuntu-latest`)**: tests `neo-relay`, `neo-agent-os`, and `neo-agent-mcu`, then runs `packaging/linux/build-multi-device.sh` to build `neo-agent-os` (`x64`/`arm64`), `neo-relayd` (`x64`/`arm64`), and the `neo-agent-mcu` C99 SDK tarball.
+7. **`publish` (`ubuntu-latest`)**: verifies all 13 artifacts exist and are non-empty, computes and self-checks sorted `SHA256SUMS.txt`, generates structured release notes alongside GitHub's changelog, and publishes a GitHub Release (`draft: false` on `v*` tag push; `workflow_dispatch` defaults to `draft: true`; semver prereleases like `v0.7.0-rc.1` are marked `prerelease: true` automatically).
 
 Running `workflow_dispatch` with an empty `tag` performs a full multi-platform dry-run build and attaches workflow artifacts without creating a GitHub Release; passing a matching `tag` publishes a release (with selectable `draft`, `prerelease`, and `skip_tests` options).
 

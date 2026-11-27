@@ -69,6 +69,31 @@ export function expectedAssets(version: string): ExpectedAsset[] {
       platform: "Linux Server arm64",
       description: "Headless `neo-agent` + `neo-recovery` + web UI + systemd units",
     },
+    {
+      filename: `neo-agent-os-${version}-linux-x64.tar.gz`,
+      platform: "Tier 1 Agent (`neo-agent-os` x64)",
+      description: "Static Rust Tier 1 OS agent + `--relay` bridge + multi-master templates",
+    },
+    {
+      filename: `neo-agent-os-${version}-linux-arm64.tar.gz`,
+      platform: "Tier 1 Agent (`neo-agent-os` arm64)",
+      description: "Static Rust Tier 1 OS agent for Raspberry Pi / ARM64 SBCs + `--relay`",
+    },
+    {
+      filename: `neo-relayd-${version}-linux-x64.tar.gz`,
+      platform: "Companion Relay (`neo-relayd` x64)",
+      description: "Multi-master isolated P2P signaling + WSS binary relay + STUN daemon",
+    },
+    {
+      filename: `neo-relayd-${version}-linux-arm64.tar.gz`,
+      platform: "Companion Relay (`neo-relayd` arm64)",
+      description: "Multi-master isolated P2P signaling + WSS binary relay + STUN daemon",
+    },
+    {
+      filename: `neo-agent-mcu-${version}-sdk.tar.gz`,
+      platform: "Tier 2 MCU SDK (`neo-agent-mcu` C99)",
+      description: "Zero-heap C99 embedded MCU SDK, tests, and Linux MQTT simulator",
+    },
   ];
 }
 

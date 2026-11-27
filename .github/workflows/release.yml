@@ -5,6 +5,7 @@ name: Release
 #   - Windows Desktop:    Neo-<version>-windows-x64-setup.exe, Neo-<version>-windows-x64-portable.zip
 #   - Linux Desktop:      Neo-<version>-linux-x64.deb, Neo-<version>-linux-x64.tar.gz
 #   - Linux Server:       neo-agent-<version>-linux-x64.tar.gz, neo-agent-<version>-linux-arm64.tar.gz
+#   - Multi-Device:       neo-agent-os-<version>-linux-{x64,arm64}.tar.gz, neo-relayd-<version>-linux-{x64,arm64}.tar.gz, neo-agent-mcu-<version>-sdk.tar.gz
 #   - Checksums:          SHA256SUMS.txt
 #
 # Each package bundles the pure-TypeScript (Bun-compiled) neo-agent backend (and neo-recovery on Linux server).
@@ -75,7 +76,7 @@ jobs:
           if [ "$EVENT_NAME" = "push" ] && [ "${REF#refs/tags/v}" != "$REF" ]; then
             bun packaging/release.ts check --tag "$REF_NAME" --github-output
             echo "should_publish=true" >> "$GITHUB_OUTPUT"
-            echo "is_draft=true" >> "$GITHUB_OUTPUT"
+            echo "is_draft=false" >> "$GITHUB_OUTPUT"
           elif [ -n "$INPUT_TAG" ]; then
             if [ "$INPUT_PRERELEASE" = "true" ]; then
               bun packaging/release.ts check --tag "$INPUT_TAG" --prerelease --github-output
@@ -286,10 +287,47 @@ jobs:
             dist/neo-agent-*-linux-arm64.tar.gz
           if-no-files-found: error
 
+  multi-device:
+    name: Multi-device agents & relay (x64 & arm64 + MCU SDK)
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - name: Install ARM64 cross-linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Test neo-relay, neo-agent-os, and neo-agent-mcu
+        if: github.event_name != 'workflow_dispatch' || !inputs.skip_tests
+        run: |
+          (cd services/neo-relay && go test -race ./...)
+          (cd agents/neo-agent-os && cargo test)
+          (cd agents/neo-agent-mcu && make clean all test size-check)
+      - name: Build multi-device release archives
+        run: |
+          packaging/linux/build-multi-device.sh --version "${{ needs.prepare.outputs.version }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: multi-device
+          path: |
+            dist/neo-agent-os-*-linux-x64.tar.gz
+            dist/neo-agent-os-*-linux-arm64.tar.gz
+            dist/neo-relayd-*-linux-x64.tar.gz
+            dist/neo-relayd-*-linux-arm64.tar.gz
+            dist/neo-agent-mcu-*-sdk.tar.gz
+          if-no-files-found: error
+
   publish:
     name: Publish release
     if: needs.prepare.outputs.should_publish == 'true'
-    needs: [prepare, macos, windows, linux-desktop, linux-server]
+    needs: [prepare, macos, windows, linux-desktop, linux-server, multi-device]
     runs-on: ubuntu-latest
     permissions:
       contents: write

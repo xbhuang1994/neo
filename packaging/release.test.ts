@@ -104,7 +104,7 @@ describe("packaging/release.ts", () => {
     try {
       const version = "0.7.0";
       const assets = expectedAssets(version);
-      expect(assets.length).toBe(8);
+      expect(assets.length).toBe(13);
 
       expect(() => verifyDistArtifacts(version, dist)).toThrow(/Missing release artifacts/);
 
@@ -112,7 +112,7 @@ describe("packaging/release.ts", () => {
         fs.writeFileSync(path.join(dist, a.filename), "mock-artifact-bytes", "utf8");
       }
       const verified = verifyDistArtifacts(version, dist);
-      expect(verified.length).toBe(8);
+      expect(verified.length).toBe(13);
 
       const notes = renderReleaseNotes(version, dist);
       for (const a of assets) {
@@ -141,6 +141,7 @@ describe("GitHub Actions multi-platform workflow contracts", () => {
     expect(releaseYml).toContain("packaging/linux/build-desktop.sh --arch x64");
     expect(releaseYml).toContain("packaging/linux/build-server.sh --arch x64");
     expect(releaseYml).toContain("packaging/linux/build-server.sh --arch arm64 --skip-web-build");
+    expect(releaseYml).toContain("packaging/linux/build-multi-device.sh");
     expect(releaseYml).toContain("packaging/release.ts verify-dist");
     expect(releaseYml).toContain("SHA256SUMS.txt");
     expect(releaseYml).toContain("softprops/action-gh-release@v2");
