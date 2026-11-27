@@ -6,7 +6,7 @@ use crate::protocol::{
 };
 use crate::transport::{
     connect_ws_bearer, derive_endpoints, http_post_json, now_ms, run_agent, run_one_shot_check,
-    AgentConfig,
+    AgentConfig, AgentExit,
 };
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -731,6 +731,7 @@ async fn perform_bootstrap_exchange(
         ts_ms: now_ms(),
         body: json!({
             "enroll_id": payload.enroll_id,
+            "version": env!("CARGO_PKG_VERSION"),
             "hostname": read_hostname(),
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
@@ -2176,6 +2177,8 @@ pub async fn run_enroll(args: EnrollArgs) -> Result<EnrollOutcome, String> {
         uart_device,
         ota_cache_dir: Some(ota_cache_dir.clone()),
         updater_state_path,
+        #[cfg(test)]
+        self_update_target: None,
     };
 
     if mode == EffectiveMode::Foreground {
@@ -2192,7 +2195,12 @@ pub async fn run_enroll(args: EnrollArgs) -> Result<EnrollOutcome, String> {
         };
         print_enroll_summary(&outcome);
         tokio::select! {
-            res = run_agent(cfg, policy) => res?,
+            res = run_agent(cfg, policy) => match res? {
+                AgentExit::Restart(plan) => {
+                    crate::updater::perform_process_restart(&plan)?;
+                }
+                AgentExit::Stopped => {}
+            },
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("[neo-agent-os] shutdown signal received");
             }

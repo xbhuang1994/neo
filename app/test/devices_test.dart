@@ -663,5 +663,103 @@ void main() {
 
       await app.close();
     });
+
+    testWidgets('shows Update button only when Tier device version < Master Neo version and triggers remote update strictly matching Master version', (tester) async {
+      final clipboard = <String>[];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(SystemChannels.platform, (call) async {
+        if (call.method == 'Clipboard.setData') {
+          clipboard.add((call.arguments as Map)['text'] as String);
+        }
+        return null;
+      });
+      addTearDown(() => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(SystemChannels.platform, null));
+
+      // Verify semver comparison edge cases directly
+      expect(compareSemver('0.8.0', '0.9.1'), -1);
+      expect(compareSemver('0.9.1', '0.10.0'), -1);
+      expect(compareSemver('0.9.1-rc.1', '0.9.1'), -1);
+      expect(compareSemver('0.9.1', '0.9.1'), 0);
+      expect(compareSemver('0.10.0', '0.9.1'), 1);
+      expect(isVersionOlder('v0.9.0', '0.9.1'), isTrue);
+      expect(isVersionOlder('0.9.1', '0.9.1'), isFalse);
+      expect(isVersionOlder('0.10.0', '0.9.1'), isFalse);
+
+      final backend = FakeBackend()
+        // Even if agentVersion were newer, UI strictly compares & targets masterVersion (0.9.1)
+        ..configureDevices(clusterId: 'personal', masterVersion: '0.9.1', agentVersion: '0.9.9')
+        ..addDevice('mac-old', status: 'online', route: 'p2p', version: '0.8.0')
+        ..addDevice('linux-current', status: 'online', route: 'relay', version: '0.9.1')
+        ..addDevice('linux-newer', status: 'online', route: 'relay', version: '0.10.0')
+        ..addDevice('win-legacy', status: 'online', route: 'relay', omitVersion: true)
+        ..addDevice('esp32-old', tier: 'mcu', status: 'sleeping', route: 'via_tier1', relayNodeId: 'linux-current', version: '0.1.0')
+        ..addDevice('esp32-current', tier: 'mcu', status: 'online', route: 'via_tier1', relayNodeId: 'linux-current', version: '0.9.1');
+
+      backend.deviceUpdateResponses['win-legacy'] = {
+        'ok': false,
+        'status': 'manual_upgrade_required',
+        'deviceId': 'win-legacy',
+        'tier': 'os',
+        'targetVersion': '0.9.1',
+        'message': 'Legacy agent predates self_update RPC',
+        'error': 'unsupported RPC method: self_update',
+        'upgradeCommand': 'irm https://neo.1inch.cn:18443/install.ps1 | iex; Install-NeoAgent -Upgrade -Version "0.9.1" -Cluster "personal"',
+      };
+
+      final app = await open(tester, backend);
+      await tester.tap(nav(2));
+      await settle(tester);
+
+      // Update button visible ONLY on outdated Tier 1 (mac-old), legacy Tier 1 (win-legacy), and outdated Tier 2 MCU (esp32-old).
+      expect(find.byKey(const ValueKey('update-mac-old')), findsOneWidget);
+      expect(find.byKey(const ValueKey('update-win-legacy')), findsOneWidget);
+      expect(find.byKey(const ValueKey('update-esp32-old')), findsOneWidget);
+      expect(find.byKey(const ValueKey('update-linux-current')), findsNothing);
+      expect(find.byKey(const ValueKey('update-linux-newer')), findsNothing);
+      expect(find.byKey(const ValueKey('update-esp32-current')), findsNothing);
+      expect(find.text('v0.8.0'), findsOneWidget);
+      expect(find.text('旧版本'), findsOneWidget);
+      expect(find.text('fw 0.1.0'), findsOneWidget);
+
+      // 1. Trigger remote update on mac-old -> strictly targets masterVersion 0.9.1
+      final macUpdateBtn = find.byKey(const ValueKey('update-mac-old'));
+      await show(tester, macUpdateBtn);
+      await tester.tap(macUpdateBtn);
+      await settle(tester);
+      expect(backend.updatedDevices.last['deviceId'], 'mac-old');
+      expect(backend.updatedDevices.last['targetVersion'], '0.9.1');
+      expect(find.byKey(const ValueKey('update-result-mac-old')), findsOneWidget);
+      expect(find.textContaining('已触发更新至 v0.9.1'), findsOneWidget);
+
+      // Simulate mac-old reconnecting with updated manifest version 0.9.1 -> Update button disappears!
+      backend.addDevice('mac-old', status: 'online', route: 'p2p', version: '0.9.1');
+      await app.state.refresh();
+      await settle(tester);
+      expect(find.byKey(const ValueKey('update-mac-old')), findsNothing);
+      expect(find.textContaining('已更新至 v0.9.1'), findsOneWidget);
+
+      // 2. Trigger remote update on legacy Tier 1 device -> shows manual upgrade guidance + copy button
+      final legacyBtn = find.byKey(const ValueKey('update-win-legacy'));
+      await show(tester, legacyBtn);
+      await tester.tap(legacyBtn);
+      await settle(tester);
+      expect(find.textContaining('暂不支持远程自更新'), findsOneWidget);
+      final copyUpgradeBtn = find.byKey(const ValueKey('copy-upgrade-win-legacy'));
+      expect(copyUpgradeBtn, findsOneWidget);
+      await show(tester, copyUpgradeBtn);
+      await tester.tap(copyUpgradeBtn);
+      await settle(tester);
+      expect(clipboard.last, contains('-Upgrade -Version "0.9.1"'));
+
+      // 3. Trigger remote update on sleeping Tier 2 MCU -> queues update for v0.9.1
+      final mcuBtn = find.byKey(const ValueKey('update-esp32-old'));
+      await show(tester, mcuBtn);
+      await tester.tap(mcuBtn);
+      await settle(tester);
+      expect(backend.updatedDevices.last['deviceId'], 'esp32-old');
+      expect(backend.updatedDevices.last['targetVersion'], '0.9.1');
+      expect(find.textContaining('已将 v0.9.1 更新加入下发队列'), findsOneWidget);
+
+      await app.close();
+    });
   });
 }

@@ -143,6 +143,7 @@ export interface DeviceActionSpec {
 export interface CapabilityManifest {
   device_id: string;
   tier: DeviceTier;
+  version?: string;
   os?: string;
   arch?: string;
   hostname?: string;
@@ -246,6 +247,7 @@ export interface DeviceConfigView {
   localRelayDetected: boolean;
   defaultRelayUrl: string;
   agentVersion: string;
+  masterVersion: string;
 }
 
 /** Input to `DeviceManager.initOrUpdateConfig`. */
@@ -270,6 +272,42 @@ export interface DevicePingResult {
   status: DeviceStatus;
   route: DeviceRouteKind;
   error?: string;
+}
+
+/** Status of a remote Tier device update request. */
+export type DeviceUpdateStatus =
+  | "restarting"
+  | "updated"
+  | "queued"
+  | "staged"
+  | "up_to_date"
+  | "manual_upgrade_required"
+  | "failed";
+
+/** Input to `DeviceManager.updateDevice`. */
+export interface DeviceUpdateInput {
+  targetVersion?: string;
+  downloadMirrors?: string[];
+  sha256?: string;
+  force?: boolean;
+  timeoutMs?: number;
+}
+
+/** Outcome of `DeviceManager.updateDevice`. */
+export interface DeviceUpdateResult {
+  ok: boolean;
+  status: DeviceUpdateStatus;
+  deviceId: string;
+  tier: DeviceTier;
+  currentVersion?: string;
+  targetVersion: string;
+  message: string;
+  error?: string;
+  upgradeCommand?: string;
+  seqId?: number;
+  installedPath?: string;
+  sha256?: string;
+  mirror?: string;
 }
 
 /** Input to `DeviceManager.invoke`. */

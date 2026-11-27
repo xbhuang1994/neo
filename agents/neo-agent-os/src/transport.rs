@@ -6,17 +6,18 @@ use crate::protocol::{
     BootstrapResponse, DeviceMessage, RelayEnvelope, RelayFlags, RelayFrame, SignalMessage,
 };
 use crate::relay_bridge::RelayBridge;
-use crate::updater::{RollbackAction, UpdaterManager};
+use crate::updater::{execute_self_update, RestartPlan, RollbackAction, SelfUpdateRequest, UpdaterManager};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
@@ -40,6 +41,15 @@ pub struct AgentConfig {
     pub uart_device: Option<PathBuf>,
     pub ota_cache_dir: Option<PathBuf>,
     pub updater_state_path: Option<PathBuf>,
+    #[cfg(test)]
+    pub self_update_target: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub enum AgentExit {
+    #[allow(dead_code)]
+    Stopped,
+    Restart(RestartPlan),
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +196,121 @@ pub async fn http_post_json(url_str: &str, body: &[u8]) -> Result<(u16, Vec<u8>)
     http_request("POST", url_str, None, Some("application/json"), body).await
 }
 
+/// Downloads a binary or text asset over HTTP/HTTPS, following up to 5 redirects (for GitHub
+/// Releases / CDN mirrors) while enforcing a strict maximum byte limit and timeout.
+pub async fn http_download_bytes(
+    url_str: &str,
+    max_bytes: usize,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    let mut current_url = url_str.to_string();
+    for hop in 0..=5 {
+        let url = Url::parse(&current_url)
+            .map_err(|e| format!("invalid download URL '{current_url}': {e}"))?;
+        let raw_host = url.host_str().ok_or("download URL missing host")?;
+        let host_for_dial = raw_host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string();
+        let use_tls = match url.scheme() {
+            "https" => true,
+            "http" => false,
+            other => return Err(format!("unsupported download URL scheme: {other}")),
+        };
+        let port = url
+            .port_or_known_default()
+            .unwrap_or(if use_tls { 443 } else { 80 });
+        let host_header = match url.port() {
+            Some(p) => format!("{raw_host}:{p}"),
+            None => raw_host.to_string(),
+        };
+        let path_str = if url.path().is_empty() { "/" } else { url.path() };
+        let path_and_query = match url.query() {
+            Some(q) => format!("{path_str}?{q}"),
+            None => path_str.to_string(),
+        };
+
+        let req = format!(
+            "GET {path_and_query} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: neo-agent-os/{}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+            env!("CARGO_PKG_VERSION")
+        );
+
+        let tcp = tokio::time::timeout(
+            Duration::from_secs(15),
+            TcpStream::connect((host_for_dial.as_str(), port)),
+        )
+        .await
+        .map_err(|_| format!("download TCP connect timed out: {current_url}"))?
+        .map_err(|e| format!("download TCP connect failed ({current_url}): {e}"))?;
+
+        let read_limit = (max_bytes as u64).saturating_add(64 * 1024);
+        let raw_resp = if use_tls {
+            let connector = build_tls_connector();
+            let server_name = ServerName::try_from(host_for_dial.clone())
+                .map_err(|_| format!("invalid TLS server name: {host_for_dial}"))?;
+            let mut tls =
+                tokio::time::timeout(Duration::from_secs(15), connector.connect(server_name, tcp))
+                    .await
+                    .map_err(|_| "download TLS handshake timed out".to_string())?
+                    .map_err(|e| format!("download TLS handshake failed: {e}"))?;
+            tls.write_all(req.as_bytes())
+                .await
+                .map_err(|e| format!("download request write failed: {e}"))?;
+            tls.flush().await.ok();
+            let mut buf = Vec::new();
+            let mut limited = tls.take(read_limit + 1);
+            tokio::time::timeout(timeout, limited.read_to_end(&mut buf))
+                .await
+                .map_err(|_| format!("download timed out: {current_url}"))?
+                .map_err(|e| format!("download read failed: {e}"))?;
+            if (buf.len() as u64) > read_limit {
+                return Err(format!("download exceeded max size limit ({max_bytes} bytes)"));
+            }
+            buf
+        } else {
+            let mut tcp = tcp;
+            tcp.write_all(req.as_bytes())
+                .await
+                .map_err(|e| format!("download request write failed: {e}"))?;
+            tcp.flush().await.ok();
+            let mut buf = Vec::new();
+            let mut limited = tcp.take(read_limit + 1);
+            tokio::time::timeout(timeout, limited.read_to_end(&mut buf))
+                .await
+                .map_err(|_| format!("download timed out: {current_url}"))?
+                .map_err(|e| format!("download read failed: {e}"))?;
+            if (buf.len() as u64) > read_limit {
+                return Err(format!("download exceeded max size limit ({max_bytes} bytes)"));
+            }
+            buf
+        };
+
+        let (status, location, body) = parse_http_response_with_location(&raw_resp)?;
+        if matches!(status, 301 | 302 | 303 | 307 | 308) {
+            if hop >= 5 {
+                return Err(format!("too many HTTP redirects for {url_str}"));
+            }
+            let loc = location.ok_or_else(|| format!("HTTP {status} redirect missing Location header"))?;
+            let next = url
+                .join(loc.trim())
+                .map_err(|e| format!("invalid redirect Location '{loc}': {e}"))?;
+            if !matches!(next.scheme(), "http" | "https") {
+                return Err(format!("disallowed redirect scheme '{}'", next.scheme()));
+            }
+            current_url = next.to_string();
+            continue;
+        }
+        if !(200..300).contains(&status) {
+            return Err(format!("HTTP {status} downloading {current_url}"));
+        }
+        if body.len() > max_bytes {
+            return Err(format!("download body exceeds max size limit ({max_bytes} bytes)"));
+        }
+        return Ok(body);
+    }
+    Err(format!("too many HTTP redirects for {url_str}"))
+}
+
 pub async fn fetch_bootstrap(bootstrap_url: &str, token: &str) -> Result<BootstrapResponse, String> {
     let (status, body) = http_request("GET", bootstrap_url, Some(token), None, &[]).await?;
     if status < 200 || status >= 300 {
@@ -198,6 +323,13 @@ pub async fn fetch_bootstrap(bootstrap_url: &str, token: &str) -> Result<Bootstr
 }
 
 fn parse_http_response(raw: &[u8]) -> Result<(u16, Vec<u8>), String> {
+    let (status, _loc, body) = parse_http_response_with_location(raw)?;
+    Ok((status, body))
+}
+
+fn parse_http_response_with_location(
+    raw: &[u8],
+) -> Result<(u16, Option<String>, Vec<u8>), String> {
     let hdr_end = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -213,12 +345,16 @@ fn parse_http_response(raw: &[u8]) -> Result<(u16, Vec<u8>), String> {
         .ok_or_else(|| format!("invalid HTTP status line: {status_line}"))?;
 
     let mut is_chunked = false;
+    let mut location: Option<String> = None;
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("transfer-encoding")
+            let key = k.trim();
+            if key.eq_ignore_ascii_case("transfer-encoding")
                 && v.to_ascii_lowercase().contains("chunked")
             {
                 is_chunked = true;
+            } else if key.eq_ignore_ascii_case("location") {
+                location = Some(v.trim().to_string());
             }
         }
     }
@@ -228,7 +364,7 @@ fn parse_http_response(raw: &[u8]) -> Result<(u16, Vec<u8>), String> {
     } else {
         body_raw.to_vec()
     };
-    Ok((status, body))
+    Ok((status, location, body))
 }
 
 fn decode_chunked(mut data: &[u8]) -> Result<Vec<u8>, String> {
@@ -378,7 +514,7 @@ pub async fn run_one_shot_check(cfg: &AgentConfig, policy: &Policy) -> Result<()
     Ok(())
 }
 
-pub async fn run_agent(cfg: AgentConfig, policy: Arc<Policy>) -> Result<(), String> {
+pub async fn run_agent(cfg: AgentConfig, policy: Arc<Policy>) -> Result<AgentExit, String> {
     let boot_started = Instant::now();
     let endpoints = derive_endpoints(&cfg.relay_url)?;
     let e2e_key = derive_e2e_key(&cfg.cluster_id, &cfg.e2e_secret);
@@ -386,6 +522,9 @@ pub async fn run_agent(cfg: AgentConfig, policy: Arc<Policy>) -> Result<(), Stri
         Arc::clone(&policy),
         cfg.ota_cache_dir.clone(),
     ));
+    let updating_flag = Arc::new(AtomicBool::new(false));
+    let (restart_tx, mut restart_rx) = oneshot::channel::<RestartPlan>();
+    let restart_slot = Arc::new(Mutex::new(Some(restart_tx)));
 
     let mut updater = cfg
         .updater_state_path
@@ -514,6 +653,16 @@ pub async fn run_agent(cfg: AgentConfig, policy: Arc<Policy>) -> Result<(), Stri
 
                 loop {
                     tokio::select! {
+                        Ok(plan) = &mut restart_rx => {
+                            // Flush any queued rpc_resp frames before closing WebSocket.
+                            while let Ok((dst, msg)) = outbound_rx.try_recv() {
+                                let _ = send_encrypted_frame(&mut ws_sink, &e2e_key, &cfg.device_id, &dst, &msg).await;
+                            }
+                            let _ = ws_sink.send(WsMessage::Close(None)).await;
+                            let _ = ws_sink.flush().await;
+                            drop(relay_bridge);
+                            return Ok(AgentExit::Restart(plan));
+                        }
                         _ = hb_tick.tick() => {
                             let ping = RelayFrame {
                                 flags: RelayFlags::Ping,
@@ -534,7 +683,7 @@ pub async fn run_agent(cfg: AgentConfig, policy: Arc<Policy>) -> Result<(), Stri
                                 cluster_id: cfg.cluster_id.clone(),
                                 device_id: cfg.device_id.clone(),
                                 ts_ms: now_ms(),
-                                body: json!({ "status": "online" }),
+                                body: json!({ "status": "online", "version": env!("CARGO_PKG_VERSION") }),
                             };
                             if send_encrypted_frame(&mut ws_sink, &e2e_key, &cfg.device_id, &dst, &hb).await.is_err() {
                                 break;
@@ -583,6 +732,8 @@ pub async fn run_agent(cfg: AgentConfig, policy: Arc<Policy>) -> Result<(), Stri
                                                                 &executor,
                                                                 &relay_bridge,
                                                                 &outbound_tx,
+                                                                &updating_flag,
+                                                                &restart_slot,
                                                                 &frame.src,
                                                                 msg,
                                                             ).await;
@@ -618,7 +769,17 @@ pub async fn run_agent(cfg: AgentConfig, policy: Arc<Policy>) -> Result<(), Stri
         while let Ok(item) = outbound_rx.try_recv() {
             push_ring(&offline_ring, item).await;
         }
-        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        if let Ok(plan) = restart_rx.try_recv() {
+            drop(relay_bridge);
+            return Ok(AgentExit::Restart(plan));
+        }
+        tokio::select! {
+            Ok(plan) = &mut restart_rx => {
+                drop(relay_bridge);
+                return Ok(AgentExit::Restart(plan));
+            }
+            _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+        }
         backoff_ms = (backoff_ms * 2).min(15_000);
     }
 }
@@ -629,6 +790,8 @@ async fn handle_device_message(
     executor: &Arc<Executor>,
     relay_bridge: &Option<Arc<RelayBridge>>,
     outbound_tx: &mpsc::Sender<(String, DeviceMessage)>,
+    updating_flag: &Arc<AtomicBool>,
+    restart_slot: &Arc<Mutex<Option<oneshot::Sender<RestartPlan>>>>,
     src_node: &str,
     msg: DeviceMessage,
 ) {
@@ -683,6 +846,158 @@ async fn handle_device_message(
                     body,
                 };
                 let _ = outbound_tx.send((src_node.to_string(), resp)).await;
+                return;
+            }
+
+            if method == "self_update" || method == "agent.update" {
+                let target_version = params
+                    .get("target_version")
+                    .or_else(|| params.get("version"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let master_version = params
+                    .get("master_version")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                let mirrors: Vec<String> = params
+                    .get("mirrors")
+                    .or_else(|| params.get("download_mirrors"))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let asset = params
+                    .get("asset")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let expected_sha256 = params
+                    .get("sha256")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let force = params
+                    .get("force")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                if target_version.is_empty() {
+                    let resp = DeviceMessage {
+                        v: 1,
+                        kind: "rpc_resp".to_string(),
+                        req_id: msg.req_id,
+                        cluster_id: cfg.cluster_id.clone(),
+                        device_id: cfg.device_id.clone(),
+                        ts_ms: now_ms(),
+                        body: json!({ "ok": false, "error": "self_update requires 'target_version'" }),
+                    };
+                    let _ = outbound_tx.send((src_node.to_string(), resp)).await;
+                    return;
+                }
+
+                if updating_flag
+                    .compare_exchange(false, true, AtomicOrdering::SeqCst, AtomicOrdering::SeqCst)
+                    .is_err()
+                {
+                    let resp = DeviceMessage {
+                        v: 1,
+                        kind: "rpc_resp".to_string(),
+                        req_id: msg.req_id,
+                        cluster_id: cfg.cluster_id.clone(),
+                        device_id: cfg.device_id.clone(),
+                        ts_ms: now_ms(),
+                        body: json!({ "ok": false, "error": "self_update already in progress" }),
+                    };
+                    let _ = outbound_tx.send((src_node.to_string(), resp)).await;
+                    return;
+                }
+
+                let upd_req = SelfUpdateRequest {
+                    target_version,
+                    master_version,
+                    mirrors,
+                    asset,
+                    expected_sha256,
+                    force,
+                };
+                let relay_url = cfg.relay_url.clone();
+                let ota_dir = cfg.ota_cache_dir.clone();
+                let state_path = cfg.updater_state_path.clone();
+                #[cfg(test)]
+                let install_target = cfg.self_update_target.clone();
+                #[cfg(not(test))]
+                let install_target: Option<PathBuf> = None;
+
+                let out = outbound_tx.clone();
+                let flag = Arc::clone(updating_flag);
+                let restart_slot = Arc::clone(restart_slot);
+                let cluster_id = cfg.cluster_id.clone();
+                let device_id = cfg.device_id.clone();
+                let dst = src_node.to_string();
+                let req_id = msg.req_id.clone();
+
+                tokio::spawn(async move {
+                    let res = execute_self_update(
+                        &upd_req,
+                        &relay_url,
+                        ota_dir.as_deref(),
+                        state_path.as_deref(),
+                        install_target.as_deref(),
+                    )
+                    .await;
+                    match res {
+                        Ok(outcome) => {
+                            let body = json!({
+                                "ok": true,
+                                "result": {
+                                    "status": outcome.status,
+                                    "previous_version": outcome.previous_version,
+                                    "target_version": outcome.target_version,
+                                    "installed_path": outcome.installed_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                                    "sha256": outcome.sha256,
+                                    "mirror": outcome.mirror,
+                                }
+                            });
+                            let resp = DeviceMessage {
+                                v: 1,
+                                kind: "rpc_resp".to_string(),
+                                req_id,
+                                cluster_id,
+                                device_id,
+                                ts_ms: now_ms(),
+                                body,
+                            };
+                            let _ = out.send((dst, resp)).await;
+
+                            if let Some(plan) = outcome.restart_plan {
+                                // Allow the encrypted rpc_resp frame to flush before tearing down WS and restarting.
+                                tokio::time::sleep(Duration::from_millis(350)).await;
+                                if let Some(tx) = restart_slot.lock().await.take() {
+                                    let _ = tx.send(plan);
+                                }
+                            } else {
+                                flag.store(false, AtomicOrdering::SeqCst);
+                            }
+                        }
+                        Err(err) => {
+                            flag.store(false, AtomicOrdering::SeqCst);
+                            let resp = DeviceMessage {
+                                v: 1,
+                                kind: "rpc_resp".to_string(),
+                                req_id,
+                                cluster_id,
+                                device_id,
+                                ts_ms: now_ms(),
+                                body: json!({ "ok": false, "error": err }),
+                            };
+                            let _ = out.send((dst, resp)).await;
+                        }
+                    }
+                });
                 return;
             }
 
@@ -949,6 +1264,10 @@ mod tests {
                                         .unwrap();
                                 assert_eq!(manifest_msg.kind, "manifest");
                                 assert_eq!(
+                                    manifest_msg.body.get("version").and_then(|v| v.as_str()),
+                                    Some(env!("CARGO_PKG_VERSION"))
+                                );
+                                assert_eq!(
                                     manifest_msg.body.get("enroll_id").and_then(|v| v.as_str()),
                                     Some("enr-test-01")
                                 );
@@ -1014,6 +1333,7 @@ mod tests {
             uart_device: None,
             ota_cache_dir: None,
             updater_state_path: None,
+            self_update_target: None,
         };
 
         let agent_task = tokio::spawn(async move {
@@ -1026,5 +1346,223 @@ mod tests {
             .unwrap();
         agent_task.abort();
         let _ = std::fs::remove_dir_all(&ws_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mock_relay_ws_executes_self_update_rpc_and_exits_with_restart_plan() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "neo_transport_self_update_{}_{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let ws_dir = tmp.join("ws");
+        let pkg_dir = tmp.join("pkg");
+        let ota_dir = tmp.join("ota");
+        let bin_dir = tmp.join("bin");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        let new_bin = pkg_dir.join("neo-agent-os");
+        std::fs::write(&new_bin, "#!/bin/sh\necho 'neo-agent-os 9.8.7'\n").unwrap();
+        std::fs::set_permissions(&new_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let asset = crate::updater::native_asset_name("9.8.7").unwrap();
+        let archive_path = tmp.join(&asset);
+        let st = std::process::Command::new("tar")
+            .args([
+                "-czf",
+                archive_path.to_string_lossy().as_ref(),
+                "-C",
+                pkg_dir.to_string_lossy().as_ref(),
+                "neo-agent-os",
+            ])
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let archive_bytes = std::fs::read(&archive_path).unwrap();
+        let archive_sha = hex::encode(Sha256::digest(&archive_bytes));
+        let sums_bytes = format!("{archive_sha}  {asset}\n").into_bytes();
+
+        let target_exe = bin_dir.join("neo-agent-os");
+        std::fs::write(&target_exe, "#!/bin/sh\necho 'neo-agent-os 0.1.0'\n").unwrap();
+        std::fs::set_permissions(&target_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let policy = Arc::new(
+            Policy::from_toml_str(&format!(
+                "allowed_workspaces = [\"{}\"]\n",
+                ws_dir.display()
+            ))
+            .unwrap(),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let e2e_secret = "test-update-secret";
+        let cluster_id = "cluster-upd";
+        let e2e_key = derive_e2e_key(cluster_id, e2e_secret);
+        let asset_srv = asset.clone();
+        let archive_srv = archive_bytes.clone();
+        let sums_srv = sums_bytes.clone();
+
+        let server_task = tokio::spawn(async move {
+            let (tx_done, mut rx_done) = mpsc::channel::<()>(1);
+            loop {
+                tokio::select! {
+                    _ = rx_done.recv() => break,
+                    accept_res = listener.accept() => {
+                        let (mut stream, _) = accept_res.unwrap();
+                        let tx_done = tx_done.clone();
+                        let asset_c = asset_srv.clone();
+                        let archive_c = archive_srv.clone();
+                        let sums_c = sums_srv.clone();
+                        tokio::spawn(async move {
+                            let mut peek_buf = [0u8; 512];
+                            let n = stream.peek(&mut peek_buf).await.unwrap_or(0);
+                            let head = String::from_utf8_lossy(&peek_buf[..n]);
+                            if head.starts_with(&format!("GET /dl/v9.8.7/{asset_c} ")) {
+                                let mut sink = [0u8; 1024];
+                                let _ = stream.read(&mut sink).await;
+                                let resp = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    archive_c.len()
+                                );
+                                let _ = stream.write_all(resp.as_bytes()).await;
+                                let _ = stream.write_all(&archive_c).await;
+                                return;
+                            }
+                            if head.starts_with("GET /dl/v9.8.7/SHA256SUMS.txt ") {
+                                let mut sink = [0u8; 1024];
+                                let _ = stream.read(&mut sink).await;
+                                let resp = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    sums_c.len()
+                                );
+                                let _ = stream.write_all(resp.as_bytes()).await;
+                                let _ = stream.write_all(&sums_c).await;
+                                return;
+                            }
+                            if head.starts_with("GET /v1/bootstrap ") {
+                                let mut sink = [0u8; 1024];
+                                let _ = stream.read(&mut sink).await;
+                                let body = br#"{"stun_servers":[]}"#;
+                                let resp = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(resp.as_bytes()).await;
+                                let _ = stream.write_all(body).await;
+                                return;
+                            }
+                            if head.starts_with("GET /v1/signal ") {
+                                if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
+                                    let _ = ws.next().await;
+                                }
+                                return;
+                            }
+                            if head.starts_with("GET /v1/relay ") {
+                                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                                let _manifest = ws.next().await.unwrap().unwrap();
+
+                                let req = DeviceMessage {
+                                    v: 1,
+                                    kind: "rpc_req".to_string(),
+                                    req_id: "upd-1".to_string(),
+                                    cluster_id: cluster_id.to_string(),
+                                    device_id: "os-upd".to_string(),
+                                    ts_ms: 1000,
+                                    body: json!({
+                                        "method": "self_update",
+                                        "params": {
+                                            "target_version": "9.8.7",
+                                            "mirrors": [format!("http://{addr}/dl/v9.8.7")],
+                                            "asset": asset_c
+                                        }
+                                    }),
+                                };
+                                let sealed = seal_device_message(&e2e_key, "master-1", "os-upd", &req).unwrap();
+                                let req_frame = RelayFrame {
+                                    flags: RelayFlags::Data,
+                                    src: "master-1".to_string(),
+                                    dst: "os-upd".to_string(),
+                                    payload: sealed,
+                                };
+                                ws.send(WsMessage::Binary(req_frame.encode().unwrap().into()))
+                                    .await
+                                    .unwrap();
+
+                                let resp_msg = loop {
+                                    let resp_bin = match ws.next().await.unwrap().unwrap() {
+                                        WsMessage::Binary(b) => b,
+                                        WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
+                                        other => panic!("expected rpc_resp binary frame, got {other:?}"),
+                                    };
+                                    let resp_rf = RelayFrame::decode(&resp_bin).unwrap();
+                                    if resp_rf.flags != RelayFlags::Data {
+                                        continue;
+                                    }
+                                    let msg = open_device_message(
+                                        &e2e_key,
+                                        cluster_id,
+                                        "os-upd",
+                                        "master-1",
+                                        &resp_rf.payload,
+                                    )
+                                    .unwrap();
+                                    if msg.kind == "rpc_resp" {
+                                        break msg;
+                                    }
+                                };
+                                assert_eq!(resp_msg.kind, "rpc_resp");
+                                assert_eq!(resp_msg.req_id, "upd-1");
+                                assert_eq!(resp_msg.body["ok"], true);
+                                assert_eq!(resp_msg.body["result"]["status"], "restarting");
+                                assert_eq!(resp_msg.body["result"]["target_version"], "9.8.7");
+                                let _ = tx_done.send(()).await;
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
+        let cfg = AgentConfig {
+            cluster_id: cluster_id.to_string(),
+            device_id: "os-upd".to_string(),
+            master_id: "master-1".to_string(),
+            relay_url: format!("http://{addr}"),
+            token: "neo1.dummy.sig".to_string(),
+            e2e_secret: e2e_secret.to_string(),
+            enroll_id: None,
+            relay_enabled: false,
+            mqtt_bind: "127.0.0.1:0".to_string(),
+            uart_device: None,
+            ota_cache_dir: Some(ota_dir.clone()),
+            updater_state_path: Some(ota_dir.join("updater-state.json")),
+            self_update_target: Some(target_exe.clone()),
+        };
+
+        let exit = tokio::time::timeout(Duration::from_secs(10), run_agent(cfg, policy))
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .unwrap()
+            .unwrap();
+
+        match exit {
+            AgentExit::Restart(plan) => {
+                assert_eq!(plan.target_version, "9.8.7");
+                assert_eq!(plan.binary_path, target_exe);
+                assert!(std::fs::read_to_string(&target_exe).unwrap().contains("9.8.7"));
+            }
+            AgentExit::Stopped => panic!("expected AgentExit::Restart"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -9,16 +9,21 @@ import {
   FLAG_PING,
   FLAG_PONG,
   RelayClient,
+  compareSemver,
   decodeCbor,
   decodeRelayFrame,
   encodeCbor,
   encodeRelayFrame,
+  isVersionOlder,
   openDeviceMessage,
   openRelayEnvelope,
+  renderDirectInstallPs1,
+  renderDirectInstallSh,
   sealDeviceMessage,
   sealRelayEnvelope,
   type RelaySocket,
 } from "../../src/devices/index.ts";
+import { VERSION } from "../../src/version.ts";
 import { Request, handle } from "../../src/http/index.ts";
 import { Store } from "../../src/store/index.ts";
 import { TempDir } from "../../src/testkit/index.ts";
@@ -608,6 +613,307 @@ describe("devices/relay-client & manager", () => {
     expect(manager.configView().hasToken).toBe(true);
     expect(JSON.stringify(manager.configView())).not.toContain("neo1.preminted.sig");
     expect(sockets.every((s) => s.headers.Authorization === "Bearer neo1.preminted.sig")).toBe(true);
+
+    await manager.stop();
+    store.close();
+  });
+
+  test("DeviceManager remote updates Tier 1 & Tier 2 devices strictly matching Master Neo version and never exceeding it", async () => {
+    // Semver ordering checks
+    expect(compareSemver("0.8.0", "0.9.1")).toBe(-1);
+    expect(compareSemver("0.9.1", "0.10.0")).toBe(-1);
+    expect(compareSemver("0.9.1-rc.1", "0.9.1")).toBe(-1);
+    expect(compareSemver("v0.9.1", "0.9.1")).toBe(0);
+    expect(compareSemver("0.10.0", "0.9.1")).toBe(1);
+    expect(isVersionOlder("0.9.0", "0.9.1")).toBe(true);
+    expect(isVersionOlder("0.9.1", "0.9.1")).toBe(false);
+    expect(isVersionOlder("0.10.0", "0.9.1")).toBe(false);
+
+    // Direct install scripts include --upgrade / -Upgrade mode
+    const sh = renderDirectInstallSh({ origin: "http://127.0.0.1:3082", agentVersion: VERSION });
+    expect(sh).toContain("--upgrade");
+    const ps1 = renderDirectInstallPs1({ origin: "http://127.0.0.1:3082", agentVersion: VERSION });
+    expect(ps1).toContain("[switch]$Upgrade");
+
+    const store = Store.memory();
+    const { sockets, wsFactory } = makeMockSockets();
+    const clusterId = "cluster-upd";
+    const e2eKey = "upd-e2e-key";
+
+    // Even if agentVersion override is higher, auto-update strictly pins to masterVersion!
+    const manager = new DeviceManager({
+      store,
+      masterId: "m1",
+      masterVersion: "0.9.1",
+      agentVersion: "0.9.9",
+      fetchFn: (async () =>
+        new Response(JSON.stringify({ cluster_id: clusterId }), { status: 200 })) as unknown as typeof fetch,
+      wsFactory,
+      pingIntervalMs: 0,
+    });
+
+    await manager.configure(
+      {
+        clusterId,
+        masterNodeId: "master-m1",
+        relayUrl: "https://relay.local:18443",
+        relaySecret: "relay-root-secret",
+        e2eKey,
+      },
+      { persist: true, connect: true },
+    );
+    expect(manager.configView().masterVersion).toBe("0.9.1");
+    const relaySock = sockets.find((s) => s.url.endsWith("/v1/relay"))!;
+
+    // 1. Register outdated Tier 1 device (v0.8.0) via manifest
+    const oldManifest = sealDeviceMessage(
+      {
+        v: 1,
+        kind: "manifest",
+        req_id: "m-old",
+        cluster_id: clusterId,
+        device_id: "mac-01",
+        ts_ms: Date.now(),
+        body: {
+          device_id: "mac-01",
+          tier: "os",
+          version: "0.8.0",
+          os: "macos",
+          arch: "aarch64",
+          capabilities: ["exec", "fs", "self_update"],
+        },
+      },
+      e2eKey,
+      "mac-01",
+      "master-m1",
+    );
+    manager.handleRelayFrame({ flags: FLAG_DATA, src: "mac-01", dst: "master-m1", payload: oldManifest });
+    expect(manager.getDevice("mac-01")?.manifest?.version).toBe("0.8.0");
+
+    // 2. Reject any explicit targetVersion higher than Master Neo version (0.9.2 > 0.9.1)
+    await expect(manager.updateDevice("mac-01", { targetVersion: "0.9.2" })).rejects.toThrow(
+      /exceeds Master Neo version/,
+    );
+    // Also reject any targetVersion that does not match Master Neo version (0.9.0 != 0.9.1)
+    await expect(manager.updateDevice("mac-01", { targetVersion: "0.9.0" })).rejects.toThrow(
+      /must match Master Neo version/,
+    );
+
+    // 3. Default update targets exact Master Neo version (0.9.1), NOT agentVersion (0.9.9)
+    const updPromise = manager.updateDevice("mac-01");
+    await new Promise((r) => setTimeout(r, 10));
+    expect(relaySock.sent.length).toBe(1);
+    const outFrame = decodeRelayFrame(relaySock.sent[0] as Uint8Array);
+    const outMsg = openDeviceMessage(outFrame.payload, e2eKey, clusterId, "master-m1", "mac-01");
+    expect(outMsg.kind).toBe("rpc_req");
+    expect(outMsg.body.method).toBe("self_update");
+    const outParams = outMsg.body.params as Record<string, unknown>;
+    expect(outParams.target_version).toBe("0.9.1");
+    expect(outParams.master_version).toBe("0.9.1");
+    expect(outParams.asset).toBe("neo-agent-os-0.9.1-macos-arm64.tar.gz");
+    expect(outParams.mirrors).toEqual([
+      "https://relay.local:18443/dl/v0.9.1",
+      "https://github.com/xbhuang1994/neo/releases/download/v0.9.1",
+    ]);
+
+    // Simulate Tier 1 agent rpc_resp
+    const respWire = sealDeviceMessage(
+      {
+        v: 1,
+        kind: "rpc_resp",
+        req_id: outMsg.req_id,
+        cluster_id: clusterId,
+        device_id: "mac-01",
+        ts_ms: Date.now(),
+        body: {
+          ok: true,
+          result: {
+            status: "restarting",
+            previous_version: "0.8.0",
+            target_version: "0.9.1",
+            installed_path: "/Users/test/.local/bin/neo-agent-os",
+            sha256: "abc123",
+            mirror: "https://relay.local:18443/dl/v0.9.1",
+          },
+        },
+      },
+      e2eKey,
+      "mac-01",
+      "master-m1",
+    );
+    manager.handleRelayFrame({ flags: FLAG_DATA, src: "mac-01", dst: "master-m1", payload: respWire });
+    const updRes = await updPromise;
+    expect(updRes.ok).toBe(true);
+    expect(updRes.status).toBe("restarting");
+    expect(updRes.targetVersion).toBe("0.9.1");
+    expect(updRes.currentVersion).toBe("0.8.0");
+    expect(updRes.installedPath).toBe("/Users/test/.local/bin/neo-agent-os");
+
+    // 4. After agent reconnects with heartbeat/manifest v0.9.1, updateDevice returns up_to_date
+    const hbWire = sealDeviceMessage(
+      {
+        v: 1,
+        kind: "heartbeat",
+        req_id: "hb-1",
+        cluster_id: clusterId,
+        device_id: "mac-01",
+        ts_ms: Date.now(),
+        body: { status: "online", version: "0.9.1" },
+      },
+      e2eKey,
+      "mac-01",
+      "master-m1",
+    );
+    manager.handleRelayFrame({ flags: FLAG_DATA, src: "mac-01", dst: "master-m1", payload: hbWire });
+    expect(manager.getDevice("mac-01")?.manifest?.version).toBe("0.9.1");
+    const upToDate = await manager.updateDevice("mac-01");
+    expect(upToDate.ok).toBe(true);
+    expect(upToDate.status).toBe("up_to_date");
+
+    // 5. Legacy Tier 1 device returning unsupported RPC method -> manual_upgrade_required with exact masterVersion pinned
+    manager.upsertDeviceManifest({
+      device_id: "win-legacy",
+      tier: "os",
+      os: "windows",
+      arch: "x86_64",
+      capabilities: ["exec", "fs"],
+    });
+    const legacyPromise = manager.updateDevice("win-legacy");
+    await new Promise((r) => setTimeout(r, 10));
+    const legacyFrame = decodeRelayFrame(relaySock.sent[relaySock.sent.length - 1] as Uint8Array);
+    const legacyMsg = openDeviceMessage(legacyFrame.payload, e2eKey, clusterId, "master-m1", "win-legacy");
+    const legacyResp = sealDeviceMessage(
+      {
+        v: 1,
+        kind: "rpc_resp",
+        req_id: legacyMsg.req_id,
+        cluster_id: clusterId,
+        device_id: "win-legacy",
+        ts_ms: Date.now(),
+        body: { ok: false, error: "unsupported RPC method: self_update" },
+      },
+      e2eKey,
+      "win-legacy",
+      "master-m1",
+    );
+    manager.handleRelayFrame({ flags: FLAG_DATA, src: "win-legacy", dst: "master-m1", payload: legacyResp });
+    const legacyRes = await legacyPromise;
+    expect(legacyRes.ok).toBe(false);
+    expect(legacyRes.status).toBe("manual_upgrade_required");
+    expect(legacyRes.upgradeCommand).toContain('Install-NeoAgent -Upgrade -Version "0.9.1"');
+
+    // 6. Tier 2 MCU sleeping with ota_apply -> queued in pendingQueue targeting exact masterVersion
+    manager.upsertDeviceManifest(
+      {
+        device_id: "esp32-01",
+        tier: "mcu",
+        chip: "ESP32-S3",
+        fw: "0.1.0",
+        acts: ["get_temp", "ota_apply"],
+        capabilities: ["get_temp", "ota_apply"],
+      },
+      { status: "sleeping", route: "via_tier1", relayNodeId: "mac-01" },
+    );
+    const mcuQueued = await manager.updateDevice("esp32-01");
+    expect(mcuQueued.ok).toBe(true);
+    expect(mcuQueued.status).toBe("queued");
+    expect(mcuQueued.targetVersion).toBe("0.9.1");
+    expect(manager.getDevice("esp32-01")?.pendingQueue.length).toBe(1);
+    expect(manager.getDevice("esp32-01")?.pendingQueue[0]?.action).toBe("ota_apply");
+    expect(manager.getDevice("esp32-01")?.pendingQueue[0]?.params).toEqual({
+      version: "0.9.1",
+      master_version: "0.9.1",
+    });
+
+    // 7. Tier 2 MCU without native OTA action -> stages mcu-update.json on online Tier 1 relay
+    manager.upsertDeviceManifest(
+      {
+        device_id: "stm32-02",
+        tier: "mcu",
+        chip: "STM32",
+        fw: "0.2.0",
+        acts: ["read_sensor"],
+        capabilities: ["read_sensor"],
+      },
+      { status: "online", route: "via_tier1", relayNodeId: "mac-01" },
+    );
+    const stagePromise = manager.updateDevice("stm32-02");
+    await new Promise((r) => setTimeout(r, 10));
+    const stageFrame = decodeRelayFrame(relaySock.sent[relaySock.sent.length - 1] as Uint8Array);
+    const stageMsg = openDeviceMessage(stageFrame.payload, e2eKey, clusterId, "master-m1", "mac-01");
+    expect(stageMsg.body.method).toBe("fs_write");
+    const stageParams = stageMsg.body.params as Record<string, unknown>;
+    expect(stageParams.path).toBe("neo-mcu/stm32-02/mcu-update.json");
+    expect(String(stageParams.content)).toContain('"target_version": "0.9.1"');
+    const stageResp = sealDeviceMessage(
+      {
+        v: 1,
+        kind: "rpc_resp",
+        req_id: stageMsg.req_id,
+        cluster_id: clusterId,
+        device_id: "mac-01",
+        ts_ms: Date.now(),
+        body: { ok: true, result: { path: "neo-mcu/stm32-02/mcu-update.json", bytes_written: 120 } },
+      },
+      e2eKey,
+      "mac-01",
+      "master-m1",
+    );
+    manager.handleRelayFrame({ flags: FLAG_DATA, src: "mac-01", dst: "master-m1", payload: stageResp });
+    const stageRes = await stagePromise;
+    expect(stageRes.ok).toBe(true);
+    expect(stageRes.status).toBe("staged");
+
+    // 8. HTTP API POST /api/devices/:id/update validation & 404/400/200 behavior
+    const dir = new TempDir("neo-device-update-http-");
+    try {
+      const scripted = new Scripted();
+      scripted.model = async () => "ok";
+      const app = App.open(
+        { stateDir: dir.path, wechat: new Protocol() },
+        new ScriptedKernels(scripted),
+        defaultTimings(),
+      );
+      await app.start();
+      await app.devices.configure(
+        { clusterId: "http-upd", masterNodeId: "master-1", e2eKey: "k1" },
+        { connect: false },
+      );
+      app.devices.upsertDeviceManifest({
+        device_id: "edge-http-1",
+        tier: "os",
+        version: VERSION,
+        os: "linux",
+        arch: "x86_64",
+      });
+
+      const access = {};
+      const peer = { host: "127.0.0.1", port: 50000 };
+
+      const notFound = await handle(app, access, makeRequest("POST", "/api/devices/missing/update", {}), peer);
+      expect(notFound.status).toBe(404);
+
+      const higherReject = await handle(
+        app,
+        access,
+        makeRequest("POST", "/api/devices/edge-http-1/update", { targetVersion: "99.0.0" }),
+        peer,
+      );
+      expect(higherReject.status).toBe(400);
+      expect(new TextDecoder().decode(higherReject.body)).toContain("exceeds Master Neo version");
+
+      const okRes = await handle(app, access, makeRequest("POST", "/api/devices/edge-http-1/update", {}), peer);
+      expect(okRes.status).toBe(200);
+      const okJson = JSON.parse(new TextDecoder().decode(okRes.body)) as { ok: boolean; status: string; targetVersion: string };
+      expect(okJson.ok).toBe(true);
+      expect(okJson.status).toBe("up_to_date");
+      expect(okJson.targetVersion).toBe(VERSION);
+
+      await app.stop();
+      app.close();
+    } finally {
+      dir.cleanup();
+    }
 
     await manager.stop();
     store.close();

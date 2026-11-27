@@ -15,7 +15,7 @@ use prober::CapabilityProber;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use transport::{run_agent, run_one_shot_check, AgentConfig};
+use transport::{run_agent, run_one_shot_check, AgentConfig, AgentExit};
 
 const DEFAULT_RELAY_URL: &str = "https://neo.1inch.cn:18443";
 const DEFAULT_MASTER_ID: &str = "master-neo";
@@ -387,6 +387,13 @@ async fn run_daemon_mode(args: RunArgs) {
         .as_ref()
         .map(|d| d.join("updater-state.json"));
 
+    if !opts.one_shot_check {
+        updater::maybe_handoff_or_rollback_on_boot(
+            updater_state_path.as_deref(),
+            opts.ota_cache_dir.as_deref(),
+        );
+    }
+
     let cfg = AgentConfig {
         cluster_id,
         device_id: opts.device_id,
@@ -400,6 +407,8 @@ async fn run_daemon_mode(args: RunArgs) {
         uart_device: opts.uart_device,
         ota_cache_dir: opts.ota_cache_dir,
         updater_state_path,
+        #[cfg(test)]
+        self_update_target: None,
     };
 
     if opts.one_shot_check {
@@ -412,9 +421,18 @@ async fn run_daemon_mode(args: RunArgs) {
 
     tokio::select! {
         res = run_agent(cfg, policy) => {
-            if let Err(e) = res {
-                eprintln!("neo-agent-os exited with error: {e}");
-                std::process::exit(1);
+            match res {
+                Ok(AgentExit::Restart(plan)) => {
+                    if let Err(e) = updater::perform_process_restart(&plan) {
+                        eprintln!("neo-agent-os restart failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                Ok(AgentExit::Stopped) => {}
+                Err(e) => {
+                    eprintln!("neo-agent-os exited with error: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         _ = tokio::signal::ctrl_c() => {

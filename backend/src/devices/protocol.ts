@@ -719,3 +719,69 @@ export function openEnrollPayload<T = EnrollPayload>(
   const plaintext = Buffer.concat([part1, part2]);
   return JSON.parse(utf8FatalDecoder.decode(plaintext)) as T;
 }
+
+interface ParsedSemver {
+  major: number;
+  minor: number;
+  patch: number;
+  pre: string[];
+}
+
+function parseSemver(raw: string): ParsedSemver | null {
+  const trimmed = raw.trim().replace(/^[vV]/, "").split("+")[0]?.trim() ?? "";
+  if (!trimmed) return null;
+  const dashIdx = trimmed.indexOf("-");
+  const core = dashIdx === -1 ? trimmed : trimmed.slice(0, dashIdx);
+  const preRaw = dashIdx === -1 ? "" : trimmed.slice(dashIdx + 1);
+  const parts = core.split(".");
+  if (parts.length !== 3) return null;
+  if (!parts.every((p) => /^(0|[1-9]\d*)$/.test(p))) return null;
+  const pre = preRaw.length > 0 ? preRaw.split(".") : [];
+  if (dashIdx !== -1 && (pre.length === 0 || pre.some((id) => !/^[0-9A-Za-z-]+$/.test(id)))) {
+    return null;
+  }
+  return {
+    major: Number(parts[0]),
+    minor: Number(parts[1]),
+    patch: Number(parts[2]),
+    pre,
+  };
+}
+
+/** Compare two SemVer 2.0.0 strings (`-1`, `0`, `1`), or `null` if either is invalid. */
+export function compareSemver(a: string, b: string): number | null {
+  const pa = parseSemver(a);
+  const pb = parseSemver(b);
+  if (!pa || !pb) return null;
+  if (pa.major !== pb.major) return pa.major < pb.major ? -1 : 1;
+  if (pa.minor !== pb.minor) return pa.minor < pb.minor ? -1 : 1;
+  if (pa.patch !== pb.patch) return pa.patch < pb.patch ? -1 : 1;
+  if (pa.pre.length === 0 && pb.pre.length === 0) return 0;
+  if (pa.pre.length === 0) return 1;
+  if (pb.pre.length === 0) return -1;
+  const len = Math.min(pa.pre.length, pb.pre.length);
+  for (let i = 0; i < len; i++) {
+    const ia = pa.pre[i]!;
+    const ib = pb.pre[i]!;
+    const na = /^\d+$/.test(ia);
+    const nb = /^\d+$/.test(ib);
+    if (na && nb) {
+      const va = Number(ia);
+      const vb = Number(ib);
+      if (va !== vb) return va < vb ? -1 : 1;
+    } else if (na) {
+      return -1;
+    } else if (nb) {
+      return 1;
+    } else if (ia !== ib) {
+      return ia < ib ? -1 : 1;
+    }
+  }
+  return pa.pre.length === pb.pre.length ? 0 : pa.pre.length < pb.pre.length ? -1 : 1;
+}
+
+/** Return true iff `current` and `target` are valid semver and `current < target`. */
+export function isVersionOlder(current: string, target: string): boolean {
+  const cmp = compareSemver(current, target);
+  return cmp !== null && cmp < 0;
+}

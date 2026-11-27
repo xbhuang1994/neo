@@ -288,6 +288,7 @@ CLAIM_URL=""
 RELAY_URL="$DEFAULT_RELAY_URL"
 MODE="auto"
 VERSION="$DEFAULT_VERSION"
+UPGRADE="0"
 UNINSTALL="0"
 CLUSTER=""
 PURGE_WS="0"
@@ -304,6 +305,8 @@ while [ "$#" -gt 0 ]; do
       MODE="$2"; shift 2 ;;
     --version)
       VERSION="$2"; shift 2 ;;
+    --upgrade)
+      UPGRADE="1"; shift ;;
     --uninstall)
       UNINSTALL="1"; shift ;;
     --cluster)
@@ -340,12 +343,13 @@ if [ "$UNINSTALL" = "1" ]; then
   exec "$BIN_PATH" uninstall --cluster "$CLUSTER"
 fi
 
-if [ -z "$ENROLL_CODE" ]; then
+if [ "$UPGRADE" != "1" ] && [ -z "$ENROLL_CODE" ]; then
   echo "Usage: install.sh --enroll <neo_enr_v1.id.key> [--claim-url <url>] [--relay-url <url>] [--mode auto|system|user|foreground]" >&2
+  echo "       install.sh --upgrade [--version <ver>] [--cluster <id>]" >&2
   exit 2
 fi
 
-if [ -z "$CLAIM_URL" ]; then
+if [ "$UPGRADE" != "1" ] && [ -z "$CLAIM_URL" ]; then
   TICKET_ID="$(printf '%s' "$ENROLL_CODE" | awk -F'.' '{print $2}')"
   if [ -z "$TICKET_ID" ]; then
     echo "Invalid enrollment ticket format" >&2
@@ -428,6 +432,22 @@ cp "$BIN_SRC" "\${BIN_PATH}.tmp"
 chmod 0755 "\${BIN_PATH}.tmp"
 mv -f "\${BIN_PATH}.tmp" "$BIN_PATH"
 
+if [ "$UPGRADE" = "1" ]; then
+  echo "[neo-install] Upgraded neo-agent-os to v\${VERSION} at \${BIN_PATH}"
+  if [ -n "$CLUSTER" ]; then
+    if [ "$OS" = "linux" ] && command -v systemctl >/dev/null 2>&1; then
+      if [ "$(id -u)" -eq 0 ]; then
+        systemctl restart "neo-agent-os@\${CLUSTER}.service" 2>/dev/null || true
+      else
+        systemctl --user restart "neo-agent-os-\${CLUSTER}.service" 2>/dev/null || true
+      fi
+    elif [ "$OS" = "macos" ] && command -v launchctl >/dev/null 2>&1; then
+      launchctl kickstart -k "gui/$(id -u)/cn.1inch.neo.agent.\${CLUSTER}" 2>/dev/null || true
+    fi
+  fi
+  exit 0
+fi
+
 echo "[neo-install] Running neo-agent-os enroll via \${CLAIM_URL}..."
 printf '%s\\n' "$ENROLL_CODE" | "$BIN_PATH" enroll --relay-url "$RELAY_URL" --claim-url "$CLAIM_URL" --mode "$MODE" --ticket-stdin
 `;
@@ -455,6 +475,7 @@ function Install-NeoAgent {
     [string]$RelayUrl = $script:NeoDefaultRelayUrl,
     [string]$Version = $script:NeoDefaultVersion,
     [string]$Mode = 'auto',
+    [switch]$Upgrade,
     [switch]$Uninstall,
     [string]$Cluster = '',
     [switch]$PurgeWorkspace
@@ -473,17 +494,19 @@ function Install-NeoAgent {
     return
   }
 
-  if ([string]::IsNullOrWhiteSpace($Enroll)) {
-    throw 'Install-NeoAgent requires -Enroll <neo_enr_v1.id.key>'
-  }
+  if (-not $Upgrade) {
+    if ([string]::IsNullOrWhiteSpace($Enroll)) {
+      throw 'Install-NeoAgent requires -Enroll <neo_enr_v1.id.key> or -Upgrade'
+    }
 
-  $parts = $Enroll.Trim().Split('.')
-  if ($parts.Length -ne 3 -or $parts[0] -ne 'neo_enr_v1') {
-    throw 'Invalid enrollment ticket format'
-  }
-  $ticketId = $parts[1]
-  if ([string]::IsNullOrWhiteSpace($ClaimUrl)) {
-    $ClaimUrl = "$script:NeoDefaultOrigin/enroll/claim/$ticketId"
+    $parts = $Enroll.Trim().Split('.')
+    if ($parts.Length -ne 3 -or $parts[0] -ne 'neo_enr_v1') {
+      throw 'Invalid enrollment ticket format'
+    }
+    $ticketId = $parts[1]
+    if ([string]::IsNullOrWhiteSpace($ClaimUrl)) {
+      $ClaimUrl = "$script:NeoDefaultOrigin/enroll/claim/$ticketId"
+    }
   }
 
   $asset = "neo-agent-os-$Version-windows-x64.zip"
@@ -544,6 +567,16 @@ function Install-NeoAgent {
         try { Move-Item -LiteralPath $dstPath -Destination $oldPath -Force -ErrorAction Stop } catch {}
       }
       Copy-Item -Path $srcFile.FullName -Destination $dstPath -Force
+    }
+
+    if ($Upgrade) {
+      Write-Host "[neo-install] Upgraded neo-agent-os.exe to v$Version at $binPath"
+      if (-not [string]::IsNullOrWhiteSpace($Cluster)) {
+        $taskName = "NeoAgent-$Cluster"
+        try { & schtasks /End /TN $taskName 2>$null | Out-Null } catch {}
+        try { & schtasks /Run /TN $taskName 2>$null | Out-Null } catch {}
+      }
+      return
     }
 
     Write-Host "[neo-install] Running neo-agent-os enroll via $ClaimUrl..."

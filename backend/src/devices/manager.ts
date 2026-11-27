@@ -14,7 +14,9 @@ import type { Store } from "../store/index.ts";
 import { VERSION } from "../version.ts";
 import { EnrollmentManager } from "./enrollment.ts";
 import {
+  compareSemver,
   deriveMcuE2eKey,
+  isVersionOlder,
   mintRelayToken,
   openDeviceMessage,
   openRelayEnvelope,
@@ -39,6 +41,8 @@ import {
   type DeviceRouteKind,
   type DeviceStatus,
   type DeviceTwin,
+  type DeviceUpdateInput,
+  type DeviceUpdateResult,
   type DirectClaimResult,
   type EnrollmentCreateInput,
   type EnrollmentView,
@@ -75,6 +79,8 @@ const DEFAULT_CONFIRM_ACTIONS: ReadonlySet<string> = new Set([
   "set_fan_pwm",
   "set_gpio",
   "ota_apply",
+  "self_update",
+  "agent.update",
   "reboot",
   "shutdown",
   "unlock_door",
@@ -84,6 +90,9 @@ const DEFAULT_CONFIRM_ACTIONS: ReadonlySet<string> = new Set([
 const CLUSTER_ID_RE = /^[a-zA-Z0-9_-]{1,32}$/;
 const MCU_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 const CHIP_RE = /^[a-zA-Z0-9._-]{1,32}$/;
+const SEMVER_VERSION_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?$/;
+const DEFAULT_UPDATE_TIMEOUT_MS = 180_000;
+const GITHUB_RELEASE_BASE = "https://github.com/xbhuang1994/neo/releases/download";
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -201,6 +210,48 @@ function sanitizeShellArg(value: string): string {
   return value.replace(/[^A-Za-z0-9._:/-]/g, "");
 }
 
+function resolveTier1AssetName(
+  manifest: CapabilityManifest | undefined,
+  version: string,
+): string | undefined {
+  const rawOs = manifest?.os?.trim().toLowerCase();
+  const rawArch = manifest?.arch?.trim().toLowerCase();
+  if (!rawOs || !rawArch) return undefined;
+  const osTag =
+    rawOs === "linux"
+      ? "linux"
+      : rawOs === "macos" || rawOs === "darwin"
+        ? "macos"
+        : rawOs === "windows" || rawOs === "win32"
+          ? "windows"
+          : null;
+  const archTag =
+    rawArch === "x86_64" || rawArch === "amd64" || rawArch === "x64"
+      ? "x64"
+      : rawArch === "aarch64" || rawArch === "arm64"
+        ? "arm64"
+        : null;
+  if (!osTag || !archTag) return undefined;
+  const ext = osTag === "windows" ? "zip" : "tar.gz";
+  return `neo-agent-os-${version}-${osTag}-${archTag}.${ext}`;
+}
+
+function buildManualUpgradeCommand(
+  twin: DeviceTwin,
+  targetVersion: string,
+  relayUrl?: string,
+  requestOrigin?: string,
+): string {
+  const base = sanitizeShellArg((relayUrl || requestOrigin || DEFAULT_RELAY_URL).replace(/\/+$/, "")) || DEFAULT_RELAY_URL;
+  const ver = sanitizeShellArg(targetVersion);
+  const cluster = sanitizeShellArg(twin.clusterId);
+  const os = twin.manifest?.os?.trim().toLowerCase() ?? "";
+  if (os === "windows" || os === "win32") {
+    return `irm ${base}/install.ps1 | iex; Install-NeoAgent -Upgrade -Version "${ver}" -Cluster "${cluster}"`;
+  }
+  return `curl -fsSL ${base}/install.sh | bash -s -- --upgrade --version "${ver}" --cluster "${cluster}"`;
+}
+
 function renderMcuInstallScript(opts: {
   clusterId: string;
   mcuId: string;
@@ -274,6 +325,7 @@ export interface DeviceManagerOptions {
   reconnectMaxMs?: number;
   localRelayEnvPath?: string;
   agentVersion?: string;
+  masterVersion?: string;
   nowMs?: () => number;
 }
 
@@ -293,6 +345,7 @@ export class DeviceManager {
   private readonly reconnectMaxMs?: number;
   private readonly localRelayEnvPathOverride?: string;
   private readonly agentVersion: string;
+  private readonly masterVersion: string;
   private readonly enrollment: EnrollmentManager;
 
   private config: DeviceConfig | null = null;
@@ -313,7 +366,8 @@ export class DeviceManager {
     this.reconnectBaseMs = options.reconnectBaseMs;
     this.reconnectMaxMs = options.reconnectMaxMs;
     this.localRelayEnvPathOverride = options.localRelayEnvPath;
-    this.agentVersion = options.agentVersion?.trim() || process.env.NEO_AGENT_VERSION?.trim() || VERSION;
+    this.masterVersion = options.masterVersion?.trim() || VERSION;
+    this.agentVersion = options.agentVersion?.trim() || process.env.NEO_AGENT_VERSION?.trim() || this.masterVersion;
     this.enrollment = new EnrollmentManager({
       store: this.store,
       getConfig: () => this.config,
@@ -557,6 +611,7 @@ export class DeviceManager {
         localRelayDetected,
         defaultRelayUrl: DEFAULT_RELAY_URL,
         agentVersion: this.agentVersion,
+        masterVersion: this.masterVersion,
       };
     }
     return {
@@ -574,6 +629,7 @@ export class DeviceManager {
       localRelayDetected,
       defaultRelayUrl: DEFAULT_RELAY_URL,
       agentVersion: this.agentVersion,
+      masterVersion: this.masterVersion,
     };
   }
 
@@ -948,6 +1004,344 @@ export class DeviceManager {
       status: twin.status,
       route: twin.route,
       ...(parentPing.ok ? {} : { error: parentPing.error ?? `Parent relay ${relayNodeId} unreachable` }),
+    };
+  }
+
+  /**
+   * Remotely update a paired Tier 1 OS agent or Tier 2 MCU to the Master Neo target version.
+   * - Tier 1 (`os`): dispatches E2E encrypted `self_update` RPC (mirror download, SHA-256 verify,
+   *   atomic swap + rollback metadata, and clean in-place restart). If the remote agent predates
+   *   `self_update` RPC, returns `manual_upgrade_required` with a ready-to-run upgrade command.
+   * - Tier 2 (`mcu`): dispatches signed CBOR `ota_apply`/`ota_update` downlink command when
+   *   supported (queuing in Deep Sleep shadow when sleeping), or stages `mcu-update.json` onto
+   *   the online parent Tier 1 relay workspace.
+   */
+  async updateDevice(
+    deviceId: string,
+    input: DeviceUpdateInput = {},
+    opts: { requestOrigin?: string } = {},
+  ): Promise<DeviceUpdateResult> {
+    const cfg = this.requireConfig();
+    const twin = this.getDevice(deviceId);
+    if (!twin) {
+      throw new Error(`Unknown device: ${deviceId}`);
+    }
+    if (twin.clusterId !== cfg.clusterId) {
+      return {
+        ok: false,
+        status: "failed",
+        deviceId,
+        tier: twin.tier,
+        targetVersion: this.masterVersion,
+        message: `Cross-cluster device update rejected (${twin.clusterId} !== ${cfg.clusterId})`,
+        error: `Cross-cluster device update rejected (${twin.clusterId} !== ${cfg.clusterId})`,
+      };
+    }
+
+    // Automatic remote updates MUST strictly match Master Neo's version and never exceed it.
+    const masterVer = this.masterVersion.replace(/^[vV]/, "");
+    const rawTarget = (input.targetVersion?.trim() || masterVer).replace(/^[vV]/, "");
+    if (!SEMVER_VERSION_RE.test(rawTarget)) {
+      throw new Error(`Invalid targetVersion '${rawTarget}': expected semver (e.g. ${masterVer})`);
+    }
+    const cmpToMaster = compareSemver(rawTarget, masterVer);
+    if (cmpToMaster === null || cmpToMaster > 0) {
+      throw new Error(
+        `Target update version v${rawTarget} exceeds Master Neo version v${masterVer}; automatic updates must match Master Neo version and never exceed it`,
+      );
+    }
+    if (cmpToMaster !== 0) {
+      throw new Error(
+        `Target update version v${rawTarget} must match Master Neo version v${masterVer}`,
+      );
+    }
+    const targetVersion = masterVer;
+
+    const currentVersion =
+      twin.tier === "mcu"
+        ? (twin.manifest?.fw?.trim() || twin.manifest?.version?.trim() || undefined)
+        : (twin.manifest?.version?.trim() ||
+          (typeof twin.reportedState.version === "string" && twin.reportedState.version.trim().length > 0
+            ? twin.reportedState.version.trim()
+            : undefined));
+
+    if (!input.force && currentVersion && !isVersionOlder(currentVersion, targetVersion)) {
+      return {
+        ok: true,
+        status: "up_to_date",
+        deviceId,
+        tier: twin.tier,
+        currentVersion,
+        targetVersion,
+        message: `Device ${deviceId} is already on v${currentVersion} (target v${targetVersion})`,
+      };
+    }
+
+    if (twin.tier === "os") {
+      if (twin.status === "offline") {
+        const error = `Device ${deviceId} is offline`;
+        return {
+          ok: false,
+          status: "failed",
+          deviceId,
+          tier: "os",
+          ...(currentVersion ? { currentVersion } : {}),
+          targetVersion,
+          message: error,
+          error,
+        };
+      }
+
+      const canSend =
+        (twin.route === "lan" && Boolean(twin.lanUrl)) ||
+        Boolean(this.relayClient?.isRelayConnected());
+      if (!canSend) {
+        const error = "Relay client is not connected";
+        return {
+          ok: false,
+          status: "failed",
+          deviceId,
+          tier: "os",
+          ...(currentVersion ? { currentVersion } : {}),
+          targetVersion,
+          message: error,
+          error,
+        };
+      }
+
+      const relayBase = cfg.relayUrl ? cfg.relayUrl.replace(/\/+$/, "") : "";
+      const mirrors =
+        input.downloadMirrors && input.downloadMirrors.length > 0
+          ? input.downloadMirrors
+          : relayBase
+            ? [`${relayBase}/dl/v${targetVersion}`, `${GITHUB_RELEASE_BASE}/v${targetVersion}`]
+            : [`${GITHUB_RELEASE_BASE}/v${targetVersion}`];
+      const asset = resolveTier1AssetName(twin.manifest, targetVersion);
+
+      const rpcRes = await this.dispatchTier1Rpc(twin, {
+        action: "self_update",
+        params: {
+          target_version: targetVersion,
+          master_version: targetVersion,
+          mirrors,
+          ...(asset ? { asset } : {}),
+          ...(input.sha256 ? { sha256: input.sha256 } : {}),
+          ...(input.force ? { force: true } : {}),
+        },
+        timeoutMs: input.timeoutMs ?? DEFAULT_UPDATE_TIMEOUT_MS,
+      });
+
+      if (rpcRes.status === "ok") {
+        const body = isRecord(rpcRes.result) ? rpcRes.result : {};
+        const rpcStatus = body.status === "up_to_date" ? "up_to_date" : "restarting";
+        const installedPath =
+          typeof body.installed_path === "string" && body.installed_path.length > 0
+            ? body.installed_path
+            : undefined;
+        const sha256 =
+          typeof body.sha256 === "string" && body.sha256.length > 0 ? body.sha256 : undefined;
+        const mirror =
+          typeof body.mirror === "string" && body.mirror.length > 0 ? body.mirror : undefined;
+        const latest = this.getDevice(deviceId) ?? twin;
+        this.saveDevice({
+          ...latest,
+          reportedState: {
+            ...latest.reportedState,
+            lastUpdate: {
+              status: rpcStatus,
+              fromVersion: currentVersion ?? null,
+              targetVersion,
+              at: nowIso(),
+            },
+          },
+        });
+        return {
+          ok: true,
+          status: rpcStatus,
+          deviceId,
+          tier: "os",
+          ...(currentVersion ? { currentVersion } : {}),
+          targetVersion,
+          message:
+            rpcStatus === "up_to_date"
+              ? `Device ${deviceId} is already on v${targetVersion}`
+              : `Triggered remote update to v${targetVersion}; awaiting agent reconnect`,
+          ...(installedPath ? { installedPath } : {}),
+          ...(sha256 ? { sha256 } : {}),
+          ...(mirror ? { mirror } : {}),
+        };
+      }
+
+      const error = rpcRes.status === "rejected" ? rpcRes.error : "Remote update failed";
+      if (error.includes("unsupported RPC method")) {
+        const upgradeCommand = buildManualUpgradeCommand(
+          twin,
+          targetVersion,
+          cfg.relayUrl,
+          opts.requestOrigin,
+        );
+        return {
+          ok: false,
+          status: "manual_upgrade_required",
+          deviceId,
+          tier: "os",
+          ...(currentVersion ? { currentVersion } : {}),
+          targetVersion,
+          message:
+            "Remote agent predates self_update RPC; run the upgrade command once on the device to enable one-click updates.",
+          error,
+          upgradeCommand,
+        };
+      }
+
+      return {
+        ok: false,
+        status: "failed",
+        deviceId,
+        tier: "os",
+        ...(currentVersion ? { currentVersion } : {}),
+        targetVersion,
+        message: error,
+        error,
+      };
+    }
+
+    // Tier 2 MCU remote update
+    const acts = new Set<string>([...twin.capabilities, ...(twin.manifest?.acts ?? [])]);
+    const otaAction = acts.has("ota_apply")
+      ? "ota_apply"
+      : acts.has("ota_update")
+        ? "ota_update"
+        : null;
+
+    if (otaAction !== null) {
+      const mcuRes = await this.dispatchMcuCommand(twin, {
+        action: otaAction,
+        params: { version: targetVersion, master_version: targetVersion },
+        timeoutMs: input.timeoutMs ?? 60_000,
+      });
+      if (mcuRes.status === "ok") {
+        const latest = this.getDevice(deviceId) ?? twin;
+        const resData = isRecord(mcuRes.result) ? mcuRes.result : {};
+        const reportedFw =
+          typeof resData.fw === "string" && resData.fw.trim().length > 0
+            ? resData.fw.trim()
+            : undefined;
+        if (reportedFw && latest.manifest) {
+          this.saveDevice({
+            ...latest,
+            manifest: { ...latest.manifest, fw: reportedFw },
+          });
+        }
+        return {
+          ok: true,
+          status: "updated",
+          deviceId,
+          tier: "mcu",
+          ...(currentVersion ? { currentVersion } : {}),
+          targetVersion,
+          ...(mcuRes.seqId !== undefined ? { seqId: mcuRes.seqId } : {}),
+          message: `Dispatched ${otaAction} to MCU ${deviceId} (target v${targetVersion})`,
+        };
+      }
+      if (mcuRes.status === "queued") {
+        return {
+          ok: true,
+          status: "queued",
+          deviceId,
+          tier: "mcu",
+          ...(currentVersion ? { currentVersion } : {}),
+          targetVersion,
+          seqId: mcuRes.seqId,
+          message: mcuRes.reason,
+        };
+      }
+      const error = mcuRes.status === "rejected" ? mcuRes.error : "MCU update failed";
+      return {
+        ok: false,
+        status: "failed",
+        deviceId,
+        tier: "mcu",
+        ...(currentVersion ? { currentVersion } : {}),
+        targetVersion,
+        message: error,
+        error,
+      };
+    }
+
+    const relayNodeId = this.resolveOnlineRelayForMcu(twin);
+    if (!relayNodeId) {
+      const error = `MCU ${deviceId} is unreachable_via_relay (no online Tier 1 relay)`;
+      return {
+        ok: false,
+        status: "failed",
+        deviceId,
+        tier: "mcu",
+        ...(currentVersion ? { currentVersion } : {}),
+        targetVersion,
+        message: error,
+        error,
+      };
+    }
+    const relayTwin = this.getDevice(relayNodeId);
+    if (!relayTwin) {
+      const error = `Parent Tier 1 relay ${relayNodeId} not found`;
+      return {
+        ok: false,
+        status: "failed",
+        deviceId,
+        tier: "mcu",
+        ...(currentVersion ? { currentVersion } : {}),
+        targetVersion,
+        message: error,
+        error,
+      };
+    }
+
+    const updateDescriptor = JSON.stringify(
+      {
+        cluster_id: cfg.clusterId,
+        mcu_id: deviceId,
+        chip: twin.manifest?.chip ?? "esp32",
+        current_fw: currentVersion ?? null,
+        target_version: targetVersion,
+        master_version: targetVersion,
+        requested_at: nowIso(),
+      },
+      null,
+      2,
+    );
+    const descriptorPath = `neo-mcu/${deviceId}/mcu-update.json`;
+    const stageRes = await this.dispatchTier1Rpc(relayTwin, {
+      action: "fs_write",
+      params: { path: descriptorPath, content: updateDescriptor },
+      timeoutMs: 15_000,
+    });
+    if (stageRes.status !== "ok") {
+      const error =
+        stageRes.status === "rejected"
+          ? `Failed to stage MCU update on ${relayNodeId}: ${stageRes.error}`
+          : `Failed to stage MCU update on ${relayNodeId}`;
+      return {
+        ok: false,
+        status: "failed",
+        deviceId,
+        tier: "mcu",
+        ...(currentVersion ? { currentVersion } : {}),
+        targetVersion,
+        message: error,
+        error,
+      };
+    }
+    return {
+      ok: true,
+      status: "staged",
+      deviceId,
+      tier: "mcu",
+      ...(currentVersion ? { currentVersion } : {}),
+      targetVersion,
+      installedPath: `${relayNodeId}:${descriptorPath}`,
+      message: `Staged v${targetVersion} MCU update descriptor on ${relayNodeId}:${descriptorPath}`,
     };
   }
 
@@ -1890,9 +2284,16 @@ export class DeviceManager {
     switch (msg.kind) {
       case "manifest": {
         const body = msg.body;
+        const manifestVersion =
+          typeof body.version === "string" && body.version.trim().length > 0
+            ? body.version.trim()
+            : typeof body.agent_version === "string" && body.agent_version.trim().length > 0
+              ? body.agent_version.trim()
+              : undefined;
         const manifest: CapabilityManifest = {
           device_id: typeof body.device_id === "string" ? body.device_id : msg.device_id || srcNodeId,
           tier: body.tier === "mcu" ? "mcu" : "os",
+          ...(manifestVersion ? { version: manifestVersion } : {}),
           ...(typeof body.os === "string" ? { os: body.os } : {}),
           ...(typeof body.arch === "string" ? { arch: body.arch } : {}),
           ...(typeof body.hostname === "string" ? { hostname: body.hostname } : {}),
@@ -1916,10 +2317,14 @@ export class DeviceManager {
           typeof body.fingerprint === "string" && body.fingerprint.trim().length > 0
             ? body.fingerprint.trim()
             : undefined;
-        if (fingerprint) {
+        if (fingerprint || manifestVersion) {
           this.saveDevice({
             ...twin,
-            reportedState: { ...twin.reportedState, fingerprint },
+            reportedState: {
+              ...twin.reportedState,
+              ...(fingerprint ? { fingerprint } : {}),
+              ...(manifestVersion ? { version: manifestVersion } : {}),
+            },
           });
         }
         const enrollId = typeof body.enroll_id === "string" ? body.enroll_id.trim() : "";
@@ -1950,10 +2355,19 @@ export class DeviceManager {
         const devId = msg.device_id || srcNodeId;
         const existing = this.getDevice(devId);
         if (existing) {
+          const hbVersion =
+            typeof msg.body.version === "string" && msg.body.version.trim().length > 0
+              ? msg.body.version.trim()
+              : undefined;
+          const nextManifest =
+            hbVersion && existing.manifest && existing.manifest.version !== hbVersion
+              ? { ...existing.manifest, version: hbVersion }
+              : existing.manifest;
           this.saveDevice({
             ...existing,
             status: "online",
             alertSuppressed: false,
+            ...(nextManifest ? { manifest: nextManifest } : {}),
             lastSeenAt: nowIso(),
             lastSeenMs: Date.now(),
             reportedState: { ...existing.reportedState, ...msg.body },
