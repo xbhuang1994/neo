@@ -6,6 +6,7 @@ GITHUB_REPO="xbhuang1994/neo"
 ENROLL_CODE=""
 VER=""
 MODE="auto"
+UPGRADE=0
 UNINSTALL=0
 CLUSTER=""
 PURGE_WORKSPACE=0
@@ -20,8 +21,9 @@ Usage: install.sh [options]
   --relay-url <url>               Relay base URL
   --version <ver>                 Pin neo-agent-os version (e.g. 0.9.0)
   --mode <auto|system|user|foreground>
+  --upgrade                       Upgrade neo-agent-os binary in place and restart service
   --uninstall                     Uninstall neo-agent-os
-  --cluster <id>                  Target cluster ID (used with --uninstall)
+  --cluster <id>                  Target cluster ID (used with --upgrade / --uninstall)
   --purge-workspace               Purge workspace data (used with --uninstall)
   --github-only                   Skip relay /dl mirror and download from GitHub
 EOF
@@ -37,6 +39,7 @@ while [ $# -gt 0 ]; do
 	--version=*)      VER="${1#*=}"; shift ;;
 	--mode)           [ $# -ge 2 ] || die "--mode requires an argument"; MODE="$2"; shift 2 ;;
 	--mode=*)         MODE="${1#*=}"; shift ;;
+	--upgrade)        UPGRADE=1; shift ;;
 	--uninstall)      UNINSTALL=1; shift ;;
 	--cluster)        [ $# -ge 2 ] || die "--cluster requires an argument"; CLUSTER="$2"; shift 2 ;;
 	--cluster=*)      CLUSTER="${1#*=}"; shift ;;
@@ -75,10 +78,10 @@ auto|system|user|foreground) ;;
 *) die "invalid --mode: $MODE" ;;
 esac
 
-if [ "$ENROLL_CODE" = "-" ]; then
-	IFS= read -r ENROLL_CODE || true
+if [ "$UPGRADE" -ne 1 ]; then
+	[ "$ENROLL_CODE" = "-" ] && { IFS= read -r ENROLL_CODE || true; }
+	[ -n "$ENROLL_CODE" ] || die "missing --enroll <code|-> (or pass --upgrade)"
 fi
-[ -n "$ENROLL_CODE" ] || die "missing --enroll <code|->"
 command -v curl >/dev/null 2>&1 || die "curl is required"
 command -v tar >/dev/null 2>&1 || die "tar is required"
 
@@ -143,16 +146,20 @@ EXTRACTED="$TMP_DIR/neo-agent-os"
 [ -f "$EXTRACTED" ] || EXTRACTED="$(find "$TMP_DIR" -maxdepth 3 -type f -name neo-agent-os | head -n 1)"
 [ -f "$EXTRACTED" ] || die "neo-agent-os binary not found inside $ASSET"
 
-if [ "$(id -u)" -eq 0 ]; then
-	BIN_DIR="/usr/local/bin"
-else
-	BIN_DIR="${HOME}/.local/bin"
-fi
+if [ "$(id -u)" -eq 0 ]; then BIN_DIR="/usr/local/bin"; else BIN_DIR="${HOME}/.local/bin"; fi
 mkdir -p "$BIN_DIR"
 BIN="$BIN_DIR/neo-agent-os"
 BIN_TMP="$BIN_DIR/.neo-agent-os.tmp.$$"
-cp "$EXTRACTED" "$BIN_TMP"
-chmod 755 "$BIN_TMP"
-mv -f "$BIN_TMP" "$BIN"
+cp "$EXTRACTED" "$BIN_TMP" && chmod 755 "$BIN_TMP" && mv -f "$BIN_TMP" "$BIN"
+
+if [ "$UPGRADE" -eq 1 ]; then
+	printf 'Upgraded neo-agent-os to v%s at %s\n' "$VER" "$BIN" >&2
+	if [ -n "$CLUSTER" ] && [ "$OS_TAG" = "linux" ] && command -v systemctl >/dev/null 2>&1; then
+		[ "$(id -u)" -eq 0 ] && systemctl restart "neo-agent-os@${CLUSTER}.service" 2>/dev/null || systemctl --user restart "neo-agent-os-${CLUSTER}.service" 2>/dev/null || true
+	elif [ -n "$CLUSTER" ] && [ "$OS_TAG" = "macos" ] && command -v launchctl >/dev/null 2>&1; then
+		launchctl kickstart -k "gui/$(id -u)/cn.1inch.neo.agent.${CLUSTER}" 2>/dev/null || true
+	fi
+	exit 0
+fi
 
 printf '%s\n' "$ENROLL_CODE" | "$BIN" enroll --relay-url "$RELAY_URL" --mode "$MODE" --ticket-stdin

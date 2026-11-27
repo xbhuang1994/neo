@@ -85,7 +85,8 @@ class FakeBackend {
     'relayState': 'idle',
     'localRelayDetected': false,
     'defaultRelayUrl': 'https://neo.1inch.cn:18443',
-    'agentVersion': '0.9.0',
+    'agentVersion': '0.9.1',
+    'masterVersion': '0.9.1',
   };
   final List<Map<String, dynamic>> devices = [];
   final List<Map<String, dynamic>> deviceApprovals = [];
@@ -96,6 +97,8 @@ class FakeBackend {
   final List<String> revokedEnrollments = [];
   final List<String> removedDevices = [];
   final List<String> pingedDevices = [];
+  final List<Map<String, dynamic>> updatedDevices = [];
+  final Map<String, Map<String, dynamic>> deviceUpdateResponses = {};
   final List<Map<String, dynamic>> mcuInstalls = [];
   final List<String> approvedApprovals = [];
   final List<String> rejectedApprovals = [];
@@ -108,6 +111,8 @@ class FakeBackend {
     String relayUrl = 'https://neo.1inch.cn:18443',
     String relayState = 'connected',
     bool localRelayDetected = false,
+    String? masterVersion,
+    String? agentVersion,
   }) {
     deviceConfig = {
       ...deviceConfig,
@@ -123,6 +128,8 @@ class FakeBackend {
       'canMintTokens': true,
       'relayState': relayState,
       'localRelayDetected': localRelayDetected,
+      'masterVersion': ?masterVersion,
+      'agentVersion': ?agentVersion,
     };
   }
 
@@ -132,11 +139,14 @@ class FakeBackend {
     String status = 'online',
     String route = 'relay',
     String? relayNodeId,
+    String? version,
+    bool omitVersion = false,
     Map<String, dynamic>? manifest,
     List<String> capabilities = const ['exec', 'fs'],
     List<Map<String, dynamic>> pendingQueue = const [],
   }) {
     devices.removeWhere((d) => d['deviceId'] == deviceId);
+    final effectiveVer = omitVersion ? null : (version ?? (tier == 'mcu' ? '0.1.0' : (deviceConfig['masterVersion'] as String? ?? '0.9.1')));
     devices.add({
       'deviceId': deviceId,
       'clusterId': (deviceConfig['clusterId'] as String?)?.isNotEmpty == true ? deviceConfig['clusterId'] : 'personal',
@@ -146,10 +156,11 @@ class FakeBackend {
       'relayNodeId': ?relayNodeId,
       'manifest': manifest ??
           (tier == 'mcu'
-              ? {'device_id': deviceId, 'tier': 'mcu', 'chip': 'ESP32', 'fw': '0.1.0', 'acts': ['get_temp']}
+              ? {'device_id': deviceId, 'tier': 'mcu', 'chip': 'ESP32', 'fw': ?effectiveVer, 'acts': ['get_temp']}
               : {
                   'device_id': deviceId,
                   'tier': 'os',
+                  'version': ?effectiveVer,
                   'os': 'linux',
                   'arch': 'amd64',
                   'hostname': deviceId,
@@ -620,6 +631,35 @@ class FakeBackend {
         'latencyMs': 18,
         'status': device['status'],
         'route': device['route'],
+      });
+    }
+    if (method == 'POST' && path.startsWith('/api/devices/') && path.endsWith('/update')) {
+      final id = Uri.decodeComponent(path.substring('/api/devices/'.length, path.length - '/update'.length));
+      final index = devices.indexWhere((d) => d['deviceId'] == id);
+      if (index == -1) return _json(404, {'error': 'Device not found'});
+      final req = body is Map ? body.cast<String, dynamic>() : <String, dynamic>{};
+      final masterVer = (deviceConfig['masterVersion'] as String?) ?? (deviceConfig['agentVersion'] as String?) ?? '0.9.1';
+      final requestedTarget = (req['targetVersion'] as String?)?.trim();
+      if (requestedTarget != null && requestedTarget.isNotEmpty && requestedTarget != masterVer) {
+        return _json(400, {'error': 'Target update version v$requestedTarget must match Master Neo version v$masterVer'});
+      }
+      updatedDevices.add({'deviceId': id, 'targetVersion': requestedTarget ?? masterVer, ...req});
+      final override = deviceUpdateResponses[id];
+      if (override != null) {
+        return _json(200, override);
+      }
+      final device = devices[index];
+      final manifest = device['manifest'] is Map ? (device['manifest'] as Map).cast<String, dynamic>() : <String, dynamic>{};
+      final tier = device['tier'] as String? ?? 'os';
+      final prev = tier == 'mcu' ? manifest['fw'] as String? : manifest['version'] as String?;
+      return _json(200, {
+        'ok': true,
+        'status': tier == 'mcu' ? 'queued' : 'restarting',
+        'deviceId': id,
+        'tier': tier,
+        'currentVersion': ?prev,
+        'targetVersion': masterVer,
+        'message': 'Triggered remote update to v$masterVer',
       });
     }
     if (method == 'DELETE' && path.startsWith('/api/devices/')) {

@@ -277,6 +277,18 @@ abstract class Strings {
   String get ping;
   String pingOk(int ms, String route);
   String get pingFailed;
+  String get updateDevice;
+  String get updatingDevice;
+  String get legacyVersion;
+  String updateRestarting(String target);
+  String updateCompleted(String target);
+  String updateQueued(String target);
+  String updateStaged(String target);
+  String updateUpToDate(String target);
+  String get updateFailed;
+  String get updateManualRequired;
+  String get copyUpgradeCommand;
+  String get upgradeCommandCopied;
   String get uninstallCommand;
   String get uninstallCopied;
   String get removeDevice;
@@ -884,6 +896,30 @@ class ZhStrings extends Strings {
   String pingOk(int ms, String route) => '延迟 ${ms}ms · $route';
   @override
   String get pingFailed => 'Ping 失败';
+  @override
+  String get updateDevice => '更新';
+  @override
+  String get updatingDevice => '正在更新…';
+  @override
+  String get legacyVersion => '旧版本';
+  @override
+  String updateRestarting(String target) => '已触发更新至 v$target，等待设备重连…';
+  @override
+  String updateCompleted(String target) => '已更新至 v$target';
+  @override
+  String updateQueued(String target) => '设备休眠中，已将 v$target 更新加入下发队列';
+  @override
+  String updateStaged(String target) => '已推送 v$target 更新包至 Tier 1 网关';
+  @override
+  String updateUpToDate(String target) => '已是主控版本 v$target';
+  @override
+  String get updateFailed => '更新失败';
+  @override
+  String get updateManualRequired => '旧版 Agent 暂不支持远程自更新，请先执行一次升级命令';
+  @override
+  String get copyUpgradeCommand => '复制升级命令';
+  @override
+  String get upgradeCommandCopied => '已复制升级命令';
   @override
   String get uninstallCommand => '卸载命令';
   @override
@@ -1554,6 +1590,30 @@ class EnStrings extends Strings {
   String pingOk(int ms, String route) => '${ms}ms · $route';
   @override
   String get pingFailed => 'Ping failed';
+  @override
+  String get updateDevice => 'Update';
+  @override
+  String get updatingDevice => 'Updating…';
+  @override
+  String get legacyVersion => 'Legacy';
+  @override
+  String updateRestarting(String target) => 'Updating to v$target, waiting for reconnect…';
+  @override
+  String updateCompleted(String target) => 'Updated to v$target';
+  @override
+  String updateQueued(String target) => 'Device sleeping; v$target update queued';
+  @override
+  String updateStaged(String target) => 'Staged v$target update bundle on Tier 1 gateway';
+  @override
+  String updateUpToDate(String target) => 'Already on v$target';
+  @override
+  String get updateFailed => 'Update failed';
+  @override
+  String get updateManualRequired => 'Legacy agent predates remote self-update; run the upgrade command once';
+  @override
+  String get copyUpgradeCommand => 'Copy upgrade cmd';
+  @override
+  String get upgradeCommandCopied => 'Upgrade command copied';
   @override
   String get uninstallCommand => 'Uninstall cmd';
   @override

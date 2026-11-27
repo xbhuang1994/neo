@@ -59,9 +59,12 @@ class _DevicesPageState extends State<DevicesPage> {
   final Set<String> _busyApprovals = {};
   final Set<String> _busyEnrollments = {};
   final Set<String> _pingingDevices = {};
+  final Set<String> _updatingDevices = {};
   final Set<String> _removingDevices = {};
   final Map<String, DevicePingResult> _pingResults = {};
   final Map<String, String> _pingErrors = {};
+  final Map<String, DeviceUpdateResult> _updateResults = {};
+  final Map<String, String> _updateErrors = {};
 
   String? _toast;
   bool _toastGood = true;
@@ -230,6 +233,41 @@ class _DevicesPageState extends State<DevicesPage> {
     }
   }
 
+  Future<void> _updateDevice(AppState state, DeviceTwin device, String? masterVersion) async {
+    final api = state.client;
+    if (api == null) return;
+    setState(() {
+      _updatingDevices.add(device.deviceId);
+      _updateErrors.remove(device.deviceId);
+    });
+    try {
+      final result = await api.updateDevice(device.deviceId, targetVersion: masterVersion);
+      if (!mounted) return;
+      setState(() {
+        _updateResults[device.deviceId] = result;
+        if (!result.ok && result.status != 'manual_upgrade_required') {
+          _updateErrors[device.deviceId] = result.error ?? result.message;
+        }
+      });
+      unawaited(state.refresh());
+    } on ApiException catch (error) {
+      if (mounted) {
+        setState(() {
+          _updateResults.remove(device.deviceId);
+          _updateErrors[device.deviceId] = error.message;
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _updatingDevices.remove(device.deviceId));
+    }
+  }
+
+  void _copyUpgradeCommand(DeviceTwin device, String cmd) {
+    final strings = Strings.read(context);
+    unawaited(Clipboard.setData(ClipboardData(text: cmd)));
+    _showToast('${strings.upgradeCommandCopied} (${device.deviceId})', good: true);
+  }
+
   String _uninstallCommandFor(DeviceTwin device, List<DeviceEnrollment> enrollments) {
     for (final enrollment in enrollments) {
       if (enrollment.enrolledDeviceIds.contains(device.deviceId) && enrollment.commands.uninstall.isNotEmpty) {
@@ -274,6 +312,8 @@ class _DevicesPageState extends State<DevicesPage> {
       await api.removeDevice(device.deviceId);
       _pingResults.remove(device.deviceId);
       _pingErrors.remove(device.deviceId);
+      _updateResults.remove(device.deviceId);
+      _updateErrors.remove(device.deviceId);
       await state.refresh();
     } on ApiException catch (error) {
       if (mounted) _showToast(error.message, good: false);
@@ -432,6 +472,7 @@ class _DevicesPageState extends State<DevicesPage> {
     final palette = Palette.of(context);
     final typo = Typo.of(context);
     final config = overview.config;
+    final masterVersion = config.targetVersion;
     final (relayLabel, relayColor) = relayStatusAppearance(config, strings, palette);
     final pendingApprovals = overview.pendingApprovals;
     final activeEnrollments = overview.activeEnrollments;
@@ -480,8 +521,8 @@ class _DevicesPageState extends State<DevicesPage> {
                                   strings.devicesOnlineSummary(overview.onlineDevicesCount, overview.devices.length),
                                   style: typo.footnote,
                                 ),
-                                if (config.agentVersion != null)
-                                  Text('v${config.agentVersion}', style: typo.caption),
+                                if (masterVersion != null)
+                                  Text('v$masterVersion', style: typo.caption),
                               ],
                             ),
                             if (config.relayUrl != null && config.relayUrl!.isNotEmpty) ...[
@@ -555,7 +596,7 @@ class _DevicesPageState extends State<DevicesPage> {
                           ),
                         )
                       else
-                        for (final device in sortedDevices) _buildDeviceRow(state, device, overview.enrollments),
+                        for (final device in sortedDevices) _buildDeviceRow(state, device, overview.enrollments, masterVersion),
                     ],
                   ),
                 ],
@@ -690,17 +731,27 @@ class _DevicesPageState extends State<DevicesPage> {
     );
   }
 
-  Widget _chip(String label) {
+  Widget _chip(String label, {Color? accent}) {
     final palette = Palette.of(context);
     final typo = Typo.of(context);
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
-      decoration: BoxDecoration(color: palette.fill, borderRadius: BorderRadius.circular(6)),
-      child: Text(label, style: typo.caption.copyWith(color: palette.label, fontSize: 11.5)),
+      decoration: BoxDecoration(
+        color: accent != null ? accent.withValues(alpha: 0.14) : palette.fill,
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Text(
+        label,
+        style: typo.caption.copyWith(
+          color: accent ?? palette.label,
+          fontSize: 11.5,
+          fontWeight: accent != null ? FontWeight.w600 : FontWeight.normal,
+        ),
+      ),
     );
   }
 
-  Widget _buildDeviceRow(AppState state, DeviceTwin device, List<DeviceEnrollment> enrollments) {
+  Widget _buildDeviceRow(AppState state, DeviceTwin device, List<DeviceEnrollment> enrollments, String? masterVersion) {
     final strings = Strings.read(context);
     final palette = Palette.of(context);
     final typo = Typo.of(context);
@@ -718,38 +769,79 @@ class _DevicesPageState extends State<DevicesPage> {
     };
 
     final manifest = device.manifest;
-    final chips = <String>[];
+    final outdated = device.needsUpdate(masterVersion);
+    final versionText = device.isMcu
+        ? (device.version != null ? 'fw ${device.version!}' : null)
+        : (device.version != null ? 'v${device.version!}' : (outdated ? strings.legacyVersion : null));
+
+    final chips = <(String, Color?)>[];
     if (device.isMcu) {
-      if (manifest?.chip != null) chips.add(manifest!.chip!);
-      if (manifest?.fw != null) chips.add('fw ${manifest!.fw!}');
-      if (device.relayNodeId != null) chips.add(strings.viaRelayDevice(device.relayNodeId!));
-      if (device.pendingQueueLength > 0) chips.add(strings.queuedCommands(device.pendingQueueLength));
+      if (manifest?.chip != null) chips.add((manifest!.chip!, null));
+      if (versionText != null) chips.add((versionText, outdated ? palette.orange : null));
+      if (device.relayNodeId != null) chips.add((strings.viaRelayDevice(device.relayNodeId!), null));
+      if (device.pendingQueueLength > 0) chips.add((strings.queuedCommands(device.pendingQueueLength), null));
     } else {
+      if (versionText != null) chips.add((versionText, outdated ? palette.orange : null));
       if (manifest?.os != null) {
-        chips.add(manifest?.arch != null ? '${manifest!.os}/${manifest.arch}' : manifest!.os!);
+        chips.add((manifest?.arch != null ? '${manifest!.os}/${manifest.arch}' : manifest!.os!, null));
       }
       if (manifest?.cpus != null && manifest!.cpus! > 0) {
-        chips.add('${manifest.cpus} CPU');
+        chips.add(('${manifest.cpus} CPU', null));
       }
       if (manifest?.ramMb != null && manifest!.ramMb! > 0) {
         final mb = manifest.ramMb!;
-        chips.add(mb >= 1024 ? '${(mb / 1024).toStringAsFixed(1)} GB RAM' : '$mb MB RAM');
+        chips.add((mb >= 1024 ? '${(mb / 1024).toStringAsFixed(1)} GB RAM' : '$mb MB RAM', null));
       }
       if (manifest != null && manifest.gpus.isNotEmpty) {
         for (final gpu in manifest.gpus) {
-          chips.add('GPU $gpu');
+          chips.add(('GPU $gpu', null));
         }
       } else if (device.hasGpu) {
-        chips.add('GPU');
+        chips.add(('GPU', null));
       }
-      if (device.mqttBind != null) chips.add('MQTT ${device.mqttBind}');
-      if (device.uartDevice != null) chips.add('UART ${device.uartDevice}');
+      if (device.mqttBind != null) chips.add(('MQTT ${device.mqttBind}', null));
+      if (device.uartDevice != null) chips.add(('UART ${device.uartDevice}', null));
     }
 
     final pinging = _pingingDevices.contains(device.deviceId);
+    final updating = _updatingDevices.contains(device.deviceId);
     final removing = _removingDevices.contains(device.deviceId);
     final pingResult = _pingResults[device.deviceId];
     final pingError = _pingErrors[device.deviceId];
+    final updateResult = _updateResults[device.deviceId];
+    final updateError = _updateErrors[device.deviceId];
+
+    String? updateStatusText;
+    Color? updateStatusColor;
+    if (updating) {
+      updateStatusText = strings.updatingDevice;
+      updateStatusColor = palette.accent;
+    } else if (updateResult != null) {
+      if (updateResult.ok) {
+        final target = updateResult.targetVersion.isNotEmpty ? updateResult.targetVersion : (masterVersion ?? '');
+        if (!outdated) {
+          updateStatusText = strings.updateCompleted(target);
+        } else {
+          updateStatusText = switch (updateResult.status) {
+            'restarting' => strings.updateRestarting(target),
+            'queued' => strings.updateQueued(target),
+            'staged' => strings.updateStaged(target),
+            'up_to_date' => strings.updateUpToDate(target),
+            _ => strings.updateCompleted(target),
+          };
+        }
+        updateStatusColor = palette.green;
+      } else if (updateResult.status == 'manual_upgrade_required') {
+        updateStatusText = strings.updateManualRequired;
+        updateStatusColor = palette.orange;
+      } else {
+        updateStatusText = '${strings.updateFailed}: ${updateResult.error ?? updateResult.message}';
+        updateStatusColor = palette.red;
+      }
+    } else if (updateError != null) {
+      updateStatusText = '${strings.updateFailed}: $updateError';
+      updateStatusColor = palette.red;
+    }
 
     return Padding(
       key: ValueKey('device-${device.deviceId}'),
@@ -788,7 +880,7 @@ class _DevicesPageState extends State<DevicesPage> {
           ),
           if (chips.isNotEmpty) ...[
             const SizedBox(height: 8),
-            Wrap(spacing: 6, runSpacing: 6, children: [for (final c in chips) _chip(c)]),
+            Wrap(spacing: 6, runSpacing: 6, children: [for (final (label, accent) in chips) _chip(label, accent: accent)]),
           ],
           if (device.workspaces.isNotEmpty) ...[
             const SizedBox(height: 7),
@@ -828,6 +920,12 @@ class _DevicesPageState extends State<DevicesPage> {
                         key: ValueKey('ping-result-${device.deviceId}'),
                         style: typo.caption.copyWith(color: palette.red),
                       ),
+                    if (updateStatusText != null)
+                      Text(
+                        updateStatusText,
+                        key: ValueKey('update-result-${device.deviceId}'),
+                        style: typo.caption.copyWith(color: updateStatusColor, fontWeight: FontWeight.w600),
+                      ),
                   ],
                 ),
               ),
@@ -838,6 +936,20 @@ class _DevicesPageState extends State<DevicesPage> {
             spacing: 8,
             runSpacing: 8,
             children: [
+              if (outdated)
+                ActionButton(
+                  key: ValueKey('update-${device.deviceId}'),
+                  label: strings.updateDevice,
+                  busy: updating,
+                  onPressed: updating ? null : () => unawaited(_updateDevice(state, device, masterVersion)),
+                ),
+              if (outdated && updateResult?.upgradeCommand != null && updateResult!.upgradeCommand!.isNotEmpty)
+                ActionButton(
+                  key: ValueKey('copy-upgrade-${device.deviceId}'),
+                  label: strings.copyUpgradeCommand,
+                  plain: true,
+                  onPressed: () => _copyUpgradeCommand(device, updateResult.upgradeCommand!),
+                ),
               ActionButton(
                 key: ValueKey('ping-${device.deviceId}'),
                 label: strings.ping,

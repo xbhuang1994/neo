@@ -5,6 +5,7 @@ function Install-NeoAgent {
         [string]$RelayUrl = "{{PUBLIC_URL}}",
         [string]$Version = "",
         [string]$Mode = "auto",
+        [switch]$Upgrade,
         [switch]$Uninstall,
         [string]$Cluster = "",
         [switch]$PurgeWorkspace,
@@ -54,8 +55,8 @@ function Install-NeoAgent {
     if ($Mode -notin @("auto", "system", "user", "foreground")) {
         throw "Invalid -Mode '$Mode' (expected auto|system|user|foreground)"
     }
-    if ([string]::IsNullOrWhiteSpace($Enroll)) {
-        throw "Missing -Enroll parameter"
+    if (-not $Upgrade -and [string]::IsNullOrWhiteSpace($Enroll)) {
+        throw "Missing -Enroll parameter (or pass -Upgrade)"
     }
 
     if ([string]::IsNullOrWhiteSpace($Version)) {
@@ -150,6 +151,16 @@ function Install-NeoAgent {
             }
         }
         Copy-Item -LiteralPath $ExtractedBin.FullName -Destination $BinPath -Force
+
+        if ($Upgrade) {
+            Write-Host "Upgraded neo-agent-os.exe to v$Version at $BinPath"
+            if (-not [string]::IsNullOrWhiteSpace($Cluster)) {
+                $TaskName = "NeoAgent-$Cluster"
+                try { & schtasks /End /TN $TaskName 2>$null | Out-Null } catch {}
+                try { & schtasks /Run /TN $TaskName 2>$null | Out-Null } catch {}
+            }
+            return
+        }
 
         $Enroll | & $BinPath enroll --relay-url $RelayBase --mode $Mode --ticket-stdin
         if ($LASTEXITCODE -ne 0) {

@@ -14,6 +14,7 @@ import {
   renderDirectInstallPs1,
   renderDirectInstallSh,
   type DeviceConfigUpdateInput,
+  type DeviceUpdateInput,
   type EnrollmentCreateInput,
   type EnrollmentInstallMode,
   type EnrollmentPlatform,
@@ -864,6 +865,61 @@ async function routeDevices(
         return Response.error(404, "Device not found");
       }
       return await done(async () => await app.devices.pingDevice(id));
+    }
+
+    if (reqPath.startsWith(DEVICES_PREFIX) && reqPath.endsWith("/update")) {
+      const id = safeDecodeSegment(
+        reqPath.slice(DEVICES_PREFIX.length, reqPath.length - "/update".length),
+      );
+      if (!id || id.includes("/")) {
+        return Response.error(404, "Device not found");
+      }
+      if (app.devices.getDevice(id) === null) {
+        return Response.error(404, "Device not found");
+      }
+      const parsed = optionalJsonBody(request);
+      if (!parsed.ok) return parsed.response;
+      if (!isRecord(parsed.value)) {
+        return Response.error(400, "Expected JSON object");
+      }
+      const targetVersion = parseOptionalStringField(
+        parsed.value,
+        ["targetVersion", "target_version", "version"],
+        "targetVersion",
+      );
+      if (!targetVersion.ok) return targetVersion.response;
+      const sha256 = parseOptionalStringField(parsed.value, ["sha256"], "sha256");
+      if (!sha256.ok) return sha256.response;
+      const force = parseOptionalBoolField(parsed.value, ["force"], "force");
+      if (!force.ok) return force.response;
+      const timeoutMs = parseOptionalIntField(
+        parsed.value,
+        ["timeoutMs", "timeout_ms"],
+        "timeoutMs",
+      );
+      if (!timeoutMs.ok) return timeoutMs.response;
+      if (timeoutMs.value !== undefined && timeoutMs.value <= 0) {
+        return Response.error(400, "timeoutMs must be a positive integer");
+      }
+      let downloadMirrors: string[] | undefined;
+      const rawMirrors = parsed.value.downloadMirrors ?? parsed.value.download_mirrors ?? parsed.value.mirrors;
+      if (rawMirrors !== undefined && rawMirrors !== null) {
+        if (!Array.isArray(rawMirrors) || !rawMirrors.every((m) => typeof m === "string")) {
+          return Response.error(400, "downloadMirrors must be an array of strings");
+        }
+        downloadMirrors = rawMirrors;
+      }
+      const updateInput: DeviceUpdateInput = {
+        ...(targetVersion.value !== undefined ? { targetVersion: targetVersion.value } : {}),
+        ...(downloadMirrors !== undefined ? { downloadMirrors } : {}),
+        ...(sha256.value !== undefined ? { sha256: sha256.value } : {}),
+        ...(force.value !== undefined ? { force: force.value } : {}),
+        ...(timeoutMs.value !== undefined ? { timeoutMs: timeoutMs.value } : {}),
+      };
+      const origin = requestOrigin(request);
+      return await done(
+        async () => await app.devices.updateDevice(id, updateInput, { requestOrigin: origin }),
+      );
     }
 
     if (reqPath.startsWith(DEVICES_PREFIX) && reqPath.endsWith("/invoke")) {

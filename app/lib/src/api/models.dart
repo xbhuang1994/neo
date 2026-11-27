@@ -470,6 +470,65 @@ class AccountsView {
 
 List<String> _strings(Object? value) => [for (final item in _list(value)) if (item is String && item.isNotEmpty) item];
 
+final RegExp _semverPartRe = RegExp(r'^(0|[1-9]\d*)$');
+final RegExp _semverPreRe = RegExp(r'^[0-9A-Za-z-]+$');
+
+({int major, int minor, int patch, List<String> pre})? _parseSemver(String raw) {
+  var text = raw.trim();
+  if (text.startsWith('v') || text.startsWith('V')) text = text.substring(1);
+  final plusIdx = text.indexOf('+');
+  if (plusIdx != -1) text = text.substring(0, plusIdx);
+  text = text.trim();
+  if (text.isEmpty) return null;
+  final dashIdx = text.indexOf('-');
+  final core = dashIdx == -1 ? text : text.substring(0, dashIdx);
+  final preRaw = dashIdx == -1 ? '' : text.substring(dashIdx + 1);
+  final parts = core.split('.');
+  if (parts.length != 3 || !parts.every(_semverPartRe.hasMatch)) return null;
+  final pre = preRaw.isEmpty ? const <String>[] : preRaw.split('.');
+  if (dashIdx != -1 && (pre.isEmpty || !pre.every(_semverPreRe.hasMatch))) return null;
+  return (major: int.parse(parts[0]), minor: int.parse(parts[1]), patch: int.parse(parts[2]), pre: pre);
+}
+
+/// Compare two SemVer 2.0.0 version strings (`-1`, `0`, `1`), or `null` if either cannot be parsed.
+int? compareSemver(String a, String b) {
+  final pa = _parseSemver(a);
+  final pb = _parseSemver(b);
+  if (pa == null || pb == null) return null;
+  if (pa.major != pb.major) return pa.major < pb.major ? -1 : 1;
+  if (pa.minor != pb.minor) return pa.minor < pb.minor ? -1 : 1;
+  if (pa.patch != pb.patch) return pa.patch < pb.patch ? -1 : 1;
+  if (pa.pre.isEmpty && pb.pre.isEmpty) return 0;
+  if (pa.pre.isEmpty) return 1;
+  if (pb.pre.isEmpty) return -1;
+  final len = pa.pre.length < pb.pre.length ? pa.pre.length : pb.pre.length;
+  for (var i = 0; i < len; i++) {
+    final ia = pa.pre[i];
+    final ib = pb.pre[i];
+    final na = _semverPartRe.hasMatch(ia);
+    final nb = _semverPartRe.hasMatch(ib);
+    if (na && nb) {
+      final va = int.parse(ia);
+      final vb = int.parse(ib);
+      if (va != vb) return va < vb ? -1 : 1;
+    } else if (na) {
+      return -1;
+    } else if (nb) {
+      return 1;
+    } else {
+      final cmp = ia.compareTo(ib);
+      if (cmp != 0) return cmp < 0 ? -1 : 1;
+    }
+  }
+  return pa.pre.length == pb.pre.length ? 0 : (pa.pre.length < pb.pre.length ? -1 : 1);
+}
+
+/// True iff [current] and [target] are valid semver versions and [current] is strictly lower than [target].
+bool isVersionOlder(String current, String target) {
+  final cmp = compareSemver(current, target);
+  return cmp != null && cmp < 0;
+}
+
 /// Public configuration and relay connectivity state for the Master Neo device control plane.
 class DeviceControlConfig {
   const DeviceControlConfig({
@@ -487,6 +546,7 @@ class DeviceControlConfig {
     this.localRelayDetected = false,
     this.defaultRelayUrl,
     this.agentVersion,
+    this.masterVersion,
   });
 
   DeviceControlConfig.fromJson(Map<String, dynamic> json)
@@ -503,7 +563,8 @@ class DeviceControlConfig {
       relayState = _text(json['relayState']) ?? 'idle',
       localRelayDetected = json['localRelayDetected'] == true,
       defaultRelayUrl = _text(json['defaultRelayUrl']),
-      agentVersion = _text(json['agentVersion']);
+      agentVersion = _text(json['agentVersion']),
+      masterVersion = _text(json['masterVersion']);
 
   final bool enabled;
   final bool configured;
@@ -521,6 +582,10 @@ class DeviceControlConfig {
   final bool localRelayDetected;
   final String? defaultRelayUrl;
   final String? agentVersion;
+  final String? masterVersion;
+
+  /// Canonical Master Neo version that remote Tier device updates must strictly match.
+  String? get targetVersion => masterVersion ?? agentVersion;
 }
 
 /// Optional Tier 2 MCU bridge settings advertised by a Tier 1 OS agent.
@@ -556,6 +621,7 @@ class DeviceManifest {
   DeviceManifest.fromJson(Map<String, dynamic> json)
     : deviceId = _text(json['device_id']) ?? _text(json['deviceId']) ?? '',
       tier = _text(json['tier']) ?? 'os',
+      version = _text(json['version']) ?? _text(json['agent_version']) ?? _text(json['agentVersion']),
       os = _text(json['os']),
       arch = _text(json['arch']),
       hostname = _text(json['hostname']),
@@ -586,6 +652,7 @@ class DeviceManifest {
 
   final String deviceId;
   final String tier;
+  final String? version;
   final String? os;
   final String? arch;
   final String? hostname;
@@ -679,6 +746,23 @@ class DeviceTwin {
       capabilities.contains('relay') ||
       (mqttBind != null && mqttBind!.isNotEmpty) ||
       (uartDevice != null && uartDevice!.isNotEmpty);
+
+  /// Reported program or firmware version for this Tier device.
+  String? get version => isMcu
+      ? (manifest?.fw ?? manifest?.version)
+      : (manifest?.version ?? _text(reportedState['version']) ?? _text(reportedState['agentVersion']));
+
+  /// Whether this Tier device's version is strictly lower than [masterVersion] (or is a legacy
+  /// Tier 1 manifest predating version reporting).
+  bool needsUpdate(String? masterVersion) {
+    if (masterVersion == null || masterVersion.trim().isEmpty) return false;
+    final current = version;
+    if (current != null && current.isNotEmpty) {
+      return isVersionOlder(current, masterVersion);
+    }
+    // Tier 1 agents built before version reporting omit `manifest.version`.
+    return isTier1 && manifest != null;
+  }
 }
 
 /// A risk-gated device invocation awaiting human approval.
@@ -870,6 +954,40 @@ class DevicePingResult {
   final String status;
   final String route;
   final String? error;
+}
+
+/// Result of `POST /api/devices/:id/update`.
+class DeviceUpdateResult {
+  DeviceUpdateResult.fromJson(Map<String, dynamic> json)
+    : ok = json['ok'] == true,
+      status = _text(json['status']) ?? 'failed',
+      deviceId = json['deviceId'] as String? ?? '',
+      tier = _text(json['tier']) ?? 'os',
+      currentVersion = _text(json['currentVersion']),
+      targetVersion = json['targetVersion'] as String? ?? '',
+      message = json['message'] as String? ?? '',
+      error = _text(json['error']),
+      upgradeCommand = _text(json['upgradeCommand']),
+      seqId = (json['seqId'] as num?)?.toInt(),
+      installedPath = _text(json['installedPath']),
+      sha256 = _text(json['sha256']),
+      mirror = _text(json['mirror']);
+
+  final bool ok;
+
+  /// `restarting`, `updated`, `queued`, `staged`, `up_to_date`, `manual_upgrade_required`, or `failed`.
+  final String status;
+  final String deviceId;
+  final String tier;
+  final String? currentVersion;
+  final String targetVersion;
+  final String message;
+  final String? error;
+  final String? upgradeCommand;
+  final int? seqId;
+  final String? installedPath;
+  final String? sha256;
+  final String? mirror;
 }
 
 /// Result of Tier 1-driven Tier 2 MCU installation returned by `POST /api/devices/mcu/install`.

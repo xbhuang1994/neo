@@ -320,6 +320,19 @@ class ApiClient {
   Future<DevicePingResult> pingDevice(String id) async =>
       DevicePingResult.fromJson(await _object('POST', '/api/devices/${Uri.encodeComponent(id)}/ping', body: const <String, dynamic>{}, timeout: const Duration(seconds: 30)));
 
+  Future<DeviceUpdateResult> updateDevice(String id, {String? targetVersion, bool force = false}) async =>
+      DeviceUpdateResult.fromJson(
+        await _object(
+          'POST',
+          '/api/devices/${Uri.encodeComponent(id)}/update',
+          body: {
+            if (targetVersion != null && targetVersion.trim().isNotEmpty) 'targetVersion': targetVersion.trim(),
+            if (force) 'force': true,
+          },
+          timeout: const Duration(minutes: 3),
+        ),
+      );
+
   Future<DeviceApproval> approveDeviceApproval(String id, {String? reason}) async {
     final body = await _object(
       'POST',

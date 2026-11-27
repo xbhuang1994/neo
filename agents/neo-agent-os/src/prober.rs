@@ -20,6 +20,7 @@ pub struct RelayConfigSummary {
 pub struct CapabilityManifest {
     pub device_id: String,
     pub tier: String,
+    pub version: String,
     pub os: String,
     pub arch: String,
     pub hostname: String,
@@ -53,6 +54,7 @@ impl CapabilityProber {
             "fs".to_string(),
             "transfer".to_string(),
             "ota".to_string(),
+            "self_update".to_string(),
         ];
         #[cfg(target_os = "linux")]
         if Path::new("/dev/nvidia0").exists() {
@@ -89,6 +91,7 @@ impl CapabilityProber {
         CapabilityManifest {
             device_id: device_id.to_string(),
             tier: "os".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             os,
             arch,
             hostname,
@@ -194,9 +197,11 @@ mod tests {
         );
         assert_eq!(manifest.device_id, "os-node-test");
         assert_eq!(manifest.tier, "os");
+        assert_eq!(manifest.version, env!("CARGO_PKG_VERSION"));
         assert!(manifest.cpus >= 1);
         assert!(manifest.capabilities.contains(&"relay".to_string()));
         assert!(manifest.capabilities.contains(&"exec".to_string()));
+        assert!(manifest.capabilities.contains(&"self_update".to_string()));
         assert!(manifest.relay_config.as_ref().unwrap().enabled);
     }
 }
