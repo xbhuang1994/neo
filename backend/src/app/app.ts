@@ -24,6 +24,7 @@ import {
   type Trigger,
 } from "../core/index.ts";
 import type { Entry, KernelEvent } from "../kernel/index.ts";
+import { DeviceManager } from "../devices/index.ts";
 import { Store } from "../store/index.ts";
 import { AccountsState, type AccountsView, type LoginView } from "./accounts.ts";
 import * as assessMod from "./assess.ts";
@@ -109,6 +110,7 @@ export class App implements AppContext {
   readonly executorState: ExecutorState;
   readonly watchdogState: WatchdogState;
   readonly wechatState: WeChatState;
+  readonly devices: DeviceManager;
 
   get stopSignal(): AbortSignal {
     return this.stopController.signal;
@@ -196,6 +198,8 @@ export class App implements AppContext {
     this.executorState = new ExecutorState();
     this.watchdogState = new WatchdogState(timings.watchdog);
     this.wechatState = new WeChatState(machine.wechat);
+    this.devices = new DeviceManager({ store, board, masterId });
+    this.devices.initFromEnv();
     this.accounts = new AccountsState({
       onCredentialsChanged: () => {
         this.modelLists.delete("antigravity");
@@ -435,6 +439,7 @@ export class App implements AppContext {
     this.effects.start();
     this.watchdogStart();
     this.wechatStart();
+    await this.devices.start();
     this.board.set("runtime", Health.ready("Ready"));
     this.passes.pump();
   }
@@ -450,6 +455,7 @@ export class App implements AppContext {
     await this.passes.stop();
     await this.watchdogStop();
     await this.wechatStop();
+    await this.devices.stop();
     await this.stopAllSessions();
     await this.effects.drain();
     this.board.set("runtime", Health.waiting("Stopped"));

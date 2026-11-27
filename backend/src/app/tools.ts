@@ -39,6 +39,7 @@ import {
   type PendingClarification,
 } from "./clarification.ts";
 import { Args, WORKTREE_NAME_RULE, validWorktreeName, type AppContext } from "./context.ts";
+import type { DeviceStatus, DeviceTier } from "../devices/index.ts";
 import { SIDECAR } from "./effects.ts";
 import { receiptNotice, reportRelay, threadFollowedNotice } from "./notices.ts";
 import { recallConfig, sanitizeCardText } from "./recall.ts";
@@ -96,6 +97,15 @@ const ALLOWED_REPLY: readonly string[] = [
 ];
 const ALLOWED_THREAD: readonly string[] = ["thread"];
 const ALLOWED_WECHAT_SEND_FILE: readonly string[] = ["path", "caption", "ticket_id"];
+const ALLOWED_DEVICE_LIST: readonly string[] = ["tier", "status"];
+const ALLOWED_DEVICE_INVOKE: readonly string[] = [
+  "device_id",
+  "action",
+  "params",
+  "timeout_ms",
+  "reason",
+];
+const ALLOWED_DEVICE_APPROVE: readonly string[] = ["approval_id", "decision", "reason"];
 const ALLOWED_ACK: readonly string[] = ["trigger_id", "text"];
 const ALLOWED_THREAD_REASON: readonly string[] = ["thread", "reason"];
 const ALLOWED_HANDBACK: readonly string[] = ["trigger_id", "reason"];
@@ -210,6 +220,45 @@ function readSpec(description: string, worker: boolean): ToolSpec {
     },
     ["resource"],
   );
+}
+
+function deviceSpecs(): ToolSpec[] {
+  return [
+    spec(
+      "device_list",
+      "List paired Tier 1 OS agents and Tier 2 MCUs with their online status, routing path, and capabilities.",
+      {
+        tier: { type: ["string", "null"], enum: ["os", "mcu", null] },
+        status: {
+          type: ["string", "null"],
+          enum: ["online", "offline", "sleeping", "unreachable_via_relay", null],
+        },
+      },
+      [],
+    ),
+    spec(
+      "device_invoke",
+      "Invoke a capability or action on a paired Tier 1 OS agent or Tier 2 MCU. Risky actions return pending_approval with a short code.",
+      {
+        device_id: { type: "string" },
+        action: { type: "string" },
+        params: { type: ["object", "null"] },
+        timeout_ms: { type: ["integer", "null"], minimum: 100, maximum: 300000 },
+        reason: { type: ["string", "null"] },
+      },
+      ["device_id", "action"],
+    ),
+    spec(
+      "device_approve",
+      "Approve or reject a pending high-risk device action by approval_id or shortCode.",
+      {
+        approval_id: { type: "string", description: "Approval ID or 6-character short code." },
+        decision: { type: "string", enum: ["approve", "reject"] },
+        reason: { type: ["string", "null"] },
+      },
+      ["approval_id", "decision"],
+    ),
+  ];
 }
 
 const cachedMainSpecsByFlag = new Map<string, ToolSpec[]>();
@@ -496,6 +545,7 @@ export function mainSpecs(): ToolSpec[] {
       },
       ["path"],
     ),
+    ...deviceSpecs(),
   ];
   cachedMainSpecsByFlag.set(cacheKey, specs);
   return specs;
@@ -588,6 +638,7 @@ export function workerSpecs(): ToolSpec[] {
       },
       ["state", "summary"],
     ),
+    ...deviceSpecs(),
   ];
   return cachedWorkerSpecs;
 }
@@ -1210,12 +1261,80 @@ function routeAll(app: AppContext, argumentsValue: unknown): Record<string, unkn
   return { results };
 }
 
+async function runDeviceTool(
+  app: AppContext,
+  name: string,
+  argumentsValue: unknown,
+): Promise<{ handled: true; result: unknown } | { handled: false }> {
+  switch (name) {
+    case "device_list": {
+      const args = Args.of(argumentsValue ?? {}, ALLOWED_DEVICE_LIST);
+      const tier = args.text("tier") as DeviceTier | undefined;
+      const status = args.text("status") as DeviceStatus | undefined;
+      const devices = app.devices
+        .listDevices()
+        .filter((d) => (tier === undefined || d.tier === tier) && (status === undefined || d.status === status));
+      return {
+        handled: true,
+        result: {
+          config: app.devices.configView(),
+          devices,
+          approvals: app.devices.listApprovals("pending"),
+        },
+      };
+    }
+    case "device_invoke": {
+      const args = Args.of(argumentsValue, ALLOWED_DEVICE_INVOKE);
+      const deviceId = args.required("device_id").trim();
+      const action = args.required("action").trim();
+      const rawParams = args.get("params");
+      if (rawParams !== undefined && rawParams !== null && !isRecord(rawParams)) {
+        throw new Error("params must be an object");
+      }
+      const rawTimeout = args.get("timeout_ms");
+      let timeoutMs: number | undefined;
+      if (rawTimeout !== undefined && rawTimeout !== null) {
+        if (typeof rawTimeout !== "number" || !Number.isInteger(rawTimeout) || rawTimeout < 100 || rawTimeout > 300_000) {
+          throw new Error("timeout_ms must be an integer between 100 and 300000");
+        }
+        timeoutMs = rawTimeout;
+      }
+      const result = await app.devices.invoke(deviceId, {
+        action,
+        params: isRecord(rawParams) ? rawParams : {},
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        ...(args.text("reason") !== undefined ? { reason: args.text("reason") } : {}),
+      });
+      return { handled: true, result };
+    }
+    case "device_approve": {
+      const args = Args.of(argumentsValue, ALLOWED_DEVICE_APPROVE);
+      const approvalId = args.required("approval_id").trim();
+      const decision = args.required("decision").trim();
+      if (decision === "approve") {
+        return { handled: true, result: await app.devices.approve(approvalId, "tool") };
+      }
+      if (decision === "reject") {
+        const approval = app.devices.reject(approvalId, args.text("reason"), "tool");
+        return { handled: true, result: { approval } };
+      }
+      throw new Error("decision must be approve or reject");
+    }
+    default:
+      return { handled: false };
+  }
+}
+
 /** Run one of the main Session's tools. */
 export async function mainTool(
   app: AppContext,
   name: string,
   argumentsValue: unknown,
 ): Promise<unknown> {
+  const deviceHandled = await runDeviceTool(app, name, argumentsValue);
+  if (deviceHandled.handled) {
+    return deviceHandled.result;
+  }
   switch (name) {
     case "orchestrator_read": {
       const args = Args.of(argumentsValue, ALLOWED_READ);
@@ -1398,6 +1517,10 @@ export async function workerTool(
   name: string,
   argumentsValue: unknown,
 ): Promise<unknown> {
+  const deviceHandled = await runDeviceTool(app, name, argumentsValue);
+  if (deviceHandled.handled) {
+    return deviceHandled.result;
+  }
   switch (name) {
     case "orchestrator_read": {
       const args = Args.of(argumentsValue, ALLOWED_READ);

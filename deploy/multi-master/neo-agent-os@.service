@@ -1,0 +1,61 @@
+# Layer 3 OS & cgroup v2 isolated multi-instance unit for neo-agent-os.
+# Install to /etc/systemd/system/neo-agent-os@.service alongside neo-agent-slice@.slice.
+# Instance name (%i) identifies the isolated cluster profile (e.g. personal, corp).
+# Provision per-cluster policy and secrets with deploy/multi-master/provision-cluster.sh.
+
+[Unit]
+Description=Neo Tier 1 OS Agent (cluster %i)
+After=network-online.target
+Wants=network-online.target
+PartOf=neo-agent-slice@%i.slice
+
+[Service]
+Type=simple
+User=neo-%i
+Group=neo-%i
+Slice=neo-agent-slice@%i.slice
+WorkingDirectory=/home/neo-%i/work
+
+# Cluster-specific secrets and identity (mode 0600, owned by neo-%i).
+# Optional GPU pinning can be set in this file or a drop-in via CUDA_VISIBLE_DEVICES=0.
+EnvironmentFile=/etc/neo-agent/cluster-%i.env
+# Optional default; override in cluster-%i.env or systemd drop-in when GPU isolation is needed.
+# Environment=CUDA_VISIBLE_DEVICES=0
+
+ExecStart=/usr/local/bin/neo-agent-os \
+  --cluster ${NEO_CLUSTER_ID} \
+  --device-id ${NEO_DEVICE_ID} \
+  --relay-url ${NEO_RELAY_URL} \
+  --token ${NEO_RELAY_TOKEN} \
+  --e2e-key ${NEO_E2E_KEY} \
+  --master-id ${NEO_MASTER_ID} \
+  --policy /etc/neo-agent/policy-%i.toml \
+  --ota-cache-dir /var/lib/neo-agent/%i/ota \
+  $NEO_EXTRA_ARGS
+
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=30
+
+# Layer 3 cgroup v2 resource bounds & OOM priority
+MemoryAccounting=true
+MemoryMax=4G
+CPUAccounting=true
+CPUQuota=200%
+OOMScoreAdjust=-500
+
+# Filesystem & privilege hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/neo-agent/policy-%i.toml
+ReadWritePaths=/home/neo-%i/work /var/lib/neo-agent/%i
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
