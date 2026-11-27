@@ -1058,4 +1058,194 @@ describe("HTTP compression, ETag caching, and combined /api/poll", () => {
     expect(msg2.status).toBe(304);
     expect(msg2.body.byteLength).toBe(0);
   });
+
+  test("GET /api/messages, /api/workers, and /api/poll support paginated 20-item queries and reject invalid params", async () => {
+    const allMessages = Array.from({ length: 45 }, (_, i) => ({
+      id: i,
+      role: i % 2 === 0 ? "user" : "assistant",
+      text: `msg-${i}`,
+      source: i % 2 === 0 ? "web-panel" : "chat-reply",
+    }));
+    const allWorkers = Array.from({ length: 45 }, (_, i) => ({
+      ticketId: `t-${45 - i}`,
+      title: `Task ${45 - i}`,
+      stage: { stage: i < 2 ? "working" : "ended" },
+    }));
+
+    const app = mockApp({
+      panelMessages: () => allMessages,
+      workerCards: async () => allWorkers,
+    });
+
+    // Legacy calls without query params keep exact backward-compatible shapes.
+    const legacyMsgs = await handle(
+      app,
+      {},
+      new Request({ method: "GET", path: "/api/messages", headers: { host: "127.0.0.1:3082" } }),
+      local,
+    );
+    expect(legacyMsgs.status).toBe(200);
+    const legacyMsgsJson = parseJsonBody(legacyMsgs.body) as Record<string, unknown>;
+    expect(Object.keys(legacyMsgsJson)).toEqual(["messages"]);
+    expect((legacyMsgsJson.messages as unknown[]).length).toBe(45);
+
+    // Paginated /api/messages?limit=20 and before cursor.
+    const mPage1 = await handle(
+      app,
+      {},
+      new Request({ method: "GET", path: "/api/messages", query: "limit=20", headers: { host: "127.0.0.1:3082" } }),
+      local,
+    );
+    expect(mPage1.status).toBe(200);
+    const mPage1Json = parseJsonBody(mPage1.body) as {
+      messages: Array<{ id: number }>;
+      hasMore: boolean;
+      total: number;
+      oldestId: number | null;
+    };
+    expect(mPage1Json.messages.length).toBe(20);
+    expect(mPage1Json.messages[0].id).toBe(25);
+    expect(mPage1Json.messages[19].id).toBe(44);
+    expect(mPage1Json.hasMore).toBe(true);
+    expect(mPage1Json.total).toBe(45);
+    expect(mPage1Json.oldestId).toBe(25);
+
+    const mPage2 = await handle(
+      app,
+      {},
+      new Request({
+        method: "GET",
+        path: "/api/messages",
+        query: "limit=20&before=25",
+        headers: { host: "127.0.0.1:3082" },
+      }),
+      local,
+    );
+    const mPage2Json = parseJsonBody(mPage2.body) as typeof mPage1Json;
+    expect(mPage2Json.messages.length).toBe(20);
+    expect(mPage2Json.messages[0].id).toBe(5);
+    expect(mPage2Json.messages[19].id).toBe(24);
+    expect(mPage2Json.hasMore).toBe(true);
+
+    const mPage3 = await handle(
+      app,
+      {},
+      new Request({
+        method: "GET",
+        path: "/api/messages",
+        query: "limit=20&before=5",
+        headers: { host: "127.0.0.1:3082" },
+      }),
+      local,
+    );
+    const mPage3Json = parseJsonBody(mPage3.body) as typeof mPage1Json;
+    expect(mPage3Json.messages.length).toBe(5);
+    expect(mPage3Json.messages[0].id).toBe(0);
+    expect(mPage3Json.hasMore).toBe(false);
+
+    // Paginated /api/workers?limit=20&offset=...
+    const wPage1 = await handle(
+      app,
+      {},
+      new Request({ method: "GET", path: "/api/workers", query: "limit=20", headers: { host: "127.0.0.1:3082" } }),
+      local,
+    );
+    expect(wPage1.status).toBe(200);
+    const wPage1Json = parseJsonBody(wPage1.body) as {
+      workers: Array<{ ticketId: string }>;
+      hasMore: boolean;
+      total: number;
+      activeCount: number;
+      offset: number;
+      limit: number;
+    };
+    expect(wPage1Json.workers.length).toBe(20);
+    expect(wPage1Json.workers[0].ticketId).toBe("t-45");
+    expect(wPage1Json.hasMore).toBe(true);
+    expect(wPage1Json.total).toBe(45);
+    expect(wPage1Json.activeCount).toBe(2);
+
+    const wPage3 = await handle(
+      app,
+      {},
+      new Request({
+        method: "GET",
+        path: "/api/workers",
+        query: "limit=20&offset=40",
+        headers: { host: "127.0.0.1:3082" },
+      }),
+      local,
+    );
+    const wPage3Json = parseJsonBody(wPage3.body) as typeof wPage1Json;
+    expect(wPage3Json.workers.length).toBe(5);
+    expect(wPage3Json.hasMore).toBe(false);
+    expect(wPage3Json.total).toBe(45);
+    expect(wPage3Json.activeCount).toBe(2);
+
+    // Combined /api/poll with mLimit=20&wLimit=20 returns sliced lists + meta + 304 on repeat.
+    const poll1 = await handle(
+      app,
+      {},
+      new Request({
+        method: "GET",
+        path: "/api/poll",
+        query: "include=m,w&mLimit=20&wLimit=20",
+        headers: { host: "127.0.0.1:3082" },
+      }),
+      local,
+    );
+    expect(poll1.status).toBe(200);
+    const poll1Json = parseJsonBody(poll1.body) as {
+      changed: { messages: unknown[]; workers: unknown[] };
+      meta: {
+        messages: { hasMore: boolean; total: number; oldestId: number | null };
+        workers: { hasMore: boolean; total: number; activeCount: number };
+      };
+      etags: Record<string, string>;
+    };
+    expect(poll1Json.changed.messages.length).toBe(20);
+    expect(poll1Json.changed.workers.length).toBe(20);
+    expect(poll1Json.meta).toEqual({
+      messages: { hasMore: true, total: 45, oldestId: 25 },
+      workers: { hasMore: true, total: 45, activeCount: 2 },
+    });
+
+    const poll2 = await handle(
+      app,
+      {},
+      new Request({
+        method: "GET",
+        path: "/api/poll",
+        query: new URLSearchParams({
+          include: "m,w",
+          mLimit: "20",
+          wLimit: "20",
+          ...poll1Json.etags,
+        }).toString(),
+        headers: { host: "127.0.0.1:3082" },
+      }),
+      local,
+    );
+    expect(poll2.status).toBe(304);
+
+    // Invalid query parameters are rejected with 400.
+    for (const [reqPath, query] of [
+      ["/api/messages", "limit=0"],
+      ["/api/messages", "limit=999"],
+      ["/api/messages", "limit=abc"],
+      ["/api/messages", "before=-1"],
+      ["/api/workers", "limit=0"],
+      ["/api/workers", "offset=abc"],
+      ["/api/poll", "include=m&mLimit=0"],
+      ["/api/poll", "include=w&wLimit=201"],
+    ] as const) {
+      const bad = await handle(
+        app,
+        {},
+        new Request({ method: "GET", path: reqPath, query, headers: { host: "127.0.0.1:3082" } }),
+        local,
+      );
+      expect(bad.status).toBe(400);
+    }
+  });
 });

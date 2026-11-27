@@ -85,6 +85,9 @@ typedef ClientFactory = ApiClient Function(Uri base, String? token);
 class AppState extends ChangeNotifier {
   AppState(this.host, {ClientFactory? clients, this.pollEvery = const Duration(seconds: 2)}) : _clients = clients ?? ((base, token) => ApiClient(base, token: token));
 
+  /// Default page size for conversation and task history lists.
+  static const int historyPageSize = 20;
+
   final Host host;
   final Duration pollEvery;
   final ClientFactory _clients;
@@ -96,7 +99,17 @@ class AppState extends ChangeNotifier {
   String? linkDetail;
   ApiClient? client;
   List<ChatMessage> messages = const [];
+  bool messagesHasMore = false;
+  int messagesTotal = 0;
+  bool loadingMoreMessages = false;
+  String? loadMoreMessagesError;
+
   List<Worker> workers = const [];
+  bool workersHasMore = false;
+  int workersTotal = 0;
+  bool loadingMoreWorkers = false;
+  String? loadMoreWorkersError;
+
   Health? health;
 
   /// What is at work now, for the ticker.
@@ -125,6 +138,9 @@ class AppState extends ChangeNotifier {
   Future<void>? _running;
   int _ticks = 0;
   int _epoch = 0;
+  int _messagesEpoch = 0;
+  int _workersEpoch = 0;
+  bool _workersExpanded = false;
   int _activeTab = 0;
   bool _foreground = true;
   bool _started = false;
@@ -145,6 +161,8 @@ class AppState extends ChangeNotifier {
   bool _disposed = false;
 
   int get activeWorkers => _cachedActiveWorkers;
+  int get remainingOlderMessages => messagesTotal > messages.length ? messagesTotal - messages.length : 0;
+  int get remainingMoreWorkers => workersTotal > workers.length ? workersTotal - workers.length : 0;
   DeviceControlConfig? get deviceConfig => devicesOverview?.config;
   List<DeviceTwin> get devices => devicesOverview?.devices ?? const [];
   List<DeviceApproval> get deviceApprovals => devicesOverview?.approvals ?? const [];
@@ -224,11 +242,22 @@ class AppState extends ChangeNotifier {
     client?.close();
     client = next;
     _epoch++;
+    _messagesEpoch++;
+    _workersEpoch++;
+    _workersExpanded = false;
     _ticks = 0;
     _pollEndpointSupported = true;
     _pollEtags.clear();
     messages = const [];
+    messagesHasMore = false;
+    messagesTotal = 0;
+    loadingMoreMessages = false;
+    loadMoreMessagesError = null;
     workers = const [];
+    workersHasMore = false;
+    workersTotal = 0;
+    loadingMoreWorkers = false;
+    loadMoreWorkersError = null;
     _cachedActiveWorkers = 0;
     health = null;
     activity = const Activity.idle();
@@ -317,6 +346,178 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  void _applyPolledMessages(List<ChatMessage> incoming, MessagesPageMeta? meta) {
+    if (incoming.isEmpty) {
+      messages = const [];
+      messagesHasMore = false;
+      messagesTotal = 0;
+      loadingMoreMessages = false;
+      loadMoreMessagesError = null;
+      _messagesEpoch++;
+      messagesRev++;
+      return;
+    }
+    if (meta == null) {
+      messages = incoming;
+      messagesHasMore = false;
+      messagesTotal = incoming.length;
+      loadMoreMessagesError = null;
+      messagesRev++;
+      return;
+    }
+
+    final prev = messages;
+    var isResetOrGap = false;
+    if (prev.isNotEmpty) {
+      if (meta.total < messagesTotal || incoming.last.id < prev.last.id || incoming.first.id > prev.last.id) {
+        isResetOrGap = true;
+      } else {
+        final anchorId = incoming.first.id;
+        for (final existing in prev) {
+          if (existing.id == anchorId) {
+            if (existing.fromUser != incoming.first.fromUser || existing.text != incoming.first.text || existing.at != incoming.first.at) {
+              isResetOrGap = true;
+            }
+            break;
+          }
+        }
+      }
+    }
+
+    if (prev.isEmpty || isResetOrGap) {
+      messages = incoming;
+      messagesHasMore = meta.hasMore;
+      messagesTotal = meta.total;
+      if (isResetOrGap) {
+        _messagesEpoch++;
+        loadingMoreMessages = false;
+        loadMoreMessagesError = null;
+      }
+    } else {
+      final firstIncomingId = incoming.first.id;
+      final older = [for (final m in prev) if (m.id < firstIncomingId) m];
+      messages = older.isEmpty ? incoming : List<ChatMessage>.unmodifiable([...older, ...incoming]);
+      messagesHasMore = older.isNotEmpty ? messagesHasMore : meta.hasMore;
+      messagesTotal = meta.total;
+    }
+    messagesRev++;
+  }
+
+  void _applyPolledWorkers(List<Worker> incoming, WorkersPageMeta? meta) {
+    final prevActive = _cachedActiveWorkers;
+    if (meta == null) {
+      workers = incoming;
+      workersHasMore = false;
+      workersTotal = incoming.length;
+      _cachedActiveWorkers = workers.where((w) => w.active).length;
+    } else {
+      if (!_workersExpanded) {
+        workers = incoming;
+        workersHasMore = meta.hasMore;
+      } else {
+        final incomingIds = {for (final w in incoming) w.ticketId};
+        final tail = [for (final w in workers) if (!incomingIds.contains(w.ticketId)) w];
+        workers = tail.isEmpty ? incoming : List<Worker>.unmodifiable([...incoming, ...tail]);
+        workersHasMore = workers.length < meta.total;
+      }
+      workersTotal = meta.total;
+      _cachedActiveWorkers = meta.activeCount;
+    }
+    workersRev++;
+    if (_cachedActiveWorkers != prevActive) badgesRev++;
+  }
+
+  /// Loads the next older page of conversation messages on demand.
+  Future<void> loadMoreMessages() async {
+    if (loadingMoreMessages || !messagesHasMore) return;
+    final api = client;
+    if (api == null) return;
+    final beforeId = messages.isNotEmpty ? messages.first.id : null;
+    if (beforeId == null || beforeId <= 0) {
+      messagesHasMore = false;
+      loadMoreMessagesError = null;
+      messagesRev++;
+      _notify();
+      return;
+    }
+    final epoch = _epoch;
+    final msgEpoch = _messagesEpoch;
+    loadingMoreMessages = true;
+    loadMoreMessagesError = null;
+    messagesRev++;
+    _notify();
+    try {
+      final page = await api.messagesPage(limit: historyPageSize, beforeId: beforeId, previousMessages: messages);
+      if (_disposed || epoch != _epoch || msgEpoch != _messagesEpoch) return;
+      final currentFirstId = messages.isEmpty ? null : messages.first.id;
+      final older = currentFirstId == null
+          ? page.messages
+          : [for (final m in page.messages) if (m.id < currentFirstId) m];
+      if (older.isNotEmpty) {
+        messages = List<ChatMessage>.unmodifiable([...older, ...messages]);
+      }
+      if (page.meta != null) {
+        messagesHasMore = page.hasMore && older.isNotEmpty;
+        if (page.total > messagesTotal) messagesTotal = page.total;
+      } else {
+        messagesHasMore = false;
+        messagesTotal = messages.length;
+      }
+    } on ApiException catch (error) {
+      if (_disposed || epoch != _epoch || msgEpoch != _messagesEpoch) return;
+      loadMoreMessagesError = error.message;
+    } finally {
+      if (!_disposed && epoch == _epoch && msgEpoch == _messagesEpoch) {
+        loadingMoreMessages = false;
+        messagesRev++;
+        _notify();
+      }
+    }
+  }
+
+  /// Loads the next page of historical tasks on demand.
+  Future<void> loadMoreWorkers() async {
+    if (loadingMoreWorkers || !workersHasMore) return;
+    final api = client;
+    if (api == null) return;
+    final epoch = _epoch;
+    final workersEpoch = _workersEpoch;
+    final offset = workers.length;
+    loadingMoreWorkers = true;
+    loadMoreWorkersError = null;
+    workersRev++;
+    _notify();
+    try {
+      final page = await api.workersPage(limit: historyPageSize, offset: offset);
+      if (_disposed || epoch != _epoch || workersEpoch != _workersEpoch) return;
+      final seen = {for (final w in workers) w.ticketId};
+      final added = [for (final w in page.workers) if (seen.add(w.ticketId)) w];
+      if (added.isNotEmpty) {
+        workers = List<Worker>.unmodifiable([...workers, ...added]);
+        _workersExpanded = true;
+      }
+      if (page.meta != null) {
+        workersTotal = page.total;
+        final prevActive = _cachedActiveWorkers;
+        _cachedActiveWorkers = page.activeCount;
+        if (_cachedActiveWorkers != prevActive) badgesRev++;
+        workersHasMore = page.hasMore && workers.length < page.total && page.workers.isNotEmpty;
+      } else {
+        workersTotal = workers.length;
+        workersHasMore = false;
+      }
+    } on ApiException catch (error) {
+      if (_disposed || epoch != _epoch || workersEpoch != _workersEpoch) return;
+      loadMoreWorkersError = error.message;
+    } finally {
+      if (!_disposed && epoch == _epoch && workersEpoch == _workersEpoch) {
+        loadingMoreWorkers = false;
+        workersRev++;
+        _notify();
+      }
+    }
+  }
+
   Future<void> _refresh() async {
     final api = client;
     if (api == null) return;
@@ -339,6 +540,8 @@ class AppState extends ChangeNotifier {
           etags: _pollEtags,
           workerId: selected,
           wantHealth: wantHealth,
+          messagesLimit: historyPageSize,
+          workersLimit: historyPageSize,
           previousMessages: messages,
         );
         if (epoch != _epoch) return;
@@ -346,16 +549,11 @@ class AppState extends ChangeNotifier {
           if (!poll.unchanged) {
             _pollEtags.addAll(poll.etags);
             if (poll.messages != null) {
-              messages = poll.messages!;
-              messagesRev++;
+              _applyPolledMessages(poll.messages!, poll.messagesMeta);
               changed = true;
             }
             if (poll.workers != null) {
-              final prevActive = _cachedActiveWorkers;
-              workers = poll.workers!;
-              _cachedActiveWorkers = workers.where((w) => w.active).length;
-              workersRev++;
-              if (_cachedActiveWorkers != prevActive) badgesRev++;
+              _applyPolledWorkers(poll.workers!, poll.workersMeta);
               changed = true;
             }
             if (poll.activity != null) {
@@ -404,8 +602,17 @@ class AppState extends ChangeNotifier {
         _detailEtag = null;
       }
 
-      final messagesFuture = api.messagesIfChanged(ifNoneMatch: _messagesEtag, previousRaw: _messagesRaw, previousMessages: messages);
-      final workersFuture = api.workersIfChanged(ifNoneMatch: _workersEtag, previousRaw: _workersRaw);
+      final messagesFuture = api.messagesIfChanged(
+        ifNoneMatch: _messagesEtag,
+        previousRaw: _messagesRaw,
+        limit: historyPageSize,
+        previousMessages: messages,
+      );
+      final workersFuture = api.workersIfChanged(
+        ifNoneMatch: _workersEtag,
+        previousRaw: _workersRaw,
+        limit: historyPageSize,
+      );
       final activityFuture = api.activityIfChanged(ifNoneMatch: _activityEtag, previousRaw: _activityRaw);
       final healthFuture = wantHealth ? api.health() : Future<Health?>.value(null);
       final detailFuture = selected != null
@@ -427,19 +634,14 @@ class AppState extends ChangeNotifier {
       _messagesEtag = msgRes.etag;
       if (msgRes.changed) {
         _messagesRaw = msgRes.raw;
-        messages = msgRes.value!;
-        messagesRev++;
+        _applyPolledMessages(msgRes.value!.messages, msgRes.value!.meta);
         changed = true;
       }
 
       _workersEtag = workersRes.etag;
       if (workersRes.changed) {
         _workersRaw = workersRes.raw;
-        final prevActive = _cachedActiveWorkers;
-        workers = workersRes.value!;
-        _cachedActiveWorkers = workers.where((worker) => worker.active).length;
-        workersRev++;
-        if (_cachedActiveWorkers != prevActive) badgesRev++;
+        _applyPolledWorkers(workersRes.value!.workers, workersRes.value!.meta);
         changed = true;
       }
 
@@ -532,9 +734,17 @@ class AppState extends ChangeNotifier {
     final api = client;
     if (api == null) throw ApiException(0, 'offline');
     await api.resetSession();
+    _messagesEpoch++;
+    messages = const [];
+    messagesHasMore = false;
+    messagesTotal = 0;
+    loadingMoreMessages = false;
+    loadMoreMessagesError = null;
     _pollEtags.remove('m');
     _messagesRaw = '';
     _messagesEtag = null;
+    messagesRev++;
+    _notify();
     await refresh();
   }
 
@@ -548,8 +758,15 @@ class AppState extends ChangeNotifier {
       workerDetailRev++;
     }
     final prevActive = _cachedActiveWorkers;
+    final wasActive = workers.any((worker) => worker.ticketId == ticketId && worker.active);
     workers = List<Worker>.unmodifiable([for (final worker in workers) worker.ticketId == ticketId ? stopped : worker]);
-    _cachedActiveWorkers = workers.where((worker) => worker.active).length;
+    if (workersHasMore) {
+      if (wasActive && !stopped.active && _cachedActiveWorkers > 0) {
+        _cachedActiveWorkers--;
+      }
+    } else {
+      _cachedActiveWorkers = workers.where((worker) => worker.active).length;
+    }
     workersRev++;
     if (_cachedActiveWorkers != prevActive) badgesRev++;
     _pollEtags.remove('w');

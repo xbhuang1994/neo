@@ -50,6 +50,12 @@ import {
 } from "./settings.ts";
 import { clip } from "./text.ts";
 
+/** Default page size for paginated chat and task history lists. */
+export const DEFAULT_HISTORY_PAGE_SIZE = 20;
+
+/** Upper bound on a single history page request. */
+export const MAX_HISTORY_PAGE_SIZE = 200;
+
 /** How old a kernel's model list may be before it is listed again in the background (60s). */
 export const MODEL_LIST_STALE_MS = 60_000;
 
@@ -124,6 +130,36 @@ export interface PanelMessageView {
   at?: number;
   images?: PanelImageView[];
   files?: PanelFileView[];
+}
+
+/** Query options for paginated chat history (`GET /api/messages?limit=...&before=...`). */
+export interface PanelMessagesPageOptions {
+  limit?: number;
+  beforeId?: number;
+}
+
+/** Paginated chat history payload. */
+export interface PanelMessagesPageView {
+  messages: PanelMessageView[];
+  hasMore: boolean;
+  total: number;
+  oldestId: number | null;
+}
+
+/** Query options for paginated worker cards (`GET /api/workers?limit=...&offset=...`). */
+export interface WorkerCardsPageOptions {
+  limit?: number;
+  offset?: number;
+}
+
+/** Paginated worker cards payload. */
+export interface WorkerCardsPageView {
+  workers: WorkerCardView[];
+  hasMore: boolean;
+  total: number;
+  activeCount: number;
+  offset: number;
+  limit: number;
 }
 
 /** One background job on a worker card. */
@@ -535,70 +571,158 @@ export async function activityView(app: AppContext): Promise<ActivityView> {
   return { router, workers };
 }
 
+function panelMessageRole(entry: Entry): "user" | "assistant" | null {
+  if (entry.type !== "custom_message") {
+    return null;
+  }
+  const source = entrySource(entry);
+  if (source === "chat-reply") {
+    return "assistant";
+  }
+  if (source === "web-panel" || source === "wechat") {
+    return "user";
+  }
+  return null;
+}
+
+function hasVisibleText(entry: Entry): boolean {
+  if (entry.type !== "custom_message") {
+    return false;
+  }
+  let textCount = 0;
+  for (let i = 0; i < entry.content.length; i += 1) {
+    const block = entry.content[i];
+    if (block.type === "text") {
+      if (block.text.length > 0) return true;
+      textCount += 1;
+      if (textCount > 1) return true;
+    }
+  }
+  return false;
+}
+
+function isVisiblePanelEntry(entry: Entry): boolean {
+  return panelMessageRole(entry) !== null && hasVisibleText(entry);
+}
+
+function toPanelMessage(entry: Entry, index: number): PanelMessageView | null {
+  const role = panelMessageRole(entry);
+  if (role === null || entry.type !== "custom_message") {
+    return null;
+  }
+  const text = textOf(entry.content);
+  if (text.length === 0) {
+    return null;
+  }
+  const source = entrySource(entry)!;
+  const files = entryAttachments(entry);
+  const imageNames: string[] = [];
+  const others: PanelFileView[] = [];
+  for (const [name, mediaType, kind] of files) {
+    if (kind === "image") {
+      imageNames.push(name);
+    } else {
+      others.push({ name, mediaType, kind });
+    }
+  }
+
+  let imageNameIdx = 0;
+  const images: PanelImageView[] = [];
+  for (let at = 0; at < entry.content.length; at += 1) {
+    const block = entry.content[at];
+    if (block.type === "image") {
+      const name =
+        imageNameIdx < imageNames.length ? imageNames[imageNameIdx++] : `image-${at + 1}`;
+      images.push({ name, mediaType: block.mimeType, data: block.data });
+    }
+  }
+
+  const message: PanelMessageView = {
+    id: index,
+    role,
+    text,
+    source,
+  };
+  const at = parseIso(entryTimestamp(entry));
+  if (at !== undefined) {
+    message.at = at;
+  }
+  if (images.length > 0) {
+    message.images = images;
+  }
+  if (others.length > 0) {
+    message.files = others;
+  }
+  return message;
+}
+
+function clampPageLimit(limit: number | undefined): number {
+  if (limit === undefined || !Number.isFinite(limit)) {
+    return DEFAULT_HISTORY_PAGE_SIZE;
+  }
+  return Math.max(1, Math.min(MAX_HISTORY_PAGE_SIZE, Math.trunc(limit)));
+}
+
 /** The conversation as people see it: what they wrote, in the app or WeChat, and what they were answered. */
 export function panelMessages(app: AppContext): PanelMessageView[] {
   const transcript = app.chatTranscript();
   const out: PanelMessageView[] = [];
   for (let index = 0; index < transcript.length; index += 1) {
-    const entry = transcript[index];
-    if (entry.type !== "custom_message") {
-      continue;
+    const message = toPanelMessage(transcript[index], index);
+    if (message !== null) {
+      out.push(message);
     }
-    const source = entrySource(entry);
-    let role: "user" | "assistant";
-    if (source === "chat-reply") {
-      role = "assistant";
-    } else if (source === "web-panel" || source === "wechat") {
-      role = "user";
-    } else {
-      continue;
-    }
-    const text = textOf(entry.content);
-    if (text.length === 0) {
-      continue;
-    }
-
-    const files = entryAttachments(entry);
-    const imageNames: string[] = [];
-    const others: PanelFileView[] = [];
-    for (const [name, mediaType, kind] of files) {
-      if (kind === "image") {
-        imageNames.push(name);
-      } else {
-        others.push({ name, mediaType, kind });
-      }
-    }
-
-    let imageNameIdx = 0;
-    const images: PanelImageView[] = [];
-    for (let at = 0; at < entry.content.length; at += 1) {
-      const block = entry.content[at];
-      if (block.type === "image") {
-        const name =
-          imageNameIdx < imageNames.length ? imageNames[imageNameIdx++] : `image-${at + 1}`;
-        images.push({ name, mediaType: block.mimeType, data: block.data });
-      }
-    }
-
-    const message: PanelMessageView = {
-      id: index,
-      role,
-      text,
-      source,
-    };
-    const at = parseIso(entryTimestamp(entry));
-    if (at !== undefined) {
-      message.at = at;
-    }
-    if (images.length > 0) {
-      message.images = images;
-    }
-    if (others.length > 0) {
-      message.files = others;
-    }
-    out.push(message);
   }
   return out;
+}
+
+/**
+ * One page of the visible conversation, oldest first within the page.
+ * Defaults to the latest `DEFAULT_HISTORY_PAGE_SIZE` (20) messages, or the latest `limit` messages strictly
+ * before `beforeId`, without materializing attachments/images outside the returned window.
+ */
+export function panelMessagesPage(
+  app: AppContext,
+  options: PanelMessagesPageOptions = {},
+): PanelMessagesPageView {
+  const limit = clampPageLimit(options.limit);
+  const transcript = app.chatTranscript();
+  const endExclusive =
+    options.beforeId !== undefined
+      ? Math.max(0, Math.min(Math.trunc(options.beforeId), transcript.length))
+      : transcript.length;
+
+  const reversed: PanelMessageView[] = [];
+  let total = 0;
+  let hasMore = false;
+
+  for (let index = transcript.length - 1; index >= endExclusive; index -= 1) {
+    if (isVisiblePanelEntry(transcript[index])) {
+      total += 1;
+    }
+  }
+
+  for (let index = endExclusive - 1; index >= 0; index -= 1) {
+    const entry = transcript[index];
+    if (reversed.length < limit) {
+      const message = toPanelMessage(entry, index);
+      if (message !== null) {
+        reversed.push(message);
+        total += 1;
+      }
+    } else if (isVisiblePanelEntry(entry)) {
+      hasMore = true;
+      total += 1;
+    }
+  }
+
+  reversed.reverse();
+  return {
+    messages: reversed,
+    hasMore,
+    total,
+    oldestId: reversed.length > 0 ? reversed[0].id : null,
+  };
 }
 
 function workerCardWithJobs(
@@ -655,18 +779,10 @@ function workerCardWithJobs(
   };
 }
 
-/** Every ticket with its worker, open ones first and each group by latest change. */
-export async function workerCards(app: AppContext): Promise<WorkerCardView[]> {
-  const tickets = app.store.tickets();
-  tickets.sort((left, right) => {
-    const leftEnded = left.ended !== undefined ? 1 : 0;
-    const rightEnded = right.ended !== undefined ? 1 : 0;
-    if (leftEnded !== rightEnded) {
-      return leftEnded - rightEnded;
-    }
-    return right.updatedAt < left.updatedAt ? -1 : right.updatedAt > left.updatedAt ? 1 : 0;
-  });
-
+async function buildWorkerCards(
+  app: AppContext,
+  tickets: readonly Ticket[],
+): Promise<WorkerCardView[]> {
   const activeIds: string[] = [];
   for (const ticket of tickets) {
     const loaded = app.session(workerSessionId(ticket.id));
@@ -691,6 +807,47 @@ export async function workerCards(app: AppContext): Promise<WorkerCardView[]> {
   return tickets.map((ticket) =>
     workerCardWithJobs(app, ticket, jobsByTicket.get(ticket.id) ?? []),
   );
+}
+
+/** Every ticket with its worker, open ones first and each group by latest change. */
+export async function workerCards(app: AppContext): Promise<WorkerCardView[]> {
+  const tickets = app.store.tickets();
+  tickets.sort((left, right) => {
+    const leftEnded = left.ended !== undefined ? 1 : 0;
+    const rightEnded = right.ended !== undefined ? 1 : 0;
+    if (leftEnded !== rightEnded) {
+      return leftEnded - rightEnded;
+    }
+    if (right.updatedAt !== left.updatedAt) {
+      return right.updatedAt < left.updatedAt ? -1 : 1;
+    }
+    return right.id < left.id ? -1 : right.id > left.id ? 1 : 0;
+  });
+
+  return await buildWorkerCards(app, tickets);
+}
+
+/**
+ * One page of tickets with their workers, open ones first and each group newest `updatedAt` first.
+ * Reads only the requested slice from SQLite and fetches live jobs only for sessions in that slice.
+ */
+export async function workerCardsPage(
+  app: AppContext,
+  options: WorkerCardsPageOptions = {},
+): Promise<WorkerCardsPageView> {
+  const limit = clampPageLimit(options.limit);
+  const offset = Math.max(0, Math.trunc(options.offset ?? 0));
+  const counts = app.store.ticketCounts();
+  const tickets = app.store.workerTicketPage(offset, limit);
+  const workers = await buildWorkerCards(app, tickets);
+  return {
+    workers,
+    hasMore: offset + workers.length < counts.total,
+    total: counts.total,
+    activeCount: counts.active,
+    offset,
+    limit,
+  };
 }
 
 /** One ticket with its Inputs, newest first, and its worker's latest thirty transcript entries. */

@@ -49,7 +49,16 @@ class WorkersPage extends StatelessWidget {
         final wide = constraints.maxWidth >= 720;
         final selected = state.selectedWorkerId;
         final showDetailOnly = !wide && selected != null;
-        final list = WorkerList(workers: state.workers, selected: selected, onSelect: state.selectWorker);
+        final list = WorkerList(
+          workers: state.workers,
+          selected: selected,
+          onSelect: state.selectWorker,
+          hasMore: state.workersHasMore,
+          loadingMore: state.loadingMoreWorkers,
+          loadMoreError: state.loadMoreWorkersError,
+          remainingCount: state.remainingMoreWorkers,
+          onLoadMore: state.loadMoreWorkers,
+        );
         final detail = WorkerDetail(worker: state.detail ?? _cardOf(state, selected));
         return ColoredBox(
           color: palette.background,
@@ -60,7 +69,7 @@ class WorkersPage extends StatelessWidget {
                 leading: showDetailOnly
                     ? Tappable(onTap: () => state.selectWorker(null), padding: const EdgeInsets.all(6), child: Icon(CupertinoIcons.chevron_back, size: 20, color: palette.accent))
                     : null,
-                subtitle: showDetailOnly ? null : Text(strings.workersSummary(state.activeWorkers, state.workers.length), style: Typo.of(context).footnote),
+                subtitle: showDetailOnly ? null : Text(strings.workersSummary(state.activeWorkers, state.workersTotal > 0 ? state.workersTotal : state.workers.length), style: Typo.of(context).footnote),
               ),
               LinkNotice(onOpenSettings: onOpenSettings),
               Expanded(
@@ -92,28 +101,153 @@ class WorkersPage extends StatelessWidget {
   }
 }
 
-/// The tasks as cards, open ones first.
-class WorkerList extends StatelessWidget {
-  const WorkerList({super.key, required this.workers, required this.selected, required this.onSelect});
+/// The tasks as cards, open ones first, with on-demand pagination as the user scrolls or taps load more.
+class WorkerList extends StatefulWidget {
+  const WorkerList({
+    super.key,
+    required this.workers,
+    required this.selected,
+    required this.onSelect,
+    this.hasMore = false,
+    this.loadingMore = false,
+    this.loadMoreError,
+    this.remainingCount = 0,
+    this.onLoadMore,
+  });
 
   final List<Worker> workers;
   final String? selected;
   final ValueChanged<String?> onSelect;
+  final bool hasMore;
+  final bool loadingMore;
+  final String? loadMoreError;
+  final int remainingCount;
+  final Future<void> Function()? onLoadMore;
+
+  @override
+  State<WorkerList> createState() => _WorkerListState();
+}
+
+class _WorkerListState extends State<WorkerList> {
+  final ScrollController _scroll = ScrollController();
+  double _lastPixels = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _scroll.addListener(_onScroll);
+  }
+
+  void _triggerLoadMore() {
+    final loader = widget.onLoadMore;
+    if (loader == null || widget.loadingMore || !widget.hasMore) return;
+    unawaited(loader());
+  }
+
+  void _onScroll() {
+    if (!_scroll.hasClients) return;
+    final pos = _scroll.position;
+    final pixels = pos.pixels;
+    final delta = pixels - _lastPixels;
+    _lastPixels = pixels;
+    if (delta > 0.5 &&
+        widget.hasMore &&
+        !widget.loadingMore &&
+        widget.loadMoreError == null &&
+        pos.maxScrollExtent - pixels <= 160) {
+      _triggerLoadMore();
+    }
+  }
+
+  @override
+  void dispose() {
+    _scroll.removeListener(_onScroll);
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  Widget _buildFooter(BuildContext context) {
+    final strings = Strings.read(context);
+    final palette = Palette.of(context);
+    final typo = Typo.of(context);
+    final hasError = widget.loadMoreError != null;
+    final label = widget.loadingMore
+        ? strings.loadingMoreWorkers
+        : hasError
+        ? strings.loadMoreWorkersFailed
+        : widget.remainingCount > 0
+        ? strings.loadMoreWorkersRemaining(widget.remainingCount)
+        : strings.loadMoreWorkers;
+    final tint = hasError ? palette.red : palette.accent;
+    return Padding(
+      padding: const EdgeInsets.only(top: 6, bottom: 8),
+      child: Center(
+        child: widget.loadingMore
+            ? Container(
+                key: const ValueKey('load-more-workers'),
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                decoration: BoxDecoration(color: palette.fill, borderRadius: BorderRadius.circular(999)),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const CupertinoActivityIndicator(radius: 7.5),
+                    const SizedBox(width: 8),
+                    Text(label, style: typo.caption.copyWith(color: palette.secondary)),
+                  ],
+                ),
+              )
+            : Tappable(
+                key: const ValueKey('load-more-workers'),
+                borderRadius: 999,
+                onTap: _triggerLoadMore,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: hasError ? palette.red.withValues(alpha: 0.12) : palette.fill,
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(hasError ? CupertinoIcons.exclamationmark_circle : CupertinoIcons.arrow_down_circle, size: 14, color: tint),
+                      const SizedBox(width: 6),
+                      Flexible(
+                        child: Text(
+                          label,
+                          style: typo.caption.copyWith(color: tint, fontWeight: FontWeight.w600),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     final strings = Strings.read(context);
     final palette = Palette.of(context);
     final typo = Typo.of(context);
+    final showFooter = widget.hasMore || widget.loadingMore || widget.loadMoreError != null;
+    final itemCount = widget.workers.length + (showFooter ? 1 : 0);
     return RepaintBoundary(
       child: CupertinoScrollbar(
+        controller: _scroll,
         child: ListView.builder(
+          controller: _scroll,
           scrollCacheExtent: const ScrollCacheExtent.pixels(500),
           addAutomaticKeepAlives: false,
           padding: const EdgeInsets.all(grid * 1.5),
-          itemCount: workers.length,
+          itemCount: itemCount,
           itemBuilder: (context, index) {
-            final worker = workers[index];
+            if (index >= widget.workers.length) {
+              return _buildFooter(context);
+            }
+            final worker = widget.workers[index];
             final (status, color) = workerStatus(worker, strings, palette);
             final facts = [
               if (worker.report != null) strings.reportState(worker.report!.state) else if (worker.assignmentState != null) strings.reportState(worker.assignmentState!) else strings.notStarted,
@@ -125,10 +259,10 @@ class WorkerList extends StatelessWidget {
               padding: const EdgeInsets.only(bottom: 6),
               child: Tappable(
                 key: ValueKey('worker-${worker.ticketId}'),
-                selected: worker.ticketId == selected,
+                selected: worker.ticketId == widget.selected,
                 borderRadius: radius,
                 padding: const EdgeInsets.all(12),
-                onTap: () => onSelect(worker.ticketId),
+                onTap: () => widget.onSelect(worker.ticketId),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [

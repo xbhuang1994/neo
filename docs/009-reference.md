@@ -66,8 +66,9 @@ JSON over HTTP, as [006 Deployment](006-deployment.md) says who may call. Errors
 | Route | Does |
 | --- | --- |
 | `GET /api/health` | `{ready, version, kernel, paused, activeWorkers, components}`; each component has `state` (`ready`, `waiting`, `error`), `detail` and `at` |
-| `GET /api/messages` | `{messages}`: the visible conversation, each `{id, role: user\|assistant, text, at, source, images?, files?}` |
-| `GET /api/workers` | `{workers}`: every Ticket with its worker: `{ticketId, title, stage, outcome, updatedAt, directory, digest, session, background, assignment, progress, attention, pendingInputs, delivery}` |
+| `GET /api/messages` | `{messages}`: the visible conversation, each `{id, role: user\|assistant, text, at, source, images?, files?}`. Optional `?limit=<1..200>&before=<id>` returns `{messages, hasMore, total, oldestId}` for on-demand history pagination (default 20) |
+| `GET /api/workers` | `{workers}`: every Ticket with its worker: `{ticketId, title, stage, outcome, updatedAt, directory, digest, session, background, assignment, progress, attention, pendingInputs, delivery}`. Optional `?limit=<1..200>&offset=<n>` returns `{workers, hasMore, total, activeCount, offset, limit}` for on-demand pagination (default 20) |
+| `GET /api/poll` | Combined conditional poll (`?include=m,w,a,d,wd,h&mLimit=20&wLimit=20`) returning only changed slices, per-slice ETags, and optional pagination `meta` (`{messages?, workers?}`), or `304 Not Modified` when unchanged |
 | `GET /api/workers/{ticketId}` | The same with `inputs` and `recent`, the worker's latest thirty transcript entries |
 | `POST /api/workers/{ticketId}/stop` | Stops an open Ticket together with its worker, subagents and background jobs, marking it `ended` with outcome `stopped`, and answers the updated worker detail; refuses a Ticket that has already ended |
 | `GET /api/activity` | `{router, workers}`: whether the main Session is thinking, and for each busy worker `{ticketId, title, doing}`, a line on what it does now: its latest tool call or line while in a turn, else its background job, else its latest report. The app's ticker polls it |

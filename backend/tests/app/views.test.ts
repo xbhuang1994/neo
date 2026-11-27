@@ -7,6 +7,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { roleModels, type ChatAttachment, type ModelOption } from "../../src/app/index.ts";
+import { mandateBasisVia } from "../../src/core/index.ts";
 import { VERSION } from "../../src/version.ts";
 import { coreModel, Fixture, fixture, modelsReady, started } from "./common.ts";
 
@@ -380,6 +381,106 @@ describe("views", () => {
         (view.eval as Record<string, unknown>).mode,
         ((view.policy as Record<string, unknown>).rules as Record<string, unknown>[])[0].id,
       ]).toEqual([false, 5, "auto", "docs"]);
+      await f.app.stop();
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("paginates panelMessagesPage and workerCardsPage with 20-item defaults and stable cursors", async () => {
+    const f = await started();
+    try {
+      // Seed 45 visible chat messages directly into the orchestrator session.
+      for (let i = 1; i <= 45; i++) {
+        if (i % 2 === 1) {
+          await f.app.presentChat(`User message #${i}`, [], `req-user-${i}`, "web-panel");
+        } else {
+          await f.app.publish(`req-reply-${i}`, `Assistant reply #${i}`);
+        }
+      }
+
+      const full = f.app.panelMessages() as Array<{ id: number; text: string }>;
+      expect(full.length).toBe(45);
+
+      const page1 = f.app.panelMessagesPage();
+      expect(page1.messages.length).toBe(20);
+      expect(page1.hasMore).toBe(true);
+      expect(page1.total).toBe(45);
+      expect(page1.oldestId).toBe(page1.messages[0].id);
+      expect(page1.messages.map((m) => m.id)).toEqual(full.slice(25).map((m) => m.id));
+
+      const page2 = f.app.panelMessagesPage({ limit: 20, beforeId: page1.oldestId! });
+      expect(page2.messages.length).toBe(20);
+      expect(page2.hasMore).toBe(true);
+      expect(page2.total).toBe(45);
+      expect(page2.messages.map((m) => m.id)).toEqual(full.slice(5, 25).map((m) => m.id));
+
+      const page3 = f.app.panelMessagesPage({ limit: 20, beforeId: page2.oldestId! });
+      expect(page3.messages.length).toBe(5);
+      expect(page3.hasMore).toBe(false);
+      expect(page3.total).toBe(45);
+      expect(page3.messages.map((m) => m.id)).toEqual(full.slice(0, 5).map((m) => m.id));
+
+      const page4 = f.app.panelMessagesPage({ limit: 20, beforeId: page3.oldestId! });
+      expect(page4.messages).toEqual([]);
+      expect(page4.hasMore).toBe(false);
+      expect(page4.oldestId).toBeNull();
+      expect(page4.total).toBe(45);
+
+      // Seed 45 tickets: 2 active + 43 ended.
+      const baseMs = Date.parse("2026-11-28T01:00:00.000Z");
+      for (let i = 1; i <= 45; i++) {
+        const isOpen = i >= 44;
+        const iso = new Date(baseMs + i * 60_000).toISOString();
+        f.app.store.saveTicket({
+          id: `tk-${String(i).padStart(3, "0")}`,
+          title: `Task ${i}`,
+          decisionId: `dec-${i}`,
+          mandate: {
+            strength: "explicit",
+            policyVersion: "v1",
+            basis: mandateBasisVia({ via: "addressed", addressed: "direct" }),
+            actor: { source: "chat", id: "web:local" },
+            scope: "small",
+          },
+          channels: [{ source: "chat", thread: "web:local", address: {} }],
+          origin: {
+            triggerId: `tr-${i}`,
+            triggerIds: [`tr-${i}`],
+          },
+          inputs: [],
+          undelivered: [],
+          assignments: [],
+          ...(isOpen ? {} : { ended: { outcome: "completed", by: "executor", at: iso, reason: "done" } }),
+          createdAt: iso,
+          updatedAt: iso,
+        });
+      }
+
+      const wPage1 = await f.app.workerCardsPage();
+      expect(wPage1.workers.length).toBe(20);
+      expect(wPage1.hasMore).toBe(true);
+      expect(wPage1.total).toBe(45);
+      expect(wPage1.activeCount).toBe(2);
+      expect(wPage1.offset).toBe(0);
+      expect(wPage1.limit).toBe(20);
+      expect(wPage1.workers[0].ticketId).toBe("tk-045");
+      expect(wPage1.workers[1].ticketId).toBe("tk-044");
+      expect(wPage1.workers[2].ticketId).toBe("tk-043");
+      expect(wPage1.workers[19].ticketId).toBe("tk-026");
+
+      const wPage2 = await f.app.workerCardsPage({ limit: 20, offset: 20 });
+      expect(wPage2.workers.length).toBe(20);
+      expect(wPage2.hasMore).toBe(true);
+      expect(wPage2.workers[0].ticketId).toBe("tk-025");
+      expect(wPage2.workers[19].ticketId).toBe("tk-006");
+
+      const wPage3 = await f.app.workerCardsPage({ limit: 20, offset: 40 });
+      expect(wPage3.workers.length).toBe(5);
+      expect(wPage3.hasMore).toBe(false);
+      expect(wPage3.workers[0].ticketId).toBe("tk-005");
+      expect(wPage3.workers[4].ticketId).toBe("tk-001");
+
       await f.app.stop();
     } finally {
       await f.cleanup();

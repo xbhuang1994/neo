@@ -51,11 +51,14 @@ import {
   getThreadPage,
   getThreadTriggers,
   getTicketCount,
+  getTicketCounts,
   getTicketPage,
   getTriggersByIds,
+  getWorkerTicketPage,
   searchTriggers,
   type FailingReply,
   type Place,
+  type TicketCounts,
 } from "./read.ts";
 import {
   addReceipt,
@@ -85,7 +88,7 @@ export {
   type Receipt,
   type Settled,
 };
-export type { EffectRow, EffectSummary, FailingReply, Place };
+export type { EffectRow, EffectSummary, FailingReply, Place, TicketCounts };
 
 /** The schema this build reads and writes. Earlier TypeScript deployments used schema 1 and are not migrated. */
 export const SCHEMA_VERSION = 100;
@@ -705,6 +708,16 @@ export class Store implements Repositories {
   /** Total number of stored tickets. */
   ticketCount(): number {
     return getTicketCount(this.db);
+  }
+
+  /** Total and open (active) ticket counts. */
+  ticketCounts(): TicketCounts {
+    return getTicketCounts(this.db);
+  }
+
+  /** One page of tickets ordered for the task list: open first, each group newest `updatedAt` first. */
+  workerTicketPage(offset: number, limit: number): Ticket[] {
+    return getWorkerTicketPage(this.db, offset, limit);
   }
 
   /** Batch-fetch triggers by id in chunks, avoiding SQLite bind-parameter limits and N+1 queries. */

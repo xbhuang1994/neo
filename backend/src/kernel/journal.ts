@@ -267,6 +267,8 @@ export class Journal {
   private fd: number;
   private closed = false;
   private readonly entryList: Entry[];
+  /** Cached visible chat entries, oldest first. */
+  private readonly chatList: Entry[];
   /** O(1) index into `entryList` by entry id. */
   private readonly idIndex: Map<string, number>;
   /** O(1) index into `entryList` by delivery request id. */
@@ -282,6 +284,7 @@ export class Journal {
     filePath: string,
     fd: number,
     entries: Entry[],
+    chatEntries: Entry[],
     idIndex: Map<string, number>,
     requestIndex: Map<string, number>,
     pendingMap: Map<string, boolean>,
@@ -291,6 +294,7 @@ export class Journal {
     this.filePath = filePath;
     this.fd = fd;
     this.entryList = entries;
+    this.chatList = chatEntries;
     this.idIndex = idIndex;
     this.requestIndex = requestIndex;
     this.pendingMap = pendingMap;
@@ -313,6 +317,7 @@ export class Journal {
     const journal = new Journal(
       filePath,
       fd,
+      [],
       [],
       new Map(),
       new Map(),
@@ -338,6 +343,7 @@ export class Journal {
     }
 
     const entries: Entry[] = [];
+    const chatEntries: Entry[] = [];
     const idIndex = new Map<string, number>();
     const requestIndex = new Map<string, number>();
     const pendingMap = new Map<string, boolean>();
@@ -395,6 +401,10 @@ export class Journal {
             requestIndex.set(reqId, index);
           }
           entries.push(entry);
+          const source = entrySource(entry);
+          if (source !== undefined && VISIBLE_SOURCE_SET.has(source)) {
+            chatEntries.push(entry);
+          }
           continue;
         }
 
@@ -453,6 +463,7 @@ export class Journal {
       filePath,
       appendFd,
       entries,
+      chatEntries,
       idIndex,
       requestIndex,
       pendingMap,
@@ -583,6 +594,10 @@ export class Journal {
       this.requestIndex.set(reqId, index);
     }
     this.entryList.push(entry);
+    const source = entrySource(entry);
+    if (source !== undefined && VISIBLE_SOURCE_SET.has(source)) {
+      this.chatList.push(entry);
+    }
     return entry;
   }
 
@@ -664,14 +679,7 @@ export class Journal {
 
   /** The visible chat transcript: what the app shows. */
   chat(): Entry[] {
-    const out: Entry[] = [];
-    for (const entry of this.entryList) {
-      const source = entrySource(entry);
-      if (source !== undefined && VISIBLE_SOURCE_SET.has(source)) {
-        out.push(entry);
-      }
-    }
-    return out;
+    return this.chatList.slice();
   }
 
   /** The text of the model's latest message with non-empty text. */
