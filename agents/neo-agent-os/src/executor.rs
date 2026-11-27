@@ -1,3 +1,4 @@
+use crate::file_transfer::{replace_file_atomic, system_time_to_ms};
 use crate::policy::{Policy, SandboxLevel};
 use crate::prober::SandboxSummary;
 use crate::updater::verify_ed25519_signature;
@@ -6,7 +7,7 @@ use base64::Engine;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -190,6 +191,7 @@ impl Executor {
     ) -> Value {
         let res = match method {
             "exec" => self.handle_exec(params, timeout_ms).await,
+            "fs_stat" | "fs.stat" => self.handle_fs_stat(params).await,
             "fs_read" | "fs.read" => self.handle_fs_read(params).await,
             "fs_write" | "fs.write" => self.handle_fs_write(params).await,
             "fs_list" | "fs.list" => self.handle_fs_list(params).await,
@@ -447,6 +449,95 @@ impl Executor {
         Ok(result)
     }
 
+    async fn handle_fs_stat(&self, params: &Value) -> Result<Value, String> {
+        let raw_path = params
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or("fs_stat requires 'path'")?;
+        let want_sha256 = params
+            .get("sha256")
+            .or_else(|| params.get("checksum"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        // Enforce workspace boundary BEFORE checking filesystem existence so paths outside
+        // allowed_workspaces never leak existence metadata.
+        let policy = self.policy_snapshot();
+        let resolved = policy.validate_path(raw_path, false)?;
+
+        // Also check whether the caller's entry itself (strictly inside workspace) was a symlink.
+        let input_path = Path::new(raw_path);
+        let candidate = if input_path.is_absolute() {
+            input_path.to_path_buf()
+        } else {
+            policy.default_cwd()?.join(input_path)
+        };
+        let is_symlink = tokio::fs::symlink_metadata(&candidate)
+            .await
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+
+        let meta = match tokio::fs::metadata(&resolved).await {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(json!({
+                    "exists": false,
+                    "path": resolved.to_string_lossy(),
+                }));
+            }
+            Err(e) => return Err(format!("fs_stat metadata error: {e}")),
+        };
+
+        let is_file = meta.is_file();
+        let is_dir = meta.is_dir();
+        let kind = if is_file {
+            "file"
+        } else if is_dir {
+            "dir"
+        } else if is_symlink {
+            "symlink"
+        } else {
+            "other"
+        };
+        let name = resolved
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        #[cfg(unix)]
+        let mode: Option<u32> = {
+            use std::os::unix::fs::PermissionsExt;
+            Some(meta.permissions().mode() & 0o7777)
+        };
+        #[cfg(not(unix))]
+        let mode: Option<u32> = None;
+
+        let sha256 = if want_sha256 && is_file {
+            Some(compute_file_sha256(&resolved).await?)
+        } else {
+            None
+        };
+
+        let mut out = json!({
+            "exists": true,
+            "path": resolved.to_string_lossy(),
+            "name": name,
+            "kind": kind,
+            "is_file": is_file,
+            "is_dir": is_dir,
+            "is_symlink": is_symlink,
+            "size": meta.len(),
+            "readonly": meta.permissions().readonly(),
+            "mode": mode,
+            "mtime_ms": system_time_to_ms(meta.modified().ok()),
+            "ctime_ms": system_time_to_ms(meta.created().ok()),
+        });
+        if let Some(hash) = sha256 {
+            out["sha256"] = json!(hash);
+        }
+        Ok(out)
+    }
+
     async fn handle_fs_read(&self, params: &Value) -> Result<Value, String> {
         let policy = self.policy_snapshot();
         let raw_path = params
@@ -665,10 +756,7 @@ impl Executor {
         let mut finalized = false;
         let mut final_sha_hex = None;
         if eof {
-            let full = tokio::fs::read(&staging_path)
-                .await
-                .map_err(|e| format!("failed to read staging file for verification: {e}"))?;
-            let actual_final = hex::encode(Sha256::digest(&full));
+            let actual_final = compute_file_sha256(&staging_path).await?;
             if let Some(expected_final) = params.get("final_sha256").and_then(|v| v.as_str()) {
                 if !actual_final.eq_ignore_ascii_case(expected_final) {
                     let _ = tokio::fs::remove_file(&staging_path).await;
@@ -678,9 +766,7 @@ impl Executor {
                     ));
                 }
             }
-            tokio::fs::rename(&staging_path, &target_path)
-                .await
-                .map_err(|e| format!("failed to finalize transfer rename: {e}"))?;
+            replace_file_atomic(&staging_path, &target_path, true).await?;
             self.transfers.lock().await.remove(transfer_id);
             finalized = true;
             final_sha_hex = Some(actual_final);
@@ -755,6 +841,25 @@ impl Executor {
             "path": pkg_path.to_string_lossy(),
         }))
     }
+}
+
+pub async fn compute_file_sha256(path: &Path) -> Result<String, String> {
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| format!("failed to open file for SHA-256: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("failed to read file for SHA-256: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 pub fn split_command_no_shell(cmd_str: &str) -> Result<(String, Vec<String>), String> {
@@ -915,6 +1020,54 @@ max_exec_timeout_sec = 5
         assert_eq!(r2["ok"], true);
         assert_eq!(r2["result"]["finalized"], true);
         assert_eq!(std::fs::read(&tx_target).unwrap(), full);
+
+        // fs.stat / fs_stat on file (with sha256), dir, missing file in workspace, and sandbox escape
+        let st = exec
+            .dispatch(
+                "fs.stat",
+                &json!({"path": tx_target.to_string_lossy(), "sha256": true}),
+                None,
+            )
+            .await;
+        assert_eq!(st["ok"], true);
+        assert_eq!(st["result"]["exists"], true);
+        assert_eq!(st["result"]["is_file"], true);
+        assert_eq!(st["result"]["is_dir"], false);
+        assert_eq!(st["result"]["kind"], "file");
+        assert_eq!(st["result"]["size"], full.len());
+        assert_eq!(st["result"]["sha256"], final_sha);
+
+        let st_dir = exec
+            .dispatch("fs_stat", &json!({"path": ws.to_string_lossy()}), None)
+            .await;
+        assert_eq!(st_dir["ok"], true);
+        assert_eq!(st_dir["result"]["exists"], true);
+        assert_eq!(st_dir["result"]["is_dir"], true);
+        assert_eq!(st_dir["result"]["kind"], "dir");
+
+        let st_missing = exec
+            .dispatch(
+                "fs.stat",
+                &json!({"path": ws.join("does-not-exist.pdf").to_string_lossy()}),
+                None,
+            )
+            .await;
+        assert_eq!(st_missing["ok"], true);
+        assert_eq!(st_missing["result"]["exists"], false);
+
+        let st_escape = exec
+            .dispatch("fs.stat", &json!({"path": "/etc/passwd"}), None)
+            .await;
+        assert_eq!(st_escape["ok"], false);
+
+        let st_traversal = exec
+            .dispatch(
+                "fs.stat",
+                &json!({"path": format!("{}/../../etc/passwd", ws.display())}),
+                None,
+            )
+            .await;
+        assert_eq!(st_traversal["ok"], false);
 
         let _ = std::fs::remove_dir_all(&ws);
     }

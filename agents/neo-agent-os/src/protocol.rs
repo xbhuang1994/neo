@@ -19,6 +19,11 @@ pub const RELAY_VERSION: u8 = 0x01;
 pub const RELAY_HEADER_LEN: usize = 10;
 pub const MAX_RELAY_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
 pub const E2E_ENVELOPE_VERSION: u8 = 0xE1;
+pub const FILE_ENVELOPE_VERSION: u8 = 0xE3;
+pub const FILE_FRAME_VERSION: u8 = 0x01;
+pub const FILE_FRAME_FIXED_HEADER_LEN: usize = 25;
+pub const MAX_FILE_FRAME_DATA_LEN: usize = 1024 * 1024;
+pub const MAX_TRANSFER_ID_LEN: usize = 64;
 pub const E2E_NONCE_LEN: usize = 12;
 pub const E2E_TAG_LEN: usize = 16;
 
@@ -290,6 +295,213 @@ pub fn open_device_message(
         ));
     }
     Ok(msg)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FileFrameKind {
+    Data = 0x01,
+    Ack = 0x02,
+    Finish = 0x03,
+    Done = 0x04,
+    Abort = 0x05,
+}
+
+impl TryFrom<u8> for FileFrameKind {
+    type Error = String;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0x01 => Ok(Self::Data),
+            0x02 => Ok(Self::Ack),
+            0x03 => Ok(Self::Finish),
+            0x04 => Ok(Self::Done),
+            0x05 => Ok(Self::Abort),
+            other => Err(format!("unknown FileFrame kind: 0x{other:02x}")),
+        }
+    }
+}
+
+pub fn validate_transfer_id(transfer_id: &str) -> Result<(), String> {
+    if transfer_id.is_empty()
+        || transfer_id.len() > MAX_TRANSFER_ID_LEN
+        || !transfer_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!("invalid transfer_id: {transfer_id:?}"));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileFrame {
+    pub kind: FileFrameKind,
+    pub flags: u16,
+    pub seq: u32,
+    pub offset: u64,
+    pub window: u32,
+    pub transfer_id: String,
+    pub data: Vec<u8>,
+}
+
+impl FileFrame {
+    /// Encodes `FileFramePlaintext`:
+    /// `[0]=0x01, [1]=kind, [2..4]=flags(u16 BE), [4..8]=seq(u32 BE), [8..16]=offset(u64 BE),
+    ///  [16..20]=window(u32 BE), [20]=id_len(u8), [21..21+id_len]=transfer_id,
+    ///  [21+id_len..25+id_len]=data_len(u32 BE), [25+id_len..]=data`.
+    pub fn encode_plaintext(&self) -> Result<Vec<u8>, String> {
+        validate_transfer_id(&self.transfer_id)?;
+        if self.data.len() > MAX_FILE_FRAME_DATA_LEN {
+            return Err(format!(
+                "file frame data exceeds limit: {} > {MAX_FILE_FRAME_DATA_LEN}",
+                self.data.len()
+            ));
+        }
+        let id_bytes = self.transfer_id.as_bytes();
+        let mut out = Vec::with_capacity(FILE_FRAME_FIXED_HEADER_LEN + id_bytes.len() + self.data.len());
+        out.push(FILE_FRAME_VERSION);
+        out.push(self.kind as u8);
+        out.extend_from_slice(&self.flags.to_be_bytes());
+        out.extend_from_slice(&self.seq.to_be_bytes());
+        out.extend_from_slice(&self.offset.to_be_bytes());
+        out.extend_from_slice(&self.window.to_be_bytes());
+        out.push(id_bytes.len() as u8);
+        out.extend_from_slice(id_bytes);
+        out.extend_from_slice(&(self.data.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.data);
+        Ok(out)
+    }
+
+    pub fn decode_plaintext(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() < FILE_FRAME_FIXED_HEADER_LEN {
+            return Err(format!("file frame plaintext too short: {} bytes", bytes.len()));
+        }
+        if bytes[0] != FILE_FRAME_VERSION {
+            return Err(format!("unsupported file frame version: {}", bytes[0]));
+        }
+        let kind = FileFrameKind::try_from(bytes[1])?;
+        let flags = u16::from_be_bytes([bytes[2], bytes[3]]);
+        let seq = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let offset = u64::from_be_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ]);
+        let window = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let id_len = bytes[20] as usize;
+        if id_len == 0 || id_len > MAX_TRANSFER_ID_LEN {
+            return Err(format!("invalid file frame transfer_id length: {id_len}"));
+        }
+        let data_len_off = 21 + id_len;
+        if bytes.len() < data_len_off + 4 {
+            return Err("truncated file frame transfer_id/data_len".to_string());
+        }
+        let transfer_id = std::str::from_utf8(&bytes[21..data_len_off])
+            .map_err(|e| format!("invalid transfer_id UTF-8: {e}"))?
+            .to_string();
+        validate_transfer_id(&transfer_id)?;
+        let data_len = u32::from_be_bytes([
+            bytes[data_len_off],
+            bytes[data_len_off + 1],
+            bytes[data_len_off + 2],
+            bytes[data_len_off + 3],
+        ]) as usize;
+        if data_len > MAX_FILE_FRAME_DATA_LEN {
+            return Err(format!(
+                "file frame data exceeds limit: {data_len} > {MAX_FILE_FRAME_DATA_LEN}"
+            ));
+        }
+        let data_start = data_len_off + 4;
+        let expected_len = data_start + data_len;
+        if bytes.len() != expected_len {
+            return Err(format!(
+                "file frame length mismatch: got {}, expected {expected_len}",
+                bytes.len()
+            ));
+        }
+        let data = bytes[data_start..].to_vec();
+        Ok(Self {
+            kind,
+            flags,
+            seq,
+            offset,
+            window,
+            transfer_id,
+            data,
+        })
+    }
+}
+
+pub fn build_file_aad(cluster_id: &str, src_id: &str, dst_id: &str) -> Vec<u8> {
+    format!("file-v1|{cluster_id}|{src_id}|{dst_id}").into_bytes()
+}
+
+pub fn seal_file_frame_with_nonce(
+    key: &[u8; 32],
+    cluster_id: &str,
+    src_id: &str,
+    dst_id: &str,
+    frame: &FileFrame,
+    nonce_bytes: [u8; E2E_NONCE_LEN],
+) -> Result<Vec<u8>, String> {
+    let plaintext = frame.encode_plaintext()?;
+    let aad = build_file_aad(cluster_id, src_id, dst_id);
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("cipher init error: {e}"))?;
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: &plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| "file frame AEAD encryption failed".to_string())?;
+    let mut out = Vec::with_capacity(1 + E2E_NONCE_LEN + ciphertext.len());
+    out.push(FILE_ENVELOPE_VERSION);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+pub fn seal_file_frame(
+    key: &[u8; 32],
+    cluster_id: &str,
+    src_id: &str,
+    dst_id: &str,
+    frame: &FileFrame,
+) -> Result<Vec<u8>, String> {
+    let mut nonce_bytes = [0u8; E2E_NONCE_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    seal_file_frame_with_nonce(key, cluster_id, src_id, dst_id, frame, nonce_bytes)
+}
+
+pub fn open_file_frame(
+    key: &[u8; 32],
+    local_cluster_id: &str,
+    src_id: &str,
+    dst_id: &str,
+    wire: &[u8],
+) -> Result<FileFrame, String> {
+    if wire.len() < 1 + E2E_NONCE_LEN + E2E_TAG_LEN {
+        return Err("file E2E envelope too short".to_string());
+    }
+    if wire[0] != FILE_ENVELOPE_VERSION {
+        return Err(format!("invalid file E2E version byte: 0x{:02x}", wire[0]));
+    }
+    let nonce = Nonce::from_slice(&wire[1..1 + E2E_NONCE_LEN]);
+    let ciphertext = &wire[1 + E2E_NONCE_LEN..];
+    let aad = build_file_aad(local_cluster_id, src_id, dst_id);
+
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("cipher init error: {e}"))?;
+    let plaintext = cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| "file frame AEAD decryption/authentication failed".to_string())?;
+
+    FileFrame::decode_plaintext(&plaintext)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -640,5 +852,52 @@ mod tests {
 
         let parsed = parse_stun_binding_response(&resp, &tx_id).unwrap();
         assert_eq!(parsed, "203.0.113.42:54321".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn file_frame_0xe3_wire_roundtrip_and_aad_isolation() {
+        let key_a = derive_e2e_key("cluster-a", "e2e-shared-secret");
+        let frame = FileFrame {
+            kind: FileFrameKind::Data,
+            flags: 0,
+            seq: 7,
+            offset: 131_072,
+            window: 524_288,
+            transfer_id: "ft_demo_01".to_string(),
+            data: vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x42],
+        };
+        let plain = frame.encode_plaintext().unwrap();
+        assert_eq!(plain[0], FILE_FRAME_VERSION);
+        assert_eq!(plain[1], FileFrameKind::Data as u8);
+        assert_eq!(plain[20], 10); // "ft_demo_01".len()
+        assert_eq!(plain.len(), FILE_FRAME_FIXED_HEADER_LEN + 10 + 6);
+        assert_eq!(FileFrame::decode_plaintext(&plain).unwrap(), frame);
+
+        let fixed_nonce = [0x33u8; E2E_NONCE_LEN];
+        let wire = seal_file_frame_with_nonce(
+            &key_a,
+            "cluster-a",
+            "os-node-1",
+            "master-1",
+            &frame,
+            fixed_nonce,
+        )
+        .unwrap();
+        assert_eq!(wire[0], FILE_ENVELOPE_VERSION);
+        assert_eq!(&wire[1..1 + E2E_NONCE_LEN], &fixed_nonce);
+
+        let opened = open_file_frame(&key_a, "cluster-a", "os-node-1", "master-1", &wire).unwrap();
+        assert_eq!(opened, frame);
+
+        // Wrong AAD src/dst, wrong cluster key, or tampered byte must fail
+        assert!(open_file_frame(&key_a, "cluster-a", "master-1", "os-node-1", &wire).is_err());
+        assert!(open_file_frame(&key_a, "cluster-b", "os-node-1", "master-1", &wire).is_err());
+        let key_b = derive_e2e_key("cluster-b", "e2e-shared-secret");
+        assert!(open_file_frame(&key_b, "cluster-b", "os-node-1", "master-1", &wire).is_err());
+        let mut tampered = wire.clone();
+        tampered[20] ^= 0xFF;
+        assert!(open_file_frame(&key_a, "cluster-a", "os-node-1", "master-1", &tampered).is_err());
+        // Cannot open 0xE3 wire as 0xE1 DeviceMessage
+        assert!(open_device_message(&key_a, "cluster-a", "os-node-1", "master-1", &wire).is_err());
     }
 }

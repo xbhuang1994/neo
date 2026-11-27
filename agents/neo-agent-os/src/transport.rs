@@ -1,9 +1,11 @@
 use crate::executor::Executor;
+use crate::file_transfer::{FileTransferManager, OutboundFileFrame};
 use crate::policy::Policy;
 use crate::prober::{CapabilityManifest, CapabilityProber};
 use crate::protocol::{
-    derive_e2e_key, open_device_message, seal_device_message, stun_probe, udp_punch_peer,
-    BootstrapResponse, DeviceMessage, RelayEnvelope, RelayFlags, RelayFrame, SignalMessage,
+    derive_e2e_key, open_device_message, open_file_frame, seal_device_message, seal_file_frame,
+    stun_probe, udp_punch_peer, BootstrapResponse, DeviceMessage, FileFrame, RelayEnvelope,
+    RelayFlags, RelayFrame, SignalMessage, E2E_ENVELOPE_VERSION, FILE_ENVELOPE_VERSION,
 };
 use crate::relay_bridge::RelayBridge;
 use crate::updater::{execute_self_update, RestartPlan, RollbackAction, SelfUpdateRequest, UpdaterManager};
@@ -539,6 +541,17 @@ pub async fn run_agent(
 
     let (uplink_tx, mut uplink_rx) = mpsc::channel::<RelayEnvelope>(128);
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<(String, DeviceMessage)>(256);
+    let (outbound_file_tx, mut outbound_file_rx) = mpsc::channel::<OutboundFileFrame>(256);
+    let file_transfers = FileTransferManager::new(Arc::clone(&policy), outbound_file_tx);
+    let (inbound_file_tx, mut inbound_file_rx) = mpsc::channel::<(String, FileFrame)>(256);
+    {
+        let ft = Arc::clone(&file_transfers);
+        tokio::spawn(async move {
+            while let Some((src, file_frame)) = inbound_file_rx.recv().await {
+                ft.handle_incoming_frame(&src, file_frame).await;
+            }
+        });
+    }
 
     let relay_bridge = if cfg.relay_enabled {
         let bridge = RelayBridge::new(
@@ -659,7 +672,11 @@ pub async fn run_agent(
 
                 loop {
                     tokio::select! {
+                        biased;
                         Ok(plan) = &mut restart_rx => {
+                            file_transfers
+                                .fail_all_for_disconnect("agent restarting for self_update")
+                                .await;
                             // Flush any queued rpc_resp frames before closing WebSocket.
                             while let Ok((dst, msg)) = outbound_rx.try_recv() {
                                 let _ = send_encrypted_frame(&mut ws_sink, &e2e_key, &cfg.device_id, &dst, &msg).await;
@@ -719,33 +736,63 @@ pub async fn run_agent(
                                                     }
                                                 }
                                                 RelayFlags::Pong => {}
-                                                RelayFlags::ErrOffline | RelayFlags::ErrSpoofed | RelayFlags::ErrRate => {
+                                                RelayFlags::ErrRate => {
+                                                    eprintln!("[relay] control error frame {:?} from '{}' -> '{}'", frame.flags, frame.src, frame.dst);
+                                                    file_transfers.notify_rate_limited().await;
+                                                }
+                                                RelayFlags::ErrOffline | RelayFlags::ErrSpoofed => {
                                                     eprintln!("[relay] control error frame {:?} from '{}' -> '{}'", frame.flags, frame.src, frame.dst);
                                                 }
                                                 RelayFlags::Data => {
-                                                    match open_device_message(
-                                                        &e2e_key,
-                                                        &cfg.cluster_id,
-                                                        &frame.src,
-                                                        &cfg.device_id,
-                                                        &frame.payload,
-                                                    ) {
-                                                        Ok(msg) => {
-                                                            *active_master.lock().await = frame.src.clone();
-                                                            handle_device_message(
-                                                                &cfg,
-                                                                &policy,
-                                                                &executor,
-                                                                &relay_bridge,
-                                                                &outbound_tx,
-                                                                &updating_flag,
-                                                                &restart_slot,
+                                                    match frame.payload.first().copied() {
+                                                        Some(FILE_ENVELOPE_VERSION) => {
+                                                            match open_file_frame(
+                                                                &e2e_key,
+                                                                &cfg.cluster_id,
                                                                 &frame.src,
-                                                                msg,
-                                                            ).await;
+                                                                &cfg.device_id,
+                                                                &frame.payload,
+                                                            ) {
+                                                                Ok(file_frame) => {
+                                                                    if inbound_file_tx.send((frame.src, file_frame)).await.is_err() {
+                                                                        eprintln!("[relay] inbound file worker closed");
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    eprintln!("[relay] rejected 0xE3 file frame from '{}': {e}", frame.src);
+                                                                }
+                                                            }
                                                         }
-                                                        Err(e) => {
-                                                            eprintln!("[relay] rejected E2E frame from '{}': {e}", frame.src);
+                                                        Some(E2E_ENVELOPE_VERSION) => {
+                                                            match open_device_message(
+                                                                &e2e_key,
+                                                                &cfg.cluster_id,
+                                                                &frame.src,
+                                                                &cfg.device_id,
+                                                                &frame.payload,
+                                                            ) {
+                                                                Ok(msg) => {
+                                                                    *active_master.lock().await = frame.src.clone();
+                                                                    handle_device_message(
+                                                                        &cfg,
+                                                                        &policy,
+                                                                        &executor,
+                                                                        &file_transfers,
+                                                                        &relay_bridge,
+                                                                        &outbound_tx,
+                                                                        &updating_flag,
+                                                                        &restart_slot,
+                                                                        &frame.src,
+                                                                        msg,
+                                                                    ).await;
+                                                                }
+                                                                Err(e) => {
+                                                                    eprintln!("[relay] rejected E2E frame from '{}': {e}", frame.src);
+                                                                }
+                                                            }
+                                                        }
+                                                        other => {
+                                                            eprintln!("[relay] unsupported E2E payload version {:?} from '{}'", other, frame.src);
                                                         }
                                                     }
                                                 }
@@ -763,8 +810,25 @@ pub async fn run_agent(
                                 _ => {}
                             }
                         }
+                        Some(out_file) = outbound_file_rx.recv() => {
+                            if send_encrypted_file_frame(
+                                &mut ws_sink,
+                                &e2e_key,
+                                &cfg.cluster_id,
+                                &cfg.device_id,
+                                &out_file.dst,
+                                &out_file.frame,
+                            ).await.is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
+                // Abort in-flight file transfer handles cleanly when WS disconnects and drain stale frames.
+                file_transfers
+                    .fail_all_for_disconnect("relay websocket disconnected")
+                    .await;
+                while outbound_file_rx.try_recv().is_ok() {}
             }
             Err(e) => {
                 eprintln!("[relay] connect error: {e}; retrying in {backoff_ms}ms");
@@ -794,6 +858,7 @@ async fn handle_device_message(
     cfg: &AgentConfig,
     policy: &Arc<std::sync::RwLock<Policy>>,
     executor: &Arc<Executor>,
+    file_transfers: &Arc<FileTransferManager>,
     relay_bridge: &Option<Arc<RelayBridge>>,
     outbound_tx: &mpsc::Sender<(String, DeviceMessage)>,
     updating_flag: &Arc<AtomicBool>,
@@ -1086,6 +1151,73 @@ async fn handle_device_message(
                 return;
             }
 
+            if matches!(method.as_str(), "file.pull.open" | "file_pull_open") {
+                let open_res = file_transfers.open_pull(src_node, &params).await;
+                match open_res {
+                    Ok((result, task)) => {
+                        let resp = DeviceMessage {
+                            v: 1,
+                            kind: "rpc_resp".to_string(),
+                            req_id: msg.req_id,
+                            cluster_id: cfg.cluster_id.clone(),
+                            device_id: cfg.device_id.clone(),
+                            ts_ms: now_ms(),
+                            body: json!({ "ok": true, "result": result }),
+                        };
+                        let _ = outbound_tx.send((src_node.to_string(), resp)).await;
+                        tokio::spawn(task.run());
+                    }
+                    Err(error) => {
+                        let resp = DeviceMessage {
+                            v: 1,
+                            kind: "rpc_resp".to_string(),
+                            req_id: msg.req_id,
+                            cluster_id: cfg.cluster_id.clone(),
+                            device_id: cfg.device_id.clone(),
+                            ts_ms: now_ms(),
+                            body: json!({ "ok": false, "error": error }),
+                        };
+                        let _ = outbound_tx.send((src_node.to_string(), resp)).await;
+                    }
+                }
+                return;
+            }
+
+            if matches!(method.as_str(), "file.push.open" | "file_push_open") {
+                let body = match file_transfers.open_push(src_node, &params).await {
+                    Ok(result) => json!({ "ok": true, "result": result }),
+                    Err(error) => json!({ "ok": false, "error": error }),
+                };
+                let resp = DeviceMessage {
+                    v: 1,
+                    kind: "rpc_resp".to_string(),
+                    req_id: msg.req_id,
+                    cluster_id: cfg.cluster_id.clone(),
+                    device_id: cfg.device_id.clone(),
+                    ts_ms: now_ms(),
+                    body,
+                };
+                let _ = outbound_tx.send((src_node.to_string(), resp)).await;
+                return;
+            }
+
+            if matches!(method.as_str(), "file.transfer.abort" | "file_transfer_abort") {
+                let body = match file_transfers.abort_transfer(src_node, &params).await {
+                    Ok(result) => json!({ "ok": true, "result": result }),
+                    Err(error) => json!({ "ok": false, "error": error }),
+                };
+                let resp = DeviceMessage {
+                    v: 1,
+                    kind: "rpc_resp".to_string(),
+                    req_id: msg.req_id,
+                    cluster_id: cfg.cluster_id.clone(),
+                    device_id: cfg.device_id.clone(),
+                    ts_ms: now_ms(),
+                    body,
+                };
+                let _ = outbound_tx.send((src_node.to_string(), resp)).await;
+                return;
+            }
             let exec = Arc::clone(executor);
             let out = outbound_tx.clone();
             let cluster_id = cfg.cluster_id.clone();
@@ -1239,6 +1371,32 @@ where
         .send(WsMessage::Binary(wire.into()))
         .await
         .map_err(|e| format!("WS send error: {e}"))
+}
+
+async fn send_encrypted_file_frame<S>(
+    ws_sink: &mut S,
+    e2e_key: &[u8; 32],
+    cluster_id: &str,
+    src_id: &str,
+    dst_id: &str,
+    file_frame: &FileFrame,
+) -> Result<(), String>
+where
+    S: SinkExt<WsMessage> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    let sealed = seal_file_frame(e2e_key, cluster_id, src_id, dst_id, file_frame)?;
+    let frame = RelayFrame {
+        flags: RelayFlags::Data,
+        src: src_id.to_string(),
+        dst: dst_id.to_string(),
+        payload: sealed,
+    };
+    let wire = frame.encode()?;
+    ws_sink
+        .send(WsMessage::Binary(wire.into()))
+        .await
+        .map_err(|e| format!("WS file frame send error: {e}"))
 }
 
 async fn push_ring(
@@ -2024,5 +2182,318 @@ mod tests {
             .unwrap();
         agent_task.abort();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn mock_relay_ws_handles_fs_stat_and_binary_0xe3_pull_push() {
+        use crate::protocol::FileFrameKind;
+        use sha2::{Digest, Sha256};
+
+        let ws_dir = std::env::temp_dir().join(format!(
+            "neo_transport_ft_test_{}_{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&ws_dir);
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let seed_file = ws_dir.join("seed.bin");
+        let seed_bytes: Vec<u8> = (0..(40 * 1024 + 17)).map(|i| ((i * 19 + 3) & 0xFF) as u8).collect();
+        std::fs::write(&seed_file, &seed_bytes).unwrap();
+        let seed_sha: [u8; 32] = Sha256::digest(&seed_bytes).into();
+        let push_target = ws_dir.join("sub/pushed.bin");
+        let push_bytes: Vec<u8> = (0..(35 * 1024 + 5)).map(|i| ((i * 7 + 11) & 0xFF) as u8).collect();
+        let push_sha: [u8; 32] = Sha256::digest(&push_bytes).into();
+
+        let policy = Arc::new(std::sync::RwLock::new(
+            Policy::from_toml_str(&format!(
+                "allowed_workspaces = [\"{}\"]\n",
+                ws_dir.display().to_string().replace('\\', "\\\\")
+            ))
+            .unwrap(),
+        ));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let e2e_secret = "ft-ws-secret";
+        let cluster_id = "cluster-ft-ws";
+        let e2e_key = derive_e2e_key(cluster_id, e2e_secret);
+        let seed_file_srv = seed_file.clone();
+        let seed_bytes_srv = seed_bytes.clone();
+        let push_target_srv = push_target.clone();
+        let push_bytes_srv = push_bytes.clone();
+
+        let server_task = tokio::spawn(async move {
+            let (tx_done, mut rx_done) = mpsc::channel::<()>(1);
+            loop {
+                tokio::select! {
+                    _ = rx_done.recv() => break,
+                    accept_res = listener.accept() => {
+                        let (mut stream, _) = accept_res.unwrap();
+                        let tx_done = tx_done.clone();
+                        let seed_file_srv = seed_file_srv.clone();
+                        let seed_bytes_srv = seed_bytes_srv.clone();
+                        let push_target_srv = push_target_srv.clone();
+                        let push_bytes_srv = push_bytes_srv.clone();
+                        tokio::spawn(async move {
+                            let mut peek_buf = [0u8; 512];
+                            let n = stream.peek(&mut peek_buf).await.unwrap_or(0);
+                            let head = String::from_utf8_lossy(&peek_buf[..n]);
+                            if head.starts_with("GET /v1/bootstrap ") {
+                                let mut sink = [0u8; 1024];
+                                let _ = stream.read(&mut sink).await;
+                                let body = br#"{"stun_servers":[]}"#;
+                                let resp = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(resp.as_bytes()).await;
+                                let _ = stream.write_all(body).await;
+                                return;
+                            }
+                            if head.starts_with("GET /v1/signal ") {
+                                if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
+                                    let _ = ws.next().await;
+                                }
+                                return;
+                            }
+                            if head.starts_with("GET /v1/relay ") {
+                                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                                async fn next_app_frame(
+                                    ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+                                    e2e_key: &[u8; 32],
+                                    cluster_id: &str,
+                                ) -> RelayFrame {
+                                    loop {
+                                        let Some(Ok(WsMessage::Binary(bin))) = ws.next().await else {
+                                            continue;
+                                        };
+                                        let rf = RelayFrame::decode(&bin).unwrap();
+                                        if rf.flags != RelayFlags::Data {
+                                            continue;
+                                        }
+                                        if rf.payload.first() == Some(&E2E_ENVELOPE_VERSION) {
+                                            if let Ok(m) = open_device_message(
+                                                e2e_key,
+                                                cluster_id,
+                                                &rf.src,
+                                                &rf.dst,
+                                                &rf.payload,
+                                            ) {
+                                                if m.kind == "heartbeat" || m.kind == "manifest" {
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        return rf;
+                                    }
+                                }
+
+                                // Wait for initial manifest frame first
+                                loop {
+                                    let Some(Ok(WsMessage::Binary(bin))) = ws.next().await else { continue };
+                                    let rf = RelayFrame::decode(&bin).unwrap();
+                                    if rf.flags == RelayFlags::Data
+                                        && rf.payload.first() == Some(&E2E_ENVELOPE_VERSION)
+                                    {
+                                        let m = open_device_message(&e2e_key, cluster_id, &rf.src, &rf.dst, &rf.payload).unwrap();
+                                        if m.kind == "manifest" {
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                // 1. fs.stat RPC
+                                let stat_req = DeviceMessage {
+                                    v: 1,
+                                    kind: "rpc_req".to_string(),
+                                    req_id: "stat-1".to_string(),
+                                    cluster_id: cluster_id.to_string(),
+                                    device_id: "os-ft".to_string(),
+                                    ts_ms: 1000,
+                                    body: json!({"method": "fs.stat", "params": {"path": seed_file_srv.to_string_lossy(), "sha256": true}}),
+                                };
+                                let rf = RelayFrame {
+                                    flags: RelayFlags::Data,
+                                    src: "master-1".to_string(),
+                                    dst: "os-ft".to_string(),
+                                    payload: seal_device_message(&e2e_key, "master-1", "os-ft", &stat_req).unwrap(),
+                                };
+                                ws.send(WsMessage::Binary(rf.encode().unwrap().into())).await.unwrap();
+                                let stat_rf = next_app_frame(&mut ws, &e2e_key, cluster_id).await;
+                                let stat_resp = open_device_message(&e2e_key, cluster_id, "os-ft", "master-1", &stat_rf.payload).unwrap();
+                                assert_eq!(stat_resp.body["ok"], true);
+                                assert_eq!(stat_resp.body["result"]["size"], seed_bytes_srv.len());
+                                assert_eq!(stat_resp.body["result"]["sha256"], hex::encode(seed_sha));
+
+                                // 2. file.pull.open + receive 0xE3 DATA/FINISH
+                                let pull_req = DeviceMessage {
+                                    v: 1,
+                                    kind: "rpc_req".to_string(),
+                                    req_id: "pull-1".to_string(),
+                                    cluster_id: cluster_id.to_string(),
+                                    device_id: "os-ft".to_string(),
+                                    ts_ms: 1001,
+                                    body: json!({"method": "file.pull.open", "params": {"transfer_id": "ws_pull_1", "path": seed_file_srv.to_string_lossy(), "chunk_size": 16384, "window_bytes": 32768}}),
+                                };
+                                let prf = RelayFrame {
+                                    flags: RelayFlags::Data,
+                                    src: "master-1".to_string(),
+                                    dst: "os-ft".to_string(),
+                                    payload: seal_device_message(&e2e_key, "master-1", "os-ft", &pull_req).unwrap(),
+                                };
+                                ws.send(WsMessage::Binary(prf.encode().unwrap().into())).await.unwrap();
+                                let mut pulled = Vec::new();
+                                loop {
+                                    let r = next_app_frame(&mut ws, &e2e_key, cluster_id).await;
+                                    if r.payload[0] == E2E_ENVELOPE_VERSION {
+                                        let m = open_device_message(&e2e_key, cluster_id, "os-ft", "master-1", &r.payload).unwrap();
+                                        assert_eq!(m.body["ok"], true);
+                                        continue;
+                                    }
+                                    let ff = open_file_frame(&e2e_key, cluster_id, "os-ft", "master-1", &r.payload).unwrap();
+                                    match ff.kind {
+                                        FileFrameKind::Data => {
+                                            pulled.extend_from_slice(&ff.data);
+                                            let ack = FileFrame {
+                                                kind: FileFrameKind::Ack,
+                                                flags: 0,
+                                                seq: ff.seq,
+                                                offset: pulled.len() as u64,
+                                                window: 32768,
+                                                transfer_id: "ws_pull_1".to_string(),
+                                                data: Vec::new(),
+                                            };
+                                            let aw = RelayFrame {
+                                                flags: RelayFlags::Data,
+                                                src: "master-1".to_string(),
+                                                dst: "os-ft".to_string(),
+                                                payload: seal_file_frame(&e2e_key, cluster_id, "master-1", "os-ft", &ack).unwrap(),
+                                            };
+                                            ws.send(WsMessage::Binary(aw.encode().unwrap().into())).await.unwrap();
+                                        }
+                                        FileFrameKind::Finish => {
+                                            assert_eq!(ff.data.as_slice(), seed_sha.as_slice());
+                                            let done = FileFrame {
+                                                kind: FileFrameKind::Done,
+                                                flags: 0,
+                                                seq: ff.seq,
+                                                offset: pulled.len() as u64,
+                                                window: 0,
+                                                transfer_id: "ws_pull_1".to_string(),
+                                                data: seed_sha.to_vec(),
+                                            };
+                                            let dw = RelayFrame {
+                                                flags: RelayFlags::Data,
+                                                src: "master-1".to_string(),
+                                                dst: "os-ft".to_string(),
+                                                payload: seal_file_frame(&e2e_key, cluster_id, "master-1", "os-ft", &done).unwrap(),
+                                            };
+                                            ws.send(WsMessage::Binary(dw.encode().unwrap().into())).await.unwrap();
+                                            break;
+                                        }
+                                        other => panic!("unexpected frame: {other:?}"),
+                                    }
+                                }
+                                assert_eq!(pulled, seed_bytes_srv);
+
+                                // 3. file.push.open + send 0xE3 DATA/FINISH -> receive DONE
+                                let push_req = DeviceMessage {
+                                    v: 1,
+                                    kind: "rpc_req".to_string(),
+                                    req_id: "push-1".to_string(),
+                                    cluster_id: cluster_id.to_string(),
+                                    device_id: "os-ft".to_string(),
+                                    ts_ms: 1002,
+                                    body: json!({"method": "file.push.open", "params": {"transfer_id": "ws_push_1", "path": push_target_srv.to_string_lossy(), "size": push_bytes_srv.len(), "chunk_size": 16384}}),
+                                };
+                                let psh = RelayFrame {
+                                    flags: RelayFlags::Data,
+                                    src: "master-1".to_string(),
+                                    dst: "os-ft".to_string(),
+                                    payload: seal_device_message(&e2e_key, "master-1", "os-ft", &push_req).unwrap(),
+                                };
+                                ws.send(WsMessage::Binary(psh.encode().unwrap().into())).await.unwrap();
+                                let open_rf = next_app_frame(&mut ws, &e2e_key, cluster_id).await;
+                                let open_resp = open_device_message(&e2e_key, cluster_id, "os-ft", "master-1", &open_rf.payload).unwrap();
+                                assert_eq!(open_resp.body["ok"], true);
+
+                                for (idx, chunk) in push_bytes_srv.chunks(16384).enumerate() {
+                                    let df = FileFrame {
+                                        kind: FileFrameKind::Data,
+                                        flags: 0,
+                                        seq: idx as u32,
+                                        offset: (idx * 16384) as u64,
+                                        window: 0,
+                                        transfer_id: "ws_push_1".to_string(),
+                                        data: chunk.to_vec(),
+                                    };
+                                    let dw = RelayFrame {
+                                        flags: RelayFlags::Data,
+                                        src: "master-1".to_string(),
+                                        dst: "os-ft".to_string(),
+                                        payload: seal_file_frame(&e2e_key, cluster_id, "master-1", "os-ft", &df).unwrap(),
+                                    };
+                                    ws.send(WsMessage::Binary(dw.encode().unwrap().into())).await.unwrap();
+                                    let ack_rf = next_app_frame(&mut ws, &e2e_key, cluster_id).await;
+                                    let ack = open_file_frame(&e2e_key, cluster_id, "os-ft", "master-1", &ack_rf.payload).unwrap();
+                                    assert_eq!(ack.kind, FileFrameKind::Ack);
+                                }
+                                let fin = FileFrame {
+                                    kind: FileFrameKind::Finish,
+                                    flags: 0,
+                                    seq: 99,
+                                    offset: push_bytes_srv.len() as u64,
+                                    window: 0,
+                                    transfer_id: "ws_push_1".to_string(),
+                                    data: push_sha.to_vec(),
+                                };
+                                let fw = RelayFrame {
+                                    flags: RelayFlags::Data,
+                                    src: "master-1".to_string(),
+                                    dst: "os-ft".to_string(),
+                                    payload: seal_file_frame(&e2e_key, cluster_id, "master-1", "os-ft", &fin).unwrap(),
+                                };
+                                ws.send(WsMessage::Binary(fw.encode().unwrap().into())).await.unwrap();
+                                let done_rf = next_app_frame(&mut ws, &e2e_key, cluster_id).await;
+                                let done = open_file_frame(&e2e_key, cluster_id, "os-ft", "master-1", &done_rf.payload).unwrap();
+                                assert_eq!(done.kind, FileFrameKind::Done);
+                                assert_eq!(done.data.as_slice(), push_sha.as_slice());
+
+                                let _ = tx_done.send(()).await;
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
+        let cfg = AgentConfig {
+            cluster_id: cluster_id.to_string(),
+            device_id: "os-ft".to_string(),
+            master_id: "master-1".to_string(),
+            relay_url: format!("http://{addr}"),
+            token: "neo1.dummy.sig".to_string(),
+            e2e_secret: e2e_secret.to_string(),
+            enroll_id: None,
+            relay_enabled: false,
+            mqtt_bind: "127.0.0.1:0".to_string(),
+            uart_device: None,
+            ota_cache_dir: None,
+            updater_state_path: None,
+            policy_path: None,
+            sandbox_override_path: None,
+            self_update_target: None,
+        };
+        let agent_task = tokio::spawn(async move {
+            let _ = run_agent(cfg, policy).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .unwrap()
+            .unwrap();
+        agent_task.abort();
+        assert_eq!(std::fs::read(&push_target).unwrap(), push_bytes);
+        let _ = std::fs::remove_dir_all(&ws_dir);
     }
 }

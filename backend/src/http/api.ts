@@ -426,6 +426,7 @@ const STOP_SUFFIX = "/stop";
 const DEVICES_PREFIX = "/api/devices/";
 const DEVICE_APPROVALS_PREFIX = "/api/devices/approvals/";
 const DEVICE_ENROLLMENTS_PREFIX = "/api/devices/enrollments/";
+const DEVICE_TRANSFERS_PREFIX = "/api/devices/transfers/";
 const PUBLIC_ENROLL_CLAIM_PREFIX = "/enroll/claim/";
 const VALID_TOKEN_TIERS: ReadonlySet<string> = new Set(["master", "os", "relay", "admin"]);
 
@@ -734,6 +735,22 @@ async function routeDevices(
         enrollments: app.devices.listEnrollments(),
       });
     }
+    if (reqPath === "/api/devices/transfers") {
+      return Response.json(200, {
+        transfers: app.devices.listTransfers(),
+      });
+    }
+    if (reqPath.startsWith(DEVICE_TRANSFERS_PREFIX)) {
+      const id = safeDecodeSegment(reqPath.slice(DEVICE_TRANSFERS_PREFIX.length));
+      if (!id || id.includes("/")) {
+        return Response.error(404, "Transfer not found");
+      }
+      const transfer = app.devices.getTransfer(id);
+      if (transfer === null) {
+        return Response.error(404, "Transfer not found");
+      }
+      return Response.json(200, { transfer });
+    }
     if (reqPath.startsWith(DEVICE_ENROLLMENTS_PREFIX)) {
       const id = safeDecodeSegment(reqPath.slice(DEVICE_ENROLLMENTS_PREFIX.length));
       if (!id || id.includes("/")) {
@@ -854,6 +871,133 @@ async function routeDevices(
         }
       }
       return Response.error(404, "Not found");
+    }
+
+    if (reqPath.startsWith(DEVICES_PREFIX) && reqPath.endsWith("/files/stat")) {
+      const id = safeDecodeSegment(
+        reqPath.slice(DEVICES_PREFIX.length, reqPath.length - "/files/stat".length),
+      );
+      if (!id || id.includes("/")) {
+        return Response.error(404, "Device not found");
+      }
+      const parsed = jsonBody(request);
+      if (!parsed.ok) return parsed.response;
+      if (!isRecord(parsed.value)) {
+        return Response.error(400, "Expected JSON object");
+      }
+      const filePath = parseOptionalStringField(parsed.value, ["path", "remotePath", "remote_path"], "path");
+      if (!filePath.ok) return filePath.response;
+      if (!filePath.value || filePath.value.trim().length === 0) {
+        return Response.error(400, "path is required");
+      }
+      const sha256 = parseOptionalBoolField(parsed.value, ["sha256", "checksum"], "sha256");
+      if (!sha256.ok) return sha256.response;
+      const timeoutMs = parseOptionalIntField(parsed.value, ["timeoutMs", "timeout_ms"], "timeoutMs");
+      if (!timeoutMs.ok) return timeoutMs.response;
+      if (timeoutMs.value !== undefined && timeoutMs.value <= 0) {
+        return Response.error(400, "timeoutMs must be a positive integer");
+      }
+      try {
+        const result = await app.devices.statFile(id, filePath.value.trim(), {
+          ...(sha256.value !== undefined ? { sha256: sha256.value } : {}),
+          ...(timeoutMs.value !== undefined ? { timeoutMs: timeoutMs.value } : {}),
+        });
+        if (result.status === "ok") {
+          return Response.json(200, result);
+        }
+        if (result.status === "queued" || result.status === "pending_approval") {
+          return Response.json(202, result);
+        }
+        const statusCode = result.error.startsWith("Unknown device:")
+          ? 404
+          : result.error.includes("forbidden") || result.error.includes("Cross-cluster")
+            ? 403
+            : 400;
+        return Response.json(statusCode, result);
+      } catch (error) {
+        return Response.error(400, errorMessage(error));
+      }
+    }
+
+    if (
+      reqPath.startsWith(DEVICES_PREFIX) &&
+      (reqPath.endsWith("/files/pull") || reqPath.endsWith("/files/push"))
+    ) {
+      const isPull = reqPath.endsWith("/files/pull");
+      const suffix = isPull ? "/files/pull" : "/files/push";
+      const id = safeDecodeSegment(
+        reqPath.slice(DEVICES_PREFIX.length, reqPath.length - suffix.length),
+      );
+      if (!id || id.includes("/")) {
+        return Response.error(404, "Device not found");
+      }
+      const parsed = jsonBody(request);
+      if (!parsed.ok) return parsed.response;
+      if (!isRecord(parsed.value)) {
+        return Response.error(400, "Expected JSON object");
+      }
+      const remotePath = parseOptionalStringField(
+        parsed.value,
+        ["remotePath", "remote_path"],
+        "remotePath",
+      );
+      if (!remotePath.ok) return remotePath.response;
+      if (!remotePath.value || remotePath.value.trim().length === 0) {
+        return Response.error(400, "remotePath is required");
+      }
+      const localPath = parseOptionalStringField(
+        parsed.value,
+        ["localPath", "local_path"],
+        "localPath",
+      );
+      if (!localPath.ok) return localPath.response;
+      if (!localPath.value || localPath.value.trim().length === 0) {
+        return Response.error(400, "localPath is required");
+      }
+      const overwrite = parseOptionalBoolField(parsed.value, ["overwrite"], "overwrite");
+      if (!overwrite.ok) return overwrite.response;
+      const resume = parseOptionalBoolField(parsed.value, ["resume"], "resume");
+      if (!resume.ok) return resume.response;
+      const transferId = parseOptionalStringField(
+        parsed.value,
+        ["transferId", "transfer_id"],
+        "transferId",
+      );
+      if (!transferId.ok) return transferId.response;
+      const chunkSize = parseOptionalIntField(parsed.value, ["chunkSize", "chunk_size"], "chunkSize");
+      if (!chunkSize.ok) return chunkSize.response;
+      if (chunkSize.value !== undefined && (chunkSize.value < 4096 || chunkSize.value > 524_288)) {
+        return Response.error(400, "chunkSize must be between 4096 and 524288");
+      }
+      const timeoutMs = parseOptionalIntField(parsed.value, ["timeoutMs", "timeout_ms"], "timeoutMs");
+      if (!timeoutMs.ok) return timeoutMs.response;
+      if (timeoutMs.value !== undefined && (timeoutMs.value < 1000 || timeoutMs.value > 600_000)) {
+        return Response.error(400, "timeoutMs must be between 1000 and 600000");
+      }
+      try {
+        const shared = {
+          deviceId: id,
+          remotePath: remotePath.value.trim(),
+          localPath: localPath.value.trim(),
+          ...(overwrite.value !== undefined ? { overwrite: overwrite.value } : {}),
+          ...(resume.value !== undefined ? { resume: resume.value } : {}),
+          ...(transferId.value !== undefined ? { transferId: transferId.value.trim() } : {}),
+          ...(chunkSize.value !== undefined ? { chunkSize: chunkSize.value } : {}),
+          ...(timeoutMs.value !== undefined ? { timeoutMs: timeoutMs.value } : {}),
+        };
+        const result = isPull
+          ? await app.devices.pullFile(shared)
+          : await app.devices.pushFile(shared);
+        return Response.json(200, { transfer: result });
+      } catch (error) {
+        const msg = errorMessage(error);
+        const statusCode = msg.startsWith("Unknown device:")
+          ? 404
+          : msg.includes("Cross-cluster") || msg.includes("forbidden")
+            ? 403
+            : 400;
+        return Response.error(statusCode, msg);
+      }
     }
 
     if (reqPath.startsWith(DEVICES_PREFIX) && reqPath.endsWith("/ping")) {
@@ -1051,6 +1195,17 @@ async function routeDevices(
   }
 
   if (method === "DELETE") {
+    if (reqPath.startsWith(DEVICE_TRANSFERS_PREFIX)) {
+      const id = safeDecodeSegment(reqPath.slice(DEVICE_TRANSFERS_PREFIX.length));
+      if (!id || id.includes("/")) {
+        return Response.error(404, "Transfer not found");
+      }
+      const cancelled = app.devices.cancelTransfer(id);
+      if (!cancelled) {
+        return Response.error(404, "Active transfer not found");
+      }
+      return Response.json(200, { cancelled: true, transferId: id });
+    }
     if (reqPath.startsWith(DEVICE_ENROLLMENTS_PREFIX)) {
       const id = safeDecodeSegment(reqPath.slice(DEVICE_ENROLLMENTS_PREFIX.length));
       if (!id || id.includes("/")) {

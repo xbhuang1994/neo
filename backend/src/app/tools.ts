@@ -1,6 +1,7 @@
 //! The tools the models call: the main Session's for routing, assessing and replying, and a worker's for reading its
 //! ticket, acknowledging, handing back and reporting.
 
+import * as path from "node:path";
 import {
   UserError,
   createOutcome,
@@ -116,6 +117,17 @@ const ALLOWED_DEVICE_MCU_INSTALL: readonly string[] = [
   "chip",
   "backup_relay_device_ids",
   "auto_deploy",
+];
+const ALLOWED_DEVICE_FILE_TRANSFER: readonly string[] = [
+  "device_id",
+  "direction",
+  "remote_path",
+  "local_path",
+  "overwrite",
+  "resume",
+  "transfer_id",
+  "chunk_size",
+  "timeout_ms",
 ];
 const ALLOWED_ACK: readonly string[] = ["trigger_id", "text"];
 const ALLOWED_THREAD_REASON: readonly string[] = ["thread", "reason"];
@@ -249,7 +261,7 @@ function deviceSpecs(): ToolSpec[] {
     ),
     spec(
       "device_invoke",
-      "Invoke a capability or action on a paired Tier 1 OS agent or Tier 2 MCU. Risky actions return pending_approval with a short code.",
+      "Invoke a capability or action on a paired Tier 1 OS agent (e.g. exec, fs.stat, fs.read, fs.write, fs.list, probe) or Tier 2 MCU. Risky actions return pending_approval with a short code. Use device_file_transfer for direct binary file pull/push.",
       {
         device_id: { type: "string" },
         action: { type: "string" },
@@ -258,6 +270,51 @@ function deviceSpecs(): ToolSpec[] {
         reason: { type: ["string", "null"] },
       },
       ["device_id", "action"],
+    ),
+    spec(
+      "device_file_transfer",
+      "Transfer a file directly between Master Neo local disk and a paired Tier 1 OS agent over the E2E-encrypted binary file channel (0xE3) with SHA-256 verification and resume support, without passing file bytes through model context. Use direction='pull' to download remote_path -> local_path (e.g. before wechat_send_file), or direction='push' to upload local_path -> remote_path.",
+      {
+        device_id: { type: "string", description: "Paired Tier 1 OS agent device ID." },
+        direction: {
+          type: "string",
+          enum: ["pull", "push"],
+          description: "'pull' downloads remote_path -> local_path; 'push' uploads local_path -> remote_path.",
+        },
+        remote_path: {
+          type: "string",
+          description: "File path on the Tier 1 device (strictly within its allowed workspaces).",
+        },
+        local_path: {
+          type: "string",
+          description: "Absolute file path on Master Neo (or relative to the current ticket directory for workers).",
+        },
+        overwrite: {
+          type: ["boolean", "null"],
+          description: "Overwrite destination file if it exists (default true).",
+        },
+        resume: {
+          type: ["boolean", "null"],
+          description: "Resume an interrupted transfer using the same transfer_id (default false).",
+        },
+        transfer_id: {
+          type: ["string", "null"],
+          description: "Optional ASCII transfer ID (required when resuming an existing partial transfer).",
+        },
+        chunk_size: {
+          type: ["integer", "null"],
+          minimum: 4096,
+          maximum: 524288,
+          description: "Binary chunk size in bytes (default 131072).",
+        },
+        timeout_ms: {
+          type: ["integer", "null"],
+          minimum: 1000,
+          maximum: 600000,
+          description: "Idle/transfer timeout in milliseconds (default 120000).",
+        },
+      },
+      ["device_id", "direction", "remote_path", "local_path"],
     ),
     spec(
       "device_approve",
@@ -1305,6 +1362,7 @@ async function runDeviceTool(
   app: AppContext,
   name: string,
   argumentsValue: unknown,
+  ticketId?: string,
 ): Promise<{ handled: true; result: unknown } | { handled: false }> {
   switch (name) {
     case "device_list": {
@@ -1399,6 +1457,75 @@ async function runDeviceTool(
         ...(backupRelayDeviceIds !== undefined ? { backupRelayDeviceIds } : {}),
         ...(typeof rawAutoDeploy === "boolean" ? { autoDeploy: rawAutoDeploy } : {}),
       });
+      return { handled: true, result };
+    }
+    case "device_file_transfer": {
+      const args = Args.of(argumentsValue, ALLOWED_DEVICE_FILE_TRANSFER);
+      const deviceId = args.required("device_id").trim();
+      const direction = args.required("direction").trim();
+      if (direction !== "pull" && direction !== "push") {
+        throw new Error("direction must be pull or push");
+      }
+      const remotePath = args.required("remote_path").trim();
+      const rawLocalPath = args.required("local_path").trim();
+      let localPath = rawLocalPath;
+      if (!path.isAbsolute(localPath)) {
+        const ticketDir = ticketId !== undefined ? app.storeTicket(ticketId)?.execution?.directory : undefined;
+        if (ticketDir) {
+          localPath = path.resolve(ticketDir, localPath);
+        } else {
+          throw new Error("local_path must be an absolute path");
+        }
+      }
+      const rawOverwrite = args.get("overwrite");
+      if (rawOverwrite !== undefined && rawOverwrite !== null && typeof rawOverwrite !== "boolean") {
+        throw new Error("overwrite must be a boolean");
+      }
+      const rawResume = args.get("resume");
+      if (rawResume !== undefined && rawResume !== null && typeof rawResume !== "boolean") {
+        throw new Error("resume must be a boolean");
+      }
+      const rawChunkSize = args.get("chunk_size");
+      let chunkSize: number | undefined;
+      if (rawChunkSize !== undefined && rawChunkSize !== null) {
+        if (
+          typeof rawChunkSize !== "number" ||
+          !Number.isInteger(rawChunkSize) ||
+          rawChunkSize < 4096 ||
+          rawChunkSize > 524_288
+        ) {
+          throw new Error("chunk_size must be an integer between 4096 and 524288");
+        }
+        chunkSize = rawChunkSize;
+      }
+      const rawTimeout = args.get("timeout_ms");
+      let timeoutMs: number | undefined;
+      if (rawTimeout !== undefined && rawTimeout !== null) {
+        if (
+          typeof rawTimeout !== "number" ||
+          !Number.isInteger(rawTimeout) ||
+          rawTimeout < 1000 ||
+          rawTimeout > 600_000
+        ) {
+          throw new Error("timeout_ms must be an integer between 1000 and 600000");
+        }
+        timeoutMs = rawTimeout;
+      }
+      const transferId = args.text("transfer_id");
+      const shared = {
+        deviceId,
+        remotePath,
+        localPath,
+        ...(typeof rawOverwrite === "boolean" ? { overwrite: rawOverwrite } : {}),
+        ...(typeof rawResume === "boolean" ? { resume: rawResume } : {}),
+        ...(transferId !== undefined ? { transferId } : {}),
+        ...(chunkSize !== undefined ? { chunkSize } : {}),
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      };
+      const result =
+        direction === "pull"
+          ? await app.devices.pullFile(shared)
+          : await app.devices.pushFile(shared);
       return { handled: true, result };
     }
     default:
@@ -1598,7 +1725,7 @@ export async function workerTool(
   name: string,
   argumentsValue: unknown,
 ): Promise<unknown> {
-  const deviceHandled = await runDeviceTool(app, name, argumentsValue);
+  const deviceHandled = await runDeviceTool(app, name, argumentsValue, ticketId);
   if (deviceHandled.handled) {
     return deviceHandled.result;
   }

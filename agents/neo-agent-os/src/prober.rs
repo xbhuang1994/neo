@@ -80,7 +80,9 @@ impl CapabilityProber {
         let mut capabilities = vec![
             "exec".to_string(),
             "fs".to_string(),
+            "fs_stat".to_string(),
             "transfer".to_string(),
+            "file_channel".to_string(),
             "ota".to_string(),
             "self_update".to_string(),
         ];
@@ -222,6 +224,8 @@ mod tests {
         assert!(manifest.capabilities.contains(&"relay".to_string()));
         assert!(manifest.capabilities.contains(&"exec".to_string()));
         assert!(manifest.capabilities.contains(&"self_update".to_string()));
+        assert!(manifest.capabilities.contains(&"fs_stat".to_string()));
+        assert!(manifest.capabilities.contains(&"file_channel".to_string()));
         assert!(manifest.relay_config.as_ref().unwrap().enabled);
         assert_eq!(manifest.sandbox.level, "personal");
         assert!(!manifest.sandbox.unrestricted);

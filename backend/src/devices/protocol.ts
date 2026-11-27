@@ -22,6 +22,16 @@ import {
   E2E_NONCE_BYTES,
   E2E_TAG_BYTES,
   ENROLL_ENVELOPE_VERSION,
+  FILE_ENVELOPE_VERSION,
+  FILE_FRAME_FIXED_HEADER_BYTES,
+  FILE_FRAME_KIND_ABORT,
+  FILE_FRAME_KIND_ACK,
+  FILE_FRAME_KIND_DATA,
+  FILE_FRAME_KIND_DONE,
+  FILE_FRAME_KIND_FINISH,
+  FILE_FRAME_VERSION,
+  MAX_FILE_FRAME_DATA_BYTES,
+  MAX_TRANSFER_ID_BYTES,
   RELAY_HEADER_BYTES,
   RELAY_MAGIC_0,
   RELAY_MAGIC_1,
@@ -29,6 +39,8 @@ import {
   type DeviceMessage,
   type DeviceMessageKind,
   type EnrollPayload,
+  type FileFrame,
+  type FileFrameKind,
   type RelayDirection,
   type RelayEnvelope,
   type RelayFrame,
@@ -784,4 +796,197 @@ export function compareSemver(a: string, b: string): number | null {
 export function isVersionOlder(current: string, target: string): boolean {
   const cmp = compareSemver(current, target);
   return cmp !== null && cmp < 0;
+}
+
+const VALID_FILE_FRAME_KINDS: ReadonlySet<number> = new Set([
+  FILE_FRAME_KIND_DATA,
+  FILE_FRAME_KIND_ACK,
+  FILE_FRAME_KIND_FINISH,
+  FILE_FRAME_KIND_DONE,
+  FILE_FRAME_KIND_ABORT,
+]);
+
+const TRANSFER_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+/** Validate a direct file transfer ID (`^[A-Za-z0-9_-]{1,64}$`). */
+export function validateTransferId(transferId: string): void {
+  if (!TRANSFER_ID_RE.test(transferId)) {
+    throw new Error(`Invalid transfer_id: ${JSON.stringify(transferId)}`);
+  }
+}
+
+/** Build the `0xE3` direct file channel AEAD AAD `UTF8("file-v1|" + cluster_id + "|" + src_id + "|" + dst_id)`. */
+export function buildFileAad(clusterId: string, srcId: string, dstId: string): Uint8Array {
+  const buf = Buffer.from(`file-v1|${clusterId}|${srcId}|${dstId}`, "utf8");
+  return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+}
+
+/**
+ * Encode `FileFramePlaintext` (byte-for-byte compatible with Rust `neo-agent-os::protocol::FileFrame`):
+ * `[0]=0x01, [1]=kind, [2..4]=flags(u16 BE), [4..8]=seq(u32 BE), [8..16]=offset(u64 BE),
+ *  [16..20]=window(u32 BE), [20]=idLen(u8), [21..21+idLen]=transferId,
+ *  [21+idLen..25+idLen]=dataLen(u32 BE), [25+idLen..]=data`.
+ */
+export function encodeFileFramePlaintext(frame: FileFrame): Uint8Array {
+  if (frame.v !== FILE_FRAME_VERSION) {
+    throw new Error(`Unsupported FileFrame version: ${String(frame.v)}`);
+  }
+  if (!VALID_FILE_FRAME_KINDS.has(frame.kind)) {
+    throw new Error(`Unknown FileFrame kind: 0x${frame.kind.toString(16)}`);
+  }
+  validateTransferId(frame.transferId);
+  if (!Number.isSafeInteger(frame.offset) || frame.offset < 0) {
+    throw new Error(`Invalid FileFrame offset: ${frame.offset}`);
+  }
+  if (!Number.isInteger(frame.seq) || frame.seq < 0 || frame.seq > 0xffffffff) {
+    throw new Error(`Invalid FileFrame seq: ${frame.seq}`);
+  }
+  if (!Number.isInteger(frame.window) || frame.window < 0 || frame.window > 0xffffffff) {
+    throw new Error(`Invalid FileFrame window: ${frame.window}`);
+  }
+  if (frame.data.byteLength > MAX_FILE_FRAME_DATA_BYTES) {
+    throw new Error(
+      `FileFrame data exceeds max size (${frame.data.byteLength} > ${MAX_FILE_FRAME_DATA_BYTES})`,
+    );
+  }
+  const idBytes = Buffer.from(frame.transferId, "ascii");
+  const total = FILE_FRAME_FIXED_HEADER_BYTES + idBytes.byteLength + frame.data.byteLength;
+  const out = new Uint8Array(total);
+  const view = new DataView(out.buffer);
+  out[0] = FILE_FRAME_VERSION;
+  out[1] = frame.kind;
+  view.setUint16(2, frame.flags & 0xffff, false);
+  view.setUint32(4, frame.seq >>> 0, false);
+  view.setBigUint64(8, BigInt(frame.offset), false);
+  view.setUint32(16, frame.window >>> 0, false);
+  out[20] = idBytes.byteLength;
+  out.set(idBytes, 21);
+  const dataLenOff = 21 + idBytes.byteLength;
+  view.setUint32(dataLenOff, frame.data.byteLength >>> 0, false);
+  out.set(frame.data, dataLenOff + 4);
+  return out;
+}
+
+/** Decode a `FileFramePlaintext` binary buffer strictly. */
+export function decodeFileFramePlaintext(bytes: Uint8Array): FileFrame {
+  if (bytes.byteLength < FILE_FRAME_FIXED_HEADER_BYTES) {
+    throw new Error(`FileFrame plaintext too short: ${bytes.byteLength}`);
+  }
+  if (bytes[0] !== FILE_FRAME_VERSION) {
+    throw new Error(`Unsupported FileFrame version: ${bytes[0]}`);
+  }
+  const kind = bytes[1]!;
+  if (!VALID_FILE_FRAME_KINDS.has(kind)) {
+    throw new Error(`Unknown FileFrame kind: 0x${kind.toString(16)}`);
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const flags = view.getUint16(2, false);
+  const seq = view.getUint32(4, false);
+  const offsetBig = view.getBigUint64(8, false);
+  if (offsetBig > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error(`FileFrame offset exceeds MAX_SAFE_INTEGER: ${offsetBig.toString()}`);
+  }
+  const offset = Number(offsetBig);
+  const window = view.getUint32(16, false);
+  const idLen = bytes[20]!;
+  if (idLen === 0 || idLen > MAX_TRANSFER_ID_BYTES) {
+    throw new Error(`Invalid FileFrame transferId length: ${idLen}`);
+  }
+  const dataLenOff = 21 + idLen;
+  if (bytes.byteLength < dataLenOff + 4) {
+    throw new Error("Truncated FileFrame transferId/dataLen");
+  }
+  const transferId = utf8FatalDecoder.decode(bytes.subarray(21, dataLenOff));
+  validateTransferId(transferId);
+  const dataLen = view.getUint32(dataLenOff, false);
+  if (dataLen > MAX_FILE_FRAME_DATA_BYTES) {
+    throw new Error(`FileFrame data exceeds max size: ${dataLen}`);
+  }
+  const dataStart = dataLenOff + 4;
+  const expectedLen = dataStart + dataLen;
+  if (bytes.byteLength !== expectedLen) {
+    throw new Error(`FileFrame length mismatch: expected ${expectedLen}, got ${bytes.byteLength}`);
+  }
+  const data = bytes.slice(dataStart, expectedLen);
+  return {
+    v: 1,
+    kind: kind as FileFrameKind,
+    flags,
+    seq,
+    offset,
+    window,
+    transferId,
+    data,
+  };
+}
+
+/**
+ * Encrypt and authenticate a binary `FileFrame` into wire bytes:
+ * `[0]=0xE3, [1..13]=12B nonce, [13..]=AES-256-GCM(FileFramePlaintext) || 16B tag`.
+ */
+export function sealFileFrame(
+  frame: FileFrame,
+  e2eMasterSecret: string,
+  clusterId: string,
+  srcId: string,
+  dstId: string,
+  nonceOverride?: Uint8Array,
+): Uint8Array {
+  const key = deriveE2eKey(clusterId, e2eMasterSecret);
+  const nonce = nonceOverride ?? new Uint8Array(randomBytes(E2E_NONCE_BYTES));
+  if (nonce.byteLength !== E2E_NONCE_BYTES) {
+    throw new Error(`File E2E nonce must be ${E2E_NONCE_BYTES} bytes`);
+  }
+  const aad = buildFileAad(clusterId, srcId, dstId);
+  const plaintext = encodeFileFramePlaintext(frame);
+  const cipher = createCipheriv("aes-256-gcm", key, nonce);
+  cipher.setAAD(aad);
+  const ciphertext = cipher.update(plaintext);
+  const final = cipher.final();
+  const tag = cipher.getAuthTag();
+  const out = new Uint8Array(
+    1 + E2E_NONCE_BYTES + ciphertext.byteLength + final.byteLength + tag.byteLength,
+  );
+  out[0] = FILE_ENVELOPE_VERSION;
+  out.set(nonce, 1);
+  let pos = 1 + E2E_NONCE_BYTES;
+  out.set(ciphertext, pos);
+  pos += ciphertext.byteLength;
+  out.set(final, pos);
+  pos += final.byteLength;
+  out.set(tag, pos);
+  return out;
+}
+
+/** Decrypt and authenticate an incoming `0xE3` binary `FileFrame`. */
+export function openFileFrame(
+  wire: Uint8Array,
+  e2eMasterSecret: string,
+  localClusterId: string,
+  srcId: string,
+  dstId: string,
+): FileFrame {
+  const minBytes = 1 + E2E_NONCE_BYTES + E2E_TAG_BYTES;
+  if (wire.byteLength < minBytes) {
+    throw new Error(`File E2E envelope too short: ${wire.byteLength} < ${minBytes}`);
+  }
+  if (wire[0] !== FILE_ENVELOPE_VERSION) {
+    throw new Error(`Unsupported file E2E envelope version: 0x${wire[0]!.toString(16)}`);
+  }
+  const nonce = wire.subarray(1, 1 + E2E_NONCE_BYTES);
+  const tagStart = wire.byteLength - E2E_TAG_BYTES;
+  const ciphertext = wire.subarray(1 + E2E_NONCE_BYTES, tagStart);
+  const tag = wire.subarray(tagStart);
+  const key = deriveE2eKey(localClusterId, e2eMasterSecret);
+  const aad = buildFileAad(localClusterId, srcId, dstId);
+
+  const decipher = createDecipheriv("aes-256-gcm", key, nonce);
+  decipher.setAAD(aad);
+  decipher.setAuthTag(tag);
+  const part1 = decipher.update(ciphertext);
+  const part2 = decipher.final();
+  const plaintext = Buffer.concat([part1, part2]);
+  return decodeFileFramePlaintext(
+    new Uint8Array(plaintext.buffer, plaintext.byteOffset, plaintext.byteLength),
+  );
 }
