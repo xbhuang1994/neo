@@ -140,6 +140,15 @@ function Install-NeoAgent {
         }
 
         New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+        if (Test-Path -LiteralPath $BinPath) {
+            $OldBin = "$BinPath.old"
+            Remove-Item -LiteralPath $OldBin -Force -ErrorAction SilentlyContinue
+            try {
+                Move-Item -LiteralPath $BinPath -Destination $OldBin -Force -ErrorAction Stop
+            } catch {
+                # If rename fails, Copy-Item -Force below will attempt overwrite directly.
+            }
+        }
         Copy-Item -LiteralPath $ExtractedBin.FullName -Destination $BinPath -Force
 
         $Enroll | & $BinPath enroll --relay-url $RelayBase --mode $Mode --ticket-stdin

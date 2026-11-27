@@ -535,6 +535,13 @@ function Install-NeoAgent {
       throw 'neo-agent-os.exe missing from archive'
     }
     New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+    if (Test-Path -LiteralPath $binPath) {
+      $oldBin = "$binPath.old"
+      Remove-Item -LiteralPath $oldBin -Force -ErrorAction SilentlyContinue
+      try {
+        Move-Item -LiteralPath $binPath -Destination $oldBin -Force -ErrorAction Stop
+      } catch {}
+    }
     Copy-Item -Path $exe.FullName -Destination $binPath -Force
 
     Write-Host "[neo-install] Running neo-agent-os enroll via $ClaimUrl..."

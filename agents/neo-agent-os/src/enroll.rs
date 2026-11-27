@@ -1170,13 +1170,140 @@ WantedBy=default.target
     )
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn encode_utf16le_bom(text: &str) -> Vec<u8> {
+    let crlf = text.replace("\r\n", "\n").replace('\n', "\r\n");
+    let mut out = Vec::with_capacity(2 + crlf.len() * 2);
+    out.push(0xFF);
+    out.push(0xFE);
+    for unit in crlf.encode_utf16() {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+    out
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn render_windows_task_xml(
+    cluster_id: &str,
+    exe_path: &Path,
+    workspace_dir: &Path,
+    env_path: &Path,
+    policy_path: &Path,
+    ota_cache_dir: &Path,
+    user_id: Option<&str>,
+) -> String {
+    let args = format!(
+        "--env-file \"{}\" --policy \"{}\" --ota-cache-dir \"{}\"",
+        env_path.display(),
+        policy_path.display(),
+        ota_cache_dir.display()
+    );
+    let user_xml = match user_id.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(uid) => format!("\n      <UserId>{}</UserId>", xml_escape(uid)),
+        None => String::new(),
+    };
+    let principal_user_xml = match user_id.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(uid) => format!("\n      <UserId>{}</UserId>", xml_escape(uid)),
+        None => String::new(),
+    };
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Neo Tier 1 OS Agent (cluster {cluster})</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>{user_xml}
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">{principal_user_xml}
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>999</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{command}</Command>
+      <Arguments>{arguments}</Arguments>
+      <WorkingDirectory>{workdir}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"#,
+        cluster = xml_escape(cluster_id),
+        user_xml = user_xml,
+        principal_user_xml = principal_user_xml,
+        command = xml_escape(&exe_path.to_string_lossy()),
+        arguments = xml_escape(&args),
+        workdir = xml_escape(&workspace_dir.to_string_lossy()),
+    )
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn render_windows_cmd_wrapper(
+    exe_path: &Path,
+    env_path: &Path,
+    policy_path: &Path,
+    ota_cache_dir: &Path,
+) -> String {
+    format!(
+        "@echo off\r\n\"{}\" --env-file \"{}\" --policy \"{}\" --ota-cache-dir \"{}\"\r\n",
+        exe_path.display(),
+        env_path.display(),
+        policy_path.display(),
+        ota_cache_dir.display()
+    )
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn render_windows_vbs_launcher(
+    exe_path: &Path,
+    env_path: &Path,
+    policy_path: &Path,
+    ota_cache_dir: &Path,
+) -> String {
+    let esc = |p: &Path| p.to_string_lossy().replace('"', "\"\"");
+    format!(
+        "Dim sh\r\nSet sh = CreateObject(\"WScript.Shell\")\r\nsh.Run \"\"\"{}\"\" --env-file \"\"{}\"\" --policy \"\"{}\"\" --ota-cache-dir \"\"{}\"\"\", 0, False\r\n",
+        esc(exe_path),
+        esc(env_path),
+        esc(policy_path),
+        esc(ota_cache_dir)
+    )
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1522,8 +1649,40 @@ fn install_service_macos(
 }
 
 #[cfg(target_os = "windows")]
+fn spawn_windows_detached(
+    exe_path: &Path,
+    workspace_dir: &Path,
+    env_path: &Path,
+    policy_path: &Path,
+    ota_cache_dir: &Path,
+) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    std::process::Command::new(exe_path)
+        .args([
+            "--env-file",
+            env_path.to_string_lossy().as_ref(),
+            "--policy",
+            policy_path.to_string_lossy().as_ref(),
+            "--ota-cache-dir",
+            ota_cache_dir.to_string_lossy().as_ref(),
+        ])
+        .current_dir(workspace_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .spawn()
+        .map_err(|e| format!("failed to launch neo-agent-os background process: {e}"))?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
 fn install_service_windows(
     cluster_id: &str,
+    config_dir: &Path,
+    workspace_dir: &Path,
     env_path: &Path,
     policy_path: &Path,
     ota_cache_dir: &Path,
@@ -1531,73 +1690,151 @@ fn install_service_windows(
     let exe_path = std::env::current_exe()
         .map_err(|e| format!("failed to resolve current_exe: {e}"))?;
 
-    // Best-effort ACL restriction on .env file so only current user can read/write it.
-    if let Ok(user) = std::env::var("USERNAME") {
-        if !user.trim().is_empty() {
-            let grant = format!("{}:(R,W)", user.trim());
-            let _ = std::process::Command::new("icacls")
-                .args([
-                    env_path.to_string_lossy().as_ref(),
-                    "/inheritance:r",
-                    "/grant:r",
-                    &grant,
-                ])
-                .output();
+    let user_id = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+        (Ok(dom), Ok(usr)) if !dom.trim().is_empty() && !usr.trim().is_empty() => {
+            Some(format!("{}\\{}", dom.trim(), usr.trim()))
         }
+        (_, Ok(usr)) if !usr.trim().is_empty() => Some(usr.trim().to_string()),
+        _ => None,
+    };
+
+    // Best-effort ACL restriction on .env file so only current user can read/write it.
+    if let Some(ref uid) = user_id {
+        let grant = format!("{uid}:(R,W)");
+        let _ = std::process::Command::new("icacls")
+            .args([
+                env_path.to_string_lossy().as_ref(),
+                "/inheritance:r",
+                "/grant:r",
+                &grant,
+            ])
+            .output();
     }
 
-    let task_name = format!("NeoAgent-{cluster_id}");
-    let task_cmd = format!(
-        "\"{}\" --env-file \"{}\" --policy \"{}\" --ota-cache-dir \"{}\"",
-        exe_path.display(),
-        env_path.display(),
-        policy_path.display(),
-        ota_cache_dir.display()
-    );
+    let cluster_dir = config_dir.join(cluster_id);
+    std::fs::create_dir_all(&cluster_dir)
+        .map_err(|e| format!("failed to create {}: {e}", cluster_dir.display()))?;
 
-    let out = std::process::Command::new("schtasks")
+    let task_xml_path = cluster_dir.join("task.xml");
+    let run_cmd_path = cluster_dir.join("run.cmd");
+    let run_vbs_path = cluster_dir.join("run.vbs");
+
+    let task_xml = render_windows_task_xml(
+        cluster_id,
+        &exe_path,
+        workspace_dir,
+        env_path,
+        policy_path,
+        ota_cache_dir,
+        user_id.as_deref(),
+    );
+    std::fs::write(&task_xml_path, encode_utf16le_bom(&task_xml))
+        .map_err(|e| format!("failed to write {}: {e}", task_xml_path.display()))?;
+    std::fs::write(
+        &run_cmd_path,
+        render_windows_cmd_wrapper(&exe_path, env_path, policy_path, ota_cache_dir),
+    )
+    .map_err(|e| format!("failed to write {}: {e}", run_cmd_path.display()))?;
+    std::fs::write(
+        &run_vbs_path,
+        render_windows_vbs_launcher(&exe_path, env_path, policy_path, ota_cache_dir),
+    )
+    .map_err(|e| format!("failed to write {}: {e}", run_vbs_path.display()))?;
+
+    let task_name = format!("NeoAgent-{cluster_id}");
+
+    // Primary: Task Scheduler XML import (no 261-char /TR limit, works for non-admin per-user
+    // LogonTrigger, disables 72h timeout & battery stop, runs hidden with RestartOnFailure).
+    let xml_out = std::process::Command::new("schtasks")
         .args([
             "/Create",
             "/F",
-            "/SC",
-            "ONLOGON",
             "/TN",
             &task_name,
-            "/TR",
-            &task_cmd,
+            "/XML",
+            task_xml_path.to_string_lossy().as_ref(),
+        ])
+        .output();
+
+    if let Ok(ref out) = xml_out {
+        if out.status.success() {
+            let started = std::process::Command::new("schtasks")
+                .args(["/Run", "/TN", &task_name])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !started {
+                spawn_windows_detached(&exe_path, workspace_dir, env_path, policy_path, ota_cache_dir)?;
+            }
+            return Ok(format!(
+                "Windows Scheduled Task registered via XML & started ({task_name})"
+            ));
+        }
+    }
+
+    // Fallback 1: short silent VBS wrapper via /TR (guaranteed << 261 chars).
+    let short_tr = format!("wscript.exe //B \"{}\"", run_vbs_path.display());
+    if short_tr.len() <= 260 {
+        let tr_out = std::process::Command::new("schtasks")
+            .args([
+                "/Create",
+                "/F",
+                "/SC",
+                "ONLOGON",
+                "/TN",
+                &task_name,
+                "/TR",
+                &short_tr,
+            ])
+            .output();
+        if let Ok(ref out) = tr_out {
+            if out.status.success() {
+                let started = std::process::Command::new("schtasks")
+                    .args(["/Run", "/TN", &task_name])
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+                if !started {
+                    spawn_windows_detached(&exe_path, workspace_dir, env_path, policy_path, ota_cache_dir)?;
+                }
+                return Ok(format!(
+                    "Windows Scheduled Task registered via wrapper & started ({task_name})"
+                ));
+            }
+        }
+    }
+
+    // Fallback 2: HKCU Run registry key (works without admin rights or Task Scheduler GPO)
+    // plus immediate detached headless launch.
+    let reg_out = std::process::Command::new("reg")
+        .args([
+            "add",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+            "/v",
+            &task_name,
+            "/t",
+            "REG_SZ",
+            "/d",
+            &short_tr,
+            "/f",
         ])
         .output()
-        .map_err(|e| format!("failed to invoke schtasks: {e}"))?;
-    if !out.status.success() {
+        .map_err(|e| format!("failed to register HKCU startup entry: {e}"))?;
+    if !reg_out.status.success() {
+        let xml_err = xml_out
+            .as_ref()
+            .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
+            .unwrap_or_default();
         return Err(format!(
-            "schtasks /Create failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            "failed to register Windows autostart (schtasks XML: {xml_err}; reg add exited with {})",
+            reg_out.status
         ));
     }
 
-    let started_via_task = std::process::Command::new("schtasks")
-        .args(["/Run", "/TN", &task_name])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    if !started_via_task {
-        let _ = std::process::Command::new(&exe_path)
-            .args([
-                "--env-file",
-                env_path.to_string_lossy().as_ref(),
-                "--policy",
-                policy_path.to_string_lossy().as_ref(),
-                "--ota-cache-dir",
-                ota_cache_dir.to_string_lossy().as_ref(),
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
-
-    Ok(format!("Windows Scheduled Task registered & started ({task_name})"))
+    spawn_windows_detached(&exe_path, workspace_dir, env_path, policy_path, ota_cache_dir)?;
+    Ok(format!(
+        "Windows user startup registered (HKCU Run: {task_name}) & started in background"
+    ))
 }
 
 fn install_os_service(
@@ -1649,12 +1886,17 @@ fn install_os_service(
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = (config_dir, workspace_dir, limits);
+        let _ = limits;
         match mode {
             EffectiveMode::Foreground => Ok("foreground mode (no service installed)".to_string()),
-            EffectiveMode::System | EffectiveMode::User => {
-                install_service_windows(cluster_id, env_path, policy_path, ota_cache_dir)
-            }
+            EffectiveMode::System | EffectiveMode::User => install_service_windows(
+                cluster_id,
+                config_dir,
+                workspace_dir,
+                env_path,
+                policy_path,
+                ota_cache_dir,
+            ),
         }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -2351,5 +2593,57 @@ max_exec_timeout_sec = 60
 
         server.abort();
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn renders_windows_task_xml_and_wrappers_for_long_paths_without_261_char_limit() {
+        let exe = Path::new(r"C:\Users\TroyeSimon\AppData\Local\neo-agent\bin\neo-agent-os.exe");
+        let ws = Path::new(r"C:\Users\TroyeSimon\AppData\Local\neo-agent\neo-cluster-prod\work");
+        let env = Path::new(r"C:\Users\TroyeSimon\AppData\Local\neo-agent\cluster-neo-cluster-prod.env");
+        let pol = Path::new(r"C:\Users\TroyeSimon\AppData\Local\neo-agent\policy-neo-cluster-prod.toml");
+        let ota = Path::new(r"C:\Users\TroyeSimon\AppData\Local\neo-agent\neo-cluster-prod\ota");
+
+        let legacy_tr = format!(
+            "\"{}\" --env-file \"{}\" --policy \"{}\" --ota-cache-dir \"{}\"",
+            exe.display(),
+            env.display(),
+            pol.display(),
+            ota.display()
+        );
+        assert!(
+            legacy_tr.len() > 261,
+            "test fixture should reproduce >261 char legacy /TR command (got {})",
+            legacy_tr.len()
+        );
+
+        let xml = render_windows_task_xml(
+            "neo-cluster-prod",
+            exe,
+            ws,
+            env,
+            pol,
+            ota,
+            Some(r"DESKTOP-TEST\TroyeSimon"),
+        );
+        assert!(xml.contains(r#"encoding="UTF-16""#));
+        assert!(xml.contains("<Command>C:\\Users\\TroyeSimon\\AppData\\Local\\neo-agent\\bin\\neo-agent-os.exe</Command>"));
+        assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        assert!(xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
+        assert!(xml.contains("<Hidden>true</Hidden>"));
+        assert!(xml.contains("<UserId>DESKTOP-TEST\\TroyeSimon</UserId>"));
+        assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
+
+        let utf16 = encode_utf16le_bom(&xml);
+        assert_eq!(&utf16[..2], &[0xFF, 0xFE]);
+        assert!(utf16.len() > xml.len() * 2);
+
+        let vbs = render_windows_vbs_launcher(exe, env, pol, ota);
+        assert!(vbs.contains("WScript.Shell"));
+        assert!(vbs.contains("--env-file"));
+        assert!(vbs.contains(", 0, False"));
+
+        let cmd = render_windows_cmd_wrapper(exe, env, pol, ota);
+        assert!(cmd.starts_with("@echo off\r\n"));
+        assert!(cmd.contains("--ota-cache-dir"));
     }
 }

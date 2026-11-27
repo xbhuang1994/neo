@@ -186,7 +186,16 @@ fn teardown_service_windows(cluster_id: &str) -> Result<String, String> {
     let _ = std::process::Command::new("schtasks")
         .args(["/Delete", "/F", "/TN", &task_name])
         .output();
-    Ok(format!("stopped & deleted Windows Scheduled Task ({task_name})"))
+    let _ = std::process::Command::new("reg")
+        .args([
+            "delete",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+            "/v",
+            &task_name,
+            "/f",
+        ])
+        .output();
+    Ok(format!("stopped & removed Windows Scheduled Task / HKCU Run entry ({task_name})"))
 }
 
 fn teardown_os_service(
@@ -263,6 +272,9 @@ pub fn run_uninstall(args: UninstallArgs) -> Result<UninstallOutcome, String> {
 
     let cluster_subdir = config_dir.join(&args.cluster);
     remove_file_if_exists(&cluster_subdir.join("start.sh"), &mut removed_paths)?;
+    remove_file_if_exists(&cluster_subdir.join("task.xml"), &mut removed_paths)?;
+    remove_file_if_exists(&cluster_subdir.join("run.cmd"), &mut removed_paths)?;
+    remove_file_if_exists(&cluster_subdir.join("run.vbs"), &mut removed_paths)?;
     remove_dir_all_if_exists(&ota_cache_dir, &mut removed_paths)?;
     remove_dir_all_if_exists(&cluster_subdir.join("logs"), &mut removed_paths)?;
 
