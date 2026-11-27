@@ -67,7 +67,7 @@ class ChatPage extends StatelessWidget {
         builder: (context) {
           final fonts = fallbackFonts(context);
           return CupertinoAlertDialog(
-            content: Text(error.message, style: fonts),
+            content: Selectable(child: Text(error.message, style: fonts)),
             actions: [CupertinoDialogAction(onPressed: () => Navigator.of(context).pop(), child: Text(strings.ok, style: fonts))],
           );
         },
@@ -96,21 +96,29 @@ class ChatPage extends StatelessWidget {
               ),
             ],
           ),
-          LinkNotice(onOpenSettings: onOpenSettings),
           Expanded(
-            child: Stack(
-              children: [
-                Positioned.fill(
-                  child: state.messages.isEmpty
-                      ? switch (state.link) {
-                          Link.starting || Link.connecting => const Center(child: CupertinoActivityIndicator(radius: 12)),
-                          _ => EmptyState(icon: CupertinoIcons.chat_bubble_2, title: strings.chatEmptyTitle, hint: strings.chatEmptyHint),
-                        }
-                      : Transcript(messages: state.messages),
-                ),
-                // Floats over the newest messages, just above the composer.
-                const Positioned(right: 12, bottom: 6, child: ActivityTicker()),
-              ],
+            child: Selectable(
+              child: Column(
+                children: [
+                  LinkNotice(onOpenSettings: onOpenSettings),
+                  Expanded(
+                    child: Stack(
+                      children: [
+                        Positioned.fill(
+                          child: state.messages.isEmpty
+                              ? switch (state.link) {
+                                  Link.starting || Link.connecting => const Center(child: CupertinoActivityIndicator(radius: 12)),
+                                  _ => EmptyState(icon: CupertinoIcons.chat_bubble_2, title: strings.chatEmptyTitle, hint: strings.chatEmptyHint),
+                                }
+                              : Transcript(messages: state.messages),
+                        ),
+                        // Floats over the newest messages, just above the composer.
+                        const Positioned(right: 12, bottom: 6, child: ActivityTicker()),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
           Composer(picker: picker),
@@ -144,10 +152,17 @@ class _TranscriptState extends State<Transcript> {
     _toEnd();
   }
 
+  bool _messagesChanged(List<ChatMessage> prev, List<ChatMessage> next) {
+    if (identical(prev, next)) return false;
+    if (prev.length != next.length) return true;
+    if (prev.isEmpty) return false;
+    return prev.last.id != next.last.id || prev.last.text != next.last.text;
+  }
+
   @override
   void didUpdateWidget(Transcript oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (_follow) _toEnd();
+    if (_follow && _messagesChanged(oldWidget.messages, widget.messages)) _toEnd();
   }
 
   void _toEnd() {
@@ -393,7 +408,7 @@ class _ComposerState extends State<Composer> {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          if (_error != null) Padding(padding: const EdgeInsets.only(bottom: grid), child: Notice(_error!)),
+          if (_error != null) Padding(padding: const EdgeInsets.only(bottom: grid), child: Selectable(child: Notice(_error!))),
           if (_files.isNotEmpty)
             Padding(
               padding: const EdgeInsets.only(bottom: grid),

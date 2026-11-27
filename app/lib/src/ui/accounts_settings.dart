@@ -4,11 +4,11 @@ library;
 import 'dart:async';
 
 import 'package:cupertino_ui/cupertino_ui.dart';
-import 'package:flutter/services.dart';
 
 import '../api/client.dart';
 import '../api/models.dart';
 import '../l10n/strings.dart';
+import '../platform/host.dart';
 import 'settings_page.dart';
 import 'theme.dart';
 import 'widgets.dart';
@@ -155,20 +155,18 @@ class _AccountsSettingsState extends LoadingState<AccountsSettings, AccountsView
               child: Row(
                 children: [
                   Expanded(
-                    child: Selectable(
-                      child: Text(
-                        link,
-                        style: typo.mono.copyWith(color: palette.accent),
-                        maxLines: 3,
-                        overflow: TextOverflow.ellipsis,
-                      ),
+                    child: Text(
+                      link,
+                      style: typo.mono.copyWith(color: palette.accent),
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
                     ),
                   ),
                   Tappable(
                     tooltip: strings.copyLink,
                     padding: const EdgeInsets.all(6),
                     onTap: () {
-                      unawaited(Clipboard.setData(ClipboardData(text: link)));
+                      unawaited(copyToClipboard(link));
                       setState(() {
                         notice = strings.copied;
                         noticeGood = true;
@@ -184,9 +182,7 @@ class _AccountsSettingsState extends LoadingState<AccountsSettings, AccountsView
               margin: const EdgeInsets.only(top: 8),
               padding: const EdgeInsets.all(8),
               decoration: BoxDecoration(color: palette.code, borderRadius: BorderRadius.circular(8)),
-              child: Selectable(
-                child: Text(shown.trim(), style: typo.mono.copyWith(color: palette.secondary, fontSize: 11.5)),
-              ),
+              child: Text(shown.trim(), style: typo.mono.copyWith(color: palette.secondary, fontSize: 11.5)),
             ),
           if (login.running)
             Padding(
@@ -216,10 +212,11 @@ class _AccountsSettingsState extends LoadingState<AccountsSettings, AccountsView
     final login = view.login;
     final account = view.account;
     final idle = !busy && login?.running != true;
-    return Group(
-      title: strings.antigravityAccount,
-      footer: strings.accountsFooter,
-      children: [
+    return Selectable(
+      child: Group(
+        title: strings.antigravityAccount,
+        footer: strings.accountsFooter,
+        children: [
         Padding(
           key: const ValueKey('accounts-antigravity'),
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
@@ -283,6 +280,7 @@ class _AccountsSettingsState extends LoadingState<AccountsSettings, AccountsView
             child: Text(notice!, style: typo.footnote.copyWith(color: noticeGood ? palette.green : palette.red)),
           ),
       ],
+    ),
     );
   }
 }

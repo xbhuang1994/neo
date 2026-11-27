@@ -11,6 +11,9 @@ import 'host.dart';
 /// The desktop: the app starts the backend that is installed beside it, and only one app runs per user.
 Host createHost() => DesktopHost();
 
+/// Copy [text] to the system clipboard.
+Future<void> copyToClipboard(String text) => Clipboard.setData(ClipboardData(text: text));
+
 /// The exit status with which the backend says another instance runs.
 const int alreadyRunningStatus = 3;
 

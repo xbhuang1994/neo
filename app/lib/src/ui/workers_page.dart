@@ -243,31 +243,33 @@ class _WorkerDetailState extends State<WorkerDetail> {
                 Expanded(child: Align(alignment: Alignment.centerLeft, child: Pill(status, color: color, dot: worker.tone == WorkerTone.working))),
                 if (worker.active) ...[
                   const SizedBox(width: grid),
-                  CupertinoButton(
-                    key: const ValueKey('stop-worker'),
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                    minimumSize: const Size(0, 30),
-                    borderRadius: BorderRadius.circular(8),
-                    color: palette.red.withValues(alpha: 0.12),
-                    disabledColor: palette.fill,
-                    onPressed: online && !_stopping ? () => unawaited(_stop(worker)) : null,
-                    child: _stopping
-                        ? Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              const CupertinoActivityIndicator(radius: 7),
-                              const SizedBox(width: 6),
-                              Text(strings.stoppingWorker, style: typo.footnote.copyWith(color: palette.red, fontWeight: FontWeight.w600)),
-                            ],
-                          )
-                        : Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(CupertinoIcons.stop_circle, size: 15, color: online ? palette.red : palette.tertiary),
-                              const SizedBox(width: 5),
-                              Text(strings.stopWorker, style: typo.footnote.copyWith(color: online ? palette.red : palette.tertiary, fontWeight: FontWeight.w600)),
-                            ],
-                          ),
+                  SelectionContainer.disabled(
+                    child: CupertinoButton(
+                      key: const ValueKey('stop-worker'),
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                      minimumSize: const Size(0, 30),
+                      borderRadius: BorderRadius.circular(8),
+                      color: palette.red.withValues(alpha: 0.12),
+                      disabledColor: palette.fill,
+                      onPressed: online && !_stopping ? () => unawaited(_stop(worker)) : null,
+                      child: _stopping
+                          ? Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const CupertinoActivityIndicator(radius: 7),
+                                const SizedBox(width: 6),
+                                Text(strings.stoppingWorker, style: typo.footnote.copyWith(color: palette.red, fontWeight: FontWeight.w600)),
+                              ],
+                            )
+                          : Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(CupertinoIcons.stop_circle, size: 15, color: online ? palette.red : palette.tertiary),
+                                const SizedBox(width: 5),
+                                Text(strings.stopWorker, style: typo.footnote.copyWith(color: online ? palette.red : palette.tertiary, fontWeight: FontWeight.w600)),
+                              ],
+                            ),
+                    ),
                   ),
                 ],
               ],

@@ -55,37 +55,39 @@ class _ActivityTickerState extends State<ActivityTicker> {
     if (lines.isEmpty) return const SizedBox.shrink();
     final index = _turn % lines.length;
     final style = Typo.of(context).caption.copyWith(fontSize: 11.5, color: palette.secondary);
-    return IgnorePointer(
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 380),
-        child: Container(
-          key: const ValueKey('activity-ticker'),
-          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
-          decoration: BoxDecoration(
-            color: palette.surface.withValues(alpha: 0.88),
-            borderRadius: BorderRadius.circular(999),
-            border: Border.all(color: palette.separator.withValues(alpha: 0.5), width: 0.5),
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const CupertinoActivityIndicator(radius: 5),
-              const SizedBox(width: 6),
-              Flexible(
-                child: AnimatedSwitcher(
-                  duration: const Duration(milliseconds: 280),
-                  transitionBuilder: (child, animation) => FadeTransition(
-                    opacity: animation,
-                    child: SlideTransition(
-                      position: Tween(begin: const Offset(0, 0.4), end: Offset.zero).animate(animation),
-                      child: child,
+    return SelectionContainer.disabled(
+      child: IgnorePointer(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 380),
+          child: Container(
+            key: const ValueKey('activity-ticker'),
+            padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+            decoration: BoxDecoration(
+              color: palette.surface.withValues(alpha: 0.88),
+              borderRadius: BorderRadius.circular(999),
+              border: Border.all(color: palette.separator.withValues(alpha: 0.5), width: 0.5),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const CupertinoActivityIndicator(radius: 5),
+                const SizedBox(width: 6),
+                Flexible(
+                  child: AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 280),
+                    transitionBuilder: (child, animation) => FadeTransition(
+                      opacity: animation,
+                      child: SlideTransition(
+                        position: Tween(begin: const Offset(0, 0.4), end: Offset.zero).animate(animation),
+                        child: child,
+                      ),
                     ),
+                    child: Text(lines[index], key: ValueKey('$index:${lines[index]}'), style: style, maxLines: 1, overflow: TextOverflow.ellipsis),
                   ),
-                  child: Text(lines[index], key: ValueKey('$index:${lines[index]}'), style: style, maxLines: 1, overflow: TextOverflow.ellipsis),
                 ),
-              ),
-              if (lines.length > 1) ...[const SizedBox(width: 6), Text('${index + 1}/${lines.length}', style: style.copyWith(color: palette.tertiary))],
-            ],
+                if (lines.length > 1) ...[const SizedBox(width: 6), Text('${index + 1}/${lines.length}', style: style.copyWith(color: palette.tertiary))],
+              ],
+            ),
           ),
         ),
       ),
