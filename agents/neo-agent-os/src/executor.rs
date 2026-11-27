@@ -1,4 +1,5 @@
-use crate::policy::Policy;
+use crate::policy::{Policy, SandboxLevel};
+use crate::prober::SandboxSummary;
 use crate::updater::verify_ed25519_signature;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -7,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -30,18 +31,155 @@ struct TransferSession {
 }
 
 pub struct Executor {
-    policy: Arc<Policy>,
+    policy: Arc<RwLock<Policy>>,
     ota_cache_dir: Option<PathBuf>,
+    policy_path: Option<PathBuf>,
+    sandbox_override_path: Option<PathBuf>,
     transfers: Mutex<HashMap<String, TransferSession>>,
 }
 
 impl Executor {
-    pub fn new(policy: Arc<Policy>, ota_cache_dir: Option<PathBuf>) -> Self {
+    pub fn new(policy: Arc<RwLock<Policy>>, ota_cache_dir: Option<PathBuf>) -> Self {
         Self {
             policy,
             ota_cache_dir,
+            policy_path: None,
+            sandbox_override_path: None,
             transfers: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn with_policy_paths(
+        mut self,
+        policy_path: Option<PathBuf>,
+        sandbox_override_path: Option<PathBuf>,
+    ) -> Self {
+        self.policy_path = policy_path;
+        self.sandbox_override_path = sandbox_override_path;
+        self
+    }
+
+    pub fn policy_snapshot(&self) -> Policy {
+        self.policy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn apply_sandbox_level(&self, params: &Value) -> Result<Value, String> {
+        let raw_level = params
+            .get("level")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "set_sandbox requires 'level' string".to_string())?;
+        let level = SandboxLevel::parse(raw_level)?;
+
+        let requested_workspaces: Option<Vec<String>> = match params.get("workspaces") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(arr)) => {
+                let mut out = Vec::with_capacity(arr.len());
+                for item in arr {
+                    let s = item
+                        .as_str()
+                        .ok_or_else(|| "set_sandbox 'workspaces' entries must be strings".to_string())?;
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        out.push(trimmed.to_string());
+                    }
+                }
+                if out.is_empty() {
+                    None
+                } else {
+                    Some(out)
+                }
+            }
+            Some(_) => return Err("set_sandbox 'workspaces' must be an array of strings".to_string()),
+        };
+
+        let mut guard = self.policy.write().unwrap_or_else(|e| e.into_inner());
+        if guard.is_sandbox_locked() {
+            return Err("sandbox level is locked by local policy (lock_sandbox = true)".to_string());
+        }
+
+        let workspaces = match requested_workspaces {
+            Some(ws) => ws,
+            None => {
+                if !guard.config().allowed_workspaces.is_empty() {
+                    guard.config().allowed_workspaces.clone()
+                } else {
+                    guard
+                        .canonical_workspaces()
+                        .iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect()
+                }
+            }
+        };
+
+        let new_policy = Policy::from_preset(level, workspaces, false)?;
+        *guard = new_policy.clone();
+
+        let mut persisted = false;
+        let mut persisted_path: Option<String> = None;
+        let mut persist_warning: Option<String> = None;
+
+        if let Some(ref p) = self.policy_path {
+            match new_policy.persist_to_file(p) {
+                Ok(()) => {
+                    persisted = true;
+                    persisted_path = Some(p.to_string_lossy().into_owned());
+                    if let Some(ref ov) = self.sandbox_override_path {
+                        if ov.exists() {
+                            let _ = std::fs::remove_file(ov);
+                        }
+                    }
+                }
+                Err(primary_err) => {
+                    if let Some(ref ov) = self.sandbox_override_path {
+                        match new_policy.persist_to_file(ov) {
+                            Ok(()) => {
+                                persisted = true;
+                                persisted_path = Some(ov.to_string_lossy().into_owned());
+                                persist_warning = Some(format!(
+                                    "primary policy file not writable ({primary_err}); persisted to override file"
+                                ));
+                            }
+                            Err(ov_err) => {
+                                persist_warning = Some(format!(
+                                    "applied in memory only; primary policy write failed ({primary_err}) and override write failed ({ov_err})"
+                                ));
+                            }
+                        }
+                    } else {
+                        persist_warning = Some(format!(
+                            "applied in memory only; failed to persist policy ({primary_err})"
+                        ));
+                    }
+                }
+            }
+        } else if let Some(ref ov) = self.sandbox_override_path {
+            match new_policy.persist_to_file(ov) {
+                Ok(()) => {
+                    persisted = true;
+                    persisted_path = Some(ov.to_string_lossy().into_owned());
+                }
+                Err(ov_err) => {
+                    persist_warning = Some(format!(
+                        "applied in memory only; override write failed ({ov_err})"
+                    ));
+                }
+            }
+        }
+
+        drop(guard);
+
+        let sandbox = SandboxSummary::from_policy(&new_policy);
+        Ok(json!({
+            "level": level.as_str(),
+            "sandbox": sandbox,
+            "persisted": persisted,
+            "persisted_path": persisted_path,
+            "warning": persist_warning,
+        }))
     }
 
     pub async fn dispatch(
@@ -57,6 +195,7 @@ impl Executor {
             "fs_list" | "fs.list" => self.handle_fs_list(params).await,
             "transfer_chunk" | "transfer" => self.handle_transfer_chunk(params).await,
             "ota_stage" | "ota.stage" => self.handle_ota_stage(params).await,
+            "set_sandbox" | "sandbox.set" => self.apply_sandbox_level(params),
             other => Err(format!("unsupported RPC method: {other}")),
         };
         match res {
@@ -66,96 +205,158 @@ impl Executor {
     }
 
     async fn handle_exec(&self, params: &Value, timeout_ms: Option<u64>) -> Result<Value, String> {
-        let (program, args) = if let Some(prog) = params.get("program").and_then(|v| v.as_str()) {
-            let args: Vec<String> = params
-                .get("args")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            (prog.to_string(), args)
-        } else if let Some(cmd_str) = params.get("cmd").and_then(|v| v.as_str()) {
-            split_command_no_shell(cmd_str)?
+        let policy = self.policy_snapshot();
+        let unrestricted = policy.is_unrestricted();
+
+        let (spawn_label, mut cmd) = if unrestricted {
+            if let Some(prog) = params.get("program").and_then(|v| v.as_str()) {
+                let validated_program = policy.validate_command(prog)?;
+                let args: Vec<String> = params
+                    .get("args")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut c = Command::new(&validated_program);
+                c.args(&args);
+                (validated_program, c)
+            } else if let Some(cmd_str) = params.get("cmd").and_then(|v| v.as_str()) {
+                if cmd_str.trim().is_empty() || cmd_str.contains('\0') {
+                    return Err("empty or invalid command string".to_string());
+                }
+                #[cfg(windows)]
+                let (shell, c) = {
+                    let mut c = Command::new("cmd");
+                    c.args(["/C", cmd_str]);
+                    ("cmd".to_string(), c)
+                };
+                #[cfg(not(windows))]
+                let (shell, c) = {
+                    let mut c = Command::new("sh");
+                    c.args(["-c", cmd_str]);
+                    ("sh".to_string(), c)
+                };
+                (shell, c)
+            } else {
+                return Err("exec requires 'program' or 'cmd'".to_string());
+            }
         } else {
-            return Err("exec requires 'program' or 'cmd'".to_string());
+            let (program, args) = if let Some(prog) = params.get("program").and_then(|v| v.as_str()) {
+                let args: Vec<String> = params
+                    .get("args")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (prog.to_string(), args)
+            } else if let Some(cmd_str) = params.get("cmd").and_then(|v| v.as_str()) {
+                split_command_no_shell(cmd_str)?
+            } else {
+                return Err("exec requires 'program' or 'cmd'".to_string());
+            };
+
+            let validated_program = policy.validate_command(&program)?;
+            let mut c = Command::new(&validated_program);
+            c.args(&args);
+            (validated_program, c)
         };
 
-        let validated_program = self.policy.validate_command(&program)?;
-
         let cwd = match params.get("cwd").and_then(|v| v.as_str()) {
-            Some(c) if !c.is_empty() => self.policy.validate_path(c, true)?,
-            _ => self.policy.default_workspace()?.to_path_buf(),
+            Some(c) if !c.is_empty() => policy.validate_path(c, true)?,
+            _ => policy.default_cwd()?,
         };
         if !cwd.is_dir() {
             return Err(format!("cwd is not a directory: {}", cwd.display()));
         }
 
-        let max_timeout_ms = self.policy.config().max_exec_timeout_sec.saturating_mul(1000);
-        let eff_timeout_ms = timeout_ms
-            .unwrap_or(max_timeout_ms)
-            .min(max_timeout_ms)
-            .max(100);
+        let eff_timeout_ms: Option<u64> = if unrestricted && policy.config().max_exec_timeout_sec == 0 {
+            timeout_ms.map(|ms| ms.max(100))
+        } else {
+            let max_timeout_ms = policy.config().max_exec_timeout_sec.saturating_mul(1000);
+            Some(
+                timeout_ms
+                    .unwrap_or(max_timeout_ms)
+                    .min(max_timeout_ms)
+                    .max(100),
+            )
+        };
 
-        let mut cmd = Command::new(&validated_program);
-        cmd.args(&args)
-            .current_dir(&cwd)
+        cmd.current_dir(&cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .env_clear();
+            .kill_on_drop(true);
 
-        #[cfg(target_os = "macos")]
-        {
-            cmd.env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
-                .env("HOME", cwd.to_string_lossy().as_ref())
-                .env("LANG", "C.UTF-8");
-        }
-        #[cfg(target_os = "windows")]
-        {
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-            for key in ["PATH", "SystemRoot", "COMSPEC", "PATHEXT"] {
-                if let Ok(val) = std::env::var(key) {
-                    if !BLOCKED_ENV_VARS.iter().any(|b| b.eq_ignore_ascii_case(key)) {
-                        cmd.env(key, val);
-                    }
-                }
+        if unrestricted {
+            #[cfg(target_os = "windows")]
+            {
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                cmd.creation_flags(CREATE_NO_WINDOW);
             }
-            cmd.env("USERPROFILE", cwd.to_string_lossy().as_ref())
-                .env("HOME", cwd.to_string_lossy().as_ref());
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin")
-                .env("HOME", cwd.to_string_lossy().as_ref())
-                .env("LANG", "C.UTF-8");
-        }
-
-        if let Some(env_map) = params.get("env").and_then(|v| v.as_object()) {
-            for (k, v) in env_map {
-                if let Some(val) = v.as_str() {
-                    if !BLOCKED_ENV_VARS.iter().any(|b| b.eq_ignore_ascii_case(k)) {
+            if let Some(env_map) = params.get("env").and_then(|v| v.as_object()) {
+                for (k, v) in env_map {
+                    if let Some(val) = v.as_str() {
                         cmd.env(k, val);
                     }
                 }
             }
+        } else {
+            cmd.env_clear();
+
+            #[cfg(target_os = "macos")]
+            {
+                cmd.env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+                    .env("HOME", cwd.to_string_lossy().as_ref())
+                    .env("LANG", "C.UTF-8");
+            }
+            #[cfg(target_os = "windows")]
+            {
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                cmd.creation_flags(CREATE_NO_WINDOW);
+                for key in ["PATH", "SystemRoot", "COMSPEC", "PATHEXT"] {
+                    if let Ok(val) = std::env::var(key) {
+                        if !BLOCKED_ENV_VARS.iter().any(|b| b.eq_ignore_ascii_case(key)) {
+                            cmd.env(key, val);
+                        }
+                    }
+                }
+                cmd.env("USERPROFILE", cwd.to_string_lossy().as_ref())
+                    .env("HOME", cwd.to_string_lossy().as_ref());
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            {
+                cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                    .env("HOME", cwd.to_string_lossy().as_ref())
+                    .env("LANG", "C.UTF-8");
+            }
+
+            if let Some(env_map) = params.get("env").and_then(|v| v.as_object()) {
+                for (k, v) in env_map {
+                    if let Some(val) = v.as_str() {
+                        if !BLOCKED_ENV_VARS.iter().any(|b| b.eq_ignore_ascii_case(k)) {
+                            cmd.env(k, val);
+                        }
+                    }
+                }
+            }
         }
 
-        // Best-effort Linux RLIMIT_AS memory cap in child pre_exec.
+        // Best-effort Linux RLIMIT_AS memory cap in child pre_exec (skipped if max_child_mem_mb == 0).
         #[cfg(target_os = "linux")]
         {
-            let mem_limit_bytes = self
-                .policy
+            let mem_limit_bytes = policy
                 .config()
                 .max_child_mem_mb
                 .saturating_mul(1024 * 1024);
-            unsafe {
-                cmd.pre_exec(move || {
-                    if mem_limit_bytes > 0 {
+            if mem_limit_bytes > 0 {
+                unsafe {
+                    cmd.pre_exec(move || {
                         let mut cur = libc::rlimit {
                             rlim_cur: 0,
                             rlim_max: 0,
@@ -173,19 +374,19 @@ impl Executor {
                             };
                             let _ = libc::setrlimit(libc::RLIMIT_AS, &new_lim);
                         }
-                    }
-                    Ok(())
-                });
+                        Ok(())
+                    });
+                }
             }
         }
 
         let mut child = cmd
             .spawn()
-            .map_err(|e| format!("failed to spawn '{validated_program}': {e}"))?;
+            .map_err(|e| format!("failed to spawn '{spawn_label}': {e}"))?;
 
         let mut stdout_pipe = child.stdout.take();
         let mut stderr_pipe = child.stderr.take();
-        let max_out = self.policy.config().max_output_bytes;
+        let max_out = policy.config().max_output_bytes;
 
         let stdout_task = tokio::spawn(async move {
             let mut buf = Vec::new();
@@ -204,15 +405,22 @@ impl Executor {
             buf
         });
 
-        let wait_res = tokio::time::timeout(Duration::from_millis(eff_timeout_ms), child.wait()).await;
-        let (timed_out, exit_code) = match wait_res {
-            Ok(Ok(status)) => (false, status.code()),
-            Ok(Err(e)) => return Err(format!("wait error: {e}")),
-            Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                (true, None)
+        let (timed_out, exit_code) = match eff_timeout_ms {
+            Some(limit_ms) => {
+                match tokio::time::timeout(Duration::from_millis(limit_ms), child.wait()).await {
+                    Ok(Ok(status)) => (false, status.code()),
+                    Ok(Err(e)) => return Err(format!("wait error: {e}")),
+                    Err(_) => {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        (true, None)
+                    }
+                }
             }
+            None => match child.wait().await {
+                Ok(status) => (false, status.code()),
+                Err(e) => return Err(format!("wait error: {e}")),
+            },
         };
 
         let mut stdout_bytes = stdout_task.await.unwrap_or_default();
@@ -231,19 +439,23 @@ impl Executor {
         });
 
         if timed_out {
-            return Err(format!("command timed out after {eff_timeout_ms}ms"));
+            return Err(format!(
+                "command timed out after {}ms",
+                eff_timeout_ms.unwrap_or(0)
+            ));
         }
         Ok(result)
     }
 
     async fn handle_fs_read(&self, params: &Value) -> Result<Value, String> {
+        let policy = self.policy_snapshot();
         let raw_path = params
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or("fs_read requires 'path'")?;
-        let path = self.policy.validate_path(raw_path, true)?;
+        let path = policy.validate_path(raw_path, true)?;
         let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
-        let max_limit = self.policy.config().max_output_bytes as u64;
+        let max_limit = policy.config().max_output_bytes as u64;
         let limit = params
             .get("limit")
             .and_then(|v| v.as_u64())
@@ -283,11 +495,15 @@ impl Executor {
     }
 
     async fn handle_fs_write(&self, params: &Value) -> Result<Value, String> {
+        let policy = self.policy_snapshot();
+        if policy.is_read_only() {
+            return Err("filesystem write denied by readonly sandbox policy".to_string());
+        }
         let raw_path = params
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or("fs_write requires 'path'")?;
-        let path = self.policy.validate_path(raw_path, false)?;
+        let path = policy.validate_path(raw_path, false)?;
         let append = params
             .get("append")
             .and_then(|v| v.as_bool())
@@ -332,9 +548,10 @@ impl Executor {
     }
 
     async fn handle_fs_list(&self, params: &Value) -> Result<Value, String> {
+        let policy = self.policy_snapshot();
         let path = match params.get("path").and_then(|v| v.as_str()) {
-            Some(p) if !p.is_empty() => self.policy.validate_path(p, true)?,
-            _ => self.policy.default_workspace()?.to_path_buf(),
+            Some(p) if !p.is_empty() => policy.validate_path(p, true)?,
+            _ => policy.default_cwd()?,
         };
 
         let mut entries_rd = tokio::fs::read_dir(&path)
@@ -361,6 +578,10 @@ impl Executor {
     }
 
     async fn handle_transfer_chunk(&self, params: &Value) -> Result<Value, String> {
+        let policy = self.policy_snapshot();
+        if policy.is_read_only() {
+            return Err("filesystem write denied by readonly sandbox policy".to_string());
+        }
         let transfer_id = params
             .get("transfer_id")
             .and_then(|v| v.as_str())
@@ -376,7 +597,7 @@ impl Executor {
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or("transfer_chunk requires 'path'")?;
-        let target_path = self.policy.validate_path(raw_path, false)?;
+        let target_path = policy.validate_path(raw_path, false)?;
         let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
         let eof = params.get("eof").and_then(|v| v.as_bool()).unwrap_or(false);
         let chunk_b64 = params
@@ -613,7 +834,7 @@ max_exec_timeout_sec = 5
 "#,
             ws.display()
         );
-        let policy = Arc::new(Policy::from_toml_str(&toml).unwrap());
+        let policy = Arc::new(RwLock::new(Policy::from_toml_str(&toml).unwrap()));
         let exec = Executor::new(policy, None);
 
         // Allowed exec
@@ -694,6 +915,330 @@ max_exec_timeout_sec = 5
         assert_eq!(r2["ok"], true);
         assert_eq!(r2["result"]["finalized"], true);
         assert_eq!(std::fs::read(&tx_target).unwrap(), full);
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn readonly_blocks_fs_write_and_transfer_but_allows_read_and_list() {
+        let ws = make_test_workspace("readonly");
+        let existing = ws.join("readme.txt");
+        std::fs::write(&existing, "readonly-content").unwrap();
+
+        let policy = Arc::new(RwLock::new(
+            Policy::from_preset(
+                SandboxLevel::Readonly,
+                vec![ws.to_string_lossy().into_owned()],
+                false,
+            )
+            .unwrap(),
+        ));
+        let exec = Executor::new(policy, None);
+
+        // fs_read allowed inside workspace
+        let rd = exec
+            .dispatch("fs_read", &json!({"path": existing.to_string_lossy()}), None)
+            .await;
+        assert_eq!(rd["ok"], true);
+        assert_eq!(rd["result"]["text"], "readonly-content");
+
+        // fs_list allowed inside workspace
+        let ls = exec
+            .dispatch("fs_list", &json!({"path": ws.to_string_lossy()}), None)
+            .await;
+        assert_eq!(ls["ok"], true);
+        let names: Vec<&str> = ls["result"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["name"].as_str())
+            .collect();
+        assert!(names.contains(&"readme.txt"));
+
+        // fs_write blocked
+        let wr = exec
+            .dispatch(
+                "fs_write",
+                &json!({"path": ws.join("blocked.txt").to_string_lossy(), "content": "nope"}),
+                None,
+            )
+            .await;
+        assert_eq!(wr["ok"], false);
+        assert_eq!(
+            wr["error"].as_str().unwrap(),
+            "filesystem write denied by readonly sandbox policy"
+        );
+        assert!(!ws.join("blocked.txt").exists());
+
+        // transfer_chunk blocked
+        let tx = exec
+            .dispatch(
+                "transfer_chunk",
+                &json!({
+                    "transfer_id": "tx_ro",
+                    "path": ws.join("tx.bin").to_string_lossy(),
+                    "offset": 0,
+                    "chunk_b64": STANDARD.encode(b"abc"),
+                    "eof": true
+                }),
+                None,
+            )
+            .await;
+        assert_eq!(tx["ok"], false);
+        assert_eq!(
+            tx["error"].as_str().unwrap(),
+            "filesystem write denied by readonly sandbox policy"
+        );
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn unrestricted_allows_outside_fs_dotdot_pipeline_env_and_zero_limits() {
+        let ws = make_test_workspace("unr_ws");
+        let outside = make_test_workspace("unr_out");
+        let sub = outside.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let policy = Arc::new(RwLock::new(
+            Policy::from_preset(
+                SandboxLevel::Unrestricted,
+                vec![ws.to_string_lossy().into_owned()],
+                false,
+            )
+            .unwrap(),
+        ));
+        assert_eq!(policy.read().unwrap().config().max_child_mem_mb, 0);
+        assert_eq!(policy.read().unwrap().config().max_exec_timeout_sec, 0);
+        let exec = Executor::new(policy, None);
+
+        // Write and read outside workspace using a path containing `..`
+        let outside_dotdot = format!("{}/../outside_note.txt", sub.display());
+        let wr = exec
+            .dispatch(
+                "fs_write",
+                &json!({"path": outside_dotdot, "content": "outside-ok"}),
+                None,
+            )
+            .await;
+        assert_eq!(wr["ok"], true, "fs_write failed: {wr}");
+
+        let rd = exec
+            .dispatch("fs_read", &json!({"path": outside_dotdot}), None)
+            .await;
+        assert_eq!(rd["ok"], true, "fs_read failed: {rd}");
+        assert_eq!(rd["result"]["text"], "outside-ok");
+
+        // Shell pipeline via `cmd` and no policy timeout (max_exec_timeout_sec = 0)
+        #[cfg(unix)]
+        {
+            let pipe_res = exec
+                .dispatch(
+                    "exec",
+                    &json!({"cmd": "echo hello | tr a-z A-Z", "cwd": outside.to_string_lossy()}),
+                    None,
+                )
+                .await;
+            assert_eq!(pipe_res["ok"], true, "pipeline exec failed: {pipe_res}");
+            assert_eq!(pipe_res["result"]["stdout"].as_str().unwrap().trim(), "HELLO");
+
+            // Host env is inherited and params.env overrides are not filtered by BLOCKED_ENV_VARS
+            let host_var = std::env::vars().find(|(k, v)| {
+                !matches!(k.as_str(), "PATH" | "HOME" | "LANG" | "PWD" | "SHLVL" | "_")
+                    && !v.is_empty()
+                    && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            });
+            let env_res = exec
+                .dispatch(
+                    "exec",
+                    &json!({
+                        "program": "env",
+                        "args": [],
+                        "env": {
+                            "NEO_UNRESTRICTED_TEST": "yes",
+                            "DYLD_FRAMEWORK_PATH": "/tmp/custom-fw"
+                        }
+                    }),
+                    Some(2000),
+                )
+                .await;
+            assert_eq!(env_res["ok"], true, "env exec failed: {env_res}");
+            let env_out = env_res["result"]["stdout"].as_str().unwrap();
+            assert!(env_out.contains("NEO_UNRESTRICTED_TEST=yes"));
+            assert!(env_out.contains("DYLD_FRAMEWORK_PATH=/tmp/custom-fw"));
+            if let Some((hk, hv)) = host_var {
+                assert!(
+                    env_out.contains(&format!("{hk}={hv}")),
+                    "expected inherited host env {hk}={hv} in output"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[tokio::test]
+    async fn set_sandbox_transitions_preserve_workspaces_and_persist_with_fallback() {
+        let root = make_test_workspace("switch");
+        let ws = root.join("work");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let outside_file = outside.join("ext.txt");
+        std::fs::write(&outside_file, "external-data").unwrap();
+
+        let policy_path = root.join("policy-personal.toml");
+        let override_path = root.join("ota").join("sandbox-override.toml");
+
+        let initial = Policy::from_preset(
+            SandboxLevel::Personal,
+            vec![ws.to_string_lossy().into_owned()],
+            false,
+        )
+        .unwrap();
+        initial.persist_to_file(&policy_path).unwrap();
+        // Plant a stale override file to verify primary persistence cleans it up
+        std::fs::create_dir_all(override_path.parent().unwrap()).unwrap();
+        std::fs::write(&override_path, "stale = true\n").unwrap();
+
+        let shared = Arc::new(RwLock::new(initial));
+        let exec = Executor::new(Arc::clone(&shared), None)
+            .with_policy_paths(Some(policy_path.clone()), Some(override_path.clone()));
+
+        // 1. personal -> outside fs_read denied
+        let r_denied = exec
+            .dispatch("fs_read", &json!({"path": outside_file.to_string_lossy()}), None)
+            .await;
+        assert_eq!(r_denied["ok"], false);
+
+        // 2. personal -> unrestricted
+        let sw_unr = exec
+            .dispatch("set_sandbox", &json!({"level": "unrestricted"}), None)
+            .await;
+        assert_eq!(sw_unr["ok"], true, "switch to unrestricted failed: {sw_unr}");
+        assert_eq!(sw_unr["result"]["level"], "unrestricted");
+        assert_eq!(sw_unr["result"]["sandbox"]["unrestricted"], true);
+        assert_eq!(sw_unr["result"]["persisted"], true);
+        assert_eq!(
+            sw_unr["result"]["persisted_path"].as_str(),
+            Some(policy_path.to_string_lossy().as_ref())
+        );
+        assert!(sw_unr["result"]["warning"].is_null());
+        assert!(!override_path.exists(), "stale override should be removed");
+
+        // Reload persisted policy from disk and verify workspaces preserved
+        let disk_unr = Policy::from_file(&policy_path).unwrap();
+        assert!(disk_unr.is_unrestricted());
+        assert_eq!(
+            disk_unr.config().allowed_workspaces,
+            vec![ws.to_string_lossy().into_owned()]
+        );
+
+        // Now outside fs_read succeeds
+        let r_ok = exec
+            .dispatch("fs_read", &json!({"path": outside_file.to_string_lossy()}), None)
+            .await;
+        assert_eq!(r_ok["ok"], true);
+        assert_eq!(r_ok["result"]["text"], "external-data");
+
+        // 3. unrestricted -> readonly (restores workspace confinement & blocks writes)
+        let sw_ro = exec
+            .dispatch("sandbox.set", &json!({"level": "readonly"}), None)
+            .await;
+        assert_eq!(sw_ro["ok"], true);
+        assert_eq!(sw_ro["result"]["level"], "readonly");
+        assert_eq!(sw_ro["result"]["sandbox"]["read_only"], true);
+        assert_eq!(sw_ro["result"]["sandbox"]["unrestricted"], false);
+
+        let r_out_again = exec
+            .dispatch("fs_read", &json!({"path": outside_file.to_string_lossy()}), None)
+            .await;
+        assert_eq!(r_out_again["ok"], false);
+        let w_ro = exec
+            .dispatch(
+                "fs_write",
+                &json!({"path": ws.join("ro.txt").to_string_lossy(), "content": "x"}),
+                None,
+            )
+            .await;
+        assert_eq!(w_ro["ok"], false);
+
+        // 4. readonly -> personal (restores writes inside workspace, keeps outside blocked)
+        let sw_pers = exec
+            .dispatch("set_sandbox", &json!({"level": "personal"}), None)
+            .await;
+        assert_eq!(sw_pers["ok"], true);
+        assert_eq!(sw_pers["result"]["level"], "personal");
+        let w_pers = exec
+            .dispatch(
+                "fs_write",
+                &json!({"path": ws.join("ok.txt").to_string_lossy(), "content": "back"}),
+                None,
+            )
+            .await;
+        assert_eq!(w_pers["ok"], true);
+        let r_out_still_blocked = exec
+            .dispatch("fs_read", &json!({"path": outside_file.to_string_lossy()}), None)
+            .await;
+        assert_eq!(r_out_still_blocked["ok"], false);
+
+        // 5. Fallback to override file when primary policy_path cannot be written (e.g. directory path)
+        let unwritable_policy_dir = root.join("unwritable_primary_dir");
+        std::fs::create_dir_all(&unwritable_policy_dir).unwrap();
+        let fallback_override = root.join("fallback_ota").join("sandbox-override.toml");
+        let exec_fb = Executor::new(Arc::clone(&shared), None)
+            .with_policy_paths(Some(unwritable_policy_dir), Some(fallback_override.clone()));
+        let sw_fb = exec_fb
+            .dispatch("set_sandbox", &json!({"level": "desktop"}), None)
+            .await;
+        assert_eq!(sw_fb["ok"], true, "fallback switch failed: {sw_fb}");
+        assert_eq!(sw_fb["result"]["level"], "desktop");
+        assert_eq!(sw_fb["result"]["persisted"], true);
+        assert_eq!(
+            sw_fb["result"]["persisted_path"].as_str(),
+            Some(fallback_override.to_string_lossy().as_ref())
+        );
+        assert!(sw_fb["result"]["warning"].as_str().is_some());
+        let loaded_ov = Policy::from_file(&fallback_override).unwrap();
+        assert_eq!(loaded_ov.effective_level(), SandboxLevel::Desktop);
+
+        // 6. Reject `..` in workspaces when switching to a restricted level without mutating policy
+        let bad_ws = exec_fb
+            .dispatch(
+                "set_sandbox",
+                &json!({"level": "personal", "workspaces": [format!("{}/../outside", ws.display())]}),
+                None,
+            )
+            .await;
+        assert_eq!(bad_ws["ok"], false);
+        assert_eq!(shared.read().unwrap().effective_level(), SandboxLevel::Desktop);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn lock_sandbox_rejects_remote_set_sandbox() {
+        let ws = make_test_workspace("locked");
+        let locked_policy = Policy::from_preset(
+            SandboxLevel::Corp,
+            vec![ws.to_string_lossy().into_owned()],
+            true,
+        )
+        .unwrap();
+        let shared = Arc::new(RwLock::new(locked_policy));
+        let exec = Executor::new(Arc::clone(&shared), None);
+
+        let res = exec
+            .dispatch("set_sandbox", &json!({"level": "unrestricted"}), None)
+            .await;
+        assert_eq!(res["ok"], false);
+        assert!(res["error"]
+            .as_str()
+            .unwrap()
+            .contains("lock_sandbox = true"));
+        assert_eq!(shared.read().unwrap().effective_level(), SandboxLevel::Corp);
+        assert!(!shared.read().unwrap().is_unrestricted());
 
         let _ = std::fs::remove_dir_all(&ws);
     }

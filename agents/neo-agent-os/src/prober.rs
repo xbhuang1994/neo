@@ -4,9 +4,37 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxSummary {
+    pub level: String,
+    pub unrestricted: bool,
+    pub read_only: bool,
+    pub locked: bool,
     pub allowed_workspaces: Vec<String>,
     pub max_child_mem_mb: u64,
     pub max_exec_timeout_sec: u64,
+}
+
+impl SandboxSummary {
+    pub fn from_policy(policy: &Policy) -> Self {
+        let allowed_workspaces = if !policy.canonical_workspaces().is_empty() {
+            policy
+                .canonical_workspaces()
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect()
+        } else {
+            policy.config().allowed_workspaces.clone()
+        };
+
+        Self {
+            level: policy.effective_level().as_str().to_string(),
+            unrestricted: policy.is_unrestricted(),
+            read_only: policy.is_read_only(),
+            locked: policy.is_sandbox_locked(),
+            allowed_workspaces,
+            max_child_mem_mb: policy.config().max_child_mem_mb,
+            max_exec_timeout_sec: policy.config().max_exec_timeout_sec,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,15 +92,7 @@ impl CapabilityProber {
             capabilities.push("relay".to_string());
         }
 
-        let sandbox = SandboxSummary {
-            allowed_workspaces: policy
-                .canonical_workspaces()
-                .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect(),
-            max_child_mem_mb: policy.config().max_child_mem_mb,
-            max_exec_timeout_sec: policy.config().max_exec_timeout_sec,
-        };
+        let sandbox = SandboxSummary::from_policy(policy);
 
         let relay_config = Some(RelayConfigSummary {
             enabled: relay_enabled,
@@ -203,5 +223,33 @@ mod tests {
         assert!(manifest.capabilities.contains(&"exec".to_string()));
         assert!(manifest.capabilities.contains(&"self_update".to_string()));
         assert!(manifest.relay_config.as_ref().unwrap().enabled);
+        assert_eq!(manifest.sandbox.level, "personal");
+        assert!(!manifest.sandbox.unrestricted);
+        assert!(!manifest.sandbox.read_only);
+        assert!(!manifest.sandbox.locked);
+    }
+
+    #[test]
+    fn probes_sandbox_summary_for_readonly_unrestricted_and_locked_policies() {
+        use crate::policy::SandboxLevel;
+        let ws = std::env::temp_dir().to_string_lossy().into_owned();
+
+        let ro = Policy::from_preset(SandboxLevel::Readonly, vec![ws.clone()], true).unwrap();
+        let m_ro = CapabilityProber::probe(&ro, "os-ro", false, None, None);
+        assert_eq!(m_ro.sandbox.level, "readonly");
+        assert!(m_ro.sandbox.read_only);
+        assert!(!m_ro.sandbox.unrestricted);
+        assert!(m_ro.sandbox.locked);
+        assert_eq!(m_ro.sandbox.max_child_mem_mb, 1024);
+        assert_eq!(m_ro.sandbox.max_exec_timeout_sec, 60);
+
+        let unr = Policy::from_preset(SandboxLevel::Unrestricted, vec![ws], false).unwrap();
+        let m_unr = CapabilityProber::probe(&unr, "os-unr", false, None, None);
+        assert_eq!(m_unr.sandbox.level, "unrestricted");
+        assert!(m_unr.sandbox.unrestricted);
+        assert!(!m_unr.sandbox.read_only);
+        assert!(!m_unr.sandbox.locked);
+        assert_eq!(m_unr.sandbox.max_child_mem_mb, 0);
+        assert_eq!(m_unr.sandbox.max_exec_timeout_sec, 0);
     }
 }

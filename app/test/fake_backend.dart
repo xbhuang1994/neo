@@ -99,6 +99,10 @@ class FakeBackend {
   final List<String> pingedDevices = [];
   final List<Map<String, dynamic>> updatedDevices = [];
   final Map<String, Map<String, dynamic>> deviceUpdateResponses = {};
+  final List<Map<String, dynamic>> sandboxUpdates = [];
+  String? sandboxError;
+  String? sandboxWarning;
+  bool sandboxPendingMode = false;
   final List<Map<String, dynamic>> mcuInstalls = [];
   final List<String> approvedApprovals = [];
   final List<String> rejectedApprovals = [];
@@ -144,7 +148,19 @@ class FakeBackend {
     Map<String, dynamic>? manifest,
     List<String> capabilities = const ['exec', 'fs'],
     List<Map<String, dynamic>> pendingQueue = const [],
+    String? sandboxLevel,
+    String? desiredSandboxLevel,
+    String? sandboxSyncState,
+    String? sandboxSyncError,
+    bool sandboxLocked = false,
   }) {
+    final (memMb, timeoutSec) = switch (sandboxLevel) {
+      'readonly' => (1024, 60),
+      'corp' => (4096, 90),
+      'desktop' => (4096, 180),
+      'unrestricted' => (0, 0),
+      _ => (2048, 120),
+    };
     devices.removeWhere((d) => d['deviceId'] == deviceId);
     final effectiveVer = omitVersion ? null : (version ?? (tier == 'mcu' ? '0.1.0' : (deviceConfig['masterVersion'] as String? ?? '0.9.1')));
     devices.add({
@@ -154,6 +170,10 @@ class FakeBackend {
       'status': status,
       'route': route,
       'relayNodeId': ?relayNodeId,
+      'sandboxLevel': ?sandboxLevel,
+      'desiredSandboxLevel': ?desiredSandboxLevel,
+      'sandboxSyncState': ?sandboxSyncState,
+      'sandboxSyncError': ?sandboxSyncError,
       'manifest': manifest ??
           (tier == 'mcu'
               ? {'device_id': deviceId, 'tier': 'mcu', 'chip': 'ESP32', 'fw': ?effectiveVer, 'acts': ['get_temp']}
@@ -168,9 +188,13 @@ class FakeBackend {
                   'ram_mb': 16384,
                   'capabilities': capabilities,
                   'sandbox': {
+                    'level': ?sandboxLevel,
+                    if (sandboxLevel == 'unrestricted') 'unrestricted': true,
+                    if (sandboxLevel == 'readonly') 'read_only': true,
+                    if (sandboxLocked) 'locked': true,
                     'allowed_workspaces': ['/home/neo-personal/work'],
-                    'max_child_mem_mb': 2048,
-                    'max_exec_timeout_sec': 120,
+                    'max_child_mem_mb': memMb,
+                    'max_exec_timeout_sec': timeoutSec,
                   },
                 }),
       'capabilities': capabilities,
@@ -618,6 +642,71 @@ class FakeBackend {
         }
         return _json(200, {'approval': approval});
       }
+    }
+    if (method == 'PUT' && path.startsWith('/api/devices/') && path.endsWith('/sandbox') && path.length > '/api/devices//sandbox'.length) {
+      final id = Uri.decodeComponent(path.substring('/api/devices/'.length, path.length - '/sandbox'.length));
+      final index = devices.indexWhere((d) => d['deviceId'] == id);
+      if (index == -1) return _json(404, {'error': 'Device not found'});
+      final req = body is Map ? body.cast<String, dynamic>() : <String, dynamic>{};
+      final level = (req['level'] as String?)?.trim() ?? '';
+      sandboxUpdates.add({'deviceId': id, ...req});
+      if (sandboxError != null) {
+        final error = sandboxError!;
+        sandboxError = null;
+        return _json(400, {'error': error});
+      }
+      final device = devices[index];
+      final manifest = (device['manifest'] as Map?)?.cast<String, dynamic>() ?? <String, dynamic>{};
+      final sandbox = (manifest['sandbox'] as Map?)?.cast<String, dynamic>() ?? <String, dynamic>{};
+      if (sandbox['locked'] == true || device['sandboxSyncState'] == 'locked') {
+        return _json(403, {'error': 'Device sandbox policy is locked locally (lock_sandbox = true)'});
+      }
+      final warning = sandboxWarning;
+      sandboxWarning = null;
+      final isOnline = device['status'] == 'online';
+      final pending = sandboxPendingMode || !isOnline;
+      if (pending) {
+        device['desiredSandboxLevel'] = level;
+        device['sandboxSyncState'] = 'pending';
+        device.remove('sandboxSyncError');
+        return _json(200, {
+          'device': device,
+          'level': level,
+          'applied': false,
+          'pending': true,
+          'persisted': null,
+          'warning': ?warning,
+        });
+      }
+      final (memMb, timeoutSec) = switch (level) {
+        'readonly' => (1024, 60),
+        'corp' => (4096, 90),
+        'desktop' => (4096, 180),
+        'unrestricted' => (0, 0),
+        _ => (2048, 120),
+      };
+      manifest['sandbox'] = <String, dynamic>{
+        ...sandbox,
+        'level': level,
+        'unrestricted': level == 'unrestricted',
+        'read_only': level == 'readonly',
+        'max_child_mem_mb': memMb,
+        'max_exec_timeout_sec': timeoutSec,
+        if (req['workspaces'] is List) 'allowed_workspaces': (req['workspaces'] as List).cast<String>(),
+      };
+      device['manifest'] = manifest;
+      device['sandboxLevel'] = level;
+      device['desiredSandboxLevel'] = level;
+      device['sandboxSyncState'] = 'synced';
+      device.remove('sandboxSyncError');
+      return _json(200, {
+        'device': device,
+        'level': level,
+        'applied': true,
+        'pending': false,
+        'persisted': true,
+        'warning': ?warning,
+      });
     }
     if (method == 'POST' && path.startsWith('/api/devices/') && path.endsWith('/ping')) {
       final id = Uri.decodeComponent(path.substring('/api/devices/'.length, path.length - '/ping'.length));

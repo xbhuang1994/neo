@@ -333,6 +333,22 @@ class ApiClient {
         ),
       );
 
+  Future<DeviceSandboxUpdateResult> updateDeviceSandbox(
+    String id, {
+    required String level,
+    List<String>? workspaces,
+  }) async => DeviceSandboxUpdateResult.fromJson(
+    await _object(
+      'PUT',
+      '/api/devices/${Uri.encodeComponent(id)}/sandbox',
+      body: {
+        'level': level,
+        if (workspaces != null && workspaces.isNotEmpty) 'workspaces': workspaces,
+      },
+      timeout: const Duration(seconds: 30),
+    ),
+  );
+
   Future<DeviceApproval> approveDeviceApproval(String id, {String? reason}) async {
     final body = await _object(
       'POST',

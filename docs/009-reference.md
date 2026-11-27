@@ -88,6 +88,8 @@ JSON over HTTP, as [006 Deployment](006-deployment.md) says who may call. Errors
 | `POST /api/wechat/connect` | Starts a login, or takes up the binding |
 | `POST /api/wechat/verify` | `{code}`: the verification code the phone shows |
 | `POST /api/wechat/disconnect` | Unbinds |
+| `GET /api/devices` | `{config, devices, approvals, enrollments}`: Multi-device control plane overview; each Tier 1 OS device twin includes `sandboxLevel`, `desiredSandboxLevel`, `sandboxSyncState` (`synced\|pending\|unsupported\|locked\|error`) and `manifest.sandbox` |
+| `PUT /api/devices/{id}/sandbox` | `{level, workspaces?, timeoutMs?}`: switches a Tier 1 OS device among the 5 sandbox levels (`readonly`, `corp`, `personal`, `desktop`, `unrestricted`) via E2E `set_sandbox` RPC. Offline devices save `desiredSandboxLevel` as `pending` and sync automatically on reconnect; agents with `lock_sandbox = true` reject changes with status `403` |
 
 A Ticket's `stage` is `{stage: person, action: delivery\|answer\|review\|blocked\|failed}`, `{stage: working, action?: queued}`, `{stage: idle}` or `{stage: ended}`; an ended Ticket's `outcome` is `completed`, `dropped` or `stopped`.
 

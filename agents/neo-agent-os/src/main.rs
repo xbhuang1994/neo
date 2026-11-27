@@ -326,6 +326,29 @@ where
     })
 }
 
+fn load_effective_policy(
+    policy_path: &Path,
+    sandbox_override_path: Option<&Path>,
+) -> Result<Policy, String> {
+    let base_policy = Policy::from_file(policy_path)?;
+    if !base_policy.is_sandbox_locked() {
+        if let Some(ov_path) = sandbox_override_path {
+            if ov_path.exists() {
+                match Policy::from_file(ov_path) {
+                    Ok(override_policy) => return Ok(override_policy),
+                    Err(e) => {
+                        eprintln!(
+                            "[neo-agent-os] warning: failed to load sandbox override {}: {e}; keeping base policy",
+                            ov_path.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(base_policy)
+}
+
 async fn run_daemon_mode(args: RunArgs) {
     let env_file_map = match args.env_file.as_deref() {
         Some(path) => match parse_env_file(path) {
@@ -346,8 +369,16 @@ async fn run_daemon_mode(args: RunArgs) {
         }
     };
 
-    let policy = match Policy::from_file(&opts.policy_path) {
-        Ok(p) => Arc::new(p),
+    let sandbox_override_path = opts
+        .ota_cache_dir
+        .as_ref()
+        .map(|d| d.join("sandbox-override.toml"));
+
+    let initial_policy = match load_effective_policy(
+        &opts.policy_path,
+        sandbox_override_path.as_deref(),
+    ) {
+        Ok(p) => p,
         Err(e) => {
             eprintln!("policy load error: {e}");
             std::process::exit(2);
@@ -356,7 +387,7 @@ async fn run_daemon_mode(args: RunArgs) {
 
     if opts.print_manifest {
         let manifest = CapabilityProber::probe(
-            &policy,
+            &initial_policy,
             &opts.device_id,
             opts.relay,
             Some(&opts.mqtt_bind),
@@ -407,17 +438,21 @@ async fn run_daemon_mode(args: RunArgs) {
         uart_device: opts.uart_device,
         ota_cache_dir: opts.ota_cache_dir,
         updater_state_path,
+        policy_path: Some(opts.policy_path),
+        sandbox_override_path,
         #[cfg(test)]
         self_update_target: None,
     };
 
     if opts.one_shot_check {
-        if let Err(e) = run_one_shot_check(&cfg, &policy).await {
+        if let Err(e) = run_one_shot_check(&cfg, &initial_policy).await {
             eprintln!("one-shot-check failed: {e}");
             std::process::exit(1);
         }
         return;
     }
+
+    let policy = Arc::new(std::sync::RwLock::new(initial_policy));
 
     tokio::select! {
         res = run_agent(cfg, policy) => {
@@ -601,5 +636,68 @@ NEO_EXTRA_ARGS="--relay --mqtt-bind 127.0.0.1:1884"
             }
             other => panic!("expected Uninstall subcommand, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn load_effective_policy_respects_override_lock_and_corrupt_fallback() {
+        use crate::policy::SandboxLevel;
+        let root = std::env::temp_dir().join(format!(
+            "neo_main_pol_override_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ws = root.join("work");
+        std::fs::create_dir_all(&ws).unwrap();
+        let base_path = root.join("policy.toml");
+        let ov_path = root.join("sandbox-override.toml");
+
+        let base_unlocked = Policy::from_preset(
+            SandboxLevel::Personal,
+            vec![ws.to_string_lossy().into_owned()],
+            false,
+        )
+        .unwrap();
+        base_unlocked.persist_to_file(&base_path).unwrap();
+
+        let ov_unr = Policy::from_preset(
+            SandboxLevel::Unrestricted,
+            vec![ws.to_string_lossy().into_owned()],
+            false,
+        )
+        .unwrap();
+        ov_unr.persist_to_file(&ov_path).unwrap();
+
+        // Unlocked base + valid override => loads override
+        let loaded = load_effective_policy(&base_path, Some(&ov_path)).unwrap();
+        assert_eq!(loaded.effective_level(), SandboxLevel::Unrestricted);
+        assert!(loaded.is_unrestricted());
+
+        // Locked base + valid override => ignores override, keeps base
+        let base_locked = Policy::from_preset(
+            SandboxLevel::Corp,
+            vec![ws.to_string_lossy().into_owned()],
+            true,
+        )
+        .unwrap();
+        base_locked.persist_to_file(&base_path).unwrap();
+        let loaded_locked = load_effective_policy(&base_path, Some(&ov_path)).unwrap();
+        assert_eq!(loaded_locked.effective_level(), SandboxLevel::Corp);
+        assert!(loaded_locked.is_sandbox_locked());
+
+        // Unlocked base + corrupt override => falls back to base gracefully
+        base_unlocked.persist_to_file(&base_path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&ov_path, std::fs::Permissions::from_mode(0o644));
+        }
+        std::fs::write(&ov_path, "this is not valid toml [[[").unwrap();
+        let loaded_fallback = load_effective_policy(&base_path, Some(&ov_path)).unwrap();
+        assert_eq!(loaded_fallback.effective_level(), SandboxLevel::Personal);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

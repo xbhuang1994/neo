@@ -11,6 +11,8 @@ import * as path from "node:path";
 import { StopWorkerError } from "../app/context.ts";
 import type { AppContext, ChatAttachment } from "../app/context.ts";
 import {
+  SANDBOX_LEVELS,
+  isSandboxLevel,
   renderDirectInstallPs1,
   renderDirectInstallSh,
   type DeviceConfigUpdateInput,
@@ -983,6 +985,68 @@ async function routeDevices(
       return await done(async () => ({
         config: await app.devices.initOrUpdateConfig(input.value),
       }));
+    }
+
+    if (reqPath.startsWith(DEVICES_PREFIX) && reqPath.endsWith("/sandbox")) {
+      const id =
+        reqPath.length > DEVICES_PREFIX.length + "/sandbox".length
+          ? safeDecodeSegment(
+              reqPath.slice(DEVICES_PREFIX.length, reqPath.length - "/sandbox".length),
+            )
+          : null;
+      if (!id || id.includes("/")) {
+        return Response.error(404, "Device not found");
+      }
+      const parsed = jsonBody(request);
+      if (!parsed.ok) return parsed.response;
+      if (!isRecord(parsed.value)) {
+        return Response.error(400, "Expected JSON object");
+      }
+
+      const rawLevel = parsed.value.level;
+      if (!isSandboxLevel(rawLevel)) {
+        return Response.error(400, `level must be one of: ${SANDBOX_LEVELS.join(", ")}`);
+      }
+
+      let workspaces: string[] | undefined;
+      const rawWorkspaces = parsed.value.workspaces;
+      if (rawWorkspaces !== undefined && rawWorkspaces !== null) {
+        if (!Array.isArray(rawWorkspaces) || !rawWorkspaces.every((w) => typeof w === "string")) {
+          return Response.error(400, "workspaces must be an array of strings");
+        }
+        workspaces = rawWorkspaces;
+      }
+
+      const rawTimeout = parsed.value.timeoutMs ?? parsed.value.timeout_ms;
+      if (
+        rawTimeout !== undefined &&
+        rawTimeout !== null &&
+        (typeof rawTimeout !== "number" || !Number.isInteger(rawTimeout) || rawTimeout <= 0)
+      ) {
+        return Response.error(400, "timeoutMs must be a positive integer");
+      }
+
+      try {
+        const result = await app.devices.setDeviceSandboxLevel(id, rawLevel, {
+          ...(workspaces !== undefined ? { workspaces } : {}),
+          ...(typeof rawTimeout === "number" ? { timeoutMs: rawTimeout } : {}),
+        });
+        if (!result.applied && !result.pending && result.device.sandboxSyncState === "locked") {
+          return Response.json(403, {
+            ...result,
+            error: result.error ?? "Sandbox level is locked by local policy",
+          });
+        }
+        return Response.json(200, result);
+      } catch (error) {
+        const msg = errorMessage(error);
+        const statusCode = msg.startsWith("Unknown device:")
+          ? 404
+          : msg.includes("Cross-cluster")
+            ? 403
+            : 400;
+        return Response.error(statusCode, msg);
+      }
     }
   }
 

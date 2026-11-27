@@ -2,11 +2,14 @@ import 'package:cupertino_ui/cupertino_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:neo_agent/main.dart';
+import 'package:neo_agent/src/api/client.dart';
 import 'package:neo_agent/src/api/models.dart';
 import 'package:neo_agent/src/qr/qr_view.dart';
 import 'package:neo_agent/src/state/app_state.dart';
 import 'package:neo_agent/src/ui/device_enroll_sheet.dart';
+import 'package:neo_agent/src/ui/settings_page.dart' show ActionButton;
 import 'package:neo_agent/src/ui/theme.dart' show cjkFont;
+import 'package:neo_agent/src/ui/widgets.dart' show Pill;
 
 import 'fake_backend.dart';
 
@@ -206,6 +209,101 @@ void main() {
 
       await api.removeDevice('esp32-lab-1');
       expect(backend.removedDevices, ['esp32-lab-1']);
+
+      final sandboxRes = await api.updateDeviceSandbox('worker-01', level: 'desktop', workspaces: ['/workspace', '/tmp/build']);
+      expect((sandboxRes.level, sandboxRes.applied, sandboxRes.pending, sandboxRes.persisted), ('desktop', true, false, true));
+      expect(sandboxRes.device.effectiveSandboxLevel, 'desktop');
+      expect(sandboxRes.device.workspaces, ['/workspace', '/tmp/build']);
+      expect(backend.sandboxUpdates.last, {
+        'deviceId': 'worker-01',
+        'level': 'desktop',
+        'workspaces': ['/workspace', '/tmp/build'],
+      });
+
+      backend.sandboxPendingMode = true;
+      final pendingRes = await api.updateDeviceSandbox('worker-01', level: 'unrestricted');
+      expect((pendingRes.level, pendingRes.applied, pendingRes.pending, pendingRes.persisted), ('unrestricted', false, true, null));
+      expect((pendingRes.device.desiredSandboxLevel, pendingRes.device.sandboxSyncState, pendingRes.device.isSandboxSyncPending), ('unrestricted', 'pending', true));
+      backend.sandboxPendingMode = false;
+
+      backend.sandboxError = 'Invalid sandbox level';
+      await expectLater(api.updateDeviceSandbox('worker-01', level: 'invalid'), throwsA(isA<ApiException>()));
+    });
+
+    test('parses sandbox level inference, twin sync flags, and update results accurately', () {
+      expect(sandboxLevels, ['readonly', 'corp', 'personal', 'desktop', 'unrestricted']);
+
+      // Explicit level takes precedence.
+      final explicitDesktop = DeviceManifest.fromJson({
+        'device_id': 'd1',
+        'sandbox': {'level': 'desktop', 'max_child_mem_mb': 1024, 'max_exec_timeout_sec': 60},
+      });
+      expect((explicitDesktop.sandboxLevel, explicitDesktop.isUnrestricted, explicitDesktop.isSandboxLocked), ('desktop', false, false));
+
+      // Boolean flags unrestricted & read_only & locked.
+      final unrestrictedFlag = DeviceManifest.fromJson({
+        'device_id': 'd2',
+        'sandbox': {'unrestricted': true, 'locked': true},
+      });
+      expect((unrestrictedFlag.sandboxLevel, unrestrictedFlag.isUnrestricted, unrestrictedFlag.isSandboxLocked), ('unrestricted', true, true));
+
+      final readOnlyFlag = DeviceManifest.fromJson({
+        'device_id': 'd3',
+        'sandbox': {'read_only': true},
+      });
+      expect(readOnlyFlag.sandboxLevel, 'readonly');
+
+      // Inferred from resource limits.
+      expect(DeviceManifest.fromJson({'sandbox': {'max_child_mem_mb': 0, 'max_exec_timeout_sec': 0}}).sandboxLevel, 'unrestricted');
+      expect(DeviceManifest.fromJson({'sandbox': {'max_child_mem_mb': 1024, 'max_exec_timeout_sec': 60}}).sandboxLevel, 'readonly');
+      expect(DeviceManifest.fromJson({'sandbox': {'max_child_mem_mb': 4096, 'max_exec_timeout_sec': 90}}).sandboxLevel, 'corp');
+      expect(DeviceManifest.fromJson({'sandbox': {'max_child_mem_mb': 4096, 'max_exec_timeout_sec': 180}}).sandboxLevel, 'desktop');
+      expect(DeviceManifest.fromJson({'sandbox': {'allowed_workspaces': ['/work']}}).sandboxLevel, 'personal');
+      expect(DeviceManifest.fromJson({'sandbox': <String, dynamic>{}}).sandboxLevel, isNull);
+
+      // DeviceTwin fallback chain & flags.
+      final twinFallback = DeviceTwin.fromJson({
+        'deviceId': 'dev-fallback',
+        'sandboxLevel': 'corp',
+        'desiredSandboxLevel': 'unrestricted',
+        'sandboxSyncState': 'pending',
+        'sandboxSyncError': 'Waiting for reconnect',
+      });
+      expect(twinFallback.effectiveSandboxLevel, 'corp');
+      expect(twinFallback.isUnrestricted, isFalse);
+      expect(twinFallback.isSandboxLocked, isFalse);
+      expect(twinFallback.isSandboxSyncPending, isTrue);
+      expect(twinFallback.sandboxSyncError, 'Waiting for reconnect');
+
+      final twinLocked = DeviceTwin.fromJson({
+        'deviceId': 'dev-locked',
+        'sandboxLevel': 'personal',
+        'sandboxSyncState': 'locked',
+      });
+      expect((twinLocked.effectiveSandboxLevel, twinLocked.isSandboxLocked, twinLocked.isSandboxSyncPending), ('personal', true, false));
+
+      final twinDefault = DeviceTwin.fromJson({'deviceId': 'dev-default'});
+      expect((twinDefault.effectiveSandboxLevel, twinDefault.isUnrestricted, twinDefault.isSandboxSyncPending), ('personal', false, false));
+
+      final result = DeviceSandboxUpdateResult.fromJson({
+        'device': {
+          'deviceId': 'dev-1',
+          'sandboxLevel': 'unrestricted',
+          'manifest': {
+            'device_id': 'dev-1',
+            'sandbox': {'level': 'unrestricted', 'unrestricted': true},
+          },
+        },
+        'level': 'unrestricted',
+        'applied': true,
+        'pending': false,
+        'persisted': false,
+        'warning': 'Runtime only; config file is read-only',
+      });
+      expect((result.level, result.applied, result.pending, result.persisted), ('unrestricted', true, false, false));
+      expect(result.warning, 'Runtime only; config file is read-only');
+      expect(result.error, isNull);
+      expect(result.device.isUnrestricted, isTrue);
     });
   });
 
@@ -759,6 +857,221 @@ void main() {
       expect(backend.updatedDevices.last['targetVersion'], '0.9.1');
       expect(find.textContaining('已将 v0.9.1 更新加入下发队列'), findsOneWidget);
 
+      await app.close();
+    });
+
+    testWidgets('displays sandbox badges on Tier 1 devices only and switches levels including confirmed unrestricted mode', (tester) async {
+      final backend = FakeBackend()
+        ..configureDevices(clusterId: 'personal')
+        ..addDevice('workstation-1', status: 'online', route: 'p2p', sandboxLevel: 'desktop')
+        ..addDevice('dev-box-2', status: 'online', route: 'relay', sandboxLevel: 'personal')
+        ..addDevice('esp32-sensor-1', tier: 'mcu', status: 'online', route: 'via_tier1', relayNodeId: 'workstation-1');
+
+      final app = await open(tester, backend, bundledCjk: true);
+
+      await tester.tap(nav(2));
+      await settle(tester);
+
+      // Tier 1 devices render sandbox pills & button; Tier 2 MCU does not.
+      expect(find.descendant(of: find.byKey(const ValueKey('sandbox-pill-workstation-1')), matching: find.text('桌面协作')), findsOneWidget);
+      expect(find.descendant(of: find.byKey(const ValueKey('sandbox-pill-dev-box-2')), matching: find.text('个人开发')), findsOneWidget);
+      expect(find.byKey(const ValueKey('sandbox-workstation-1')), findsOneWidget);
+      expect(find.byKey(const ValueKey('sandbox-dev-box-2')), findsOneWidget);
+      expect(find.byKey(const ValueKey('sandbox-pill-esp32-sensor-1')), findsNothing);
+      expect(find.byKey(const ValueKey('sandbox-esp32-sensor-1')), findsNothing);
+
+      // Open sandbox sheet on workstation-1.
+      final sandboxBtn = find.byKey(const ValueKey('sandbox-workstation-1'));
+      await show(tester, sandboxBtn);
+      await tester.tap(sandboxBtn);
+      await settle(tester);
+
+      expect(find.text('沙箱权限 · workstation-1'), findsOneWidget);
+      expect(find.text('L1'), findsOneWidget);
+      expect(find.text('L5'), findsOneWidget);
+      expect(find.text('最高等级'), findsOneWidget);
+
+      // Apply button starts disabled while the already-active level is selected.
+      expect(tester.widget<ActionButton>(find.byKey(const ValueKey('apply-sandbox-btn'))).onPressed, isNull);
+
+      // Switch to readonly -> applies immediately with no confirmation dialog.
+      await tester.tap(find.byKey(const ValueKey('sandbox-option-readonly')));
+      await tester.pump();
+      expect(tester.widget<ActionButton>(find.byKey(const ValueKey('apply-sandbox-btn'))).onPressed, isNotNull);
+
+      await tester.tap(find.byKey(const ValueKey('apply-sandbox-btn')));
+      await settle(tester);
+
+      expect(find.byType(CupertinoAlertDialog), findsNothing);
+      expect(backend.sandboxUpdates, hasLength(1));
+      expect(backend.sandboxUpdates.single, {'deviceId': 'workstation-1', 'level': 'readonly'});
+      expect(find.descendant(of: find.byKey(const ValueKey('sandbox-pill-workstation-1')), matching: find.text('只读巡检')), findsOneWidget);
+      expect(find.text('已将 workstation-1 沙箱权限切换为「只读巡检」'), findsOneWidget);
+
+      // Open sheet again and switch to unrestricted -> warning + confirm dialog (cancel then confirm).
+      await show(tester, sandboxBtn);
+      await tester.tap(sandboxBtn);
+      await settle(tester);
+
+      final unrestrictedOption = find.byKey(const ValueKey('sandbox-option-unrestricted'));
+      await show(tester, unrestrictedOption);
+      await tester.tap(unrestrictedOption);
+      await settle(tester);
+
+      expect(find.textContaining('警告：「完全不限制」将允许主控 Neo'), findsOneWidget);
+      expect(tester.widget<ActionButton>(find.byKey(const ValueKey('apply-sandbox-btn'))).destructive, isTrue);
+
+      await tester.tap(find.byKey(const ValueKey('apply-sandbox-btn')));
+      await settle(tester);
+
+      expect(find.byType(CupertinoAlertDialog), findsOneWidget);
+      expect(find.text('切换为「完全不限制」？'), findsOneWidget);
+      final dialogTitleRich = tester.widget<RichText>(find.descendant(of: find.text('切换为「完全不限制」？'), matching: find.byType(RichText)));
+      expect(dialogTitleRich.text.style?.fontFamilyFallback, contains(cjkFont));
+
+      // Cancel dialog -> no API request, sheet remains open.
+      await tester.tap(find.descendant(of: find.byType(CupertinoAlertDialog), matching: find.text('取消')));
+      await settle(tester);
+      expect(find.byType(CupertinoAlertDialog), findsNothing);
+      expect(backend.sandboxUpdates, hasLength(1));
+      expect(find.text('沙箱权限 · workstation-1'), findsOneWidget);
+
+      // Confirm dialog -> sends PUT with level: 'unrestricted' and updates row to red unrestricted badge + access text.
+      await tester.tap(find.byKey(const ValueKey('apply-sandbox-btn')));
+      await settle(tester);
+      await tester.tap(find.byKey(const ValueKey('confirm-unrestricted-btn')));
+      await settle(tester);
+
+      expect(backend.sandboxUpdates, hasLength(2));
+      expect(backend.sandboxUpdates.last, {'deviceId': 'workstation-1', 'level': 'unrestricted'});
+      final pill = tester.widget<Pill>(find.byKey(const ValueKey('sandbox-pill-workstation-1')));
+      expect(pill.text, '完全不限制');
+      expect(pill.dot, isTrue);
+      expect(find.text('全文件系统访问 · 无命令限制'), findsOneWidget);
+      expect(find.text('已将 workstation-1 沙箱权限切换为「完全不限制」'), findsOneWidget);
+
+      // API error inside sheet keeps modal open and shows error notice.
+      backend.sandboxError = 'Agent rejected policy update';
+      await show(tester, sandboxBtn);
+      await tester.tap(sandboxBtn);
+      await settle(tester);
+      await tester.tap(find.byKey(const ValueKey('sandbox-option-corp')));
+      await tester.pump();
+      await tester.tap(find.byKey(const ValueKey('apply-sandbox-btn')));
+      await settle(tester);
+      expect(find.text('Agent rejected policy update'), findsOneWidget);
+      expect(find.text('沙箱权限 · workstation-1'), findsOneWidget);
+
+      await tester.tap(find.byKey(const ValueKey('sandbox-cancel-btn')));
+      await settle(tester);
+      await app.close();
+    });
+
+    testWidgets('handles offline pending sync, locked sandbox policy, sync error display, and English strings', (tester) async {
+      final backend = FakeBackend()
+        ..configureDevices(clusterId: 'personal')
+        ..addDevice(
+          'offline-node',
+          status: 'offline',
+          route: 'relay',
+          sandboxLevel: 'personal',
+          sandboxSyncError: 'Previous sync timed out',
+          sandboxSyncState: 'error',
+        )
+        ..addDevice(
+          'locked-node',
+          status: 'online',
+          route: 'lan',
+          sandboxLevel: 'corp',
+          sandboxLocked: true,
+        );
+
+      final app = await open(tester, backend, locale: const Locale('en'), size: narrow);
+
+      await tester.tap(nav(2));
+      await settle(tester);
+
+      // Sync error is visible on offline-node.
+      expect(find.byKey(const ValueKey('sandbox-error-offline-node')), findsOneWidget);
+      expect(find.text('Previous sync timed out'), findsOneWidget);
+
+      // Open sandbox sheet on locked-node -> shows locked hint and disables Apply.
+      final lockedBtn = find.byKey(const ValueKey('sandbox-locked-node'));
+      await show(tester, lockedBtn);
+      await tester.tap(lockedBtn);
+      await settle(tester);
+
+      expect(find.text('Sandbox · locked-node'), findsOneWidget);
+      expect(find.textContaining('lock_sandbox = true'), findsOneWidget);
+      expect(tester.widget<ActionButton>(find.byKey(const ValueKey('apply-sandbox-btn'))).onPressed, isNull);
+      final lockedDesktopOption = find.byKey(const ValueKey('sandbox-option-desktop'));
+      await show(tester, lockedDesktopOption);
+      await tester.tap(lockedDesktopOption);
+      await tester.pump();
+      expect(tester.widget<ActionButton>(find.byKey(const ValueKey('apply-sandbox-btn'))).onPressed, isNull);
+
+      await tester.tap(find.byKey(const ValueKey('sandbox-cancel-btn')));
+      await settle(tester);
+
+      // Open sandbox sheet on offline-node -> shows offline hint and queues pending sync.
+      final offlineBtn = find.byKey(const ValueKey('sandbox-offline-node'));
+      await show(tester, offlineBtn);
+      await tester.tap(offlineBtn);
+      await settle(tester);
+
+      expect(find.textContaining('Device is offline; the new level will sync automatically'), findsOneWidget);
+      final offlineDesktopOption = find.byKey(const ValueKey('sandbox-option-desktop'));
+      await show(tester, offlineDesktopOption);
+      await tester.tap(offlineDesktopOption);
+      await tester.pump();
+      await tester.tap(find.byKey(const ValueKey('apply-sandbox-btn')));
+      await settle(tester);
+
+      expect(backend.sandboxUpdates.single, {'deviceId': 'offline-node', 'level': 'desktop'});
+      expect(find.descendant(of: find.byKey(const ValueKey('sandbox-pending-offline-node')), matching: find.text('Pending → Desktop')), findsOneWidget);
+      expect(find.textContaining('Saved target sandbox level "Desktop" for offline-node'), findsOneWidget);
+
+      // Re-opening sheet while pending sync is active allows applying the current effective level to cancel/overwrite pending target.
+      await show(tester, offlineBtn);
+      await tester.tap(offlineBtn);
+      await settle(tester);
+      expect(tester.widget<ActionButton>(find.byKey(const ValueKey('apply-sandbox-btn'))).onPressed, isNotNull);
+      await tester.tap(find.byKey(const ValueKey('sandbox-cancel-btn')));
+      await settle(tester);
+
+      await app.close();
+    });
+
+    testWidgets('supports unrestricted profile preset in DeviceEnrollSheet', (tester) async {
+      final backend = FakeBackend()..configureDevices(clusterId: 'personal');
+      final app = await open(tester, backend);
+
+      await tester.tap(nav(2));
+      await settle(tester);
+
+      await tester.tap(find.byKey(const ValueKey('add-device-btn')));
+      await settle(tester);
+
+      final unrestrictedProfile = find.byKey(const ValueKey('profile-unrestricted'));
+      await show(tester, unrestrictedProfile);
+      expect(find.text('最高等级'), findsOneWidget);
+      expect(find.textContaining('警告：「完全不限制」将允许主控 Neo'), findsNothing);
+
+      await tester.tap(unrestrictedProfile);
+      await settle(tester);
+      expect(find.textContaining('警告：「完全不限制」将允许主控 Neo'), findsOneWidget);
+
+      final genBtn = find.byKey(const ValueKey('generate-install-cmd-btn'));
+      await show(tester, genBtn);
+      await tester.tap(genBtn);
+      await settle(tester);
+
+      expect(backend.createdEnrollments, hasLength(1));
+      expect(backend.createdEnrollments.single['profile'], 'unrestricted');
+      expect(find.textContaining('--profile unrestricted'), findsOneWidget);
+
+      await tester.tap(find.byKey(const ValueKey('enroll-close-btn')));
+      await settle(tester);
       await app.close();
     });
   });

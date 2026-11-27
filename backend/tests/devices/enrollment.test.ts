@@ -10,11 +10,13 @@ import {
   ENROLL_ENVELOPE_VERSION,
   ENROLL_KEY_PREFIX,
   FLAG_DATA,
+  SANDBOX_LEVELS,
   buildEnrollAad,
   decodeRelayFrame,
   deriveEnrollKey,
   deriveMcuE2eKey,
   generateEnrollTicket,
+  isSandboxLevel,
   openDeviceMessage,
   openEnrollPayload,
   parseEnrollTicket,
@@ -179,10 +181,19 @@ describe("devices/enrollment protocol, config, flow, MCU install, and HTTP API",
     tamperedTag[tamperedTag.length - 1] ^= 0x80;
     expect(() => openEnrollPayload(tamperedTag.toString("base64"), ticket.ticketId, ticket.ephemeralKey)).toThrow();
 
-    // All 4 policy presets use {{WORKSPACE_DIR}} and enforce expected limits/commands
-    for (const profile of ["personal", "corp", "readonly", "desktop"] as const) {
+    // All 5 policy presets use {{WORKSPACE_DIR}} and enforce expected limits/commands
+    expect(SANDBOX_LEVELS).toEqual(["readonly", "corp", "personal", "desktop", "unrestricted"]);
+    expect(isSandboxLevel("unrestricted")).toBe(true);
+    expect(isSandboxLevel("readonly")).toBe(true);
+    expect(isSandboxLevel("superadmin")).toBe(false);
+    expect(isSandboxLevel(123)).toBe(false);
+
+    for (const profile of SANDBOX_LEVELS) {
       const toml = renderPolicyPreset(profile);
       expect(toml).toContain('allowed_workspaces = [\n  "{{WORKSPACE_DIR}}",\n]');
+      expect(toml).toContain(`sandbox_level = "${profile}"`);
+      expect(toml).toContain(`unrestricted = ${profile === "unrestricted" ? "true" : "false"}`);
+      expect(toml).toContain(`read_only = ${profile === "readonly" ? "true" : "false"}`);
     }
     expect(renderPolicyPreset("personal")).toContain("max_child_mem_mb = 2048");
     expect(renderPolicyPreset("corp")).toContain('"bash"');
@@ -190,6 +201,69 @@ describe("devices/enrollment protocol, config, flow, MCU install, and HTTP API",
     expect(renderPolicyPreset("readonly")).toContain("max_child_mem_mb = 1024");
     expect(renderPolicyPreset("desktop")).toContain('"flutter"');
     expect(renderPolicyPreset("desktop")).toContain("max_exec_timeout_sec = 180");
+
+    const unrestrictedToml = renderPolicyPreset("unrestricted");
+    expect(unrestrictedToml).toContain('sandbox_level = "unrestricted"');
+    expect(unrestrictedToml).toContain("unrestricted = true");
+    expect(unrestrictedToml).toContain("read_only = false");
+    expect(unrestrictedToml).toContain("allowed_commands = []");
+    expect(unrestrictedToml).toContain("denied_commands = []");
+    expect(unrestrictedToml).toContain("max_child_mem_mb = 0");
+    expect(unrestrictedToml).toContain("max_exec_timeout_sec = 0");
+    expect(unrestrictedToml).toContain("max_output_bytes = 8388608");
+  });
+
+  test("createEnrollment supports profile 'unrestricted' with 8G default memory limit and unrestricted policy TOML", async () => {
+    const store = Store.memory();
+    const manager = new DeviceManager({ store, masterId: "m-unr" });
+
+    try {
+      await manager.configure(
+        {
+          clusterId: "cluster-unr",
+          masterNodeId: "master-unr",
+          clusterSecret: "unr-cluster-secret",
+          e2eKey: "unr-e2e-key",
+        },
+        { persist: true, connect: false },
+      );
+
+      const enr = await manager.createEnrollment({
+        platform: "linux",
+        profile: "unrestricted",
+        deviceId: "os-trusted-01",
+        transportMode: "direct",
+        masterPublicUrl: "http://127.0.0.1:3082",
+      });
+      expect(enr.profile).toBe("unrestricted");
+      expect(enr.policyPreview).toContain('sandbox_level = "unrestricted"');
+      expect(enr.policyPreview).toContain("unrestricted = true");
+      expect(enr.policyPreview).toContain("allowed_commands = []");
+      expect(enr.policyPreview).toContain("denied_commands = []");
+
+      const parsed = parseEnrollTicket(enr.enrollCode!);
+      const claimed = manager.claimDirectEnrollment(parsed.ticketId, "127.0.0.1");
+      expect(claimed.ok).toBe(true);
+      if (!claimed.ok) throw new Error("unreachable");
+      const payload = openEnrollPayload<EnrollPayload>(
+        claimed.ciphertext_b64,
+        parsed.ticketId,
+        parsed.ephemeralKey,
+      );
+      expect(payload.policy_profile).toBe("unrestricted");
+      expect(payload.limits.memory_max).toBe("8G");
+      expect(payload.policy_toml).toBe(renderPolicyPreset("unrestricted"));
+
+      await expect(
+        manager.createEnrollment({
+          profile: "invalid-level" as never,
+          transportMode: "direct",
+        }),
+      ).rejects.toThrow("Invalid enrollment profile");
+    } finally {
+      await manager.stop();
+      store.close();
+    }
   });
 
   test("initOrUpdateConfig auto-detects local relay.env, derives matching neo-relayd key, persists, and hot-connects", async () => {

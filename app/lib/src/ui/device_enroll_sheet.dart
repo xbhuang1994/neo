@@ -411,6 +411,7 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
       ('corp', strings.profileCorpTitle, strings.profileCorpDesc),
       ('readonly', strings.profileReadonlyTitle, strings.profileReadonlyDesc),
       ('desktop', strings.profileDesktopTitle, strings.profileDesktopDesc),
+      ('unrestricted', strings.profileUnrestrictedTitle, strings.profileUnrestrictedDesc),
     ];
     final showInstallMode = _tab == 'linux' || _tab == 'macos';
 
@@ -439,14 +440,28 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
                         child: Icon(
                           _profile == id ? CupertinoIcons.checkmark_circle_fill : CupertinoIcons.circle,
                           size: 18,
-                          color: _profile == id ? palette.accent : palette.tertiary,
+                          color: _profile == id ? (id == 'unrestricted' ? palette.red : palette.accent) : palette.tertiary,
                         ),
                       ),
                       Expanded(
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            Text(title, style: typo.headline.copyWith(fontSize: 14)),
+                            Wrap(
+                              spacing: 6,
+                              runSpacing: 4,
+                              crossAxisAlignment: WrapCrossAlignment.center,
+                              children: [
+                                Text(
+                                  title,
+                                  style: typo.headline.copyWith(
+                                    fontSize: 14,
+                                    color: id == 'unrestricted' && _profile == id ? palette.red : palette.label,
+                                  ),
+                                ),
+                                if (id == 'unrestricted') Pill(strings.sandboxHighestBadge, color: palette.red),
+                              ],
+                            ),
                             const SizedBox(height: 2),
                             Text(desc, style: typo.caption),
                           ],
@@ -459,6 +474,10 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
             ],
           ),
         ),
+        if (_profile == 'unrestricted') ...[
+          const SizedBox(height: 10),
+          Notice(strings.sandboxUnrestrictedWarning),
+        ],
         if (showInstallMode) ...[
           const SizedBox(height: 16),
           _sectionLabel(strings.installMode),
@@ -706,7 +725,7 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
           crossAxisAlignment: WrapCrossAlignment.center,
           children: [
             Pill(enrollment.platform.toUpperCase(), color: palette.accent),
-            Pill(enrollment.profile, color: palette.secondary),
+            Pill(enrollment.profile, color: enrollment.profile == 'unrestricted' ? palette.red : palette.secondary),
             if (enrollment.isActive)
               Pill(strings.remainingTime(remaining), color: palette.orange, dot: true),
             if (enrollment.maxUses > 1)

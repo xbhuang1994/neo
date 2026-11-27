@@ -22,17 +22,29 @@ A single relay server (`neo-relayd`) and shared host hardware can serve independ
 | --- | --- | --- |
 | 1. Relay control plane | Per-cluster HMAC-SHA256 `neo1` tokens and cluster-scoped `/v1/peers` + `/v1/relay` routing (`0x81 ErrOffline` across clusters) | [provision-cluster.sh](../deploy/multi-master/provision-cluster.sh) |
 | 2. End-to-end cryptography | Per-cluster AES-256-GCM (`0xE1`, AAD `cluster_id\|src\|dst`) for Tier 1 and HMAC-SHA256 (`neo-mcu-e2e-v1`) for Tier 2 | [provision-cluster.sh](../deploy/multi-master/provision-cluster.sh) |
-| 3. Host OS & cgroup v2 | Distinct OS user `neo-%i`, read-only local policy (`/etc/neo-agent/policy-%i.toml`), systemd slice/unit limits, `NoNewPrivileges=true` | [neo-agent-os@.service](../deploy/multi-master/neo-agent-os@.service), [neo-agent-slice@.slice](../deploy/multi-master/neo-agent-slice@.slice) |
+| 3. Host OS & cgroup v2 | Distinct OS user `neo-%i`, local sandbox policy (`/etc/neo-agent/policy-%i.toml`, with opt-in `lock_sandbox = true`), systemd slice/unit limits, `NoNewPrivileges=true` | [neo-agent-os@.service](../deploy/multi-master/neo-agent-os@.service), [neo-agent-slice@.slice](../deploy/multi-master/neo-agent-slice@.slice) |
 | 4. Artifact storage | S3/MinIO IAM policy confining each master to `neo-artifacts/${CLUSTER_ID}/*` and denying cross-cluster listing or reads | [s3-cluster-policy.json.tmpl](../deploy/multi-master/s3-cluster-policy.json.tmpl) |
 
-## Local read-only agent policies
+## Per-device sandbox levels and runtime switching
 
-Each Tier 1 OS agent reads an immutable local TOML policy file on startup (`--policy /etc/neo-agent/policy-%i.toml`). The Master Neo control plane cannot relax or overwrite this file over the relay:
+Each Tier 1 OS agent enforces one of 5 sandbox permission levels (`sandbox_level` in its local TOML policy, from most restricted to completely unrestricted):
 
-- [agent-policy.personal.toml](../deploy/multi-master/agent-policy.personal.toml): restricts workspace access to `/home/neo-personal/work`, permits common development tools, denies destructive/privilege commands, and caps child memory at `2048` MB and execution time at `120` s.
-- [agent-policy.corp.toml](../deploy/multi-master/agent-policy.corp.toml): restricts workspace access to `/home/neo-corp/work`, narrows the command allowlist (denying ad-hoc shells and script interpreters), and enforces a `90` s execution timeout.
+| Level | `read_only` / `unrestricted` | Command & workspace limits | Default limits (`mem` / `timeout` / `output`) |
+| --- | --- | --- | --- |
+| `readonly` | `read_only = true` | Inspection-only allowlist (`ls`, `cat`, `rg`, `git`, …); mutating commands and shells denied; workspace-confined | `1024` MB / `60` s / `1` MiB |
+| `corp` | `false` / `false` | Narrow corporate dev allowlist; ad-hoc shells and script interpreters denied; workspace-confined | `4096` MB / `90` s / `1` MiB |
+| `personal` | `false` / `false` | Standard personal dev tools (`git`, `cargo`, `bun`, `python3`, `make`, …); destructive/privilege commands denied; workspace-confined | `2048` MB / `120` s / `1` MiB |
+| `desktop` | `false` / `false` | Personal tools plus desktop/UI tooling (`node`, `npm`, `flutter`, `dart`, `open`/`xdg-open`, …); workspace-confined | `4096` MB / `180` s / `1` MiB |
+| `unrestricted` | `unrestricted = true` | Completely unrestricted execution for trusted hosts (no workspace or command allowlist/denylist limits) | `0` (no cap) / `0` (no timeout cap) / `8` MiB |
 
-Both files canonicalize `allowed_workspaces` at load time and reject `..` traversal or symlink escapes.
+Workspace-confined profiles (`readonly`, `corp`, `personal`, `desktop`) canonicalize `allowed_workspaces` at load time and reject `..` traversal or symlink escapes. Example static presets remain in [agent-policy.personal.toml](../deploy/multi-master/agent-policy.personal.toml) and [agent-policy.corp.toml](../deploy/multi-master/agent-policy.corp.toml), and all 5 presets are available during one-click enrollment (`profile`).
+
+Runtime switching via Master Neo:
+
+- Operators switch a Tier 1 OS device's level at runtime via `PUT /api/devices/:id/sandbox` (`{ "level": "<level>", "workspaces"?: [...], "timeoutMs"?: number }`). Master Neo persists `desiredSandboxLevel` on the Device Twin and sends an E2E-encrypted `set_sandbox` RPC to `neo-agent-os`.
+- If the device is offline or unreachable, Master Neo records `sandboxSyncState = "pending"` and automatically pushes `set_sandbox` when the agent reconnects and publishes its `manifest`.
+- Autonomous LLM tool invocations (`device_invoke` with action `set_sandbox` or `sandbox.set`) are gated as `confirm_required` and require explicit operator approval.
+- Hosts requiring strict local immutability can opt in by setting `lock_sandbox = true` in the agent's local TOML policy; locked agents reject remote `set_sandbox` RPCs and `PUT /api/devices/:id/sandbox` responds with HTTP `403`.
 
 ## Provisioning and running an isolated cluster
 

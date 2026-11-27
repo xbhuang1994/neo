@@ -12,7 +12,7 @@ import * as fs from "node:fs";
 import type { HealthBoard } from "../app/health.ts";
 import type { Store } from "../store/index.ts";
 import { VERSION } from "../version.ts";
-import { EnrollmentManager } from "./enrollment.ts";
+import { EnrollmentManager, validateWorkspacePath } from "./enrollment.ts";
 import {
   compareSemver,
   deriveMcuE2eKey,
@@ -29,6 +29,8 @@ import {
   DEFAULT_LOCAL_RELAY_ENV_PATH,
   DEFAULT_RELAY_URL,
   FLAG_ERR_OFFLINE,
+  SANDBOX_LEVELS,
+  isSandboxLevel,
   type CapabilityManifest,
   type DeviceConfig,
   type DeviceConfigUpdateInput,
@@ -39,6 +41,7 @@ import {
   type DevicePingResult,
   type DeviceRiskLevel,
   type DeviceRouteKind,
+  type DeviceSandboxUpdateResult,
   type DeviceStatus,
   type DeviceTwin,
   type DeviceUpdateInput,
@@ -55,6 +58,9 @@ import {
   type RelayEnvelope,
   type RelayFrame,
   type S3PrefixValidation,
+  type SandboxLevel,
+  type SandboxSummary,
+  type SandboxSyncState,
   type SignalMessage,
   type TokenTier,
 } from "./types.ts";
@@ -85,6 +91,8 @@ const DEFAULT_CONFIRM_ACTIONS: ReadonlySet<string> = new Set([
   "shutdown",
   "unlock_door",
   "relay_switch",
+  "set_sandbox",
+  "sandbox.set",
 ]);
 
 const CLUSTER_ID_RE = /^[a-zA-Z0-9_-]{1,32}$/;
@@ -100,6 +108,86 @@ function nowIso(): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function normalizeSandboxSummary(raw: Record<string, unknown>): SandboxSummary {
+  const out: SandboxSummary = { ...raw };
+  if (isSandboxLevel(raw.level)) {
+    out.level = raw.level;
+  } else {
+    delete out.level;
+  }
+  if (typeof raw.unrestricted === "boolean") {
+    out.unrestricted = raw.unrestricted;
+  } else {
+    delete out.unrestricted;
+  }
+  if (typeof raw.read_only === "boolean") {
+    out.read_only = raw.read_only;
+  } else {
+    delete out.read_only;
+  }
+  if (typeof raw.locked === "boolean") {
+    out.locked = raw.locked;
+  } else {
+    delete out.locked;
+  }
+  if (Array.isArray(raw.allowed_workspaces)) {
+    out.allowed_workspaces = raw.allowed_workspaces.filter((w): w is string => typeof w === "string");
+  } else {
+    delete out.allowed_workspaces;
+  }
+  if (typeof raw.max_child_mem_mb === "number") {
+    out.max_child_mem_mb = raw.max_child_mem_mb;
+  } else {
+    delete out.max_child_mem_mb;
+  }
+  if (typeof raw.max_exec_timeout_sec === "number") {
+    out.max_exec_timeout_sec = raw.max_exec_timeout_sec;
+  } else {
+    delete out.max_exec_timeout_sec;
+  }
+  return out;
+}
+
+/** Infer a Tier 1 OS device's reported `SandboxLevel` from its manifest sandbox summary. */
+export function inferSandboxLevel(
+  sandbox?: Record<string, unknown>,
+  fallback?: SandboxLevel,
+): SandboxLevel | undefined {
+  if (isRecord(sandbox)) {
+    if (isSandboxLevel(sandbox.level)) {
+      return sandbox.level;
+    }
+    if (sandbox.unrestricted === true) {
+      return "unrestricted";
+    }
+    if (sandbox.read_only === true) {
+      return "readonly";
+    }
+  }
+  if (fallback !== undefined) {
+    return fallback;
+  }
+  if (isRecord(sandbox)) {
+    const mem = typeof sandbox.max_child_mem_mb === "number" ? sandbox.max_child_mem_mb : undefined;
+    const timeout =
+      typeof sandbox.max_exec_timeout_sec === "number" ? sandbox.max_exec_timeout_sec : undefined;
+    if (mem === 0 && timeout === 0) {
+      return "unrestricted";
+    }
+    if (mem === 1024 && timeout === 60) {
+      return "readonly";
+    }
+    if (mem === 4096 && timeout === 90) {
+      return "corp";
+    }
+    if (mem === 4096 && timeout === 180) {
+      return "desktop";
+    }
+    return "personal";
+  }
+  return undefined;
 }
 
 function generateId(prefix: string): string {
@@ -353,6 +441,7 @@ export class DeviceManager {
   private readonly pendingTier1Rpcs = new Map<string, PendingRpc>();
   private readonly pendingMcuRpcs = new Map<string, PendingRpc>();
   private readonly actionRiskOverrides = new Map<string, DeviceRiskLevel>();
+  private readonly syncingSandboxDevices = new Set<string>();
   private closed = false;
 
   constructor(options: DeviceManagerOptions) {
@@ -793,17 +882,51 @@ export class DeviceManager {
     const cfg = this.requireConfig();
     const existing = this.getDevice(manifest.device_id);
     const now = nowIso();
+    const normalizedManifest: CapabilityManifest = isRecord(manifest.sandbox)
+      ? { ...manifest, sandbox: normalizeSandboxSummary(manifest.sandbox) }
+      : manifest;
     const capabilities =
-      manifest.capabilities ??
-      manifest.acts ??
-      (manifest.actions ? manifest.actions.map((a) => a.name) : existing?.capabilities ?? []);
+      normalizedManifest.capabilities ??
+      normalizedManifest.acts ??
+      (normalizedManifest.actions
+        ? normalizedManifest.actions.map((a) => a.name)
+        : existing?.capabilities ?? []);
     const defaultRoute: DeviceRouteKind =
-      manifest.tier === "mcu" ? "via_tier1" : opts.route ?? existing?.route ?? "relay";
+      normalizedManifest.tier === "mcu" ? "via_tier1" : opts.route ?? existing?.route ?? "relay";
+
+    let sandboxLevel: SandboxLevel | undefined;
+    let desiredSandboxLevel: SandboxLevel | undefined = existing?.desiredSandboxLevel;
+    let sandboxUpdatedAt: string | undefined = existing?.sandboxUpdatedAt;
+    let sandboxSyncState: SandboxSyncState | undefined = existing?.sandboxSyncState;
+    let sandboxSyncError: string | undefined = existing?.sandboxSyncError;
+
+    if (normalizedManifest.tier === "os") {
+      sandboxLevel = inferSandboxLevel(normalizedManifest.sandbox, existing?.sandboxLevel);
+      if (existing?.desiredSandboxLevel) {
+        if (sandboxLevel === existing.desiredSandboxLevel) {
+          sandboxSyncState = "synced";
+          sandboxSyncError = undefined;
+        } else if (normalizedManifest.sandbox?.locked === true) {
+          sandboxSyncState = "locked";
+          sandboxSyncError = "Sandbox level is locked by local policy";
+        } else {
+          sandboxSyncState = existing.sandboxSyncState ?? "pending";
+        }
+      } else if (sandboxLevel) {
+        sandboxSyncState = "synced";
+        sandboxSyncError = undefined;
+      }
+    }
+
+    const reportedState: Record<string, unknown> =
+      normalizedManifest.tier === "os" && sandboxLevel !== undefined
+        ? { ...(existing?.reportedState ?? {}), sandboxLevel }
+        : existing?.reportedState ?? {};
 
     const twin: DeviceTwin = {
-      deviceId: manifest.device_id,
+      deviceId: normalizedManifest.device_id,
       clusterId: cfg.clusterId,
-      tier: manifest.tier,
+      tier: normalizedManifest.tier,
       status: opts.status ?? "online",
       route: opts.route ?? existing?.route ?? defaultRoute,
       ...(opts.lanUrl !== undefined
@@ -822,10 +945,15 @@ export class DeviceManager {
           ? { backupRelayNodeIds: existing.backupRelayNodeIds }
           : {}),
       alertSuppressed: false,
-      manifest,
+      manifest: normalizedManifest,
       capabilities,
+      ...(sandboxLevel !== undefined ? { sandboxLevel } : {}),
+      ...(desiredSandboxLevel !== undefined ? { desiredSandboxLevel } : {}),
+      ...(sandboxSyncState !== undefined ? { sandboxSyncState } : {}),
+      ...(sandboxSyncError !== undefined ? { sandboxSyncError } : {}),
+      ...(sandboxUpdatedAt !== undefined ? { sandboxUpdatedAt } : {}),
       desiredState: existing?.desiredState ?? {},
-      reportedState: existing?.reportedState ?? {},
+      reportedState,
       pendingQueue: existing?.pendingQueue ?? [],
       lastSeqId: existing?.lastSeqId ?? 0,
       lastAckedSeqId: existing?.lastAckedSeqId ?? 0,
@@ -835,6 +963,291 @@ export class DeviceManager {
       updatedAt: now,
     };
     return this.saveDevice(twin);
+  }
+
+  /**
+   * Configure the 5-level sandbox execution policy (`readonly | corp | personal | desktop | unrestricted`)
+   * on a Tier 1 OS device via E2E `set_sandbox` RPC, persisting desired state for auto-sync on reconnect
+   * when the device is offline or unreachable.
+   */
+  async setDeviceSandboxLevel(
+    deviceId: string,
+    level: SandboxLevel,
+    opts: { workspaces?: string[]; timeoutMs?: number } = {},
+  ): Promise<DeviceSandboxUpdateResult> {
+    if (!isSandboxLevel(level)) {
+      throw new Error(
+        `Invalid sandbox level '${String(level)}': must be one of ${SANDBOX_LEVELS.join(", ")}`,
+      );
+    }
+    const cfg = this.requireConfig();
+    const twin = this.getDevice(deviceId);
+    if (!twin) {
+      throw new Error(`Unknown device: ${deviceId}`);
+    }
+    if (twin.clusterId !== cfg.clusterId) {
+      throw new Error(`Cross-cluster device sandbox update rejected (${twin.clusterId} !== ${cfg.clusterId})`);
+    }
+    if (twin.tier !== "os") {
+      throw new Error("Sandbox level can only be configured on Tier 1 OS devices");
+    }
+
+    let cleanedWorkspaces: string[] | undefined;
+    if (opts.workspaces !== undefined) {
+      if (!Array.isArray(opts.workspaces)) {
+        throw new Error("workspaces must be an array of strings");
+      }
+      cleanedWorkspaces = opts.workspaces.map((raw) => {
+        if (typeof raw !== "string") {
+          throw new Error("workspaces must be an array of strings");
+        }
+        return validateWorkspacePath(raw);
+      });
+    }
+    if (
+      opts.timeoutMs !== undefined &&
+      (!Number.isInteger(opts.timeoutMs) || opts.timeoutMs <= 0)
+    ) {
+      throw new Error("timeoutMs must be a positive integer");
+    }
+
+    const updatedAt = nowIso();
+    const nextDesiredState: Record<string, unknown> = {
+      ...twin.desiredState,
+      sandboxLevel: level,
+    };
+    if (cleanedWorkspaces && cleanedWorkspaces.length > 0) {
+      nextDesiredState.sandboxWorkspaces = cleanedWorkspaces;
+    } else {
+      delete nextDesiredState.sandboxWorkspaces;
+    }
+
+    const { sandboxSyncError: _clearedErr, ...twinBase } = twin;
+    const canReach =
+      twin.status !== "offline" &&
+      ((twin.route === "lan" && Boolean(twin.lanUrl)) ||
+        Boolean(this.relayClient?.isRelayConnected()));
+
+    const staged = this.saveDevice({
+      ...twinBase,
+      desiredSandboxLevel: level,
+      desiredState: nextDesiredState,
+      sandboxSyncState: "pending",
+      sandboxUpdatedAt: updatedAt,
+    });
+
+    if (!canReach) {
+      return {
+        device: staged,
+        level,
+        applied: false,
+        pending: true,
+        warning: "Device is offline; sandbox level will apply automatically when it reconnects.",
+      };
+    }
+
+    const rpcParams: Record<string, unknown> = {
+      level,
+      ...(cleanedWorkspaces && cleanedWorkspaces.length > 0
+        ? { workspaces: cleanedWorkspaces }
+        : {}),
+    };
+    const rpcRes = await this.dispatchTier1Rpc(staged, {
+      action: "set_sandbox",
+      params: rpcParams,
+      timeoutMs: opts.timeoutMs ?? 15_000,
+    });
+
+    const latest = this.getDevice(deviceId) ?? staged;
+
+    if (rpcRes.status === "ok") {
+      const resObj = isRecord(rpcRes.result) ? rpcRes.result : {};
+      const persisted = typeof resObj.persisted === "boolean" ? resObj.persisted : undefined;
+      const warning =
+        typeof resObj.warning === "string" && resObj.warning.trim().length > 0
+          ? resObj.warning.trim()
+          : typeof resObj.persist_warning === "string" && resObj.persist_warning.trim().length > 0
+            ? resObj.persist_warning.trim()
+            : undefined;
+
+      let nextManifest = latest.manifest;
+      if (isRecord(resObj.manifest)) {
+        const m = resObj.manifest;
+        const rawSandbox = isRecord(m.sandbox)
+          ? normalizeSandboxSummary(m.sandbox)
+          : isRecord(resObj.sandbox)
+            ? normalizeSandboxSummary(resObj.sandbox)
+            : nextManifest?.sandbox;
+        const mergedSandbox: SandboxSummary | undefined = rawSandbox
+          ? { ...rawSandbox, level: rawSandbox.level ?? level }
+          : undefined;
+        nextManifest = {
+          ...(nextManifest ?? { device_id: latest.deviceId, tier: latest.tier }),
+          ...(typeof m.device_id === "string" ? { device_id: m.device_id } : {}),
+          tier: m.tier === "mcu" ? "mcu" : "os",
+          ...(typeof m.os === "string" ? { os: m.os } : {}),
+          ...(typeof m.arch === "string" ? { arch: m.arch } : {}),
+          ...(typeof m.hostname === "string" ? { hostname: m.hostname } : {}),
+          ...(typeof m.cpus === "number" ? { cpus: m.cpus } : {}),
+          ...(typeof m.ram_mb === "number" ? { ram_mb: m.ram_mb } : {}),
+          ...(Array.isArray(m.capabilities)
+            ? { capabilities: m.capabilities.filter((c): c is string => typeof c === "string") }
+            : {}),
+          ...(Array.isArray(m.actions) ? { actions: m.actions as CapabilityManifest["actions"] } : {}),
+          ...(isRecord(m.relay_config)
+            ? { relay_config: m.relay_config as CapabilityManifest["relay_config"] }
+            : {}),
+          ...(mergedSandbox ? { sandbox: mergedSandbox } : {}),
+        };
+      } else if (isRecord(resObj.sandbox)) {
+        const normalizedSandbox = normalizeSandboxSummary(resObj.sandbox);
+        if (normalizedSandbox.level === undefined) {
+          normalizedSandbox.level = level;
+        }
+        nextManifest = {
+          ...(nextManifest ?? { device_id: latest.deviceId, tier: latest.tier }),
+          sandbox: normalizedSandbox,
+        };
+      } else if (nextManifest) {
+        nextManifest = {
+          ...nextManifest,
+          sandbox: {
+            ...(nextManifest.sandbox ?? {}),
+            level,
+            unrestricted: level === "unrestricted",
+            read_only: level === "readonly",
+            ...(cleanedWorkspaces && cleanedWorkspaces.length > 0
+              ? { allowed_workspaces: cleanedWorkspaces }
+              : {}),
+          },
+        };
+      }
+
+      const { sandboxSyncError: _dropErr, ...latestBase } = latest;
+      const nextCapabilities =
+        nextManifest?.capabilities ??
+        nextManifest?.acts ??
+        (nextManifest?.actions ? nextManifest.actions.map((a) => a.name) : latest.capabilities);
+      const saved = this.saveDevice({
+        ...latestBase,
+        ...(nextManifest ? { manifest: nextManifest } : {}),
+        capabilities: nextCapabilities,
+        sandboxLevel: level,
+        desiredSandboxLevel: level,
+        sandboxSyncState: "synced",
+        sandboxUpdatedAt: nowIso(),
+        reportedState: {
+          ...latest.reportedState,
+          sandboxLevel: level,
+        },
+      });
+
+      return {
+        device: saved,
+        level,
+        applied: true,
+        pending: false,
+        ...(persisted !== undefined ? { persisted } : {}),
+        ...(warning !== undefined ? { warning } : {}),
+      };
+    }
+
+    const err = rpcRes.status === "rejected" ? rpcRes.error : `Unexpected RPC status: ${rpcRes.status}`;
+    if (/unsupported RPC method/i.test(err)) {
+      const saved = this.saveDevice({
+        ...latest,
+        desiredSandboxLevel: level,
+        sandboxSyncState: "unsupported",
+        sandboxSyncError: err,
+        sandboxUpdatedAt: nowIso(),
+      });
+      return {
+        device: saved,
+        level,
+        applied: false,
+        pending: true,
+        error: err,
+        warning:
+          "Remote neo-agent-os does not support live sandbox switching yet; upgrade neo-agent-os to sync automatically.",
+      };
+    }
+
+    if (/locked/i.test(err)) {
+      const { desiredSandboxLevel: _oldDesired, ...latestWithoutDesired } = latest;
+      const revertedDesiredState: Record<string, unknown> = { ...latest.desiredState };
+      if (latest.sandboxLevel !== undefined) {
+        revertedDesiredState.sandboxLevel = latest.sandboxLevel;
+      } else {
+        delete revertedDesiredState.sandboxLevel;
+      }
+      delete revertedDesiredState.sandboxWorkspaces;
+      const saved = this.saveDevice({
+        ...latestWithoutDesired,
+        ...(latest.sandboxLevel !== undefined ? { desiredSandboxLevel: latest.sandboxLevel } : {}),
+        desiredState: revertedDesiredState,
+        sandboxSyncState: "locked",
+        sandboxSyncError: err,
+        sandboxUpdatedAt: nowIso(),
+      });
+      return {
+        device: saved,
+        level,
+        applied: false,
+        pending: false,
+        error: err,
+      };
+    }
+
+    const saved = this.saveDevice({
+      ...latest,
+      desiredSandboxLevel: level,
+      sandboxSyncState: "pending",
+      sandboxSyncError: err,
+      sandboxUpdatedAt: nowIso(),
+    });
+    return {
+      device: saved,
+      level,
+      applied: false,
+      pending: true,
+      error: err,
+    };
+  }
+
+  private async syncDesiredSandbox(deviceId: string): Promise<void> {
+    if (this.closed || this.syncingSandboxDevices.has(deviceId)) {
+      return;
+    }
+    const twin = this.getDevice(deviceId);
+    if (
+      !twin ||
+      twin.tier !== "os" ||
+      twin.status !== "online" ||
+      !twin.desiredSandboxLevel ||
+      twin.sandboxLevel === twin.desiredSandboxLevel ||
+      twin.manifest?.sandbox?.locked === true ||
+      twin.sandboxSyncState !== "pending"
+    ) {
+      return;
+    }
+
+    const desiredLevel = twin.desiredSandboxLevel;
+    const rawWorkspaces = twin.desiredState?.sandboxWorkspaces;
+    const workspaces =
+      Array.isArray(rawWorkspaces) && rawWorkspaces.every((w): w is string => typeof w === "string")
+        ? rawWorkspaces
+        : undefined;
+
+    this.syncingSandboxDevices.add(deviceId);
+    try {
+      await this.setDeviceSandboxLevel(deviceId, desiredLevel, {
+        ...(workspaces && workspaces.length > 0 ? { workspaces } : {}),
+      });
+    } catch {
+      // Best-effort background sync; twin stays pending for the next reconnect.
+    } finally {
+      this.syncingSandboxDevices.delete(deviceId);
+    }
   }
 
   /** Update a device's route dynamically (`lan | p2p | relay | via_tier1`). */
@@ -2303,13 +2716,13 @@ export class DeviceManager {
             ? { capabilities: body.capabilities.filter((c): c is string => typeof c === "string") }
             : {}),
           ...(Array.isArray(body.actions) ? { actions: body.actions as CapabilityManifest["actions"] } : {}),
-          ...(isRecord(body.sandbox) ? { sandbox: body.sandbox } : {}),
+          ...(isRecord(body.sandbox) ? { sandbox: normalizeSandboxSummary(body.sandbox) } : {}),
           ...(isRecord(body.relay_config)
             ? { relay_config: body.relay_config as CapabilityManifest["relay_config"] }
             : {}),
         };
         const routeHint = this.relayClient?.getPeerRouteHint(manifest.device_id);
-        const twin = this.upsertDeviceManifest(manifest, {
+        let twin = this.upsertDeviceManifest(manifest, {
           status: "online",
           ...(routeHint ? { route: routeHint } : {}),
         });
@@ -2318,7 +2731,7 @@ export class DeviceManager {
             ? body.fingerprint.trim()
             : undefined;
         if (fingerprint || manifestVersion) {
-          this.saveDevice({
+          twin = this.saveDevice({
             ...twin,
             reportedState: {
               ...twin.reportedState,
@@ -2330,6 +2743,16 @@ export class DeviceManager {
         const enrollId = typeof body.enroll_id === "string" ? body.enroll_id.trim() : "";
         if (enrollId) {
           this.enrollment.markEnrollmentCompleted(enrollId, manifest.device_id, fingerprint);
+        }
+        if (
+          twin.tier === "os" &&
+          twin.status === "online" &&
+          twin.desiredSandboxLevel &&
+          twin.sandboxLevel !== twin.desiredSandboxLevel &&
+          twin.manifest?.sandbox?.locked !== true &&
+          twin.sandboxSyncState === "pending"
+        ) {
+          void this.syncDesiredSandbox(twin.deviceId);
         }
         break;
       }

@@ -311,6 +311,28 @@ abstract class Strings {
   String get profileReadonlyDesc;
   String get profileDesktopTitle;
   String get profileDesktopDesc;
+  String get profileUnrestrictedTitle;
+  String get profileUnrestrictedDesc;
+
+  // Device Sandbox Permission Switching
+  String get sandboxPermission;
+  String sandboxSheetTitle(String deviceId);
+  String sandboxLevelLabel(String level);
+  String sandboxLevelTier(String level);
+  String get sandboxHighestBadge;
+  String get sandboxUnrestrictedAccess;
+  String get sandboxUnrestrictedWarning;
+  String get sandboxConfirmUnrestrictedTitle;
+  String sandboxConfirmUnrestrictedBody(String deviceId);
+  String get sandboxConfirmSwitch;
+  String get sandboxApply;
+  String get sandboxApplying;
+  String sandboxUpdated(String deviceId, String levelLabel);
+  String sandboxPendingSync(String levelLabel);
+  String sandboxQueuedNotice(String deviceId, String levelLabel);
+  String get sandboxLockedHint;
+  String get sandboxOfflineHint;
+  String get sandboxCurrentLabel;
   String get installMode;
   String get installModeAuto;
   String get installModeSystem;
@@ -961,6 +983,61 @@ class ZhStrings extends Strings {
   String get profileDesktopTitle => '桌面协作 (desktop)';
   @override
   String get profileDesktopDesc => '面向个人桌面与开发机协作，允许构建与桌面环境交互。';
+  @override
+  String get profileUnrestrictedTitle => '完全不限制 (unrestricted)';
+  @override
+  String get profileUnrestrictedDesc => '最高权限：解除工作区目录、命令白名单/黑名单、Shell 运算符及资源上限，可执行任意命令与全盘读写。';
+
+  @override
+  String get sandboxPermission => '沙箱权限';
+  @override
+  String sandboxSheetTitle(String deviceId) => '沙箱权限 · $deviceId';
+  @override
+  String sandboxLevelLabel(String level) => switch (level) {
+    'readonly' => '只读巡检',
+    'corp' => '企业受限',
+    'personal' => '个人开发',
+    'desktop' => '桌面协作',
+    'unrestricted' => '完全不限制',
+    _ => level,
+  };
+  @override
+  String sandboxLevelTier(String level) => switch (level) {
+    'readonly' => 'L1',
+    'corp' => 'L2',
+    'personal' => 'L3',
+    'desktop' => 'L4',
+    'unrestricted' => 'L5',
+    _ => level,
+  };
+  @override
+  String get sandboxHighestBadge => '最高等级';
+  @override
+  String get sandboxUnrestrictedAccess => '全文件系统访问 · 无命令限制';
+  @override
+  String get sandboxUnrestrictedWarning => '警告：「完全不限制」将允许主控 Neo 在该设备上执行任意 Shell 命令并读写任意路径（受限于设备系统账号权限），请仅对完全受信任的个人设备开启。';
+  @override
+  String get sandboxConfirmUnrestrictedTitle => '切换为「完全不限制」？';
+  @override
+  String sandboxConfirmUnrestrictedBody(String deviceId) => '设备 $deviceId 将解除工作区隔离、命令限制与执行超时上限。确定立即切换？';
+  @override
+  String get sandboxConfirmSwitch => '确认切换';
+  @override
+  String get sandboxApply => '应用权限';
+  @override
+  String get sandboxApplying => '正在切换…';
+  @override
+  String sandboxUpdated(String deviceId, String levelLabel) => '已将 $deviceId 沙箱权限切换为「$levelLabel」';
+  @override
+  String sandboxPendingSync(String levelLabel) => '待同步 → $levelLabel';
+  @override
+  String sandboxQueuedNotice(String deviceId, String levelLabel) => '已保存 $deviceId 的目标权限「$levelLabel」，设备恢复在线或升级 Agent 后自动生效。';
+  @override
+  String get sandboxLockedHint => '该设备本地策略已锁定（lock_sandbox = true），无法通过主控远程修改。';
+  @override
+  String get sandboxOfflineHint => '设备当前离线，保存后将在下次上线时自动同步生效。';
+  @override
+  String get sandboxCurrentLabel => '当前权限';
   @override
   String get installMode => '安装方式';
   @override
@@ -1655,6 +1732,61 @@ class EnStrings extends Strings {
   String get profileDesktopTitle => 'Desktop collab (desktop)';
   @override
   String get profileDesktopDesc => 'Tailored for desktop workstations with workspace builds and collaboration tools.';
+  @override
+  String get profileUnrestrictedTitle => 'Unrestricted (unrestricted)';
+  @override
+  String get profileUnrestrictedDesc => 'Highest level: removes workspace, command, shell, and resource limits for full host access.';
+
+  @override
+  String get sandboxPermission => 'Sandbox';
+  @override
+  String sandboxSheetTitle(String deviceId) => 'Sandbox · $deviceId';
+  @override
+  String sandboxLevelLabel(String level) => switch (level) {
+    'readonly' => 'Read-only',
+    'corp' => 'Corporate',
+    'personal' => 'Personal',
+    'desktop' => 'Desktop',
+    'unrestricted' => 'Unrestricted',
+    _ => level,
+  };
+  @override
+  String sandboxLevelTier(String level) => switch (level) {
+    'readonly' => 'L1',
+    'corp' => 'L2',
+    'personal' => 'L3',
+    'desktop' => 'L4',
+    'unrestricted' => 'L5',
+    _ => level,
+  };
+  @override
+  String get sandboxHighestBadge => 'Highest';
+  @override
+  String get sandboxUnrestrictedAccess => 'Full filesystem access · No command limits';
+  @override
+  String get sandboxUnrestrictedWarning => 'Warning: "Unrestricted" allows arbitrary shell commands and full filesystem access on this device (within OS user permissions). Enable only on trusted personal devices.';
+  @override
+  String get sandboxConfirmUnrestrictedTitle => 'Switch to Unrestricted?';
+  @override
+  String sandboxConfirmUnrestrictedBody(String deviceId) => 'Device $deviceId will remove workspace confinement, command restrictions, and execution limits. Continue?';
+  @override
+  String get sandboxConfirmSwitch => 'Confirm switch';
+  @override
+  String get sandboxApply => 'Apply level';
+  @override
+  String get sandboxApplying => 'Applying…';
+  @override
+  String sandboxUpdated(String deviceId, String levelLabel) => 'Switched $deviceId sandbox level to $levelLabel';
+  @override
+  String sandboxPendingSync(String levelLabel) => 'Pending → $levelLabel';
+  @override
+  String sandboxQueuedNotice(String deviceId, String levelLabel) => 'Saved target sandbox level "$levelLabel" for $deviceId; it will apply automatically once online or updated.';
+  @override
+  String get sandboxLockedHint => 'This device has local sandbox locking enabled (lock_sandbox = true) and cannot be changed remotely.';
+  @override
+  String get sandboxOfflineHint => 'Device is offline; the new level will sync automatically when it reconnects.';
+  @override
+  String get sandboxCurrentLabel => 'Current level';
   @override
   String get installMode => 'Install mode';
   @override

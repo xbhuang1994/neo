@@ -13,10 +13,114 @@ fn default_max_output_bytes() -> usize {
     1_048_576
 }
 
-/// Immutable local policy loaded from `agent-policy.toml`.
-/// Never modified by control-plane or relay messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxLevel {
+    Readonly,
+    Corp,
+    Personal,
+    Desktop,
+    Unrestricted,
+}
+
+impl SandboxLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Readonly => "readonly",
+            Self::Corp => "corp",
+            Self::Personal => "personal",
+            Self::Desktop => "desktop",
+            Self::Unrestricted => "unrestricted",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "readonly" => Ok(Self::Readonly),
+            "corp" => Ok(Self::Corp),
+            "personal" => Ok(Self::Personal),
+            "desktop" => Ok(Self::Desktop),
+            "unrestricted" => Ok(Self::Unrestricted),
+            other => Err(format!(
+                "invalid sandbox level '{other}' (expected readonly, corp, personal, desktop, or unrestricted)"
+            )),
+        }
+    }
+}
+
+const BASE_DENIED_COMMANDS: &[&str] = &[
+    "rm",
+    "sudo",
+    "su",
+    "doas",
+    "dd",
+    "mkfs",
+    "fdisk",
+    "parted",
+    "shutdown",
+    "reboot",
+    "poweroff",
+    "halt",
+    "mount",
+    "umount",
+    "iptables",
+    "ip6tables",
+    "nft",
+    "systemctl",
+    "chmod",
+    "chown",
+    "chgrp",
+    "curl",
+    "wget",
+    "ssh",
+    "scp",
+    "sftp",
+    "nc",
+    "ncat",
+];
+
+const READONLY_ALLOWED_COMMANDS: &[&str] = &[
+    "ls", "cat", "head", "tail", "grep", "rg", "find", "pwd", "uname", "echo", "git",
+];
+
+const CORP_EXTRA_DENIED_COMMANDS: &[&str] = &["python3", "perl", "ruby", "bash", "sh"];
+
+const READONLY_EXTRA_DENIED_COMMANDS: &[&str] = &[
+    "python3", "perl", "ruby", "bash", "sh", "mv", "cp", "tee", "sed", "awk", "touch", "mkdir",
+    "rmdir", "ln",
+];
+
+const CORP_ALLOWED_COMMANDS: &[&str] = &[
+    "ls", "cat", "head", "tail", "grep", "rg", "find", "pwd", "uname", "echo", "git", "cargo",
+    "bun",
+];
+
+const PERSONAL_ALLOWED_COMMANDS: &[&str] = &[
+    "ls", "cat", "head", "tail", "grep", "rg", "find", "pwd", "uname", "echo", "git", "cargo",
+    "bun", "python3", "make",
+];
+
+const DESKTOP_EXTRA_ALLOWED_COMMANDS: &[&str] = &[
+    "node",
+    "npm",
+    "npx",
+    "flutter",
+    "dart",
+    "open",
+    "xdg-open",
+    "osascript",
+    "screencapture",
+    "scrot",
+    "xdotool",
+    "powershell",
+    "pwsh",
+];
+
+/// Local execution policy loaded from `agent-policy.toml` (or runtime sandbox override).
+/// Set `lock_sandbox = true` to refuse remote `set_sandbox` RPC transitions.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PolicyConfig {
+    #[serde(default)]
     pub allowed_workspaces: Vec<String>,
     #[serde(default)]
     pub allowed_commands: Vec<String>,
@@ -28,6 +132,14 @@ pub struct PolicyConfig {
     pub max_exec_timeout_sec: u64,
     #[serde(default = "default_max_output_bytes")]
     pub max_output_bytes: usize,
+    #[serde(default)]
+    pub sandbox_level: Option<SandboxLevel>,
+    #[serde(default)]
+    pub unrestricted: bool,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub lock_sandbox: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +152,26 @@ const FORBIDDEN_CMD_CHARS: &[char] = &[
     ';', '&', '|', '`', '$', '(', ')', '<', '>', '\n', '\r', '\0', '*', '?',
 ];
 
+fn escape_toml_string(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+fn format_toml_string_array(items: &[String]) -> String {
+    if items.is_empty() {
+        return "[]".to_string();
+    }
+    let lines: Vec<String> = items
+        .iter()
+        .map(|item| format!("  \"{}\",", escape_toml_string(item)))
+        .collect();
+    format!("[\n{}\n]", lines.join("\n"))
+}
+
 impl Policy {
     pub fn from_file(path: &Path) -> Result<Self, String> {
         let raw = std::fs::read_to_string(path)
@@ -50,8 +182,25 @@ impl Policy {
     pub fn from_toml_str(toml_str: &str) -> Result<Self, String> {
         let config: PolicyConfig =
             toml::from_str(toml_str).map_err(|e| format!("invalid policy TOML: {e}"))?;
+        Self::from_config(config)
+    }
+
+    fn from_config(config: PolicyConfig) -> Result<Self, String> {
+        let is_unrestricted =
+            config.unrestricted || config.sandbox_level == Some(SandboxLevel::Unrestricted);
         let mut canonical_workspaces = Vec::with_capacity(config.allowed_workspaces.len());
         for ws in &config.allowed_workspaces {
+            if is_unrestricted {
+                if ws.is_empty() || ws.contains('\0') {
+                    continue;
+                }
+                if let Ok(canon) = std::fs::canonicalize(Path::new(ws)) {
+                    if canon.is_dir() {
+                        canonical_workspaces.push(canon);
+                    }
+                }
+                continue;
+            }
             if ws.is_empty() || ws.contains('\0') {
                 return Err(format!("invalid workspace path in policy: {ws:?}"));
             }
@@ -72,12 +221,226 @@ impl Policy {
         })
     }
 
+    pub fn from_preset(
+        level: SandboxLevel,
+        workspaces: Vec<String>,
+        lock_sandbox: bool,
+    ) -> Result<Self, String> {
+        let to_vec = |items: &[&str]| -> Vec<String> { items.iter().map(|s| (*s).to_string()).collect() };
+        let (
+            allowed_commands,
+            denied_commands,
+            max_child_mem_mb,
+            max_exec_timeout_sec,
+            max_output_bytes,
+            read_only,
+            unrestricted,
+        ) = match level {
+            SandboxLevel::Readonly => {
+                let mut denied = to_vec(BASE_DENIED_COMMANDS);
+                denied.extend(to_vec(READONLY_EXTRA_DENIED_COMMANDS));
+                (
+                    to_vec(READONLY_ALLOWED_COMMANDS),
+                    denied,
+                    1024,
+                    60,
+                    1_048_576,
+                    true,
+                    false,
+                )
+            }
+            SandboxLevel::Corp => {
+                let mut denied = to_vec(BASE_DENIED_COMMANDS);
+                denied.extend(to_vec(CORP_EXTRA_DENIED_COMMANDS));
+                (
+                    to_vec(CORP_ALLOWED_COMMANDS),
+                    denied,
+                    4096,
+                    90,
+                    1_048_576,
+                    false,
+                    false,
+                )
+            }
+            SandboxLevel::Personal => (
+                to_vec(PERSONAL_ALLOWED_COMMANDS),
+                to_vec(BASE_DENIED_COMMANDS),
+                2048,
+                120,
+                1_048_576,
+                false,
+                false,
+            ),
+            SandboxLevel::Desktop => {
+                let mut allowed = to_vec(PERSONAL_ALLOWED_COMMANDS);
+                allowed.extend(to_vec(DESKTOP_EXTRA_ALLOWED_COMMANDS));
+                (
+                    allowed,
+                    to_vec(BASE_DENIED_COMMANDS),
+                    4096,
+                    180,
+                    1_048_576,
+                    false,
+                    false,
+                )
+            }
+            SandboxLevel::Unrestricted => (
+                Vec::new(),
+                Vec::new(),
+                0,
+                0,
+                8_388_608,
+                false,
+                true,
+            ),
+        };
+
+        let config = PolicyConfig {
+            allowed_workspaces: workspaces,
+            allowed_commands,
+            denied_commands,
+            max_child_mem_mb,
+            max_exec_timeout_sec,
+            max_output_bytes,
+            sandbox_level: Some(level),
+            unrestricted,
+            read_only,
+            lock_sandbox,
+        };
+        Self::from_config(config)
+    }
+
+    pub fn render_toml(&self) -> String {
+        let level = self.effective_level();
+        let mut out = String::new();
+        out.push_str(&format!(
+            "# Neo Tier 1 OS Agent execution policy (sandbox level: {}).\n\n",
+            level.as_str()
+        ));
+        out.push_str(&format!("sandbox_level = \"{}\"\n", level.as_str()));
+        out.push_str(&format!("unrestricted = {}\n", self.is_unrestricted()));
+        out.push_str(&format!("read_only = {}\n", self.is_read_only()));
+        if self.config.lock_sandbox {
+            out.push_str("lock_sandbox = true\n");
+        }
+        out.push('\n');
+        out.push_str(&format!(
+            "allowed_workspaces = {}\n\n",
+            format_toml_string_array(&self.config.allowed_workspaces)
+        ));
+        out.push_str(&format!(
+            "allowed_commands = {}\n\n",
+            format_toml_string_array(&self.config.allowed_commands)
+        ));
+        out.push_str("# denied_commands always overrides allowed_commands.\n");
+        out.push_str(&format!(
+            "denied_commands = {}\n\n",
+            format_toml_string_array(&self.config.denied_commands)
+        ));
+        out.push_str(&format!(
+            "max_child_mem_mb = {}\n",
+            self.config.max_child_mem_mb
+        ));
+        out.push_str(&format!(
+            "max_exec_timeout_sec = {}\n",
+            self.config.max_exec_timeout_sec
+        ));
+        out.push_str(&format!(
+            "max_output_bytes = {}\n",
+            self.config.max_output_bytes
+        ));
+        out
+    }
+
+    pub fn persist_to_file(&self, path: &Path) -> Result<(), String> {
+        let content = self.render_toml();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!("failed to create policy directory {}: {e}", parent.display())
+                })?;
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if path.is_file() {
+                if let Ok(meta) = std::fs::metadata(path) {
+                    if meta.permissions().mode() & 0o200 == 0 {
+                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
+                            .map_err(|e| {
+                                format!(
+                                    "failed to temporarily make policy file {} writable: {e}",
+                                    path.display()
+                                )
+                            })?;
+                    }
+                }
+            }
+        }
+        let write_res = std::fs::write(path, content)
+            .map_err(|e| format!("failed to write policy file {}: {e}", path.display()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if path.is_file() {
+                if let Err(e) =
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444))
+                {
+                    if write_res.is_ok() {
+                        return Err(format!("failed to set 0444 on {}: {e}", path.display()));
+                    }
+                }
+            }
+        }
+        write_res
+    }
+
     pub fn config(&self) -> &PolicyConfig {
         &self.config
     }
 
     pub fn canonical_workspaces(&self) -> &[PathBuf] {
         &self.canonical_workspaces
+    }
+
+    pub fn is_unrestricted(&self) -> bool {
+        self.config.unrestricted || self.config.sandbox_level == Some(SandboxLevel::Unrestricted)
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        !self.is_unrestricted()
+            && (self.config.read_only || self.config.sandbox_level == Some(SandboxLevel::Readonly))
+    }
+
+    pub fn is_sandbox_locked(&self) -> bool {
+        self.config.lock_sandbox
+    }
+
+    pub fn effective_level(&self) -> SandboxLevel {
+        if self.is_unrestricted() {
+            return SandboxLevel::Unrestricted;
+        }
+        if let Some(lvl) = self.config.sandbox_level {
+            return lvl;
+        }
+        if self.config.read_only {
+            return SandboxLevel::Readonly;
+        }
+        if self.config.max_child_mem_mb == 1024 && self.config.max_exec_timeout_sec == 60 {
+            SandboxLevel::Readonly
+        } else if self.config.denied_commands.iter().any(|c| c == "bash") {
+            SandboxLevel::Corp
+        } else if self
+            .config
+            .allowed_commands
+            .iter()
+            .any(|c| c == "flutter" || c == "osascript")
+        {
+            SandboxLevel::Desktop
+        } else {
+            SandboxLevel::Personal
+        }
     }
 
     pub fn default_workspace(&self) -> Result<&Path, String> {
@@ -87,17 +450,54 @@ impl Policy {
             .ok_or_else(|| "no allowed_workspaces configured in local policy".to_string())
     }
 
+    pub fn default_cwd(&self) -> Result<PathBuf, String> {
+        if let Ok(ws) = self.default_workspace() {
+            return Ok(ws.to_path_buf());
+        }
+        if self.is_unrestricted() {
+            return crate::enroll::user_home_dir()
+                .or_else(|_| std::env::current_dir().map_err(|e| e.to_string()));
+        }
+        Err("no allowed_workspaces configured in local policy".to_string())
+    }
+
     fn is_within_workspaces(&self, canonical_path: &Path) -> bool {
         self.canonical_workspaces
             .iter()
             .any(|ws| canonical_path.starts_with(ws))
     }
 
-    /// Validates that `raw_path` resolves strictly within `allowed_workspaces`,
+    /// Validates that `raw_path` resolves strictly within `allowed_workspaces` when restricted,
     /// rejecting any `..` traversal or symlink escapes outside workspaces.
+    /// In `unrestricted` mode, expands `~`/`~/` and allows arbitrary host paths.
     pub fn validate_path(&self, raw_path: &str, must_exist: bool) -> Result<PathBuf, String> {
         if raw_path.is_empty() || raw_path.contains('\0') {
             return Err("invalid empty or NUL path".to_string());
+        }
+        if self.is_unrestricted() {
+            let expanded = if raw_path == "~" {
+                crate::enroll::user_home_dir().unwrap_or_else(|_| PathBuf::from(raw_path))
+            } else if let Some(rest) = raw_path
+                .strip_prefix("~/")
+                .or_else(|| raw_path.strip_prefix("~\\"))
+            {
+                match crate::enroll::user_home_dir() {
+                    Ok(home) => home.join(rest),
+                    Err(_) => PathBuf::from(raw_path),
+                }
+            } else {
+                PathBuf::from(raw_path)
+            };
+            let candidate = if expanded.is_absolute() {
+                expanded
+            } else {
+                self.default_cwd()?.join(expanded)
+            };
+            if must_exist {
+                return std::fs::canonicalize(&candidate)
+                    .map_err(|e| format!("path resolution failed for {raw_path}: {e}"));
+            }
+            return Ok(candidate);
         }
         if self.canonical_workspaces.is_empty() {
             return Err("no allowed_workspaces configured in local policy".to_string());
@@ -183,7 +583,14 @@ impl Policy {
 
     /// Validates a command executable against `denied_commands` and `allowed_commands`.
     /// `denied_commands` always takes precedence.
+    /// In `unrestricted` mode, allows any non-empty, NUL-free command/path.
     pub fn validate_command(&self, program: &str) -> Result<String, String> {
+        if self.is_unrestricted() {
+            if program.is_empty() || program.contains('\0') {
+                return Err(format!("invalid or empty command name: {program:?}"));
+            }
+            return Ok(program.to_string());
+        }
         if program.is_empty()
             || program.chars().any(|c| FORBIDDEN_CMD_CHARS.contains(&c))
             || program.contains(char::is_whitespace)
@@ -358,5 +765,190 @@ denied_commands = ["rm", "sudo"]
         assert!(policy.validate_command("cat").is_err()); // not in allowlist
         assert!(policy.validate_command("echo;rm").is_err());
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn sandbox_level_parse_and_effective_level_inference() {
+        assert_eq!(SandboxLevel::parse("READONLY").unwrap(), SandboxLevel::Readonly);
+        assert_eq!(SandboxLevel::parse("  corp ").unwrap(), SandboxLevel::Corp);
+        assert_eq!(SandboxLevel::parse("Personal").unwrap(), SandboxLevel::Personal);
+        assert_eq!(SandboxLevel::parse("desktop").unwrap(), SandboxLevel::Desktop);
+        assert_eq!(
+            SandboxLevel::parse("UnReStRiCtEd").unwrap(),
+            SandboxLevel::Unrestricted
+        );
+        assert!(SandboxLevel::parse("unknown").is_err());
+
+        let ws = temp_dir("infer");
+        let ws_esc = toml_escape(&ws);
+
+        // Legacy readonly inference (1024MB / 60s)
+        let ro_legacy = Policy::from_toml_str(&format!(
+            r#"
+allowed_workspaces = ["{ws_esc}"]
+max_child_mem_mb = 1024
+max_exec_timeout_sec = 60
+"#
+        ))
+        .unwrap();
+        assert_eq!(ro_legacy.effective_level(), SandboxLevel::Readonly);
+        assert!(!ro_legacy.is_read_only()); // explicit read_only/sandbox_level not set
+
+        // Legacy corp inference (denied bash)
+        let corp_legacy = Policy::from_toml_str(&format!(
+            r#"
+allowed_workspaces = ["{ws_esc}"]
+denied_commands = ["rm", "bash"]
+max_child_mem_mb = 4096
+max_exec_timeout_sec = 90
+"#
+        ))
+        .unwrap();
+        assert_eq!(corp_legacy.effective_level(), SandboxLevel::Corp);
+
+        // Legacy desktop inference (allowed flutter)
+        let desktop_legacy = Policy::from_toml_str(&format!(
+            r#"
+allowed_workspaces = ["{ws_esc}"]
+allowed_commands = ["ls", "flutter"]
+max_child_mem_mb = 4096
+max_exec_timeout_sec = 180
+"#
+        ))
+        .unwrap();
+        assert_eq!(desktop_legacy.effective_level(), SandboxLevel::Desktop);
+
+        // Legacy personal default
+        let personal_legacy = Policy::from_toml_str(&format!(
+            r#"
+allowed_workspaces = ["{ws_esc}"]
+allowed_commands = ["ls", "cargo"]
+"#
+        ))
+        .unwrap();
+        assert_eq!(personal_legacy.effective_level(), SandboxLevel::Personal);
+
+        // Explicit flags
+        let explicit_ro = Policy::from_toml_str(&format!(
+            r#"
+allowed_workspaces = ["{ws_esc}"]
+read_only = true
+"#
+        ))
+        .unwrap();
+        assert!(explicit_ro.is_read_only());
+        assert_eq!(explicit_ro.effective_level(), SandboxLevel::Readonly);
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn presets_render_roundtrip_and_persist_to_readonly_file() {
+        let ws = temp_dir("preset");
+        let ws_str = ws.to_string_lossy().into_owned();
+
+        for (lvl, exp_mem, exp_timeout, exp_out, exp_ro, exp_unr) in [
+            (SandboxLevel::Readonly, 1024, 60, 1_048_576, true, false),
+            (SandboxLevel::Corp, 4096, 90, 1_048_576, false, false),
+            (SandboxLevel::Personal, 2048, 120, 1_048_576, false, false),
+            (SandboxLevel::Desktop, 4096, 180, 1_048_576, false, false),
+            (SandboxLevel::Unrestricted, 0, 0, 8_388_608, false, true),
+        ] {
+            let pol = Policy::from_preset(lvl, vec![ws_str.clone()], false).unwrap();
+            assert_eq!(pol.effective_level(), lvl);
+            assert_eq!(pol.config().max_child_mem_mb, exp_mem);
+            assert_eq!(pol.config().max_exec_timeout_sec, exp_timeout);
+            assert_eq!(pol.config().max_output_bytes, exp_out);
+            assert_eq!(pol.is_read_only(), exp_ro);
+            assert_eq!(pol.is_unrestricted(), exp_unr);
+            assert_eq!(pol.config().allowed_workspaces, vec![ws_str.clone()]);
+
+            let rendered = pol.render_toml();
+            let reparsed = Policy::from_toml_str(&rendered).unwrap();
+            assert_eq!(reparsed.config(), pol.config());
+        }
+
+        // Persist over an existing 0444 read-only file and verify 0444 is restored on Unix
+        let pol_path = ws.join("policy-test.toml");
+        let p1 = Policy::from_preset(SandboxLevel::Personal, vec![ws_str.clone()], false).unwrap();
+        p1.persist_to_file(&pol_path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&pol_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o444);
+        }
+
+        let p2 =
+            Policy::from_preset(SandboxLevel::Unrestricted, vec![ws_str.clone()], true).unwrap();
+        p2.persist_to_file(&pol_path).unwrap();
+        let loaded = Policy::from_file(&pol_path).unwrap();
+        assert_eq!(loaded.effective_level(), SandboxLevel::Unrestricted);
+        assert!(loaded.is_sandbox_locked());
+        assert_eq!(loaded.config().allowed_workspaces, vec![ws_str]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&pol_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o444);
+        }
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn unrestricted_allows_missing_workspaces_outside_paths_tilde_dotdot_and_any_command() {
+        let outside = temp_dir("unr_outside");
+        let outside_file = outside.join("file.txt");
+        std::fs::write(&outside_file, "free").unwrap();
+
+        // Missing workspaces and omitted workspaces are tolerated in unrestricted mode
+        let pol = Policy::from_toml_str(
+            r#"
+sandbox_level = "unrestricted"
+allowed_workspaces = ["/definitely/does/not/exist/neo_missing_ws"]
+"#,
+        )
+        .unwrap();
+        assert!(pol.is_unrestricted());
+        assert!(!pol.is_read_only());
+        assert!(pol.canonical_workspaces().is_empty());
+        assert!(pol.default_cwd().is_ok());
+
+        // Also works when allowed_workspaces is omitted entirely
+        let pol_empty = Policy::from_toml_str("unrestricted = true\n").unwrap();
+        assert!(pol_empty.is_unrestricted());
+        assert_eq!(pol_empty.effective_level(), SandboxLevel::Unrestricted);
+
+        // Paths outside workspace and with `..` succeed
+        let resolved_exist = pol
+            .validate_path(&outside_file.to_string_lossy(), true)
+            .unwrap();
+        assert_eq!(resolved_exist, std::fs::canonicalize(&outside_file).unwrap());
+
+        let dotdot_target = format!("{}/sub/../new.txt", outside.display());
+        assert!(pol.validate_path(&dotdot_target, false).is_ok());
+
+        // `~` and `~/` expand to home dir when HOME/USERPROFILE is set
+        if let Ok(home) = crate::enroll::user_home_dir() {
+            assert_eq!(pol.validate_path("~", false).unwrap(), home);
+            assert_eq!(
+                pol.validate_path("~/foo/bar", false).unwrap(),
+                home.join("foo/bar")
+            );
+        }
+
+        // Empty or NUL paths still rejected
+        assert!(pol.validate_path("", false).is_err());
+        assert!(pol.validate_path("abc\0def", false).is_err());
+
+        // Arbitrary commands allowed, empty/NUL still rejected
+        assert_eq!(pol.validate_command("rm").unwrap(), "rm");
+        assert_eq!(pol.validate_command("/usr/bin/env").unwrap(), "/usr/bin/env");
+        assert_eq!(pol.validate_command("sh").unwrap(), "sh");
+        assert!(pol.validate_command("").is_err());
+        assert!(pol.validate_command("bad\0cmd").is_err());
+
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }
