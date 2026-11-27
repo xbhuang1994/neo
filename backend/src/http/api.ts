@@ -11,7 +11,9 @@ import * as path from "node:path";
 import { StopWorkerError } from "../app/context.ts";
 import type { AppContext, ChatAttachment } from "../app/context.ts";
 import {
+  MCP_CALL_POLICY_MODES,
   SANDBOX_LEVELS,
+  isMcpCallPolicyMode,
   isSandboxLevel,
   renderDirectInstallPs1,
   renderDirectInstallSh,
@@ -22,6 +24,8 @@ import {
   type EnrollmentPlatform,
   type EnrollmentProfile,
   type EnrollmentTransportMode,
+  type McpCallAction,
+  type McpCallPolicyMode,
   type McuInstallInput,
   type McuTransportKind,
   type TokenTier,
@@ -440,6 +444,61 @@ function safeDecodeSegment(raw: string): string | null {
   }
 }
 
+function matchDeviceMcpServerPath(
+  reqPath: string,
+  suffix: string,
+): { deviceId: string; serverId: string } | null {
+  if (!reqPath.startsWith(DEVICES_PREFIX) || !reqPath.endsWith(suffix)) {
+    return null;
+  }
+  const inner = reqPath.slice(DEVICES_PREFIX.length, reqPath.length - suffix.length);
+  const mcpIdx = inner.indexOf("/mcp/");
+  if (mcpIdx <= 0) {
+    return null;
+  }
+  const rawDeviceId = inner.slice(0, mcpIdx);
+  const rawServerId = inner.slice(mcpIdx + "/mcp/".length);
+  if (!rawDeviceId || rawDeviceId.includes("/") || !rawServerId || rawServerId.includes("/")) {
+    return null;
+  }
+  const deviceId = safeDecodeSegment(rawDeviceId);
+  const serverId = safeDecodeSegment(rawServerId);
+  if (!deviceId || deviceId.includes("/") || !serverId || serverId.includes("/")) {
+    return null;
+  }
+  return { deviceId, serverId };
+}
+
+function parseQueryBool(
+  params: URLSearchParams,
+  keys: readonly string[],
+  label: string,
+): { ok: true; value?: boolean } | { ok: false; response: Response } {
+  for (let i = 0; i < keys.length; i++) {
+    const raw = params.get(keys[i]!);
+    if (raw === null) continue;
+    const lower = raw.trim().toLowerCase();
+    if (lower === "true" || lower === "1") return { ok: true, value: true };
+    if (lower === "false" || lower === "0") return { ok: true, value: false };
+    return { ok: false, response: Response.error(400, `${label} must be true or false`) };
+  }
+  return { ok: true, value: undefined };
+}
+
+function mcpHttpErrorResponse(error: unknown): Response {
+  const msg = errorMessage(error);
+  const statusCode =
+    msg.startsWith("Unknown device:") ||
+    msg.startsWith("Unknown MCP server:") ||
+    /mcp server .* not found/i.test(msg) ||
+    /mcp server not found/i.test(msg)
+      ? 404
+      : msg.includes("Cross-cluster") || /locked/i.test(msg)
+        ? 403
+        : 400;
+  return Response.error(statusCode, msg);
+}
+
 function requestOrigin(request: Request): string {
   const rawProto = (request.header("x-forwarded-proto") ?? "").split(",")[0]?.trim().toLowerCase();
   const proto = rawProto === "https" ? "https" : "http";
@@ -780,6 +839,63 @@ async function routeDevices(
         .filter((twin): twin is NonNullable<typeof twin> => twin !== null);
       return Response.json(200, { enrollment, devices });
     }
+    const mcpToolsRoute = matchDeviceMcpServerPath(reqPath, "/tools");
+    if (mcpToolsRoute !== null) {
+      const params = new URLSearchParams(request.query);
+      const rawQuery = params.get("query");
+      const refresh = parseQueryBool(params, ["refresh"], "refresh");
+      if (!refresh.ok) return refresh.response;
+      const includeResources = parseQueryBool(
+        params,
+        ["includeResources", "include_resources"],
+        "includeResources",
+      );
+      if (!includeResources.ok) return includeResources.response;
+      const includePrompts = parseQueryBool(
+        params,
+        ["includePrompts", "include_prompts"],
+        "includePrompts",
+      );
+      if (!includePrompts.ok) return includePrompts.response;
+      const rawTimeout = params.get("timeoutMs") ?? params.get("timeout_ms");
+      let timeoutMs: number | undefined;
+      if (rawTimeout !== null && rawTimeout.trim().length > 0) {
+        const parsedTimeout = Number(rawTimeout);
+        if (!Number.isInteger(parsedTimeout) || parsedTimeout <= 0) {
+          return Response.error(400, "timeoutMs must be a positive integer");
+        }
+        timeoutMs = parsedTimeout;
+      }
+      try {
+        const result = await app.devices.inspectDeviceMcp(
+          mcpToolsRoute.deviceId,
+          mcpToolsRoute.serverId,
+          {
+            ...(rawQuery !== null && rawQuery.trim().length > 0 ? { query: rawQuery } : {}),
+            ...(refresh.value !== undefined ? { refresh: refresh.value } : {}),
+            ...(includeResources.value !== undefined ? { includeResources: includeResources.value } : {}),
+            ...(includePrompts.value !== undefined ? { includePrompts: includePrompts.value } : {}),
+            ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+          },
+        );
+        return Response.json(200, result);
+      } catch (error) {
+        return mcpHttpErrorResponse(error);
+      }
+    }
+    if (reqPath.startsWith(DEVICES_PREFIX) && reqPath.endsWith("/mcp")) {
+      const id = safeDecodeSegment(
+        reqPath.slice(DEVICES_PREFIX.length, reqPath.length - "/mcp".length),
+      );
+      if (!id || id.includes("/")) {
+        return Response.error(404, "Device not found");
+      }
+      try {
+        return Response.json(200, app.devices.getDeviceMcp(id));
+      } catch (error) {
+        return mcpHttpErrorResponse(error);
+      }
+    }
     if (reqPath.startsWith(DEVICES_PREFIX)) {
       const id = safeDecodeSegment(reqPath.slice(DEVICES_PREFIX.length));
       if (!id || id.includes("/")) {
@@ -886,6 +1002,216 @@ async function routeDevices(
         }
       }
       return Response.error(404, "Not found");
+    }
+
+    if (reqPath.startsWith(DEVICES_PREFIX) && reqPath.endsWith("/mcp/discover")) {
+      const id = safeDecodeSegment(
+        reqPath.slice(DEVICES_PREFIX.length, reqPath.length - "/mcp/discover".length),
+      );
+      if (!id || id.includes("/")) {
+        return Response.error(404, "Device not found");
+      }
+      const parsed = optionalJsonBody(request);
+      if (!parsed.ok) return parsed.response;
+      if (!isRecord(parsed.value)) {
+        return Response.error(400, "Expected JSON object");
+      }
+      const includeLoopbackProbe = parseOptionalBoolField(
+        parsed.value,
+        ["includeLoopbackProbe", "include_loopback_probe"],
+        "includeLoopbackProbe",
+      );
+      if (!includeLoopbackProbe.ok) return includeLoopbackProbe.response;
+      let sources: string[] | undefined;
+      const rawSources = parsed.value.sources;
+      if (rawSources !== undefined && rawSources !== null) {
+        if (!Array.isArray(rawSources) || !rawSources.every((s) => typeof s === "string")) {
+          return Response.error(400, "sources must be an array of strings");
+        }
+        sources = rawSources;
+      }
+      const timeoutMs = parseOptionalIntField(parsed.value, ["timeoutMs", "timeout_ms"], "timeoutMs");
+      if (!timeoutMs.ok) return timeoutMs.response;
+      if (timeoutMs.value !== undefined && timeoutMs.value <= 0) {
+        return Response.error(400, "timeoutMs must be a positive integer");
+      }
+      try {
+        const overview = await app.devices.discoverDeviceMcp(id, {
+          ...(includeLoopbackProbe.value !== undefined
+            ? { includeLoopbackProbe: includeLoopbackProbe.value }
+            : {}),
+          ...(sources !== undefined ? { sources } : {}),
+          ...(timeoutMs.value !== undefined ? { timeoutMs: timeoutMs.value } : {}),
+        });
+        return Response.json(200, overview);
+      } catch (error) {
+        return mcpHttpErrorResponse(error);
+      }
+    }
+
+    const mcpInspectRoute = matchDeviceMcpServerPath(reqPath, "/inspect");
+    if (mcpInspectRoute !== null) {
+      const parsed = optionalJsonBody(request);
+      if (!parsed.ok) return parsed.response;
+      if (!isRecord(parsed.value)) {
+        return Response.error(400, "Expected JSON object");
+      }
+      const query = parseOptionalStringField(parsed.value, ["query"], "query");
+      if (!query.ok) return query.response;
+      const includeResources = parseOptionalBoolField(
+        parsed.value,
+        ["includeResources", "include_resources"],
+        "includeResources",
+      );
+      if (!includeResources.ok) return includeResources.response;
+      const includePrompts = parseOptionalBoolField(
+        parsed.value,
+        ["includePrompts", "include_prompts"],
+        "includePrompts",
+      );
+      if (!includePrompts.ok) return includePrompts.response;
+      const refresh = parseOptionalBoolField(parsed.value, ["refresh"], "refresh");
+      if (!refresh.ok) return refresh.response;
+      const timeoutMs = parseOptionalIntField(parsed.value, ["timeoutMs", "timeout_ms"], "timeoutMs");
+      if (!timeoutMs.ok) return timeoutMs.response;
+      if (timeoutMs.value !== undefined && timeoutMs.value <= 0) {
+        return Response.error(400, "timeoutMs must be a positive integer");
+      }
+      try {
+        const result = await app.devices.inspectDeviceMcp(
+          mcpInspectRoute.deviceId,
+          mcpInspectRoute.serverId,
+          {
+            ...(query.value !== undefined && query.value.trim().length > 0 ? { query: query.value } : {}),
+            ...(includeResources.value !== undefined ? { includeResources: includeResources.value } : {}),
+            ...(includePrompts.value !== undefined ? { includePrompts: includePrompts.value } : {}),
+            ...(refresh.value !== undefined ? { refresh: refresh.value } : {}),
+            ...(timeoutMs.value !== undefined ? { timeoutMs: timeoutMs.value } : {}),
+          },
+        );
+        return Response.json(200, result);
+      } catch (error) {
+        return mcpHttpErrorResponse(error);
+      }
+    }
+
+    const mcpCallRoute = matchDeviceMcpServerPath(reqPath, "/call");
+    if (mcpCallRoute !== null) {
+      const parsed = jsonBody(request);
+      if (!parsed.ok) return parsed.response;
+      if (!isRecord(parsed.value)) {
+        return Response.error(400, "Expected JSON object");
+      }
+      const actionField = parseOptionalStringField(parsed.value, ["action"], "action");
+      if (!actionField.ok) return actionField.response;
+      const action = (actionField.value?.trim() || "tools/call") as McpCallAction;
+      if (action !== "tools/call" && action !== "resources/read" && action !== "prompts/get") {
+        return Response.error(400, "action must be tools/call, resources/read, or prompts/get");
+      }
+      const toolName = parseOptionalStringField(parsed.value, ["toolName", "tool_name"], "toolName");
+      if (!toolName.ok) return toolName.response;
+      const uri = parseOptionalStringField(parsed.value, ["uri"], "uri");
+      if (!uri.ok) return uri.response;
+      const promptName = parseOptionalStringField(
+        parsed.value,
+        ["promptName", "prompt_name", "name"],
+        "promptName",
+      );
+      if (!promptName.ok) return promptName.response;
+      const reason = parseOptionalStringField(parsed.value, ["reason"], "reason");
+      if (!reason.ok) return reason.response;
+      const rawArgs = parsed.value.arguments ?? parsed.value.args;
+      if (rawArgs !== undefined && rawArgs !== null && !isRecord(rawArgs)) {
+        return Response.error(400, "arguments must be an object");
+      }
+      const timeoutMs = parseOptionalIntField(parsed.value, ["timeoutMs", "timeout_ms"], "timeoutMs");
+      if (!timeoutMs.ok) return timeoutMs.response;
+      if (timeoutMs.value !== undefined && timeoutMs.value <= 0) {
+        return Response.error(400, "timeoutMs must be a positive integer");
+      }
+      try {
+        const result = await app.devices.callDeviceMcp(mcpCallRoute.deviceId, {
+          serverId: mcpCallRoute.serverId,
+          action,
+          ...(toolName.value !== undefined ? { toolName: toolName.value } : {}),
+          ...(isRecord(rawArgs) ? { arguments: rawArgs } : {}),
+          ...(uri.value !== undefined ? { uri: uri.value } : {}),
+          ...(promptName.value !== undefined ? { promptName: promptName.value } : {}),
+          ...(timeoutMs.value !== undefined ? { timeoutMs: timeoutMs.value } : {}),
+          ...(reason.value !== undefined ? { reason: reason.value } : {}),
+        });
+        if (result.status === "ok") {
+          return Response.json(200, result);
+        }
+        if (result.status === "pending_approval" || result.status === "queued") {
+          return Response.json(202, result);
+        }
+        const statusCode =
+          result.error.startsWith("Unknown device:") || result.error.startsWith("Unknown MCP server:")
+            ? 404
+            : result.error.includes("forbidden") ||
+                result.error.includes("Cross-cluster") ||
+                result.error.includes("blocked") ||
+                result.error.includes("disabled") ||
+                /locked/i.test(result.error)
+              ? 403
+              : 400;
+        return Response.json(statusCode, result);
+      } catch (error) {
+        return mcpHttpErrorResponse(error);
+      }
+    }
+
+    const mcpStopRoute = matchDeviceMcpServerPath(reqPath, "/stop");
+    if (mcpStopRoute !== null) {
+      const parsed = optionalJsonBody(request);
+      if (!parsed.ok) return parsed.response;
+      if (!isRecord(parsed.value)) {
+        return Response.error(400, "Expected JSON object");
+      }
+      const timeoutMs = parseOptionalIntField(parsed.value, ["timeoutMs", "timeout_ms"], "timeoutMs");
+      if (!timeoutMs.ok) return timeoutMs.response;
+      if (timeoutMs.value !== undefined && timeoutMs.value <= 0) {
+        return Response.error(400, "timeoutMs must be a positive integer");
+      }
+      try {
+        return Response.json(
+          200,
+          await app.devices.stopDeviceMcpServer(
+            mcpStopRoute.deviceId,
+            mcpStopRoute.serverId,
+            timeoutMs.value,
+          ),
+        );
+      } catch (error) {
+        return mcpHttpErrorResponse(error);
+      }
+    }
+
+    const mcpRestartRoute = matchDeviceMcpServerPath(reqPath, "/restart");
+    if (mcpRestartRoute !== null) {
+      const parsed = optionalJsonBody(request);
+      if (!parsed.ok) return parsed.response;
+      if (!isRecord(parsed.value)) {
+        return Response.error(400, "Expected JSON object");
+      }
+      const timeoutMs = parseOptionalIntField(parsed.value, ["timeoutMs", "timeout_ms"], "timeoutMs");
+      if (!timeoutMs.ok) return timeoutMs.response;
+      if (timeoutMs.value !== undefined && timeoutMs.value <= 0) {
+        return Response.error(400, "timeoutMs must be a positive integer");
+      }
+      try {
+        return Response.json(
+          200,
+          await app.devices.restartDeviceMcpServer(
+            mcpRestartRoute.deviceId,
+            mcpRestartRoute.serverId,
+            timeoutMs.value,
+          ),
+        );
+      } catch (error) {
+        return mcpHttpErrorResponse(error);
+      }
     }
 
     if (reqPath.startsWith(DEVICES_PREFIX) && reqPath.endsWith("/files/stat")) {
@@ -1145,6 +1471,55 @@ async function routeDevices(
         config: await app.devices.initOrUpdateConfig(input.value),
       }));
     }
+    const mcpPolicyRoute = matchDeviceMcpServerPath(reqPath, "/policy");
+    if (mcpPolicyRoute !== null) {
+      const parsed = jsonBody(request);
+      if (!parsed.ok) return parsed.response;
+      if (!isRecord(parsed.value)) {
+        return Response.error(400, "Expected JSON object");
+      }
+      const enabled = parseOptionalBoolField(parsed.value, ["enabled"], "enabled");
+      if (!enabled.ok) return enabled.response;
+      const callModeField = parseOptionalStringField(
+        parsed.value,
+        ["callMode", "call_mode"],
+        "callMode",
+      );
+      if (!callModeField.ok) return callModeField.response;
+      let callMode: McpCallPolicyMode | undefined;
+      if (callModeField.value !== undefined) {
+        if (!isMcpCallPolicyMode(callModeField.value)) {
+          return Response.error(
+            400,
+            `callMode must be one of: ${MCP_CALL_POLICY_MODES.join(", ")}`,
+          );
+        }
+        callMode = callModeField.value;
+      }
+      if (enabled.value === undefined && callMode === undefined) {
+        return Response.error(400, "At least one of enabled or callMode is required");
+      }
+      const timeoutMs = parseOptionalIntField(parsed.value, ["timeoutMs", "timeout_ms"], "timeoutMs");
+      if (!timeoutMs.ok) return timeoutMs.response;
+      if (timeoutMs.value !== undefined && timeoutMs.value <= 0) {
+        return Response.error(400, "timeoutMs must be a positive integer");
+      }
+      try {
+        const result = await app.devices.setDeviceMcpServerPolicy(
+          mcpPolicyRoute.deviceId,
+          mcpPolicyRoute.serverId,
+          {
+            ...(enabled.value !== undefined ? { enabled: enabled.value } : {}),
+            ...(callMode !== undefined ? { callMode } : {}),
+            ...(timeoutMs.value !== undefined ? { timeoutMs: timeoutMs.value } : {}),
+          },
+        );
+        return Response.json(200, result);
+      } catch (error) {
+        return mcpHttpErrorResponse(error);
+      }
+    }
+
     if (reqPath.startsWith(DEVICES_PREFIX) && reqPath.endsWith("/sandbox")) {
       const id =
         reqPath.length > DEVICES_PREFIX.length + "/sandbox".length

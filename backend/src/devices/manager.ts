@@ -15,6 +15,7 @@ import { VERSION } from "../version.ts";
 import { EnrollmentManager, validateWorkspacePath } from "./enrollment.ts";
 import { FileTransferManager } from "./file-transfer.ts";
 import { IpGeoResolver, type IpGeoLookupFn } from "./geo.ts";
+import { DeviceMcpProxy, normalizeMcpSummary } from "./mcp-proxy.ts";
 import {
   compareSemver,
   deriveMcuE2eKey,
@@ -45,6 +46,15 @@ import {
   type DeviceFileTransferResult,
   type DeviceInvokeRequest,
   type DeviceInvokeResult,
+  type DeviceMcpCallInput,
+  type DeviceMcpDiscoverOptions,
+  type DeviceMcpInspectOptions,
+  type DeviceMcpInspectResult,
+  type DeviceMcpListOptions,
+  type DeviceMcpOverview,
+  type DeviceMcpPolicyUpdateInput,
+  type DeviceMcpPolicyUpdateResult,
+  type DeviceMcpServerActionResult,
   type DeviceMessage,
   type DevicePingResult,
   type DeviceRiskLevel,
@@ -104,6 +114,11 @@ const DEFAULT_CONFIRM_ACTIONS: ReadonlySet<string> = new Set([
   "relay_switch",
   "set_sandbox",
   "sandbox.set",
+  "mcp.server.set_policy",
+  "mcp_set_policy",
+  "mcp_server_set_policy",
+  "mcp.call",
+  "mcp_call",
 ]);
 
 const CLUSTER_ID_RE = /^[a-zA-Z0-9_-]{1,32}$/;
@@ -494,6 +509,7 @@ export class DeviceManager {
   private readonly geoResolver: IpGeoResolver;
   private readonly enrollment: EnrollmentManager;
   private readonly fileTransfer: FileTransferManager;
+  private readonly mcpProxy: DeviceMcpProxy;
 
   private config: DeviceConfig | null = null;
   private relayClient: RelayClient | null = null;
@@ -541,6 +557,17 @@ export class DeviceManager {
       getRelayClient: () => this.relayClient,
       invokeDevice: (deviceId, req) => this.invoke(deviceId, req),
       onLogError: (message) => this.updateBoard("error", message),
+    });
+    this.mcpProxy = new DeviceMcpProxy({
+      store: this.store,
+      getConfig: () => this.config,
+      getDevice: (deviceId) => this.getDevice(deviceId),
+      listDevices: () => this.listDevices(),
+      saveDevice: (twin) => this.saveDevice(twin),
+      getRelayClient: () => this.relayClient,
+      dispatchTier1Rpc: (twin, req) => this.dispatchTier1Rpc(twin, req),
+      createPendingApproval: (clusterId, deviceId, action, params, req) =>
+        this.createPendingApproval(clusterId, deviceId, action, params, req),
     });
   }
 
@@ -1013,6 +1040,9 @@ export class DeviceManager {
     const cfg = this.requireConfig();
     const existing = this.getDevice(manifest.device_id);
     const now = nowIso();
+    const explicitMcpSummary =
+      manifest.mcp_summary !== undefined ? normalizeMcpSummary(manifest.mcp_summary) : undefined;
+    const preservedMcpSummary = explicitMcpSummary ?? existing?.manifest?.mcp_summary;
     const baseManifest: CapabilityManifest = isRecord(manifest.sandbox)
       ? { ...manifest, sandbox: normalizeSandboxSummary(manifest.sandbox) }
       : manifest;
@@ -1054,6 +1084,9 @@ export class DeviceManager {
         : {}),
       ...(publicIp !== undefined && baseManifest.tier !== "mcu" ? { public_ip: publicIp } : {}),
       ...(location !== undefined && baseManifest.tier !== "mcu" ? { location } : {}),
+      ...(preservedMcpSummary !== undefined && baseManifest.tier === "os"
+        ? { mcp_summary: preservedMcpSummary }
+        : {}),
     };
 
     let sandboxLevel: SandboxLevel | undefined;
@@ -1130,6 +1163,9 @@ export class DeviceManager {
       updatedAt: now,
     };
     const saved = this.saveDevice(twin);
+    if (saved.tier === "os" && explicitMcpSummary !== undefined) {
+      this.mcpProxy.handleManifestSummary(saved.deviceId, saved.clusterId, explicitMcpSummary);
+    }
     if (
       saved.tier === "os" &&
       saved.publicIp &&
@@ -1410,6 +1446,9 @@ export class DeviceManager {
         const mergedSandbox: SandboxSummary | undefined = rawSandbox
           ? { ...rawSandbox, level: rawSandbox.level ?? level }
           : undefined;
+        const manifestMcpSummary = isRecord(m.mcp_summary)
+          ? normalizeMcpSummary(m.mcp_summary)
+          : nextManifest?.mcp_summary;
         nextManifest = {
           ...(nextManifest ?? { device_id: latest.deviceId, tier: latest.tier }),
           ...(typeof m.device_id === "string" ? { device_id: m.device_id } : {}),
@@ -1427,7 +1466,11 @@ export class DeviceManager {
             ? { relay_config: m.relay_config as CapabilityManifest["relay_config"] }
             : {}),
           ...(mergedSandbox ? { sandbox: mergedSandbox } : {}),
+          ...(manifestMcpSummary !== undefined ? { mcp_summary: manifestMcpSummary } : {}),
         };
+        if (isRecord(m.mcp_summary) && manifestMcpSummary !== undefined) {
+          this.mcpProxy.handleManifestSummary(latest.deviceId, cfg.clusterId, manifestMcpSummary);
+        }
       } else if (isRecord(resObj.sandbox)) {
         const normalizedSandbox = normalizeSandboxSummary(resObj.sandbox);
         if (normalizedSandbox.level === undefined) {
@@ -1617,6 +1660,7 @@ export class DeviceManager {
       return false;
     }
     this.store.delete(`${DEVICE_KEY_PREFIX}${deviceId}`);
+    this.mcpProxy.removeDevice(deviceId);
     this.fileTransfer.failForPeer(deviceId, `Device ${deviceId} removed`);
     this.rejectWaitersForTransport(deviceId, `Device ${deviceId} removed`);
 
@@ -2466,6 +2510,76 @@ export class DeviceManager {
     return this.fileTransfer.cancelTransfer(transferId, reason);
   }
 
+  /** Get cached MCP discovery overview for one paired Tier 1 OS device. */
+  getDeviceMcp(deviceId: string): DeviceMcpOverview {
+    return this.mcpProxy.getOverview(deviceId);
+  }
+
+  /** Summarize MCP discovery across all paired Tier 1 OS devices in the active cluster. */
+  listAllDevicesMcp(): DeviceMcpOverview[] {
+    return this.mcpProxy.listAllOverview();
+  }
+
+  /** Trigger live local MCP discovery (`mcp.discover`) on a paired Tier 1 OS device. */
+  async discoverDeviceMcp(
+    deviceId: string,
+    opts?: DeviceMcpDiscoverOptions,
+  ): Promise<DeviceMcpOverview> {
+    return await this.mcpProxy.discover(deviceId, opts);
+  }
+
+  /** List local MCP servers for a device (with optional live refresh or lazy `mcp.list` hydration). */
+  async listDeviceMcp(
+    deviceId: string,
+    opts?: DeviceMcpListOptions,
+  ): Promise<DeviceMcpOverview> {
+    return await this.mcpProxy.list(deviceId, opts);
+  }
+
+  /** Inspect tools (and optional resources/prompts) of a local MCP server with KV caching & query filtering. */
+  async inspectDeviceMcp(
+    deviceId: string,
+    serverId: string,
+    opts?: DeviceMcpInspectOptions,
+  ): Promise<DeviceMcpInspectResult> {
+    return await this.mcpProxy.inspect(deviceId, serverId, opts);
+  }
+
+  /** Update a local MCP server's enabled state and/or call policy mode via E2E RPC. */
+  async setDeviceMcpServerPolicy(
+    deviceId: string,
+    serverId: string,
+    input: DeviceMcpPolicyUpdateInput,
+  ): Promise<DeviceMcpPolicyUpdateResult> {
+    return await this.mcpProxy.setServerPolicy(deviceId, serverId, input);
+  }
+
+  /** Stop a running local MCP server session on a Tier 1 OS device. */
+  async stopDeviceMcpServer(
+    deviceId: string,
+    serverId: string,
+    timeoutMs?: number,
+  ): Promise<DeviceMcpServerActionResult> {
+    return await this.mcpProxy.stopServer(deviceId, serverId, timeoutMs);
+  }
+
+  /** Restart a local MCP server session on a Tier 1 OS device. */
+  async restartDeviceMcpServer(
+    deviceId: string,
+    serverId: string,
+    timeoutMs?: number,
+  ): Promise<DeviceMcpServerActionResult> {
+    return await this.mcpProxy.restartServer(deviceId, serverId, timeoutMs);
+  }
+
+  /** Call a tool, read a resource, or get a prompt on a local MCP server with risk gating & approval support. */
+  async callDeviceMcp(
+    deviceId: string,
+    input: DeviceMcpCallInput,
+  ): Promise<DeviceInvokeResult> {
+    return await this.mcpProxy.callTool(deviceId, input);
+  }
+
   /** Invoke an action on a Tier 1 OS Agent or Tier 2 MCU (subject to risk gating & Deep Sleep queueing). */
   async invoke(deviceId: string, request: DeviceInvokeRequest): Promise<DeviceInvokeResult> {
     const cfg = this.requireConfig();
@@ -3076,6 +3190,9 @@ export class DeviceManager {
           normalizeIp(body.public_ip ?? body.observed_ip) ??
           (enrollId ? normalizeIp(this.enrollment.getLastClaimedIp(enrollId)) : undefined);
         const reportedLocation = normalizeLocation(body.location);
+        const reportedMcpSummary = isRecord(body.mcp_summary)
+          ? normalizeMcpSummary(body.mcp_summary)
+          : undefined;
         const manifest: CapabilityManifest = {
           device_id: typeof body.device_id === "string" ? body.device_id : msg.device_id || srcNodeId,
           tier: body.tier === "mcu" ? "mcu" : "os",
@@ -3092,6 +3209,7 @@ export class DeviceManager {
             : {}),
           ...(Array.isArray(body.actions) ? { actions: body.actions as CapabilityManifest["actions"] } : {}),
           ...(isRecord(body.sandbox) ? { sandbox: normalizeSandboxSummary(body.sandbox) } : {}),
+          ...(reportedMcpSummary !== undefined ? { mcp_summary: reportedMcpSummary } : {}),
           ...(isRecord(body.relay_config)
             ? { relay_config: body.relay_config as CapabilityManifest["relay_config"] }
             : {}),
@@ -3244,6 +3362,11 @@ export class DeviceManager {
           }
         } else if (eventType === "tier1_offline") {
           this.handleTier1Disconnect(targetId);
+        } else if (eventType === "mcp.catalog_changed") {
+          const twin = this.getDevice(targetId);
+          if (!twin || (twin.clusterId === cfg.clusterId && twin.tier === "os")) {
+            this.mcpProxy.handleCatalogChangedEvent(targetId, cfg.clusterId, msg.body);
+          }
         }
         break;
       }

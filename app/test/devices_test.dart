@@ -312,6 +312,257 @@ void main() {
       expect(result.error, isNull);
       expect(result.device.isUnrestricted, isTrue);
     });
+
+    test('parses MCP summaries, descriptors, tool annotations, and results in both snake_case and camelCase', () {
+      final snakeTwin = DeviceTwin.fromJson({
+        'deviceId': 'mac-studio',
+        'tier': 'os',
+        'status': 'online',
+        'capabilities': ['exec', 'mcp_discovery', 'mcp_proxy'],
+        'manifest': {
+          'device_id': 'mac-studio',
+          'tier': 'os',
+          'capabilities': ['exec', 'mcp_discovery', 'mcp_proxy'],
+          'mcp_summary': {
+            'enabled': true,
+            'discovery_mode': 'standard',
+            'discovered_count': 3,
+            'enabled_count': 2,
+            'running_count': 1,
+            'catalog_hash': 'sha256:abc123',
+            'servers': [
+              {
+                'server_id': 'claude_desktop:github',
+                'name': 'github',
+                'source': 'claude_desktop',
+                'transport': 'stdio',
+                'trust_state': 'enabled',
+                'call_mode': 'auto_readonly',
+                'runtime_state': 'running',
+                'tool_count': 12,
+              },
+            ],
+          },
+        },
+      });
+      expect(snakeTwin.isMcpCapable, isTrue);
+      expect(snakeTwin.mcpSummary, isNotNull);
+      expect(
+        (
+          snakeTwin.mcpSummary!.enabled,
+          snakeTwin.mcpSummary!.discoveryMode,
+          snakeTwin.mcpSummary!.discoveredCount,
+          snakeTwin.mcpSummary!.enabledCount,
+          snakeTwin.mcpSummary!.runningCount,
+          snakeTwin.mcpSummary!.catalogHash,
+        ),
+        (true, 'standard', 3, 2, 1, 'sha256:abc123'),
+      );
+      final sumServer = snakeTwin.mcpSummary!.servers.single;
+      expect(
+        (sumServer.serverId, sumServer.name, sumServer.source, sumServer.transport, sumServer.trustState, sumServer.callMode, sumServer.runtimeState, sumServer.toolCount),
+        ('claude_desktop:github', 'github', 'claude_desktop', 'stdio', 'enabled', 'auto_readonly', 'running', 12),
+      );
+
+      final camelTwin = DeviceTwin.fromJson({
+        'deviceId': 'win-pc',
+        'tier': 'os',
+        'manifest': {
+          'deviceId': 'win-pc',
+          'mcpSummary': {
+            'enabled': true,
+            'discoveryMode': 'full',
+            'discoveredCount': 1,
+            'enabledCount': 0,
+            'runningCount': 0,
+            'catalogHash': 'sha256:camel',
+            'servers': [
+              {
+                'serverId': 'cursor:fs',
+                'name': 'fs',
+                'source': 'cursor',
+                'transport': 'streamable_http',
+                'trustState': 'blocked_by_policy',
+                'callMode': 'disabled',
+                'runtimeState': 'stopped',
+              },
+            ],
+          },
+        },
+      });
+      expect(camelTwin.isMcpCapable, isTrue);
+      expect(camelTwin.mcpSummary!.servers.single.isBlocked, isTrue);
+      expect(camelTwin.mcpSummary!.servers.single.toolCount, isNull);
+
+      // Tier 2 MCU is never MCP capable even if manifest had stray fields.
+      final mcuTwin = DeviceTwin.fromJson({
+        'deviceId': 'esp32-1',
+        'tier': 'mcu',
+        'capabilities': ['mcp_proxy'],
+      });
+      expect(mcuTwin.isMcpCapable, isFalse);
+
+      // Descriptor snake_case & camelCase parsing.
+      final snakeDesc = McpServerDescriptor.fromJson({
+        'server_id': 'claude_desktop:github',
+        'name': 'github',
+        'source': 'claude_desktop',
+        'source_path': '~/Library/Application Support/Claude/claude_desktop_config.json',
+        'transport': 'stdio',
+        'command_preview': 'npx -y @modelcontextprotocol/server-github',
+        'url_sanitized': null,
+        'env_keys': ['GITHUB_PERSONAL_ACCESS_TOKEN'],
+        'auth_required': true,
+        'trust_state': 'enabled',
+        'call_mode': 'confirm_all',
+        'runtime_state': 'running',
+        'tool_count': 8,
+        'dedup_key': 'stdio:npx-github',
+        'duplicate_of': 'cursor:github',
+        'fingerprint': 'sha256:9f2a',
+        'last_error': 'temporary rate limit',
+      });
+      expect(snakeDesc.isEnabled, isTrue);
+      expect(snakeDesc.isBlocked, isFalse);
+      expect(snakeDesc.isActiveRuntime, isTrue);
+      expect(snakeDesc.envKeys, ['GITHUB_PERSONAL_ACCESS_TOKEN']);
+      expect(snakeDesc.authRequired, isTrue);
+      expect(snakeDesc.duplicateOf, 'cursor:github');
+      expect(snakeDesc.lastError, 'temporary rate limit');
+
+      final camelDesc = McpServerDescriptor.fromJson({
+        'serverId': 'neo:docs',
+        'name': 'docs',
+        'source': 'neo',
+        'sourcePath': '~/.config/neo-agent/mcp.d/docs.json',
+        'transport': 'sse',
+        'urlSanitized': 'http://127.0.0.1:9000/sse',
+        'envKeys': ['DOCS_KEY'],
+        'authRequired': false,
+        'trustState': 'blocked_by_policy',
+        'callMode': 'disabled',
+        'runtimeState': 'stopped',
+      });
+      expect((camelDesc.serverId, camelDesc.isEnabled, camelDesc.isBlocked, camelDesc.urlSanitized), ('neo:docs', false, true, 'http://127.0.0.1:9000/sse'));
+      expect(camelDesc.envKeys, ['DOCS_KEY']);
+
+      // Tool annotations parsed from top-level snake/camel AND nested `annotations`.
+      final toolFlatSnake = McpToolInfo.fromJson({
+        'name': 'list_issues',
+        'description': 'List repository issues',
+        'input_schema': {'type': 'object'},
+        'read_only_hint': true,
+        'destructive_hint': false,
+        'idempotent_hint': true,
+        'open_world_hint': true,
+      });
+      expect((toolFlatSnake.name, toolFlatSnake.readOnlyHint, toolFlatSnake.destructiveHint, toolFlatSnake.idempotentHint, toolFlatSnake.openWorldHint), ('list_issues', true, false, true, true));
+
+      final toolNested = McpToolInfo.fromJson({
+        'name': 'delete_repo',
+        'description': 'Delete a repository',
+        'inputSchema': {'type': 'object', 'required': ['repo']},
+        'annotations': {'readOnlyHint': false, 'destructiveHint': true},
+      });
+      expect((toolNested.name, toolNested.readOnlyHint, toolNested.destructiveHint, toolNested.inputSchema['type']), ('delete_repo', false, true, 'object'));
+
+      // Overview, InspectResult, PolicyUpdateResult.
+      final mcpOverview = DeviceMcpOverview.fromJson({
+        'device_id': 'mac-studio',
+        'supported': true,
+        'discovery_mode': 'standard',
+        'catalog_hash': 'sha256:cat',
+        'updated_at': '2026-05-01T10:00:00.000Z',
+        'servers': [
+          {'server_id': 'cursor:fs', 'name': 'fs', 'source': 'cursor', 'transport': 'stdio'},
+        ],
+        'warnings': ['Skipped unreadable config'],
+        'summary': {'enabled': true, 'discovered_count': 1, 'enabled_count': 0, 'running_count': 0},
+      });
+      expect((mcpOverview.deviceId, mcpOverview.supported, mcpOverview.servers.length, mcpOverview.warnings.single), ('mac-studio', true, 1, 'Skipped unreadable config'));
+      expect(mcpOverview.updatedAt, isNotNull);
+      expect(mcpOverview.summary?.discoveredCount, 1);
+
+      final inspectRes = DeviceMcpInspectResult.fromJson({
+        'device_id': 'mac-studio',
+        'server': {'server_id': 'cursor:fs', 'name': 'fs', 'runtime_state': 'running', 'tool_count': 1},
+        'protocol_version': '2025-03-26',
+        'tools': [
+          {'name': 'read_file', 'readOnlyHint': true},
+        ],
+        'tools_schema_hash': 'sha256:t1',
+      });
+      expect((inspectRes.deviceId, inspectRes.protocolVersion, inspectRes.toolsSchemaHash, inspectRes.server?.runtimeState), ('mac-studio', '2025-03-26', 'sha256:t1', 'running'));
+      expect(inspectRes.tools.single.readOnlyHint, isTrue);
+
+      final policyRes = DeviceMcpPolicyUpdateResult.fromJson({
+        'deviceId': 'mac-studio',
+        'server': {'serverId': 'cursor:fs', 'name': 'fs', 'trustState': 'enabled', 'callMode': 'auto_readonly'},
+        'persisted': true,
+        'summary': {'enabled': true, 'discoveredCount': 1, 'enabledCount': 1, 'runningCount': 0},
+      });
+      expect((policyRes.deviceId, policyRes.persisted, policyRes.server.isEnabled, policyRes.summary?.enabledCount), ('mac-studio', true, true, 1));
+
+      // Also parses backend `result.persisted` nested shape cleanly.
+      final policyNestedRes = DeviceMcpPolicyUpdateResult.fromJson({
+        'deviceId': 'mac-studio',
+        'serverId': 'cursor:fs',
+        'server': {'server_id': 'cursor:fs', 'name': 'fs', 'trust_state': 'enabled', 'call_mode': 'confirm_all'},
+        'result': {'persisted': true},
+      });
+      expect((policyNestedRes.persisted, policyNestedRes.server.callMode), (true, 'confirm_all'));
+    });
+
+    test('calls all device MCP API routes cleanly including percent-encoded server IDs', () async {
+      final backend = FakeBackend()
+        ..configureDevices(clusterId: 'personal')
+        ..addDevice('mac-1', status: 'online', route: 'p2p', sandboxLevel: 'desktop')
+        ..setDeviceMcp(
+          'mac-1',
+          servers: [
+            {
+              'serverId': 'claude_desktop:github',
+              'name': 'github',
+              'source': 'claude_desktop',
+              'transport': 'stdio',
+              'commandPreview': 'npx -y @modelcontextprotocol/server-github',
+              'envKeys': ['GITHUB_PERSONAL_ACCESS_TOKEN'],
+              'authRequired': true,
+              'trustState': 'discovered',
+              'callMode': 'disabled',
+              'runtimeState': 'stopped',
+            },
+          ],
+          toolsByServer: {
+            'claude_desktop:github': [
+              {'name': 'search_code', 'description': 'Search code', 'readOnlyHint': true},
+              {'name': 'delete_branch', 'description': 'Delete git branch', 'destructiveHint': true},
+            ],
+          },
+        );
+      final api = backend.api();
+
+      final initial = await api.deviceMcp('mac-1');
+      expect((initial.supported, initial.servers.length), (true, 1));
+
+      final discovered = await api.discoverDeviceMcp('mac-1', includeLoopbackProbe: true);
+      expect(backend.mcpDiscovers.single, {'deviceId': 'mac-1', 'includeLoopbackProbe': true});
+      expect(discovered.servers.length, 2);
+
+      final policy = await api.updateDeviceMcpPolicy('mac-1', 'claude_desktop:github', enabled: true, callMode: 'auto_readonly');
+      expect((policy.persisted, policy.server.isEnabled, policy.server.callMode), (true, true, 'auto_readonly'));
+      expect(backend.mcpPolicyUpdates.single, {'deviceId': 'mac-1', 'serverId': 'claude_desktop:github', 'enabled': true, 'callMode': 'auto_readonly'});
+
+      final inspected = await api.inspectDeviceMcp('mac-1', 'claude_desktop:github', refresh: true, query: 'delete');
+      expect(backend.mcpInspects.single, {'deviceId': 'mac-1', 'serverId': 'claude_desktop:github', 'refresh': true, 'query': 'delete'});
+      expect(inspected.tools.map((t) => t.name).toList(), ['delete_branch']);
+
+      await api.restartDeviceMcpServer('mac-1', 'claude_desktop:github');
+      expect(backend.mcpRestarts.single, {'deviceId': 'mac-1', 'serverId': 'claude_desktop:github'});
+
+      await api.stopDeviceMcpServer('mac-1', 'claude_desktop:github');
+      expect(backend.mcpStops.single, {'deviceId': 'mac-1', 'serverId': 'claude_desktop:github'});
+    });
   });
 
   group('devices UI flows', () {
@@ -1257,6 +1508,321 @@ void main() {
       await settle(tester);
       expect(find.text('Device renamed to "Office GPU"'), findsOneWidget);
       await appEn.close();
+    });
+
+    testWidgets('shows MCP summary pill only when discovered > 0 on Tier 1 rows and supports full MCP discovery, policy, inspect, restart, and stop flows', (tester) async {
+      final backend = FakeBackend()
+        ..configureDevices(clusterId: 'personal')
+        ..addDevice('mac-studio', customName: '书房 Mac', status: 'online', route: 'p2p', sandboxLevel: 'desktop')
+        ..addDevice('linux-clean', status: 'online', route: 'lan', sandboxLevel: 'personal')
+        ..addDevice('esp32-node', tier: 'mcu', status: 'online', route: 'via_tier1', relayNodeId: 'mac-studio')
+        ..setDeviceMcp(
+          'mac-studio',
+          servers: [
+            {
+              'serverId': 'claude_desktop:github',
+              'name': 'github',
+              'source': 'claude_desktop',
+              'transport': 'stdio',
+              'commandPreview': 'npx -y @modelcontextprotocol/server-github',
+              'envKeys': ['GITHUB_PERSONAL_ACCESS_TOKEN'],
+              'authRequired': true,
+              'trustState': 'enabled',
+              'callMode': 'auto_readonly',
+              'runtimeState': 'running',
+              'toolCount': 2,
+            },
+            {
+              'serverId': 'cursor:filesystem',
+              'name': 'filesystem',
+              'source': 'cursor',
+              'transport': 'stdio',
+              'commandPreview': 'npx -y @modelcontextprotocol/server-filesystem /workspace',
+              'envKeys': <String>[],
+              'authRequired': false,
+              'trustState': 'discovered',
+              'callMode': 'disabled',
+              'runtimeState': 'stopped',
+            },
+          ],
+          toolsByServer: {
+            'claude_desktop:github': [
+              {
+                'name': 'list_pull_requests',
+                'description': 'List open pull requests in a repository',
+                'readOnlyHint': true,
+              },
+              {
+                'name': 'merge_pull_request',
+                'description': 'Merge a pull request into the default branch',
+                'destructiveHint': true,
+              },
+            ],
+            'cursor:filesystem': [
+              {
+                'name': 'read_text_file',
+                'description': 'Read UTF-8 text file',
+                'readOnlyHint': true,
+              },
+            ],
+          },
+        )
+        ..setDeviceMcp('linux-clean', servers: const []);
+
+      final app = await open(tester, backend, bundledCjk: true);
+      await tester.tap(nav(2));
+      await settle(tester);
+
+      // Tier 1 with discovered > 0 renders compact MCP pill & button; 0 discovered hides pill; MCU hides both.
+      final mcpPill = find.byKey(const ValueKey('mcp-pill-mac-studio'));
+      expect(mcpPill, findsOneWidget);
+      expect(find.descendant(of: mcpPill, matching: find.text('MCP 1/2')), findsOneWidget);
+      expect(find.byKey(const ValueKey('mcp-mac-studio')), findsOneWidget);
+
+      expect(find.byKey(const ValueKey('mcp-pill-linux-clean')), findsNothing);
+      expect(find.byKey(const ValueKey('mcp-linux-clean')), findsOneWidget);
+
+      expect(find.byKey(const ValueKey('mcp-pill-esp32-node')), findsNothing);
+      expect(find.byKey(const ValueKey('mcp-esp32-node')), findsNothing);
+
+      // Open MCP sheet for mac-studio.
+      final openMcpBtn = find.byKey(const ValueKey('mcp-mac-studio'));
+      await show(tester, openMcpBtn);
+      await tester.tap(openMcpBtn);
+      await settle(tester);
+
+      expect(find.text('书房 Mac · 本机 MCP 服务'), findsOneWidget);
+      final sheetTitleRich = tester.widget<RichText>(find.descendant(of: find.text('书房 Mac · 本机 MCP 服务'), matching: find.byType(RichText)));
+      expect(sheetTitleRich.text.style?.fontFamilyFallback, contains(cjkFont));
+      expect(find.text('凭据与环境变量值仅保留在该设备本机，不会上传到主控。'), findsOneWidget);
+      expect(find.byKey(const ValueKey('mcp-server-claude_desktop:github')), findsOneWidget);
+      expect(find.byKey(const ValueKey('mcp-server-cursor:filesystem')), findsOneWidget);
+      expect(find.text('Claude Desktop'), findsOneWidget);
+      expect(find.text('Cursor'), findsOneWidget);
+      expect(find.textContaining('GITHUB_PERSONAL_ACCESS_TOKEN'), findsOneWidget);
+      expect(find.textContaining('npx -y @modelcontextprotocol/server-github'), findsOneWidget);
+
+      // Desktop sandbox shows loopback probe toggle; enable it and rescan.
+      final loopbackSwitch = find.byKey(const ValueKey('mcp-loopback-switch'));
+      expect(loopbackSwitch, findsOneWidget);
+      await tester.tap(loopbackSwitch);
+      await tester.pump();
+      await tester.tap(find.byKey(const ValueKey('mcp-rescan-btn')));
+      await settle(tester);
+
+      expect(backend.mcpDiscovers.last, {'deviceId': 'mac-studio', 'includeLoopbackProbe': true});
+      expect(find.byKey(const ValueKey('mcp-server-loopback:local-http')), findsOneWidget);
+      expect(find.text('http://127.0.0.1:8765/mcp'), findsOneWidget);
+
+      // Enable cursor:filesystem via toggle switch -> call mode selector pills appear & parent badge updates to MCP 2/3.
+      final fsToggle = find.byKey(const ValueKey('mcp-toggle-cursor:filesystem'));
+      await show(tester, fsToggle);
+      await tester.tap(fsToggle);
+      await settle(tester);
+      expect(backend.mcpPolicyUpdates.last, {'deviceId': 'mac-studio', 'serverId': 'cursor:filesystem', 'enabled': true});
+      expect(find.byKey(const ValueKey('mcp-mode-cursor:filesystem-confirm_all')), findsOneWidget);
+      expect(find.byKey(const ValueKey('mcp-mode-cursor:filesystem-auto_readonly')), findsOneWidget);
+      expect(find.byKey(const ValueKey('mcp-mode-cursor:filesystem-auto_all')), findsOneWidget);
+
+      // Switch callMode on claude_desktop:github to confirm_all.
+      final confirmAllChip = find.byKey(const ValueKey('mcp-mode-claude_desktop:github-confirm_all'));
+      await show(tester, confirmAllChip);
+      await tester.tap(confirmAllChip);
+      await settle(tester);
+      expect(backend.mcpPolicyUpdates.last, {'deviceId': 'mac-studio', 'serverId': 'claude_desktop:github', 'callMode': 'confirm_all'});
+
+      // Inspect tools on claude_desktop:github -> expands inline with Read-only & Destructive badges.
+      final inspectGithub = find.byKey(const ValueKey('mcp-inspect-claude_desktop:github'));
+      await show(tester, inspectGithub);
+      await tester.tap(inspectGithub);
+      await settle(tester);
+      expect(backend.mcpInspects.last['serverId'], 'claude_desktop:github');
+      expect(find.byKey(const ValueKey('mcp-tools-claude_desktop:github')), findsOneWidget);
+      expect(find.text('list_pull_requests'), findsOneWidget);
+      expect(find.text('merge_pull_request'), findsOneWidget);
+      expect(find.text('只读'), findsOneWidget);
+      expect(find.text('变更/高危'), findsOneWidget);
+      expect(find.text('收起工具'), findsOneWidget);
+
+      // Collapse tools list.
+      await tester.tap(inspectGithub);
+      await tester.pump();
+      expect(find.byKey(const ValueKey('mcp-tools-claude_desktop:github')), findsNothing);
+
+      // Restart running server.
+      final restartGithub = find.byKey(const ValueKey('mcp-restart-claude_desktop:github'));
+      await show(tester, restartGithub);
+      await tester.tap(restartGithub);
+      await settle(tester);
+      expect(backend.mcpRestarts.single, {'deviceId': 'mac-studio', 'serverId': 'claude_desktop:github'});
+      expect(find.text('已重启 MCP 服务会话'), findsOneWidget);
+
+      // Stop running server -> runtime changes to stopped and stop button hides.
+      final stopGithub = find.byKey(const ValueKey('mcp-stop-claude_desktop:github'));
+      await show(tester, stopGithub);
+      await tester.tap(stopGithub);
+      await settle(tester);
+      expect(backend.mcpStops.single, {'deviceId': 'mac-studio', 'serverId': 'claude_desktop:github'});
+      expect(find.text('已停止 MCP 服务会话'), findsOneWidget);
+      expect(find.byKey(const ValueKey('mcp-stop-claude_desktop:github')), findsNothing);
+
+      // Close sheet and verify parent device row MCP pill updated to MCP 2/3.
+      await tester.tap(find.byKey(const ValueKey('mcp-close-btn')));
+      await settle(tester);
+      expect(find.descendant(of: find.byKey(const ValueKey('mcp-pill-mac-studio')), matching: find.text('MCP 2/3')), findsOneWidget);
+
+      // Re-open and disable cursor:filesystem -> call mode chips hide and badge returns to MCP 1/3.
+      await show(tester, openMcpBtn);
+      await tester.tap(openMcpBtn);
+      await settle(tester);
+      final fsDisableToggle = find.byKey(const ValueKey('mcp-toggle-cursor:filesystem'));
+      await show(tester, fsDisableToggle);
+      await tester.tap(fsDisableToggle);
+      await settle(tester);
+      expect(backend.mcpPolicyUpdates.last, {'deviceId': 'mac-studio', 'serverId': 'cursor:filesystem', 'enabled': false});
+      expect(find.byKey(const ValueKey('mcp-mode-cursor:filesystem-confirm_all')), findsNothing);
+      await tester.tap(find.byKey(const ValueKey('mcp-close-btn')));
+      await settle(tester);
+      expect(find.descendant(of: find.byKey(const ValueKey('mcp-pill-mac-studio')), matching: find.text('MCP 1/3')), findsOneWidget);
+
+      await app.close();
+    });
+
+    testWidgets('handles unsupported agent, locked sandbox, blocked server, empty discovery, offline cache, errors, and narrow dark English layout', (tester) async {
+      final backend = FakeBackend()
+        ..configureDevices(clusterId: 'corp-cluster')
+        ..addDevice('legacy-agent', status: 'online', route: 'relay', sandboxLevel: 'personal')
+        ..addDevice('locked-host', status: 'online', route: 'lan', sandboxLevel: 'corp', sandboxLocked: true)
+        ..addDevice('empty-host', status: 'online', route: 'p2p', sandboxLevel: 'personal')
+        ..addDevice('offline-host', status: 'offline', route: 'relay', sandboxLevel: 'personal')
+        ..addDevice('offline-cached', status: 'offline', route: 'relay', sandboxLevel: 'personal')
+        ..setDeviceMcp('legacy-agent', supported: false)
+        ..setDeviceMcp(
+          'locked-host',
+          warnings: ['Skipped 1 invalid config file'],
+          servers: [
+            {
+              'serverId': 'neo:internal',
+              'name': 'internal-db',
+              'source': 'neo',
+              'transport': 'streamable_http',
+              'urlSanitized': 'http://127.0.0.1:7000/mcp',
+              'trustState': 'enabled',
+              'callMode': 'confirm_all',
+              'runtimeState': 'error',
+              'lastError': 'Connection refused on port 7000',
+            },
+            {
+              'serverId': 'cursor:blocked',
+              'name': 'blocked-tool',
+              'source': 'cursor',
+              'transport': 'stdio',
+              'commandPreview': 'npx evil-mcp',
+              'trustState': 'blocked_by_policy',
+              'callMode': 'disabled',
+              'runtimeState': 'stopped',
+            },
+          ],
+        )
+        ..setDeviceMcp('empty-host', supported: true, servers: const [])
+        ..setDeviceMcp('offline-host', supported: true, servers: const [])
+        ..setDeviceMcp(
+          'offline-cached',
+          supported: true,
+          servers: [
+            {
+              'serverId': 'codex:sqlite',
+              'name': 'sqlite',
+              'source': 'codex',
+              'transport': 'stdio',
+              'commandPreview': 'uvx mcp-server-sqlite',
+              'trustState': 'discovered',
+              'callMode': 'disabled',
+              'runtimeState': 'stopped',
+            },
+          ],
+        );
+
+      final app = await open(tester, backend, locale: const Locale('en'), size: narrow, brightness: Brightness.dark);
+      await tester.tap(nav(2));
+      await settle(tester);
+
+      // 1. Unsupported agent shows upgrade guidance and disables Rescan.
+      final legacyBtn = find.byKey(const ValueKey('mcp-legacy-agent'));
+      await show(tester, legacyBtn);
+      await tester.tap(legacyBtn);
+      await settle(tester);
+      expect(find.text('legacy-agent · Local MCP'), findsOneWidget);
+      expect(find.textContaining('does not support local MCP discovery and proxy yet'), findsOneWidget);
+      expect(tester.widget<ActionButton>(find.byKey(const ValueKey('mcp-rescan-btn'))).onPressed, isNull);
+      await tester.tap(find.byKey(const ValueKey('mcp-close-btn')));
+      await settle(tester);
+
+      // 2. Locked host + blocked server + error display + inspect error handling.
+      final lockedBtn = find.byKey(const ValueKey('mcp-locked-host'));
+      await show(tester, lockedBtn);
+      await tester.tap(lockedBtn);
+      await settle(tester);
+      expect(find.textContaining('lock_sandbox = true'), findsOneWidget);
+      expect(find.text('Skipped 1 invalid config file'), findsOneWidget);
+      expect(find.text('Connection refused on port 7000'), findsOneWidget);
+      expect(find.text('Blocked'), findsOneWidget);
+      expect(find.text('Error'), findsOneWidget);
+      // Personal/corp sandbox does not show loopback probe toggle.
+      expect(find.byKey(const ValueKey('mcp-loopback-switch')), findsNothing);
+      // Toggles and blocked inspect button are disabled.
+      expect(tester.widget<CupertinoSwitch>(find.byKey(const ValueKey('mcp-toggle-neo:internal'))).onChanged, isNull);
+      expect(tester.widget<CupertinoSwitch>(find.byKey(const ValueKey('mcp-toggle-cursor:blocked'))).onChanged, isNull);
+      expect(tester.widget<ActionButton>(find.byKey(const ValueKey('mcp-inspect-cursor:blocked'))).onPressed, isNull);
+
+      // Inspect error renders inline cleanly.
+      backend.mcpInspectError = 'Handshake timed out';
+      final inspectInternal = find.byKey(const ValueKey('mcp-inspect-neo:internal'));
+      await show(tester, inspectInternal);
+      await tester.tap(inspectInternal);
+      await settle(tester);
+      expect(find.text('Handshake timed out'), findsOneWidget);
+
+      await tester.tap(find.byKey(const ValueKey('mcp-close-btn')));
+      await settle(tester);
+
+      // 3. Empty discovered online device shows empty guidance and enables Rescan.
+      final emptyBtn = find.byKey(const ValueKey('mcp-empty-host'));
+      await show(tester, emptyBtn);
+      await tester.tap(emptyBtn);
+      await settle(tester);
+      expect(find.textContaining('No local MCP servers discovered yet'), findsOneWidget);
+      expect(tester.widget<ActionButton>(find.byKey(const ValueKey('mcp-rescan-btn'))).onPressed, isNotNull);
+      await tester.tap(find.byKey(const ValueKey('mcp-close-btn')));
+      await settle(tester);
+
+      // 4. Offline device with no cache shows offline notice and disables Rescan.
+      final offlineBtn = find.byKey(const ValueKey('mcp-offline-host'));
+      await show(tester, offlineBtn);
+      await tester.tap(offlineBtn);
+      await settle(tester);
+      expect(find.textContaining('Device is offline with no cached MCP catalog'), findsOneWidget);
+      expect(tester.widget<ActionButton>(find.byKey(const ValueKey('mcp-rescan-btn'))).onPressed, isNull);
+      await tester.tap(find.byKey(const ValueKey('mcp-close-btn')));
+      await settle(tester);
+
+      // 5. Offline device with cached servers renders MCP 0/1 pill on row, cached list in sheet, and disables mutations.
+      final cachedPill = find.byKey(const ValueKey('mcp-pill-offline-cached'));
+      expect(cachedPill, findsOneWidget);
+      expect(find.descendant(of: cachedPill, matching: find.text('MCP 0/1')), findsOneWidget);
+      final cachedBtn = find.byKey(const ValueKey('mcp-offline-cached'));
+      await show(tester, cachedBtn);
+      await tester.tap(cachedBtn);
+      await settle(tester);
+      expect(find.textContaining('showing the last cached MCP catalog'), findsOneWidget);
+      expect(find.byKey(const ValueKey('mcp-server-codex:sqlite')), findsOneWidget);
+      expect(find.text('Codex'), findsOneWidget);
+      expect(tester.widget<CupertinoSwitch>(find.byKey(const ValueKey('mcp-toggle-codex:sqlite'))).onChanged, isNull);
+      expect(tester.widget<ActionButton>(find.byKey(const ValueKey('mcp-rescan-btn'))).onPressed, isNull);
+      await tester.tap(find.byKey(const ValueKey('mcp-close-btn')));
+      await settle(tester);
+
+      await app.close();
     });
   });
 }

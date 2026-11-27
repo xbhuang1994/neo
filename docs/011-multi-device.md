@@ -113,4 +113,16 @@ Each `DeviceTwin` supports an optional user-defined display name (`customName`, 
 
 - Set or clear a device's custom name from the Devices page (`Rename`), via `PATCH /api/devices/{deviceId}` (or `PUT /api/devices/{deviceId}` with `{ "customName": string | null }`), or via the `device_rename` tool.
 - Optional `customName` may also be supplied when creating an enrollment ticket (`POST /api/devices/enrollments`) or installing a Tier 2 MCU (`POST /api/devices/mcu/install` / `device_mcu_install`); subsequent manifests, heartbeats, and reconnects preserve the custom name.
-- `device_list` exposes `customName`, and `device_invoke` / `device_file_transfer` / `device_rename` accept either `deviceId` or a unique `customName`.
+- `device_list` exposes `customName`, and `device_invoke` / `device_file_transfer` / `device_rename` / `device_mcp_list` / `device_mcp_inspect` / `device_mcp_call` accept either `deviceId` or a unique `customName`.
+
+## Proactive local MCP discovery & E2EE proxy
+
+Tier 1 `neo-agent-os` agents (`capabilities` includes `mcp_discovery` and `mcp_proxy`) can proactively discover local MCP servers across macOS, Windows, and Linux and proxy them to Master Neo over the existing E2EE `0xE1` channel without modifying `neo-relayd`:
+
+- **Three-tier discovery**:
+  1. **Neo registry & drop-in**: `~/.config/neo-agent/mcp-servers.json` and `mcp.d/*.json` (or `%LOCALAPPDATA%\neo-agent\` on Windows; `/etc/neo-agent/` in Linux `system` mode to preserve Layer 3 OS isolation).
+  2. **Host client configs (read-only)**: Claude Desktop, Claude Code (`~/.claude.json` & `~/.claude/settings.json`), Cursor, Codex CLI (`~/.codex/config.toml`), VS Code (`User/mcp.json` & `settings.json`), Antigravity/Gemini, Windsurf, Zed, and workspace `.mcp.json` inside `allowed_workspaces`, with priority deduplication and self-loop exclusion of Neo `.neo-*` bridges.
+  3. **Optional loopback probe**: pre-filtered `127.0.0.1`/`::1` listeners verified with a short-timeout MCP `initialize` / SSE handshake (off by default unless opted in on `desktop`/`unrestricted`).
+- **Secret-stays-local & lifecycle**: full `env`, `headers`, and CLI secret flags remain strictly in local memory on Tier 1; only redacted descriptors (`command_preview`, `url_sanitized`, `env_keys`) and lightweight `manifest.mcp_summary` are sent to Master Neo. Discovered servers are not auto-spawned until enabled and lazily initialized on `mcp.inspect` / `mcp.call`, with concurrent-session caps, idle reaping, and >64 KiB binary response staging into workspace temp files for direct `0xE3` transfer.
+- **Sandbox & risk gating**: aligns with the 5 `SandboxLevel` tiers and `lock_sandbox = true` (rejecting remote `mcp.server.set_policy` changes with HTTP `403`). Master Neo's `DeviceMcpProxy` (`device-mcp:<deviceId>` KV cache) combines per-server `call_mode` (`disabled`, `confirm_all`, `auto_readonly`, `auto_all`) with MCP `ToolAnnotations` (`readOnlyHint`, `destructiveHint`) to auto-run safe reads and gate destructive or unannotated mutations via existing 6-character `PendingApproval` short codes.
+- **Interfaces**: exposed to main and worker sessions via 3 progressive-disclosure meta-tools (`device_mcp_list`, `device_mcp_inspect`, `device_mcp_call`), HTTP routes `/api/devices/:id/mcp*`, and the `_DeviceMcpSheet` manager in the Devices tab.

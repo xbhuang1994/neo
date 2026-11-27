@@ -201,6 +201,19 @@ class _DevicesPageState extends State<DevicesPage> {
     );
   }
 
+  Future<void> _openMcpSheet(AppState state, DeviceTwin device) async {
+    final api = state.client;
+    if (api == null) return;
+    await showCupertinoModalPopup<void>(
+      context: context,
+      builder: (sheet) => _DeviceMcpSheet(
+        api: api,
+        device: device,
+        onChanged: () => unawaited(state.refresh()),
+      ),
+    );
+  }
+
   Future<void> _openRenameSheet(AppState state, DeviceTwin device) async {
     final api = state.client;
     if (api == null) return;
@@ -954,6 +967,12 @@ class _DevicesPageState extends State<DevicesPage> {
                           color: palette.orange,
                           dot: true,
                         ),
+                      if (device.mcpSummary != null && device.mcpSummary!.discoveredCount > 0)
+                        Pill(
+                          strings.mcpSummaryBadge(device.mcpSummary!.enabledCount, device.mcpSummary!.discoveredCount),
+                          key: ValueKey('mcp-pill-${device.deviceId}'),
+                          color: device.mcpSummary!.enabledCount > 0 ? palette.accent : palette.gray,
+                        ),
                       if (device.isRelayCapable)
                         Pill(strings.relayBridgeBadge, color: palette.accent),
                     ],
@@ -1106,13 +1125,20 @@ class _DevicesPageState extends State<DevicesPage> {
                 busy: pinging,
                 onPressed: pinging ? null : () => unawaited(_pingDevice(state, device)),
               ),
-              if (device.isTier1)
+              if (device.isTier1) ...[
                 ActionButton(
                   key: ValueKey('sandbox-${device.deviceId}'),
                   label: strings.sandboxPermission,
                   plain: true,
                   onPressed: () => unawaited(_openSandboxSheet(state, device)),
                 ),
+                ActionButton(
+                  key: ValueKey('mcp-${device.deviceId}'),
+                  label: strings.mcpServersButton,
+                  plain: true,
+                  onPressed: () => unawaited(_openMcpSheet(state, device)),
+                ),
+              ],
               ActionButton(
                 key: ValueKey('rename-${device.deviceId}'),
                 label: strings.renameDevice,
@@ -1806,6 +1832,729 @@ class _RenameDeviceSheetState extends State<_RenameDeviceSheet> {
                       ],
                     ),
                   ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Modal popup for discovering, enabling, inspecting, and controlling local MCP servers on a Tier 1 device.
+class _DeviceMcpSheet extends StatefulWidget {
+  const _DeviceMcpSheet({required this.api, required this.device, required this.onChanged});
+
+  final ApiClient api;
+  final DeviceTwin device;
+  final VoidCallback onChanged;
+
+  @override
+  State<_DeviceMcpSheet> createState() => _DeviceMcpSheetState();
+}
+
+class _DeviceMcpSheetState extends State<_DeviceMcpSheet> {
+  static const List<String> _selectableCallModes = ['confirm_all', 'auto_readonly', 'auto_all'];
+
+  DeviceMcpOverview? _overview;
+  bool _loading = true;
+  bool _scanning = false;
+  bool _includeLoopbackProbe = false;
+  String? _error;
+  String? _statusNotice;
+
+  final Set<String> _busyPolicyServers = {};
+  final Set<String> _inspectingServers = {};
+  final Set<String> _busyRuntimeServers = {};
+  final Set<String> _expandedTools = {};
+  final Map<String, DeviceMcpInspectResult> _inspected = {};
+  final Map<String, String> _serverErrors = {};
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadOverview());
+  }
+
+  Future<void> _loadOverview({bool silent = false}) async {
+    if (!silent) {
+      setState(() {
+        _loading = true;
+        _error = null;
+      });
+    }
+    try {
+      final result = await widget.api.deviceMcp(widget.device.deviceId);
+      if (!mounted) return;
+      setState(() {
+        _overview = result;
+        _loading = false;
+        if (!silent) _error = null;
+      });
+    } on ApiException catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        if (error.status == 501) {
+          _overview = DeviceMcpOverview(deviceId: widget.device.deviceId, supported: false);
+        } else {
+          _error = error.message;
+        }
+      });
+    }
+  }
+
+  void _replaceServer(McpServerDescriptor updated, {McpSummary? summary}) {
+    final current = _overview;
+    if (current == null) return;
+    final nextServers = [
+      for (final item in current.servers) item.serverId == updated.serverId ? updated : item,
+    ];
+    _overview = DeviceMcpOverview(
+      deviceId: current.deviceId,
+      supported: current.supported,
+      discoveryMode: current.discoveryMode,
+      catalogHash: current.catalogHash,
+      updatedAt: current.updatedAt,
+      servers: nextServers,
+      warnings: current.warnings,
+      summary: summary ?? current.summary,
+    );
+  }
+
+  Future<void> _rescan() async {
+    if (_scanning) return;
+    setState(() {
+      _scanning = true;
+      _error = null;
+      _statusNotice = null;
+    });
+    try {
+      final result = await widget.api.discoverDeviceMcp(
+        widget.device.deviceId,
+        includeLoopbackProbe: _includeLoopbackProbe,
+      );
+      if (!mounted) return;
+      final knownIds = {for (final s in result.servers) s.serverId};
+      setState(() {
+        _overview = result;
+        _expandedTools.retainAll(knownIds);
+        _inspected.removeWhere((id, _) => !knownIds.contains(id));
+        _serverErrors.removeWhere((id, _) => !knownIds.contains(id));
+      });
+      widget.onChanged();
+    } on ApiException catch (error) {
+      if (mounted) setState(() => _error = error.message);
+    } finally {
+      if (mounted) setState(() => _scanning = false);
+    }
+  }
+
+  Future<void> _toggleServer(McpServerDescriptor server, bool enabled) async {
+    if (_busyPolicyServers.contains(server.serverId)) return;
+    setState(() {
+      _busyPolicyServers.add(server.serverId);
+      _serverErrors.remove(server.serverId);
+      _statusNotice = null;
+    });
+    try {
+      final result = await widget.api.updateDeviceMcpPolicy(
+        widget.device.deviceId,
+        server.serverId,
+        enabled: enabled,
+      );
+      if (!mounted) return;
+      if (result.server.serverId.isNotEmpty && result.server.name.isNotEmpty) {
+        setState(() {
+          _replaceServer(result.server, summary: result.summary);
+        });
+      } else {
+        await _loadOverview(silent: true);
+      }
+      widget.onChanged();
+    } on ApiException catch (error) {
+      if (mounted) setState(() => _serverErrors[server.serverId] = error.message);
+    } finally {
+      if (mounted) setState(() => _busyPolicyServers.remove(server.serverId));
+    }
+  }
+
+  Future<void> _setCallMode(McpServerDescriptor server, String callMode) async {
+    if (_busyPolicyServers.contains(server.serverId) || server.callMode == callMode) return;
+    setState(() {
+      _busyPolicyServers.add(server.serverId);
+      _serverErrors.remove(server.serverId);
+      _statusNotice = null;
+    });
+    try {
+      final result = await widget.api.updateDeviceMcpPolicy(
+        widget.device.deviceId,
+        server.serverId,
+        callMode: callMode,
+      );
+      if (!mounted) return;
+      if (result.server.serverId.isNotEmpty && result.server.name.isNotEmpty) {
+        setState(() {
+          _replaceServer(result.server, summary: result.summary);
+        });
+      } else {
+        await _loadOverview(silent: true);
+      }
+      widget.onChanged();
+    } on ApiException catch (error) {
+      if (mounted) setState(() => _serverErrors[server.serverId] = error.message);
+    } finally {
+      if (mounted) setState(() => _busyPolicyServers.remove(server.serverId));
+    }
+  }
+
+  Future<void> _toggleInspect(McpServerDescriptor server) async {
+    if (_expandedTools.contains(server.serverId)) {
+      setState(() => _expandedTools.remove(server.serverId));
+      return;
+    }
+    if (_inspectingServers.contains(server.serverId)) return;
+    setState(() {
+      _inspectingServers.add(server.serverId);
+      _serverErrors.remove(server.serverId);
+      _statusNotice = null;
+    });
+    try {
+      final result = await widget.api.inspectDeviceMcp(widget.device.deviceId, server.serverId);
+      if (!mounted) return;
+      setState(() {
+        _inspected[server.serverId] = result;
+        _expandedTools.add(server.serverId);
+        if (result.server != null) _replaceServer(result.server!);
+      });
+      widget.onChanged();
+    } on ApiException catch (error) {
+      if (mounted) setState(() => _serverErrors[server.serverId] = error.message);
+    } finally {
+      if (mounted) setState(() => _inspectingServers.remove(server.serverId));
+    }
+  }
+
+  Future<void> _restartServer(McpServerDescriptor server) async {
+    if (_busyRuntimeServers.contains(server.serverId)) return;
+    final strings = Strings.read(context);
+    setState(() {
+      _busyRuntimeServers.add(server.serverId);
+      _serverErrors.remove(server.serverId);
+      _statusNotice = null;
+    });
+    try {
+      await widget.api.restartDeviceMcpServer(widget.device.deviceId, server.serverId);
+      if (!mounted) return;
+      await _loadOverview(silent: true);
+      if (!mounted) return;
+      setState(() => _statusNotice = strings.mcpServerRestartedNotice);
+      widget.onChanged();
+    } on ApiException catch (error) {
+      if (mounted) setState(() => _serverErrors[server.serverId] = error.message);
+    } finally {
+      if (mounted) setState(() => _busyRuntimeServers.remove(server.serverId));
+    }
+  }
+
+  Future<void> _stopServer(McpServerDescriptor server) async {
+    if (_busyRuntimeServers.contains(server.serverId)) return;
+    final strings = Strings.read(context);
+    setState(() {
+      _busyRuntimeServers.add(server.serverId);
+      _serverErrors.remove(server.serverId);
+      _statusNotice = null;
+    });
+    try {
+      await widget.api.stopDeviceMcpServer(widget.device.deviceId, server.serverId);
+      if (!mounted) return;
+      await _loadOverview(silent: true);
+      if (!mounted) return;
+      setState(() => _statusNotice = strings.mcpServerStoppedNotice);
+      widget.onChanged();
+    } on ApiException catch (error) {
+      if (mounted) setState(() => _serverErrors[server.serverId] = error.message);
+    } finally {
+      if (mounted) setState(() => _busyRuntimeServers.remove(server.serverId));
+    }
+  }
+
+  Color _trustColor(String trustState, Palette palette) => switch (trustState) {
+    'enabled' => palette.green,
+    'discovered' => palette.accent,
+    'blocked_by_policy' => palette.red,
+    _ => palette.gray,
+  };
+
+  (Color, bool) _runtimeAppearance(String runtimeState, Palette palette) => switch (runtimeState) {
+    'running' => (palette.green, true),
+    'idle' => (palette.accent, true),
+    'starting' => (palette.orange, true),
+    'error' => (palette.red, true),
+    _ => (palette.gray, false),
+  };
+
+  Widget _buildCallModeChip(McpServerDescriptor server, String mode, {required bool disabled}) {
+    final strings = Strings.read(context);
+    final palette = Palette.of(context);
+    final typo = Typo.of(context);
+    final selected = server.callMode == mode;
+    final tint = mode == 'auto_all' ? palette.orange : palette.accent;
+    return SelectionContainer.disabled(
+      child: Tappable(
+        key: ValueKey('mcp-mode-${server.serverId}-$mode'),
+        selected: selected,
+        borderRadius: 999,
+        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+        onTap: disabled ? null : () => unawaited(_setCallMode(server, mode)),
+        child: Container(
+          decoration: BoxDecoration(
+            color: selected ? tint.withValues(alpha: 0.14) : null,
+            borderRadius: BorderRadius.circular(999),
+          ),
+          padding: const EdgeInsets.symmetric(horizontal: 2),
+          child: Text(
+            strings.mcpCallModeLabel(mode),
+            style: typo.caption.copyWith(
+              color: selected ? tint : palette.secondary,
+              fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildToolsPanel(McpServerDescriptor server) {
+    final strings = Strings.read(context);
+    final palette = Palette.of(context);
+    final typo = Typo.of(context);
+    final result = _inspected[server.serverId];
+    final tools = result?.tools ?? const <McpToolInfo>[];
+
+    return Container(
+      key: ValueKey('mcp-tools-${server.serverId}'),
+      margin: const EdgeInsets.only(top: 10),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: palette.surface,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: palette.separator.withValues(alpha: 0.45), width: 0.5),
+      ),
+      child: tools.isEmpty
+          ? Text(strings.mcpNoToolsFound, style: typo.caption)
+          : Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                for (final (index, tool) in tools.indexed) ...[
+                  if (index > 0)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 7),
+                      child: Container(height: 0.5, color: palette.separator),
+                    ),
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 4,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      Text(
+                        tool.name,
+                        style: typo.mono.copyWith(fontSize: 12, fontWeight: FontWeight.w600, color: palette.label),
+                      ),
+                      if (tool.destructiveHint == true)
+                        Pill(strings.mcpToolDestructiveBadge, color: palette.red)
+                      else if (tool.readOnlyHint == true)
+                        Pill(strings.mcpToolReadOnlyBadge, color: palette.green),
+                    ],
+                  ),
+                  if (tool.description != null) ...[
+                    const SizedBox(height: 3),
+                    Text(tool.description!, style: typo.caption),
+                  ],
+                ],
+              ],
+            ),
+    );
+  }
+
+  Widget _buildServerItem(McpServerDescriptor server) {
+    final strings = Strings.read(context);
+    final palette = Palette.of(context);
+    final typo = Typo.of(context);
+    final device = widget.device;
+
+    final policyBusy = _busyPolicyServers.contains(server.serverId);
+    final inspecting = _inspectingServers.contains(server.serverId);
+    final runtimeBusy = _busyRuntimeServers.contains(server.serverId);
+    final expanded = _expandedTools.contains(server.serverId);
+    final canEditPolicy = !policyBusy && !device.isSandboxLocked && !server.isBlocked && device.isOnline;
+    final canInspect = expanded || (!inspecting && !server.isBlocked && (device.isOnline || _inspected.containsKey(server.serverId)));
+    final showRestart = server.isActiveRuntime || (server.isEnabled && server.runtimeState == 'error');
+    final showStop = server.isActiveRuntime;
+
+    final (runtimeColor, runtimeDot) = _runtimeAppearance(server.runtimeState, palette);
+    final preview = server.commandPreview ?? server.urlSanitized;
+    final serverError = _serverErrors[server.serverId] ?? server.lastError;
+    final displayTitle = server.name.isNotEmpty ? server.name : server.serverId;
+
+    return Padding(
+      key: ValueKey('mcp-server-${server.serverId}'),
+      padding: const EdgeInsets.all(12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Wrap(
+                      spacing: 6,
+                      runSpacing: 5,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        Text(displayTitle, style: typo.headline.copyWith(fontSize: 14.5)),
+                        if (server.source.isNotEmpty)
+                          Pill(strings.mcpSourceLabel(server.source), color: palette.accent),
+                        Pill(strings.mcpTransportLabel(server.transport), color: palette.purple),
+                        Pill(strings.mcpTrustStateLabel(server.trustState), color: _trustColor(server.trustState, palette)),
+                        Pill(strings.mcpRuntimeStateLabel(server.runtimeState), color: runtimeColor, dot: runtimeDot),
+                        if (server.authRequired)
+                          Pill(strings.mcpAuthRequiredBadge, color: palette.orange),
+                        if (server.toolCount != null)
+                          Text(strings.mcpToolCount(server.toolCount!), style: typo.caption),
+                      ],
+                    ),
+                    if (server.duplicateOf != null) ...[
+                      const SizedBox(height: 4),
+                      Text(strings.mcpDuplicateOfLabel(server.duplicateOf!), style: typo.caption.copyWith(color: palette.orange)),
+                    ],
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              SelectionContainer.disabled(
+                child: Semantics(
+                  label: server.isEnabled ? strings.mcpDisable : strings.mcpEnable,
+                  child: CupertinoSwitch(
+                    key: ValueKey('mcp-toggle-${server.serverId}'),
+                    value: server.isEnabled,
+                    onChanged: canEditPolicy ? (value) => unawaited(_toggleServer(server, value)) : null,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          if (preview != null) ...[
+            const SizedBox(height: 8),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
+              decoration: BoxDecoration(color: palette.code, borderRadius: BorderRadius.circular(7)),
+              child: Text(
+                preview,
+                style: typo.mono.copyWith(fontSize: 11.5, color: palette.secondary),
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ],
+          if (server.envKeys.isNotEmpty) ...[
+            const SizedBox(height: 5),
+            Text(strings.mcpEnvKeysLabel(server.envKeys), style: typo.caption),
+          ],
+          if (server.isEnabled) ...[
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                Text(strings.mcpCallModeTitle, style: typo.caption),
+                for (final mode in _selectableCallModes)
+                  _buildCallModeChip(server, mode, disabled: !canEditPolicy),
+              ],
+            ),
+          ],
+          if (serverError != null && serverError.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(
+              serverError,
+              key: ValueKey('mcp-server-error-${server.serverId}'),
+              style: typo.caption.copyWith(color: palette.red),
+            ),
+          ],
+          const SizedBox(height: 9),
+          Wrap(
+            spacing: 8,
+            runSpacing: 6,
+            children: [
+              ActionButton(
+                key: ValueKey('mcp-inspect-${server.serverId}'),
+                label: inspecting
+                    ? strings.mcpInspecting
+                    : expanded
+                    ? strings.mcpHideTools
+                    : strings.mcpInspectTools,
+                plain: true,
+                busy: inspecting,
+                onPressed: canInspect ? () => unawaited(_toggleInspect(server)) : null,
+              ),
+              if (showRestart)
+                ActionButton(
+                  key: ValueKey('mcp-restart-${server.serverId}'),
+                  label: strings.mcpRestart,
+                  plain: true,
+                  busy: runtimeBusy,
+                  onPressed: (device.isOnline && !runtimeBusy) ? () => unawaited(_restartServer(server)) : null,
+                ),
+              if (showStop)
+                ActionButton(
+                  key: ValueKey('mcp-stop-${server.serverId}'),
+                  label: strings.mcpStop,
+                  plain: true,
+                  destructive: true,
+                  busy: runtimeBusy,
+                  onPressed: (device.isOnline && !runtimeBusy) ? () => unawaited(_stopServer(server)) : null,
+                ),
+            ],
+          ),
+          if (expanded) _buildToolsPanel(server),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = Strings.read(context);
+    final palette = Palette.of(context);
+    final typo = Typo.of(context);
+    final device = widget.device;
+    final overview = _overview;
+    final (statusLabel, statusColor) = switch (device.status) {
+      'online' => (strings.deviceStatusOnline, palette.green),
+      'sleeping' => (strings.deviceStatusSleeping, palette.orange),
+      'unreachable_via_relay' => (strings.deviceStatusUnreachable, palette.red),
+      _ => (strings.deviceStatusOffline, palette.gray),
+    };
+    final (sandboxLabel, sandboxColor) = sandboxLevelAppearance(device.effectiveSandboxLevel, strings, palette);
+    final canLoopbackProbe =
+        (device.effectiveSandboxLevel == 'desktop' || device.isUnrestricted) &&
+        (overview == null || overview.supported);
+    final canRescan = !_loading && !_scanning && device.isOnline && (overview == null || overview.supported);
+
+    return Center(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxWidth: 620, maxHeight: MediaQuery.sizeOf(context).height * 0.85),
+        child: Container(
+          margin: const EdgeInsets.all(grid * 2),
+          decoration: BoxDecoration(
+            color: palette.surface,
+            borderRadius: BorderRadius.circular(14),
+            boxShadow: const [BoxShadow(color: Color(0x33000000), blurRadius: 30, offset: Offset(0, 10))],
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 14, 8, 10),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        strings.mcpSheetTitle(device.displayName),
+                        style: typo.headline.copyWith(fontSize: 17),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    CupertinoButton(
+                      key: const ValueKey('mcp-close-btn'),
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      minimumSize: const Size(0, 30),
+                      onPressed: () => Navigator.of(context).pop(),
+                      child: Text(strings.mcpDone, style: typo.body.copyWith(color: palette.accent)),
+                    ),
+                  ],
+                ),
+              ),
+              Container(height: 0.5, color: palette.separator),
+              Flexible(
+                child: Selectable(
+                  child: SingleChildScrollView(
+                    primary: false,
+                    padding: const EdgeInsets.all(14),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          crossAxisAlignment: WrapCrossAlignment.center,
+                          alignment: WrapAlignment.spaceBetween,
+                          children: [
+                            Wrap(
+                              spacing: 7,
+                              runSpacing: 6,
+                              crossAxisAlignment: WrapCrossAlignment.center,
+                              children: [
+                                Pill(statusLabel, color: statusColor, dot: device.isOnline),
+                                Pill(sandboxLabel, color: sandboxColor, dot: device.isUnrestricted),
+                              ],
+                            ),
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 6,
+                              crossAxisAlignment: WrapCrossAlignment.center,
+                              children: [
+                                if (canLoopbackProbe)
+                                  SelectionContainer.disabled(
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Text(strings.mcpIncludeLoopbackProbe, style: typo.caption),
+                                        const SizedBox(width: 6),
+                                        CupertinoSwitch(
+                                          key: const ValueKey('mcp-loopback-switch'),
+                                          value: _includeLoopbackProbe,
+                                          onChanged: (_scanning || !device.isOnline)
+                                              ? null
+                                              : (value) => setState(() => _includeLoopbackProbe = value),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ActionButton(
+                                  key: const ValueKey('mcp-rescan-btn'),
+                                  label: _scanning ? strings.mcpRescanning : strings.mcpRescan,
+                                  busy: _scanning,
+                                  onPressed: canRescan ? () => unawaited(_rescan()) : null,
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                        if (_loading) ...[
+                          const SizedBox(height: 22),
+                          Center(
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const CupertinoActivityIndicator(radius: 9),
+                                const SizedBox(width: 10),
+                                Text(strings.loading, style: typo.footnote),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(height: 16),
+                        ] else ...[
+                          if (_error != null) ...[
+                            const SizedBox(height: 12),
+                            Notice(_error!),
+                          ],
+                          if (_statusNotice != null) ...[
+                            const SizedBox(height: 12),
+                            Notice(_statusNotice!, good: true),
+                          ],
+                          if (overview != null && !overview.supported) ...[
+                            const SizedBox(height: 12),
+                            Notice(strings.mcpUnsupportedHint),
+                          ] else if (!device.isOnline && (overview == null || overview.servers.isEmpty)) ...[
+                            const SizedBox(height: 12),
+                            Notice(strings.mcpOfflineNoCacheHint),
+                          ] else ...[
+                            if (!device.isOnline) ...[
+                              const SizedBox(height: 12),
+                              Container(
+                                width: double.infinity,
+                                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+                                decoration: BoxDecoration(
+                                  color: palette.orange.withValues(alpha: 0.12),
+                                  borderRadius: BorderRadius.circular(8),
+                                ),
+                                child: Text(strings.mcpOfflineCachedHint, style: typo.footnote.copyWith(color: palette.orange)),
+                              ),
+                            ],
+                            if (device.isSandboxLocked) ...[
+                              const SizedBox(height: 12),
+                              Notice(strings.mcpSandboxLockedHint),
+                            ],
+                            if (overview != null && overview.warnings.isNotEmpty) ...[
+                              const SizedBox(height: 12),
+                              Container(
+                                width: double.infinity,
+                                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+                                decoration: BoxDecoration(
+                                  color: palette.orange.withValues(alpha: 0.12),
+                                  borderRadius: BorderRadius.circular(8),
+                                ),
+                                child: Text(overview.warnings.join('\n'), style: typo.footnote.copyWith(color: palette.orange)),
+                              ),
+                            ],
+                            if (overview != null && overview.servers.isEmpty) ...[
+                              const SizedBox(height: 12),
+                              Container(
+                                width: double.infinity,
+                                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 18),
+                                decoration: BoxDecoration(
+                                  color: palette.grouped,
+                                  borderRadius: BorderRadius.circular(10),
+                                  border: Border.all(color: palette.separator.withValues(alpha: 0.4), width: 0.5),
+                                ),
+                                child: Text(
+                                  strings.mcpEmptyDiscoveredHint,
+                                  style: typo.footnote,
+                                  textAlign: TextAlign.center,
+                                ),
+                              ),
+                            ] else if (overview != null) ...[
+                              const SizedBox(height: 12),
+                              Container(
+                                decoration: BoxDecoration(
+                                  color: palette.grouped,
+                                  borderRadius: BorderRadius.circular(10),
+                                  border: Border.all(color: palette.separator.withValues(alpha: 0.4), width: 0.5),
+                                ),
+                                clipBehavior: Clip.antiAlias,
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                                  children: [
+                                    for (final (index, server) in overview.servers.indexed) ...[
+                                      if (index > 0)
+                                        Padding(
+                                          padding: const EdgeInsets.only(left: 12),
+                                          child: Container(height: 0.5, color: palette.separator),
+                                        ),
+                                      _buildServerItem(server),
+                                    ],
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ],
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+              Container(height: 0.5, color: palette.separator),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.only(top: 1, right: 6),
+                      child: Icon(CupertinoIcons.lock_shield, size: 14, color: palette.secondary),
+                    ),
+                    Expanded(child: Text(strings.mcpSecretSafetyNote, style: typo.caption)),
+                  ],
                 ),
               ),
             ],

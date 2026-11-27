@@ -1,3 +1,4 @@
+use crate::mcp::McpSummary;
 use crate::policy::Policy;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -62,6 +63,8 @@ pub struct CapabilityManifest {
     pub capabilities: Vec<String>,
     pub sandbox: SandboxSummary,
     pub relay_config: Option<RelayConfigSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_summary: Option<McpSummary>,
 }
 
 pub struct CapabilityProber;
@@ -73,6 +76,24 @@ impl CapabilityProber {
         relay_enabled: bool,
         mqtt_bind: Option<&str>,
         uart_device: Option<&Path>,
+    ) -> CapabilityManifest {
+        Self::probe_with_mcp(
+            policy,
+            device_id,
+            relay_enabled,
+            mqtt_bind,
+            uart_device,
+            None,
+        )
+    }
+
+    pub fn probe_with_mcp(
+        policy: &Policy,
+        device_id: &str,
+        relay_enabled: bool,
+        mqtt_bind: Option<&str>,
+        uart_device: Option<&Path>,
+        mcp_summary: Option<McpSummary>,
     ) -> CapabilityManifest {
         let os = std::env::consts::OS.to_string();
         let arch = std::env::consts::ARCH.to_string();
@@ -90,6 +111,8 @@ impl CapabilityProber {
             "file_channel".to_string(),
             "ota".to_string(),
             "self_update".to_string(),
+            "mcp_discovery".to_string(),
+            "mcp_proxy".to_string(),
         ];
         #[cfg(target_os = "linux")]
         if Path::new("/dev/nvidia0").exists() {
@@ -129,6 +152,7 @@ impl CapabilityProber {
             capabilities,
             sandbox,
             relay_config,
+            mcp_summary,
         }
     }
 }
@@ -234,6 +258,8 @@ mod tests {
         assert!(manifest.capabilities.contains(&"self_update".to_string()));
         assert!(manifest.capabilities.contains(&"fs_stat".to_string()));
         assert!(manifest.capabilities.contains(&"file_channel".to_string()));
+        assert!(manifest.capabilities.contains(&"mcp_discovery".to_string()));
+        assert!(manifest.capabilities.contains(&"mcp_proxy".to_string()));
         assert!(manifest.relay_config.as_ref().unwrap().enabled);
         assert_eq!(manifest.sandbox.level, "personal");
         assert!(!manifest.sandbox.unrestricted);

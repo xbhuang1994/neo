@@ -90,6 +90,12 @@ JSON over HTTP, as [006 Deployment](006-deployment.md) says who may call. Errors
 | `POST /api/wechat/disconnect` | Unbinds |
 | `GET /api/devices` | `{config, devices, approvals, enrollments}`: Multi-device control plane overview; each Tier 1 OS device twin includes `sandboxLevel`, `desiredSandboxLevel`, `sandboxSyncState` (`synced\|pending\|unsupported\|locked\|error`) and `manifest.sandbox` |
 | `PUT /api/devices/{id}/sandbox` | `{level, workspaces?, timeoutMs?}`: switches a Tier 1 OS device among the 5 sandbox levels (`readonly`, `corp`, `personal`, `desktop`, `unrestricted`) via E2E `set_sandbox` RPC. Offline devices save `desiredSandboxLevel` as `pending` and sync automatically on reconnect; agents with `lock_sandbox = true` reject changes with status `403` |
+| `GET /api/devices/{id}/mcp` | `{deviceId, supported, discoveryMode, catalogHash, updatedAt, servers, warnings, summary}`: returns the cached redacted catalog of locally discovered MCP servers on a Tier 1 OS device (secrets stay local on the device) |
+| `POST /api/devices/{id}/mcp/discover` | `{includeLoopbackProbe?, sources?, timeoutMs?}`: runs proactive local MCP discovery on the Tier 1 OS device via E2E `mcp.discover` RPC and refreshes the catalog |
+| `POST /api/devices/{id}/mcp/{serverId}/inspect` | `{query?, includeResources?, includePrompts?, refresh?, timeoutMs?}` (also `GET /api/devices/{id}/mcp/{serverId}/tools`): lazily initializes the local MCP server and returns its tool schemas and `annotations` |
+| `PUT /api/devices/{id}/mcp/{serverId}/policy` | `{enabled?, callMode?, timeoutMs?}`: enables/disables a discovered local MCP server or sets its call risk policy (`disabled`, `confirm_all`, `auto_readonly`, `auto_all`); agents with `lock_sandbox = true` reject changes with status `403` |
+| `POST /api/devices/{id}/mcp/{serverId}/call` | `{toolName?, action?, arguments?, uri?, promptName?, timeoutMs?, reason?}`: invokes a remote MCP tool (`tools/call`), resource (`resources/read`), or prompt (`prompts/get`) through the risk gate (`200` on `ok`, `202` on `pending_approval`) |
+| `POST /api/devices/{id}/mcp/{serverId}/stop`, `/restart` | Stops or restarts a running proxied MCP server session on the Tier 1 OS device |
 
 A Ticket's `stage` is `{stage: person, action: delivery\|answer\|review\|blocked\|failed}`, `{stage: working, action?: queued}`, `{stage: idle}` or `{stage: ended}`; an ended Ticket's `outcome` is `completed`, `dropped` or `stopped`.
 

@@ -7,6 +7,8 @@ import 'dart:typed_data';
 Map<String, dynamic> _map(Object? value) => value is Map ? value.cast<String, dynamic>() : const {};
 List<dynamic> _list(Object? value) => value is List ? value : const [];
 String? _text(Object? value) => value is String && value.isNotEmpty ? value : null;
+int? _int(Object? value) => value is num ? value.toInt() : null;
+bool? _bool(Object? value) => value is bool ? value : null;
 DateTime? _time(Object? value) {
   if (value is num) return DateTime.fromMillisecondsSinceEpoch(value.toInt());
   if (value is String) return DateTime.tryParse(value)?.toLocal();
@@ -642,6 +644,11 @@ class DeviceManifest {
           : json['relayConfig'] is Map
           ? DeviceRelayConfig.fromJson(_map(json['relayConfig']))
           : null,
+      mcpSummary = json['mcp_summary'] is Map
+          ? McpSummary.fromJson(_map(json['mcp_summary']))
+          : json['mcpSummary'] is Map
+          ? McpSummary.fromJson(_map(json['mcpSummary']))
+          : null,
       chip = _text(json['chip']),
       fw = _text(json['fw']),
       acts = _strings(json['acts']);
@@ -672,6 +679,7 @@ class DeviceManifest {
   final List<DeviceActionSpec> actions;
   final Map<String, dynamic> sandbox;
   final DeviceRelayConfig? relayConfig;
+  final McpSummary? mcpSummary;
   final String? chip;
   final String? fw;
   final List<String> acts;
@@ -796,6 +804,14 @@ class DeviceTwin {
       capabilities.contains('relay') ||
       (mqttBind != null && mqttBind!.isNotEmpty) ||
       (uartDevice != null && uartDevice!.isNotEmpty);
+  McpSummary? get mcpSummary => manifest?.mcpSummary;
+  bool get isMcpCapable =>
+      isTier1 &&
+      (capabilities.contains('mcp_proxy') ||
+          capabilities.contains('mcp_discovery') ||
+          (manifest?.capabilities.contains('mcp_proxy') ?? false) ||
+          (manifest?.capabilities.contains('mcp_discovery') ?? false) ||
+          mcpSummary != null);
 
   /// Reported program or firmware version for this Tier device.
   String? get version => isMcu
@@ -1099,4 +1115,294 @@ class McuInstallResult {
   final String configHeader;
   final String installScript;
   final String mcuE2eKeyHex;
+}
+
+/// Lightweight summary of a discovered MCP server advertised inside a device's manifest.
+class McpServerSummary {
+  const McpServerSummary({
+    required this.serverId,
+    required this.name,
+    this.source = '',
+    this.transport = 'stdio',
+    this.trustState = 'discovered',
+    this.callMode = 'disabled',
+    this.runtimeState = 'stopped',
+    this.toolCount,
+  });
+
+  McpServerSummary.fromJson(Map<String, dynamic> json)
+    : serverId = _text(json['server_id']) ?? _text(json['serverId']) ?? '',
+      name = _text(json['name']) ?? '',
+      source = _text(json['source']) ?? '',
+      transport = _text(json['transport']) ?? 'stdio',
+      trustState = _text(json['trust_state']) ?? _text(json['trustState']) ?? 'discovered',
+      callMode = _text(json['call_mode']) ?? _text(json['callMode']) ?? 'disabled',
+      runtimeState = _text(json['runtime_state']) ?? _text(json['runtimeState']) ?? 'stopped',
+      toolCount = _int(json['tool_count']) ?? _int(json['toolCount']);
+
+  final String serverId;
+  final String name;
+  final String source;
+
+  /// `stdio`, `streamable_http`, or `sse`.
+  final String transport;
+
+  /// `discovered`, `enabled`, `disabled`, or `blocked_by_policy`.
+  final String trustState;
+
+  /// `disabled`, `confirm_all`, `auto_readonly`, or `auto_all`.
+  final String callMode;
+
+  /// `stopped`, `starting`, `running`, `idle`, or `error`.
+  final String runtimeState;
+  final int? toolCount;
+
+  bool get isEnabled => trustState == 'enabled';
+  bool get isBlocked => trustState == 'blocked_by_policy';
+}
+
+/// Lightweight MCP discovery and runtime summary reported in a Tier 1 device's manifest.
+class McpSummary {
+  const McpSummary({
+    this.enabled = false,
+    this.discoveryMode = '',
+    this.discoveredCount = 0,
+    this.enabledCount = 0,
+    this.runningCount = 0,
+    this.catalogHash,
+    this.servers = const [],
+  });
+
+  McpSummary.fromJson(Map<String, dynamic> json)
+    : enabled = json['enabled'] == true,
+      discoveryMode = _text(json['discovery_mode']) ?? _text(json['discoveryMode']) ?? '',
+      discoveredCount = _int(json['discovered_count']) ?? _int(json['discoveredCount']) ?? _list(json['servers']).length,
+      enabledCount = _int(json['enabled_count']) ?? _int(json['enabledCount']) ?? 0,
+      runningCount = _int(json['running_count']) ?? _int(json['runningCount']) ?? 0,
+      catalogHash = _text(json['catalog_hash']) ?? _text(json['catalogHash']),
+      servers = [for (final item in _list(json['servers'])) McpServerSummary.fromJson(_map(item))];
+
+  final bool enabled;
+  final String discoveryMode;
+  final int discoveredCount;
+  final int enabledCount;
+  final int runningCount;
+  final String? catalogHash;
+  final List<McpServerSummary> servers;
+}
+
+/// Redacted descriptor of a local MCP server discovered on a Tier 1 device.
+class McpServerDescriptor {
+  const McpServerDescriptor({
+    required this.serverId,
+    required this.name,
+    this.source = '',
+    this.sourcePath,
+    this.transport = 'stdio',
+    this.commandPreview,
+    this.urlSanitized,
+    this.envKeys = const [],
+    this.authRequired = false,
+    this.trustState = 'discovered',
+    this.callMode = 'disabled',
+    this.runtimeState = 'stopped',
+    this.toolCount,
+    this.dedupKey,
+    this.duplicateOf,
+    this.fingerprint,
+    this.lastError,
+  });
+
+  McpServerDescriptor.fromJson(Map<String, dynamic> json)
+    : serverId = _text(json['server_id']) ?? _text(json['serverId']) ?? '',
+      name = _text(json['name']) ?? '',
+      source = _text(json['source']) ?? '',
+      sourcePath = _text(json['source_path']) ?? _text(json['sourcePath']),
+      transport = _text(json['transport']) ?? 'stdio',
+      commandPreview = _text(json['command_preview']) ?? _text(json['commandPreview']),
+      urlSanitized = _text(json['url_sanitized']) ?? _text(json['urlSanitized']),
+      envKeys = _strings(json['env_keys'] ?? json['envKeys']),
+      authRequired = (json['auth_required'] ?? json['authRequired']) == true,
+      trustState = _text(json['trust_state']) ?? _text(json['trustState']) ?? 'discovered',
+      callMode = _text(json['call_mode']) ?? _text(json['callMode']) ?? 'disabled',
+      runtimeState = _text(json['runtime_state']) ?? _text(json['runtimeState']) ?? 'stopped',
+      toolCount = _int(json['tool_count']) ?? _int(json['toolCount']),
+      dedupKey = _text(json['dedup_key']) ?? _text(json['dedupKey']),
+      duplicateOf = _text(json['duplicate_of']) ?? _text(json['duplicateOf']),
+      fingerprint = _text(json['fingerprint']),
+      lastError = _text(json['last_error']) ?? _text(json['lastError']);
+
+  final String serverId;
+  final String name;
+  final String source;
+  final String? sourcePath;
+
+  /// `stdio`, `streamable_http`, or `sse`.
+  final String transport;
+  final String? commandPreview;
+  final String? urlSanitized;
+  final List<String> envKeys;
+  final bool authRequired;
+
+  /// `discovered`, `enabled`, `disabled`, or `blocked_by_policy`.
+  final String trustState;
+
+  /// `disabled`, `confirm_all`, `auto_readonly`, or `auto_all`.
+  final String callMode;
+
+  /// `stopped`, `starting`, `running`, `idle`, or `error`.
+  final String runtimeState;
+  final int? toolCount;
+  final String? dedupKey;
+  final String? duplicateOf;
+  final String? fingerprint;
+  final String? lastError;
+
+  bool get isEnabled => trustState == 'enabled';
+  bool get isBlocked => trustState == 'blocked_by_policy';
+  bool get isActiveRuntime => runtimeState == 'running' || runtimeState == 'idle' || runtimeState == 'starting';
+}
+
+/// Metadata and risk annotations for a tool exposed by a remote MCP server.
+class McpToolInfo {
+  const McpToolInfo({
+    required this.name,
+    this.description,
+    this.inputSchema = const {},
+    this.readOnlyHint,
+    this.destructiveHint,
+    this.idempotentHint,
+    this.openWorldHint,
+  });
+
+  factory McpToolInfo.fromJson(Map<String, dynamic> json) {
+    final annotations = _map(json['annotations']);
+    return McpToolInfo(
+      name: _text(json['name']) ?? '',
+      description: _text(json['description']),
+      inputSchema: _map(json['input_schema'] ?? json['inputSchema']),
+      readOnlyHint:
+          _bool(json['read_only_hint']) ??
+          _bool(json['readOnlyHint']) ??
+          _bool(annotations['read_only_hint']) ??
+          _bool(annotations['readOnlyHint']),
+      destructiveHint:
+          _bool(json['destructive_hint']) ??
+          _bool(json['destructiveHint']) ??
+          _bool(annotations['destructive_hint']) ??
+          _bool(annotations['destructiveHint']),
+      idempotentHint:
+          _bool(json['idempotent_hint']) ??
+          _bool(json['idempotentHint']) ??
+          _bool(annotations['idempotent_hint']) ??
+          _bool(annotations['idempotentHint']),
+      openWorldHint:
+          _bool(json['open_world_hint']) ??
+          _bool(json['openWorldHint']) ??
+          _bool(annotations['open_world_hint']) ??
+          _bool(annotations['openWorldHint']),
+    );
+  }
+
+  final String name;
+  final String? description;
+  final Map<String, dynamic> inputSchema;
+  final bool? readOnlyHint;
+  final bool? destructiveHint;
+  final bool? idempotentHint;
+  final bool? openWorldHint;
+}
+
+/// Snapshot of a Tier 1 device's discovered MCP catalog returned by `GET /api/devices/:id/mcp` or `POST .../discover`.
+class DeviceMcpOverview {
+  const DeviceMcpOverview({
+    required this.deviceId,
+    this.supported = false,
+    this.discoveryMode = '',
+    this.catalogHash,
+    this.updatedAt,
+    this.servers = const [],
+    this.warnings = const [],
+    this.summary,
+  });
+
+  DeviceMcpOverview.fromJson(Map<String, dynamic> json)
+    : deviceId = _text(json['device_id']) ?? _text(json['deviceId']) ?? '',
+      supported = json['supported'] is bool ? json['supported'] as bool : json['servers'] is List,
+      discoveryMode = _text(json['discovery_mode']) ?? _text(json['discoveryMode']) ?? '',
+      catalogHash = _text(json['catalog_hash']) ?? _text(json['catalogHash']),
+      updatedAt = _time(json['updated_at']) ?? _time(json['updatedAt']),
+      servers = [for (final item in _list(json['servers'])) McpServerDescriptor.fromJson(_map(item))],
+      warnings = _strings(json['warnings']),
+      summary = json['summary'] is Map
+          ? McpSummary.fromJson(_map(json['summary']))
+          : json['mcp_summary'] is Map
+          ? McpSummary.fromJson(_map(json['mcp_summary']))
+          : json['mcpSummary'] is Map
+          ? McpSummary.fromJson(_map(json['mcpSummary']))
+          : null;
+
+  final String deviceId;
+  final bool supported;
+  final String discoveryMode;
+  final String? catalogHash;
+  final DateTime? updatedAt;
+  final List<McpServerDescriptor> servers;
+  final List<String> warnings;
+  final McpSummary? summary;
+}
+
+/// Tool schema and metadata returned by `POST /api/devices/:id/mcp/:serverId/inspect`.
+class DeviceMcpInspectResult {
+  const DeviceMcpInspectResult({
+    required this.deviceId,
+    this.server,
+    this.protocolVersion,
+    this.tools = const [],
+    this.toolsSchemaHash,
+  });
+
+  DeviceMcpInspectResult.fromJson(Map<String, dynamic> json)
+    : deviceId = _text(json['device_id']) ?? _text(json['deviceId']) ?? '',
+      server = json['server'] is Map ? McpServerDescriptor.fromJson(_map(json['server'])) : null,
+      protocolVersion = _text(json['protocol_version']) ?? _text(json['protocolVersion']),
+      tools = [for (final item in _list(json['tools'])) McpToolInfo.fromJson(_map(item))],
+      toolsSchemaHash = _text(json['tools_schema_hash']) ?? _text(json['toolsSchemaHash']);
+
+  final String deviceId;
+  final McpServerDescriptor? server;
+  final String? protocolVersion;
+  final List<McpToolInfo> tools;
+  final String? toolsSchemaHash;
+}
+
+/// Updated policy state returned by `PUT /api/devices/:id/mcp/:serverId/policy`.
+class DeviceMcpPolicyUpdateResult {
+  const DeviceMcpPolicyUpdateResult({
+    required this.deviceId,
+    required this.server,
+    this.persisted = false,
+    this.summary,
+  });
+
+  DeviceMcpPolicyUpdateResult.fromJson(Map<String, dynamic> json)
+    : deviceId = _text(json['device_id']) ?? _text(json['deviceId']) ?? '',
+      server = json['server'] is Map
+          ? McpServerDescriptor.fromJson(_map(json['server']))
+          : _map(json['result'])['server'] is Map
+          ? McpServerDescriptor.fromJson(_map(_map(json['result'])['server']))
+          : McpServerDescriptor(serverId: _text(json['server_id']) ?? _text(json['serverId']) ?? '', name: ''),
+      persisted = json['persisted'] == true || _map(json['result'])['persisted'] == true,
+      summary = json['summary'] is Map
+          ? McpSummary.fromJson(_map(json['summary']))
+          : json['mcp_summary'] is Map
+          ? McpSummary.fromJson(_map(json['mcp_summary']))
+          : json['mcpSummary'] is Map
+          ? McpSummary.fromJson(_map(json['mcpSummary']))
+          : null;
+
+  final String deviceId;
+  final McpServerDescriptor server;
+  final bool persisted;
+  final McpSummary? summary;
 }
