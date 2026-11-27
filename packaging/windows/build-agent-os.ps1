@@ -18,18 +18,22 @@ if ([string]::IsNullOrWhiteSpace($Version)) {
 $distDir = Join-Path $root "dist"
 New-Item -ItemType Directory -Force $distDir | Out-Null
 
-Write-Host "[1/3] Building Windows Tier 1 OS agent (neo-agent-os.exe)..."
+Write-Host "[1/3] Building Windows Tier 1 OS agent (neo-agent-os.exe + neo-agent-os-bg.exe)..."
 Push-Location (Join-Path $root "agents\neo-agent-os")
 try {
-  cargo build --release
-  if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed for neo-agent-os" }
+  cargo build --release --bins
+  if ($LASTEXITCODE -ne 0) { throw "cargo build --release --bins failed for neo-agent-os" }
 } finally {
   Pop-Location
 }
 
 $builtExe = Join-Path $root "agents\neo-agent-os\target\release\neo-agent-os.exe"
+$builtBgExe = Join-Path $root "agents\neo-agent-os\target\release\neo-agent-os-bg.exe"
 if (-not (Test-Path $builtExe)) {
   throw "expected compiled binary not found at $builtExe"
+}
+if (-not (Test-Path $builtBgExe)) {
+  throw "expected compiled background launcher not found at $builtBgExe"
 }
 
 $name = "neo-agent-os-$Version-windows-x64"
@@ -43,8 +47,9 @@ if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
 New-Item -ItemType Directory -Force $stageDeploy | Out-Null
 
 try {
-  Write-Host "[2/3] Staging neo-agent-os.exe and running --version smoke check..."
+  Write-Host "[2/3] Staging neo-agent-os.exe, neo-agent-os-bg.exe and running --version smoke check..."
   Copy-Item $builtExe (Join-Path $stageRoot "neo-agent-os.exe")
+  Copy-Item $builtBgExe (Join-Path $stageRoot "neo-agent-os-bg.exe")
   Copy-Item (Join-Path $root "LICENSE") $stageRoot
   Copy-Item -Recurse (Join-Path $root "deploy\multi-master\*") $stageDeploy
 

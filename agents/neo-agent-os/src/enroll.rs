@@ -1194,19 +1194,11 @@ pub(crate) fn encode_utf16le_bom(text: &str) -> Vec<u8> {
 #[cfg(any(target_os = "windows", test))]
 pub(crate) fn render_windows_task_xml(
     cluster_id: &str,
-    exe_path: &Path,
+    command_path: &Path,
+    arguments: &str,
     workspace_dir: &Path,
-    env_path: &Path,
-    policy_path: &Path,
-    ota_cache_dir: &Path,
     user_id: Option<&str>,
 ) -> String {
-    let args = format!(
-        "--env-file \"{}\" --policy \"{}\" --ota-cache-dir \"{}\"",
-        env_path.display(),
-        policy_path.display(),
-        ota_cache_dir.display()
-    );
     let user_xml = match user_id.map(str::trim).filter(|s| !s.is_empty()) {
         Some(uid) => format!("\n      <UserId>{}</UserId>", xml_escape(uid)),
         None => String::new(),
@@ -1267,10 +1259,18 @@ pub(crate) fn render_windows_task_xml(
         cluster = xml_escape(cluster_id),
         user_xml = user_xml,
         principal_user_xml = principal_user_xml,
-        command = xml_escape(&exe_path.to_string_lossy()),
-        arguments = xml_escape(&args),
+        command = xml_escape(&command_path.to_string_lossy()),
+        arguments = xml_escape(arguments),
         workdir = xml_escape(&workspace_dir.to_string_lossy()),
     )
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn windows_bg_launcher_path(exe_path: &Path) -> PathBuf {
+    exe_path
+        .parent()
+        .map(|d| d.join("neo-agent-os-bg.exe"))
+        .unwrap_or_else(|| PathBuf::from("neo-agent-os-bg.exe"))
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -1292,13 +1292,15 @@ pub(crate) fn render_windows_cmd_wrapper(
 #[cfg(any(target_os = "windows", test))]
 pub(crate) fn render_windows_vbs_launcher(
     exe_path: &Path,
+    workspace_dir: &Path,
     env_path: &Path,
     policy_path: &Path,
     ota_cache_dir: &Path,
 ) -> String {
     let esc = |p: &Path| p.to_string_lossy().replace('"', "\"\"");
     format!(
-        "Dim sh\r\nSet sh = CreateObject(\"WScript.Shell\")\r\nsh.Run \"\"\"{}\"\" --env-file \"\"{}\"\" --policy \"\"{}\"\" --ota-cache-dir \"\"{}\"\"\", 0, False\r\n",
+        "Dim sh\r\nSet sh = CreateObject(\"WScript.Shell\")\r\nsh.CurrentDirectory = \"{}\"\r\nsh.Run \"\"\"{}\"\" --env-file \"\"{}\"\" --policy \"\"{}\"\" --ota-cache-dir \"\"{}\"\"\", 0, False\r\n",
+        esc(workspace_dir),
         esc(exe_path),
         esc(env_path),
         esc(policy_path),
@@ -1338,6 +1340,8 @@ pub(crate) fn render_macos_plist(
   </array>
   <key>WorkingDirectory</key>
   <string>{}</string>
+  <key>ProcessType</key>
+  <string>Background</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -1558,10 +1562,12 @@ fn install_service_linux_user(
         return Ok(format!("systemd user service enabled & started ({unit_name})"));
     }
 
-    // Fallback when systemd user bus is unavailable (e.g. containers, headless SSH without linger)
+    // Fallback when systemd user bus is unavailable (e.g. containers, headless SSH without linger):
+    // write start.sh and immediately spawn a detached silent background daemon with log & PID files.
     let cluster_dir = config_dir.join(cluster_id);
-    std::fs::create_dir_all(&cluster_dir)
-        .map_err(|e| format!("failed to create {}: {e}", cluster_dir.display()))?;
+    let log_dir = cluster_dir.join("logs");
+    std::fs::create_dir_all(&log_dir)
+        .map_err(|e| format!("failed to create {}: {e}", log_dir.display()))?;
     let start_sh = cluster_dir.join("start.sh");
     let script = format!(
         "#!/usr/bin/env sh\nexec '{}' --env-file '{}' --policy '{}' --ota-cache-dir '{}'\n",
@@ -1573,6 +1579,53 @@ fn install_service_linux_user(
     std::fs::write(&start_sh, script)
         .map_err(|e| format!("failed to write {}: {e}", start_sh.display()))?;
     let _ = std::fs::set_permissions(&start_sh, std::fs::Permissions::from_mode(0o700));
+
+    let log_file = log_dir.join("agent.log");
+    let pid_file = cluster_dir.join("agent.pid");
+    if let Ok(old_pid_str) = std::fs::read_to_string(&pid_file) {
+        if let Ok(old_pid) = old_pid_str.trim().parse::<i32>() {
+            if old_pid > 1 {
+                unsafe {
+                    let _ = libc::kill(old_pid, libc::SIGTERM);
+                }
+            }
+        }
+    }
+    let out_fd = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file)
+        .ok();
+    let err_fd = out_fd.as_ref().and_then(|f| f.try_clone().ok());
+    let mut bg = std::process::Command::new(&exe_path);
+    bg.args([
+        "--env-file",
+        env_path.to_string_lossy().as_ref(),
+        "--policy",
+        policy_path.to_string_lossy().as_ref(),
+        "--ota-cache-dir",
+        ota_cache_dir.to_string_lossy().as_ref(),
+    ])
+    .current_dir(workspace_dir)
+    .stdin(std::process::Stdio::null())
+    .stdout(out_fd.map(std::process::Stdio::from).unwrap_or_else(std::process::Stdio::null))
+    .stderr(err_fd.map(std::process::Stdio::from).unwrap_or_else(std::process::Stdio::null));
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        bg.pre_exec(|| {
+            let _ = libc::setsid();
+            Ok(())
+        });
+    }
+    if let Ok(child) = bg.spawn() {
+        let _ = std::fs::write(&pid_file, format!("{}\n", child.id()));
+        return Ok(format!(
+            "background daemon started silently (pid={}, log={})",
+            child.id(),
+            log_file.display()
+        ));
+    }
+
     eprintln!(
         "[enroll] notice: systemd --user bus is unavailable; wrote fallback launcher at {}",
         start_sh.display()
@@ -1651,14 +1704,43 @@ fn install_service_macos(
 #[cfg(target_os = "windows")]
 fn spawn_windows_detached(
     exe_path: &Path,
+    bg_launcher: Option<&Path>,
     workspace_dir: &Path,
     env_path: &Path,
     policy_path: &Path,
     ota_cache_dir: &Path,
+    log_file: &Path,
 ) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
+    if let Some(bg_exe) = bg_launcher {
+        std::process::Command::new(bg_exe)
+            .args([
+                "--log-file",
+                log_file.to_string_lossy().as_ref(),
+                "--env-file",
+                env_path.to_string_lossy().as_ref(),
+                "--policy",
+                policy_path.to_string_lossy().as_ref(),
+                "--ota-cache-dir",
+                ota_cache_dir.to_string_lossy().as_ref(),
+            ])
+            .current_dir(workspace_dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+            .spawn()
+            .map_err(|e| format!("failed to launch neo-agent-os-bg background process: {e}"))?;
+        return Ok(());
+    }
+    let out_fd = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_file)
+        .ok();
+    let err_fd = out_fd.as_ref().and_then(|f| f.try_clone().ok());
     std::process::Command::new(exe_path)
         .args([
             "--env-file",
@@ -1670,8 +1752,8 @@ fn spawn_windows_detached(
         ])
         .current_dir(workspace_dir)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(out_fd.map(std::process::Stdio::from).unwrap_or_else(std::process::Stdio::null))
+        .stderr(err_fd.map(std::process::Stdio::from).unwrap_or_else(std::process::Stdio::null))
         .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
         .spawn()
         .map_err(|e| format!("failed to launch neo-agent-os background process: {e}"))?;
@@ -1712,24 +1794,15 @@ fn install_service_windows(
     }
 
     let cluster_dir = config_dir.join(cluster_id);
-    std::fs::create_dir_all(&cluster_dir)
-        .map_err(|e| format!("failed to create {}: {e}", cluster_dir.display()))?;
+    let log_dir = cluster_dir.join("logs");
+    std::fs::create_dir_all(&log_dir)
+        .map_err(|e| format!("failed to create {}: {e}", log_dir.display()))?;
 
+    let log_file = log_dir.join("agent.log");
     let task_xml_path = cluster_dir.join("task.xml");
     let run_cmd_path = cluster_dir.join("run.cmd");
     let run_vbs_path = cluster_dir.join("run.vbs");
 
-    let task_xml = render_windows_task_xml(
-        cluster_id,
-        &exe_path,
-        workspace_dir,
-        env_path,
-        policy_path,
-        ota_cache_dir,
-        user_id.as_deref(),
-    );
-    std::fs::write(&task_xml_path, encode_utf16le_bom(&task_xml))
-        .map_err(|e| format!("failed to write {}: {e}", task_xml_path.display()))?;
     std::fs::write(
         &run_cmd_path,
         render_windows_cmd_wrapper(&exe_path, env_path, policy_path, ota_cache_dir),
@@ -1737,14 +1810,58 @@ fn install_service_windows(
     .map_err(|e| format!("failed to write {}: {e}", run_cmd_path.display()))?;
     std::fs::write(
         &run_vbs_path,
-        render_windows_vbs_launcher(&exe_path, env_path, policy_path, ota_cache_dir),
+        render_windows_vbs_launcher(&exe_path, workspace_dir, env_path, policy_path, ota_cache_dir),
     )
     .map_err(|e| format!("failed to write {}: {e}", run_vbs_path.display()))?;
 
+    // NEVER run the console-subsystem neo-agent-os.exe directly from Task Scheduler,
+    // which would open a visible black console window on the user's desktop.
+    // Prefer the GUI-subsystem neo-agent-os-bg.exe launcher (zero console, zero flash,
+    // Job Object cleanup); fall back to wscript.exe //B //Nologo <run.vbs>.
+    let bg_candidate = windows_bg_launcher_path(&exe_path);
+    let bg_launcher = if bg_candidate.is_file() {
+        Some(bg_candidate)
+    } else {
+        None
+    };
+
+    let (xml_cmd_path, xml_args) = match bg_launcher.as_deref() {
+        Some(bg_exe) => (
+            bg_exe.to_path_buf(),
+            format!(
+                "--log-file \"{}\" --env-file \"{}\" --policy \"{}\" --ota-cache-dir \"{}\"",
+                log_file.display(),
+                env_path.display(),
+                policy_path.display(),
+                ota_cache_dir.display()
+            ),
+        ),
+        None => (
+            PathBuf::from("wscript.exe"),
+            format!("//B //Nologo \"{}\"", run_vbs_path.display()),
+        ),
+    };
+
+    let task_xml = render_windows_task_xml(
+        cluster_id,
+        &xml_cmd_path,
+        &xml_args,
+        workspace_dir,
+        user_id.as_deref(),
+    );
+    std::fs::write(&task_xml_path, encode_utf16le_bom(&task_xml))
+        .map_err(|e| format!("failed to write {}: {e}", task_xml_path.display()))?;
+
     let task_name = format!("NeoAgent-{cluster_id}");
 
-    // Primary: Task Scheduler XML import (no 261-char /TR limit, works for non-admin per-user
-    // LogonTrigger, disables 72h timeout & battery stop, runs hidden with RestartOnFailure).
+    // Stop any previously running task instance cleanly before re-registering.
+    let _ = std::process::Command::new("schtasks")
+        .args(["/End", "/TN", &task_name])
+        .output();
+
+    // Primary: Task Scheduler XML import using headless GUI-subsystem launcher
+    // (no 261-char /TR limit, zero visible console window, works for non-admin per-user
+    // LogonTrigger, disables 72h timeout & battery stop, RestartOnFailure enabled).
     let xml_out = std::process::Command::new("schtasks")
         .args([
             "/Create",
@@ -1764,16 +1881,24 @@ fn install_service_windows(
                 .map(|o| o.status.success())
                 .unwrap_or(false);
             if !started {
-                spawn_windows_detached(&exe_path, workspace_dir, env_path, policy_path, ota_cache_dir)?;
+                spawn_windows_detached(
+                    &exe_path,
+                    bg_launcher.as_deref(),
+                    workspace_dir,
+                    env_path,
+                    policy_path,
+                    ota_cache_dir,
+                    &log_file,
+                )?;
             }
             return Ok(format!(
-                "Windows Scheduled Task registered via XML & started ({task_name})"
+                "Windows Scheduled Task registered (silent headless background, {task_name})"
             ));
         }
     }
 
-    // Fallback 1: short silent VBS wrapper via /TR (guaranteed << 261 chars).
-    let short_tr = format!("wscript.exe //B \"{}\"", run_vbs_path.display());
+    // Fallback 1: short silent VBS wrapper via /TR (guaranteed << 261 chars, zero console window).
+    let short_tr = format!("wscript.exe //B //Nologo \"{}\"", run_vbs_path.display());
     if short_tr.len() <= 260 {
         let tr_out = std::process::Command::new("schtasks")
             .args([
@@ -1795,17 +1920,29 @@ fn install_service_windows(
                     .map(|o| o.status.success())
                     .unwrap_or(false);
                 if !started {
-                    spawn_windows_detached(&exe_path, workspace_dir, env_path, policy_path, ota_cache_dir)?;
+                    spawn_windows_detached(
+                        &exe_path,
+                        bg_launcher.as_deref(),
+                        workspace_dir,
+                        env_path,
+                        policy_path,
+                        ota_cache_dir,
+                        &log_file,
+                    )?;
                 }
                 return Ok(format!(
-                    "Windows Scheduled Task registered via wrapper & started ({task_name})"
+                    "Windows Scheduled Task registered via silent launcher ({task_name})"
                 ));
             }
         }
     }
 
     // Fallback 2: HKCU Run registry key (works without admin rights or Task Scheduler GPO)
-    // plus immediate detached headless launch.
+    // plus immediate detached headless background launch.
+    let reg_cmd = match bg_launcher.as_deref() {
+        Some(bg_exe) => format!("\"{}\" {}", bg_exe.display(), xml_args),
+        None => short_tr,
+    };
     let reg_out = std::process::Command::new("reg")
         .args([
             "add",
@@ -1815,7 +1952,7 @@ fn install_service_windows(
             "/t",
             "REG_SZ",
             "/d",
-            &short_tr,
+            &reg_cmd,
             "/f",
         ])
         .output()
@@ -1831,9 +1968,17 @@ fn install_service_windows(
         ));
     }
 
-    spawn_windows_detached(&exe_path, workspace_dir, env_path, policy_path, ota_cache_dir)?;
+    spawn_windows_detached(
+        &exe_path,
+        bg_launcher.as_deref(),
+        workspace_dir,
+        env_path,
+        policy_path,
+        ota_cache_dir,
+        &log_file,
+    )?;
     Ok(format!(
-        "Windows user startup registered (HKCU Run: {task_name}) & started in background"
+        "Windows silent background startup registered (HKCU Run: {task_name})"
     ))
 }
 
@@ -2598,35 +2743,37 @@ max_exec_timeout_sec = 60
     #[test]
     fn renders_windows_task_xml_and_wrappers_for_long_paths_without_261_char_limit() {
         let exe = Path::new(r"C:\Users\TroyeSimon\AppData\Local\neo-agent\bin\neo-agent-os.exe");
+        let bg = windows_bg_launcher_path(exe);
+        assert!(bg.to_string_lossy().ends_with("neo-agent-os-bg.exe"));
         let ws = Path::new(r"C:\Users\TroyeSimon\AppData\Local\neo-agent\neo-cluster-prod\work");
         let env = Path::new(r"C:\Users\TroyeSimon\AppData\Local\neo-agent\cluster-neo-cluster-prod.env");
         let pol = Path::new(r"C:\Users\TroyeSimon\AppData\Local\neo-agent\policy-neo-cluster-prod.toml");
         let ota = Path::new(r"C:\Users\TroyeSimon\AppData\Local\neo-agent\neo-cluster-prod\ota");
+        let log = Path::new(r"C:\Users\TroyeSimon\AppData\Local\neo-agent\neo-cluster-prod\logs\agent.log");
 
-        let legacy_tr = format!(
-            "\"{}\" --env-file \"{}\" --policy \"{}\" --ota-cache-dir \"{}\"",
-            exe.display(),
+        let args = format!(
+            "--log-file \"{}\" --env-file \"{}\" --policy \"{}\" --ota-cache-dir \"{}\"",
+            log.display(),
             env.display(),
             pol.display(),
             ota.display()
         );
         assert!(
-            legacy_tr.len() > 261,
-            "test fixture should reproduce >261 char legacy /TR command (got {})",
-            legacy_tr.len()
+            args.len() > 261,
+            "test fixture should reproduce >261 char command args (got {})",
+            args.len()
         );
 
         let xml = render_windows_task_xml(
             "neo-cluster-prod",
-            exe,
+            &bg,
+            &args,
             ws,
-            env,
-            pol,
-            ota,
             Some(r"DESKTOP-TEST\TroyeSimon"),
         );
         assert!(xml.contains(r#"encoding="UTF-16""#));
-        assert!(xml.contains("<Command>C:\\Users\\TroyeSimon\\AppData\\Local\\neo-agent\\bin\\neo-agent-os.exe</Command>"));
+        assert!(xml.contains("neo-agent-os-bg.exe</Command>"));
+        assert!(!xml.contains("neo-agent-os.exe</Command>"));
         assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
         assert!(xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
         assert!(xml.contains("<Hidden>true</Hidden>"));
@@ -2637,13 +2784,17 @@ max_exec_timeout_sec = 60
         assert_eq!(&utf16[..2], &[0xFF, 0xFE]);
         assert!(utf16.len() > xml.len() * 2);
 
-        let vbs = render_windows_vbs_launcher(exe, env, pol, ota);
+        let vbs = render_windows_vbs_launcher(exe, ws, env, pol, ota);
         assert!(vbs.contains("WScript.Shell"));
+        assert!(vbs.contains("CurrentDirectory"));
         assert!(vbs.contains("--env-file"));
         assert!(vbs.contains(", 0, False"));
 
         let cmd = render_windows_cmd_wrapper(exe, env, pol, ota);
         assert!(cmd.starts_with("@echo off\r\n"));
         assert!(cmd.contains("--ota-cache-dir"));
+
+        let plist = render_macos_plist("personal", exe, ws, env, pol, ota, log);
+        assert!(plist.contains("<key>ProcessType</key>\n  <string>Background</string>"));
     }
 }

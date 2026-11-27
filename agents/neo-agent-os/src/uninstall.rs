@@ -271,6 +271,20 @@ pub fn run_uninstall(args: UninstallArgs) -> Result<UninstallOutcome, String> {
     remove_file_if_exists(&policy_path, &mut removed_paths)?;
 
     let cluster_subdir = config_dir.join(&args.cluster);
+    #[cfg(unix)]
+    {
+        let pid_path = cluster_subdir.join("agent.pid");
+        if let Ok(raw_pid) = std::fs::read_to_string(&pid_path) {
+            if let Ok(pid) = raw_pid.trim().parse::<i32>() {
+                if pid > 1 {
+                    unsafe {
+                        let _ = libc::kill(pid, libc::SIGTERM);
+                    }
+                }
+            }
+        }
+        remove_file_if_exists(&pid_path, &mut removed_paths)?;
+    }
     remove_file_if_exists(&cluster_subdir.join("start.sh"), &mut removed_paths)?;
     remove_file_if_exists(&cluster_subdir.join("task.xml"), &mut removed_paths)?;
     remove_file_if_exists(&cluster_subdir.join("run.cmd"), &mut removed_paths)?;

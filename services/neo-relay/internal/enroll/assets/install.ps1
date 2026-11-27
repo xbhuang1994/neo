@@ -138,18 +138,27 @@ function Install-NeoAgent {
         if (-not $ExtractedBin) {
             throw "neo-agent-os.exe not found inside $Asset"
         }
+        $ExtractedBgBin = Get-ChildItem -Path $ExtractDir -Filter "neo-agent-os-bg.exe" -Recurse -File | Select-Object -First 1
+
+        $InstallBinary = {
+            param([string]$Src, [string]$Dst)
+            if (Test-Path -LiteralPath $Dst) {
+                $Old = "$Dst.old"
+                Remove-Item -LiteralPath $Old -Force -ErrorAction SilentlyContinue
+                try {
+                    Move-Item -LiteralPath $Dst -Destination $Old -Force -ErrorAction Stop
+                } catch {
+                    # Fallback to direct overwrite below.
+                }
+            }
+            Copy-Item -LiteralPath $Src -Destination $Dst -Force
+        }
 
         New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
-        if (Test-Path -LiteralPath $BinPath) {
-            $OldBin = "$BinPath.old"
-            Remove-Item -LiteralPath $OldBin -Force -ErrorAction SilentlyContinue
-            try {
-                Move-Item -LiteralPath $BinPath -Destination $OldBin -Force -ErrorAction Stop
-            } catch {
-                # If rename fails, Copy-Item -Force below will attempt overwrite directly.
-            }
+        & $InstallBinary $ExtractedBin.FullName $BinPath
+        if ($ExtractedBgBin) {
+            & $InstallBinary $ExtractedBgBin.FullName (Join-Path $BinDir "neo-agent-os-bg.exe")
         }
-        Copy-Item -LiteralPath $ExtractedBin.FullName -Destination $BinPath -Force
 
         $Enroll | & $BinPath enroll --relay-url $RelayBase --mode $Mode --ticket-stdin
         if ($LASTEXITCODE -ne 0) {

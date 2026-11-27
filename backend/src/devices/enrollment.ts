@@ -534,15 +534,17 @@ function Install-NeoAgent {
     if (-not $exe) {
       throw 'neo-agent-os.exe missing from archive'
     }
+    $bgExe = Get-ChildItem -Path $tmpDir -Filter 'neo-agent-os-bg.exe' -Recurse | Select-Object -First 1
     New-Item -ItemType Directory -Force -Path $binDir | Out-Null
-    if (Test-Path -LiteralPath $binPath) {
-      $oldBin = "$binPath.old"
-      Remove-Item -LiteralPath $oldBin -Force -ErrorAction SilentlyContinue
-      try {
-        Move-Item -LiteralPath $binPath -Destination $oldBin -Force -ErrorAction Stop
-      } catch {}
+    foreach ($pair in @(,@($exe, $binPath)) + $(if ($bgExe) { @(,@($bgExe, (Join-Path $binDir 'neo-agent-os-bg.exe'))) } else { @() })) {
+      $srcFile = $pair[0]; $dstPath = $pair[1]
+      if (Test-Path -LiteralPath $dstPath) {
+        $oldPath = "$dstPath.old"
+        Remove-Item -LiteralPath $oldPath -Force -ErrorAction SilentlyContinue
+        try { Move-Item -LiteralPath $dstPath -Destination $oldPath -Force -ErrorAction Stop } catch {}
+      }
+      Copy-Item -Path $srcFile.FullName -Destination $dstPath -Force
     }
-    Copy-Item -Path $exe.FullName -Destination $binPath -Force
 
     Write-Host "[neo-install] Running neo-agent-os enroll via $ClaimUrl..."
     $Enroll | & $binPath enroll --relay-url $RelayUrl --claim-url $ClaimUrl --mode $Mode --ticket-stdin

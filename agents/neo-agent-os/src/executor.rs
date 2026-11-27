@@ -116,6 +116,8 @@ impl Executor {
         }
         #[cfg(target_os = "windows")]
         {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
             for key in ["PATH", "SystemRoot", "COMSPEC", "PATHEXT"] {
                 if let Ok(val) = std::env::var(key) {
                     if !BLOCKED_ENV_VARS.iter().any(|b| b.eq_ignore_ascii_case(key)) {
