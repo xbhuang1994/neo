@@ -1,5 +1,6 @@
 mod enroll;
 mod executor;
+mod file_transfer;
 mod policy;
 mod prober;
 mod protocol;

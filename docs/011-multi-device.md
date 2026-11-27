@@ -85,3 +85,12 @@ Enrollment flow:
 2. Decrypts the `[0xE2][12B nonce][AES-256-GCM ciphertext || 16B tag]` envelope locally with key `SHA-256("neo-enroll-v1:<ticket_id>:<ephemeral_key>")` and AAD `"neo-enroll-v1|<ticket_id>"` so the relay never sees plaintext secrets.
 3. For `auth_mode = "bootstrap_exchange"`, connects briefly to `/v1/relay` and exchanges an E2E-encrypted `enroll_register` / `enroll_ack` handshake with Master Neo to obtain the permanent `device_id` and `relay_token`.
 4. Renders `{{WORKSPACE_DIR}}` into `policy-<cluster>.toml` (`0444`) and writes `cluster-<cluster>.env` (`0600`), sends an initial `manifest` containing `enroll_id`, and installs the native OS service (`systemd` system or user unit on Linux, `launchd` LaunchAgent on macOS, or Scheduled Task with restricted `.env` ACL on Windows).
+
+## Direct binary file transfer channel (`0xE3`) & `fs.stat`
+
+Master Neo and Tier 1 `neo-agent-os` nodes transfer files directly disk-to-disk without routing file bytes through LLM context or requiring external object storage:
+
+- **`fs.stat` / `fs_stat` RPC**: inspects path metadata (`exists`, `kind`, `size`, `mode`, `mtime_ms`, `ctime_ms`, optional streaming `sha256`) strictly within `allowed_workspaces` (rejecting traversal or out-of-workspace symlink escapes without leaking existence).
+- **Control plane (`0xE1` RPC)**: `file.pull.open`, `file.push.open`, and `file.transfer.abort` enforce local sandbox policy, negotiate `chunk_size` (default `128 KiB`, clamped `4 KiB..512 KiB`) and sliding `window_bytes` (default `512 KiB`), and support resumable `.neo-part-<transfer_id>` staging files.
+- **Data plane (`0xE3` binary AEAD envelope)**: raw file chunks, cumulative `ACK`, `FINISH` (32-byte SHA-256), `DONE`, and `ABORT` frames are encrypted with the cluster E2E key (`AES-256-GCM`, AAD `file-v1|<cluster_id>|<src_id>|<dst_id>`) and forwarded opaquely inside `FLAG_DATA` relay frames with zero base64 overhead, sliding-window flow control, `FLAG_ERR_RATE` (`0x83`) adaptive backoff, end-to-end SHA-256 verification, and atomic rename commit.
+- **Interfaces**: exposed via the `device_file_transfer` tool (main and worker sessions), `DeviceManager.statFile` / `pullFile` / `pushFile` / `listTransfers` / `cancelTransfer`, and HTTP API endpoints (`/api/devices/:id/files/{stat,pull,push}`, `/api/devices/transfers`), with automatic `rpc_fallback` (`fs_read` / `transfer_chunk`) for legacy Tier 1 agents.

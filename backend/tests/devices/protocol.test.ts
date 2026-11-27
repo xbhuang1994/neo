@@ -1,30 +1,42 @@
 import { describe, expect, test } from "bun:test";
 import { createHash, createHmac } from "node:crypto";
 import {
+  FILE_ENVELOPE_VERSION,
+  FILE_FRAME_FIXED_HEADER_BYTES,
+  FILE_FRAME_KIND_ACK,
+  FILE_FRAME_KIND_DATA,
+  FILE_FRAME_KIND_FINISH,
+  FILE_FRAME_VERSION,
   FLAG_DATA,
   FLAG_ERR_OFFLINE,
   FLAG_ERR_RATE,
   FLAG_ERR_SPOOFED,
   FLAG_PING,
   FLAG_PONG,
+  buildFileAad,
   computeMcuMac,
   computeMcuMacHex,
   decodeCbor,
+  decodeFileFramePlaintext,
   decodeRelayFrame,
   deriveClusterTokenKey,
   deriveE2eKey,
   deriveMcuE2eKey,
   encodeCbor,
+  encodeFileFramePlaintext,
   encodeRelayFrame,
   mintRelayToken,
   openDeviceMessage,
+  openFileFrame,
   openRelayEnvelope,
   sealDeviceMessage,
+  sealFileFrame,
   sealRelayEnvelope,
   validateS3ClusterArtifactUri,
   verifyMcuMac,
   verifyRelayToken,
   type DeviceMessage,
+  type FileFrame,
 } from "../../src/devices/index.ts";
 
 describe("devices/protocol", () => {
@@ -320,5 +332,76 @@ describe("devices/protocol", () => {
     expect(
       validateS3ClusterArtifactUri("https://neo-artifacts/cluster-a/task-1/out.bin", "cluster-a").ok,
     ).toBe(false);
+  });
+
+  test("seals and opens 0xE3 binary FileFrame with exact binary layout, AAD separation, and cross-cluster rejection", () => {
+    const clusterId = "cluster-a";
+    const e2eSecret = "e2e-shared-secret";
+    const srcId = "os-node-1";
+    const dstId = "master-1";
+    const fixedNonce = new Uint8Array(12).fill(0x33);
+
+    expect(new TextDecoder().decode(buildFileAad(clusterId, srcId, dstId))).toBe(
+      "file-v1|cluster-a|os-node-1|master-1",
+    );
+
+    const frame: FileFrame = {
+      v: 1,
+      kind: FILE_FRAME_KIND_DATA,
+      flags: 0,
+      seq: 7,
+      offset: 131_072,
+      window: 524_288,
+      transferId: "ft_demo_01",
+      data: new Uint8Array([0xde, 0xad, 0xbe, 0xef, 0x00, 0x42]),
+    };
+
+    const plain = encodeFileFramePlaintext(frame);
+    expect(plain[0]).toBe(FILE_FRAME_VERSION);
+    expect(plain[1]).toBe(FILE_FRAME_KIND_DATA);
+    expect(plain[20]).toBe(10); // "ft_demo_01".length
+    expect(plain.byteLength).toBe(FILE_FRAME_FIXED_HEADER_BYTES + 10 + 6);
+    expect(decodeFileFramePlaintext(plain)).toEqual(frame);
+
+    const wire = sealFileFrame(frame, e2eSecret, clusterId, srcId, dstId, fixedNonce);
+    expect(wire[0]).toBe(FILE_ENVELOPE_VERSION);
+    expect(wire.subarray(1, 13)).toEqual(fixedNonce);
+
+    const opened = openFileFrame(wire, e2eSecret, clusterId, srcId, dstId);
+    expect(opened).toEqual(frame);
+
+    // Wrong AAD src/dst, wrong cluster, wrong secret, tampered byte, or opening as 0xE1 must fail
+    expect(() => openFileFrame(wire, e2eSecret, clusterId, dstId, srcId)).toThrow();
+    expect(() => openFileFrame(wire, e2eSecret, "cluster-b", srcId, dstId)).toThrow();
+    expect(() => openFileFrame(wire, "wrong-secret", clusterId, srcId, dstId)).toThrow();
+    const tampered = wire.slice();
+    tampered[20] ^= 0xff;
+    expect(() => openFileFrame(tampered, e2eSecret, clusterId, srcId, dstId)).toThrow();
+    expect(() => openDeviceMessage(wire, e2eSecret, clusterId, srcId, dstId)).toThrow();
+
+    // ACK and FINISH frame roundtrips
+    const ack: FileFrame = {
+      v: 1,
+      kind: FILE_FRAME_KIND_ACK,
+      flags: 0,
+      seq: 7,
+      offset: 131_078,
+      window: 524_288,
+      transferId: "ft_demo_01",
+      data: new Uint8Array(0),
+    };
+    expect(decodeFileFramePlaintext(encodeFileFramePlaintext(ack))).toEqual(ack);
+
+    const finish: FileFrame = {
+      v: 1,
+      kind: FILE_FRAME_KIND_FINISH,
+      flags: 0,
+      seq: 8,
+      offset: 131_078,
+      window: 0,
+      transferId: "ft_demo_01",
+      data: new Uint8Array(32).fill(0xab),
+    };
+    expect(decodeFileFramePlaintext(encodeFileFramePlaintext(finish))).toEqual(finish);
   });
 });

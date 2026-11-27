@@ -49,8 +49,40 @@ export interface RelayFrame {
 export const E2E_ENVELOPE_VERSION = 0xe1;
 /** Zero-trust enrollment AEAD envelope version tag byte. */
 export const ENROLL_ENVELOPE_VERSION = 0xe2;
+/** Direct binary E2E file transfer channel AEAD envelope version tag byte. */
+export const FILE_ENVELOPE_VERSION = 0xe3;
+export const FILE_FRAME_VERSION = 0x01;
+export const FILE_FRAME_FIXED_HEADER_BYTES = 25;
+export const MAX_FILE_FRAME_DATA_BYTES = 1024 * 1024;
+export const MAX_TRANSFER_ID_BYTES = 64;
 export const E2E_NONCE_BYTES = 12;
 export const E2E_TAG_BYTES = 16;
+
+/** Binary file frame kinds inside a `0xE3` AEAD envelope. */
+export const FILE_FRAME_KIND_DATA = 0x01;
+export const FILE_FRAME_KIND_ACK = 0x02;
+export const FILE_FRAME_KIND_FINISH = 0x03;
+export const FILE_FRAME_KIND_DONE = 0x04;
+export const FILE_FRAME_KIND_ABORT = 0x05;
+
+export type FileFrameKind =
+  | typeof FILE_FRAME_KIND_DATA
+  | typeof FILE_FRAME_KIND_ACK
+  | typeof FILE_FRAME_KIND_FINISH
+  | typeof FILE_FRAME_KIND_DONE
+  | typeof FILE_FRAME_KIND_ABORT;
+
+/** Decoded binary file channel frame carried inside a `0xE3` AES-256-GCM envelope. */
+export interface FileFrame {
+  v: 1;
+  kind: FileFrameKind;
+  flags: number;
+  seq: number;
+  offset: number;
+  window: number;
+  transferId: string;
+  data: Uint8Array;
+}
 
 /** Default public relay URL used when initializing a new cluster. */
 export const DEFAULT_RELAY_URL = "https://neo.1inch.cn:18443";
@@ -519,4 +551,95 @@ export interface McuInstallResult {
   configHeader: string;
   installScript: string;
   mcuE2eKeyHex: string;
+}
+
+/** Result of Tier 1 `fs.stat` / `fs_stat` RPC. */
+export interface DeviceFileStat {
+  exists: boolean;
+  path: string;
+  name?: string;
+  kind?: "file" | "dir" | "symlink" | "other";
+  is_file?: boolean;
+  is_dir?: boolean;
+  is_symlink?: boolean;
+  size?: number;
+  readonly?: boolean;
+  mode?: number | null;
+  mtime_ms?: number | null;
+  ctime_ms?: number | null;
+  sha256?: string;
+}
+
+/** Direction of a direct Master Neo <-> Tier 1 file transfer. */
+export type FileTransferDirection = "pull" | "push";
+
+/** Wire transport protocol used for a file transfer. */
+export type FileTransferProtocol = "binary_e2e_v1" | "rpc_fallback";
+
+/** Lifecycle status of an observable file transfer. */
+export type FileTransferStatus = "opening" | "transferring" | "completed" | "failed" | "cancelled";
+
+/** Input to `DeviceManager.pullFile`. */
+export interface DeviceFilePullInput {
+  deviceId: string;
+  remotePath: string;
+  localPath: string;
+  transferId?: string;
+  overwrite?: boolean;
+  resume?: boolean;
+  chunkSize?: number;
+  windowBytes?: number;
+  timeoutMs?: number;
+  allowFallback?: boolean;
+}
+
+/** Input to `DeviceManager.pushFile`. */
+export interface DeviceFilePushInput {
+  deviceId: string;
+  localPath: string;
+  remotePath: string;
+  transferId?: string;
+  overwrite?: boolean;
+  resume?: boolean;
+  chunkSize?: number;
+  windowBytes?: number;
+  timeoutMs?: number;
+  allowFallback?: boolean;
+}
+
+/** Completed outcome of `DeviceManager.pullFile` / `DeviceManager.pushFile`. */
+export interface DeviceFileTransferResult {
+  transferId: string;
+  deviceId: string;
+  direction: FileTransferDirection;
+  remotePath: string;
+  localPath: string;
+  bytesTransferred: number;
+  totalBytes: number;
+  resumedFromBytes: number;
+  chunks: number;
+  sha256: string;
+  durationMs: number;
+  throughputBytesPerSec: number;
+  protocol: FileTransferProtocol;
+}
+
+/** Public snapshot of an active or recently finished file transfer. */
+export interface FileTransferView {
+  transferId: string;
+  deviceId: string;
+  direction: FileTransferDirection;
+  remotePath: string;
+  localPath: string;
+  status: FileTransferStatus;
+  protocol: FileTransferProtocol;
+  bytesTransferred: number;
+  totalBytes: number;
+  resumedFromBytes: number;
+  chunks: number;
+  sha256?: string;
+  error?: string;
+  startedAt: string;
+  updatedAt: string;
+  completedAt?: string;
 }

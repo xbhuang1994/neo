@@ -13,6 +13,7 @@ import type { HealthBoard } from "../app/health.ts";
 import type { Store } from "../store/index.ts";
 import { VERSION } from "../version.ts";
 import { EnrollmentManager } from "./enrollment.ts";
+import { FileTransferManager } from "./file-transfer.ts";
 import {
   deriveMcuE2eKey,
   mintRelayToken,
@@ -26,11 +27,16 @@ import { RelayClient, type RelayErrorEvent, type RelaySocket } from "./relay-cli
 import {
   DEFAULT_LOCAL_RELAY_ENV_PATH,
   DEFAULT_RELAY_URL,
+  FILE_ENVELOPE_VERSION,
   FLAG_ERR_OFFLINE,
+  FLAG_ERR_RATE,
   type CapabilityManifest,
   type DeviceConfig,
   type DeviceConfigUpdateInput,
   type DeviceConfigView,
+  type DeviceFilePullInput,
+  type DeviceFilePushInput,
+  type DeviceFileTransferResult,
   type DeviceInvokeRequest,
   type DeviceInvokeResult,
   type DeviceMessage,
@@ -42,6 +48,7 @@ import {
   type DirectClaimResult,
   type EnrollmentCreateInput,
   type EnrollmentView,
+  type FileTransferView,
   type McuCborHello,
   type McuCborResult,
   type McuInstallInput,
@@ -294,6 +301,7 @@ export class DeviceManager {
   private readonly localRelayEnvPathOverride?: string;
   private readonly agentVersion: string;
   private readonly enrollment: EnrollmentManager;
+  private readonly fileTransfer: FileTransferManager;
 
   private config: DeviceConfig | null = null;
   private relayClient: RelayClient | null = null;
@@ -323,6 +331,13 @@ export class DeviceManager {
       getAgentVersion: () => this.agentVersion,
       fetchFn: this.fetchFn,
       nowMs: options.nowMs,
+    });
+    this.fileTransfer = new FileTransferManager({
+      getConfig: () => this.config,
+      getDevice: (deviceId) => this.getDevice(deviceId),
+      getRelayClient: () => this.relayClient,
+      invokeDevice: (deviceId, req) => this.invoke(deviceId, req),
+      onLogError: (message) => this.updateBoard("error", message),
     });
   }
 
@@ -661,6 +676,7 @@ export class DeviceManager {
   async stop(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.fileTransfer.failAll("DeviceManager stopped");
     if (this.relayClient) {
       this.relayClient.close();
       this.relayClient = null;
@@ -819,6 +835,7 @@ export class DeviceManager {
       return false;
     }
     this.store.delete(`${DEVICE_KEY_PREFIX}${deviceId}`);
+    this.fileTransfer.failForPeer(deviceId, `Device ${deviceId} removed`);
     this.rejectWaitersForTransport(deviceId, `Device ${deviceId} removed`);
 
     if (existing.tier === "os") {
@@ -1290,6 +1307,40 @@ export class DeviceManager {
   validateArtifactUri(uri: string, expectedTaskId?: string): S3PrefixValidation {
     const cfg = this.requireConfig();
     return validateS3ClusterArtifactUri(uri, cfg.clusterId, expectedTaskId);
+  }
+
+  /** Query metadata (and optional streaming SHA-256) of a remote Tier 1 path via `fs.stat`. */
+  async statFile(
+    deviceId: string,
+    remotePath: string,
+    opts: { sha256?: boolean; timeoutMs?: number } = {},
+  ): Promise<DeviceInvokeResult> {
+    return await this.fileTransfer.statFile(deviceId, remotePath, opts);
+  }
+
+  /** Pull (download) a file directly from a paired Tier 1 OS agent to Master Neo local disk (`0xE3` binary E2E channel). */
+  async pullFile(input: DeviceFilePullInput): Promise<DeviceFileTransferResult> {
+    return await this.fileTransfer.pullFile(input);
+  }
+
+  /** Push (upload) a local file on Master Neo directly to a paired Tier 1 OS agent (`0xE3` binary E2E channel). */
+  async pushFile(input: DeviceFilePushInput): Promise<DeviceFileTransferResult> {
+    return await this.fileTransfer.pushFile(input);
+  }
+
+  /** List active and recently finished direct file transfers, newest first. */
+  listTransfers(): FileTransferView[] {
+    return this.fileTransfer.listTransfers();
+  }
+
+  /** Get status/progress of a direct file transfer by ID. */
+  getTransfer(transferId: string): FileTransferView | null {
+    return this.fileTransfer.getTransfer(transferId);
+  }
+
+  /** Cancel an in-flight direct file transfer by ID. */
+  cancelTransfer(transferId: string, reason?: string): boolean {
+    return this.fileTransfer.cancelTransfer(transferId, reason);
   }
 
   /** Invoke an action on a Tier 1 OS Agent or Tier 2 MCU (subject to risk gating & Deep Sleep queueing). */
@@ -1818,6 +1869,7 @@ export class DeviceManager {
       this.saveDevice({ ...parent, status: "offline" });
     }
 
+    this.fileTransfer.failForPeer(tier1DeviceId, `Peer ${tier1DeviceId} disconnected`);
     this.rejectWaitersForTransport(tier1DeviceId, `Peer ${tier1DeviceId} disconnected`);
 
     const all = this.listDevices();
@@ -1865,6 +1917,11 @@ export class DeviceManager {
   handleRelayFrame(frame: RelayFrame): void {
     const cfg = this.config;
     if (!cfg || !cfg.enabled) return;
+
+    if (frame.payload.byteLength > 0 && frame.payload[0] === FILE_ENVELOPE_VERSION) {
+      this.fileTransfer.handleIncomingEnvelope(frame.src, frame.payload);
+      return;
+    }
 
     let msg: DeviceMessage;
     try {
@@ -2134,6 +2191,9 @@ export class DeviceManager {
         this.failAllPending(`Relay peer offline: ${err.reason}`);
       }
       return;
+    }
+    if (err.code === FLAG_ERR_RATE) {
+      this.fileTransfer.notifyRateLimited();
     }
     this.updateBoard("error", `Relay error 0x${err.code.toString(16)}: ${err.reason}`);
   }
