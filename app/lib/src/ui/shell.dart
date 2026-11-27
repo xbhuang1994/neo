@@ -6,13 +6,14 @@ import 'package:cupertino_ui/cupertino_ui.dart';
 import '../l10n/strings.dart';
 import 'activity_ticker.dart';
 import 'chat_page.dart';
+import 'devices_page.dart';
 import 'scope.dart';
 import 'settings_page.dart';
 import 'theme.dart';
 import 'widgets.dart';
 import 'workers_page.dart';
 
-/// The frame and its three pages.
+/// The frame and its four pages.
 class Shell extends StatefulWidget {
   const Shell({super.key, this.picker = pickFiles});
 
@@ -35,6 +36,7 @@ class _ShellState extends State<Shell> {
     final entries = [
       (CupertinoIcons.chat_bubble_2, CupertinoIcons.chat_bubble_2_fill, strings.chat, 0),
       (CupertinoIcons.square_stack_3d_up, CupertinoIcons.square_stack_3d_up_fill, strings.workers, state.activeWorkers),
+      (CupertinoIcons.desktopcomputer, CupertinoIcons.desktopcomputer, strings.devices, state.pendingDeviceApprovals),
       (CupertinoIcons.gear, CupertinoIcons.gear_solid, strings.settings, 0),
     ];
     // Every page stays alive, so a draft or a scroll position survives a visit elsewhere.
@@ -44,9 +46,10 @@ class _ShellState extends State<Shell> {
           child: IndexedStack(
             index: _page,
             children: [
-              ChatPage(onOpenSettings: () => _go(2), picker: widget.picker),
-              WorkersPage(onOpenSettings: () => _go(2)),
-              const SettingsPage(),
+              ChatPage(onOpenSettings: () => _go(3), picker: widget.picker),
+              WorkersPage(onOpenSettings: () => _go(3)),
+              DevicesPage(onOpenSettings: () => _go(3)),
+              SettingsPage(onOpenDevices: () => _go(2)),
             ],
           ),
         ),

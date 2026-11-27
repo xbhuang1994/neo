@@ -10,7 +10,19 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { StopWorkerError } from "../app/context.ts";
 import type { AppContext, ChatAttachment } from "../app/context.ts";
-import type { TokenTier } from "../devices/index.ts";
+import {
+  renderDirectInstallPs1,
+  renderDirectInstallSh,
+  type DeviceConfigUpdateInput,
+  type EnrollmentCreateInput,
+  type EnrollmentInstallMode,
+  type EnrollmentPlatform,
+  type EnrollmentProfile,
+  type EnrollmentTransportMode,
+  type McuInstallInput,
+  type McuTransportKind,
+  type TokenTier,
+} from "../devices/index.ts";
 import { VERSION } from "../version.ts";
 import { Response, isLoopbackIp } from "./server.ts";
 import type { Request, SocketAddr } from "./server.ts";
@@ -410,7 +422,284 @@ const WORKERS_PREFIX = "/api/workers/";
 const STOP_SUFFIX = "/stop";
 const DEVICES_PREFIX = "/api/devices/";
 const DEVICE_APPROVALS_PREFIX = "/api/devices/approvals/";
+const DEVICE_ENROLLMENTS_PREFIX = "/api/devices/enrollments/";
+const PUBLIC_ENROLL_CLAIM_PREFIX = "/enroll/claim/";
 const VALID_TOKEN_TIERS: ReadonlySet<string> = new Set(["master", "os", "relay", "admin"]);
+
+const textEncoder = new TextEncoder();
+
+function safeDecodeSegment(raw: string): string | null {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return null;
+  }
+}
+
+function requestOrigin(request: Request): string {
+  const rawProto = (request.header("x-forwarded-proto") ?? "").split(",")[0]?.trim().toLowerCase();
+  const proto = rawProto === "https" ? "https" : "http";
+  const rawHost =
+    (request.header("x-forwarded-host") ?? request.header("host") ?? "").split(",")[0]?.trim() ||
+    "127.0.0.1:3082";
+  const safeHost = rawHost.replace(/[^A-Za-z0-9._:\[\]-]/g, "");
+  return `${proto}://${safeHost || "127.0.0.1:3082"}`;
+}
+
+function parseOptionalStringField(
+  body: Record<string, unknown>,
+  keys: readonly string[],
+  label: string,
+): { ok: true; value?: string } | { ok: false; response: Response } {
+  for (let i = 0; i < keys.length; i++) {
+    const val = body[keys[i]!];
+    if (val === undefined) continue;
+    if (val === null) return { ok: true, value: undefined };
+    if (typeof val !== "string") {
+      return { ok: false, response: Response.error(400, `${label} must be a string`) };
+    }
+    return { ok: true, value: val };
+  }
+  return { ok: true, value: undefined };
+}
+
+function parseOptionalBoolField(
+  body: Record<string, unknown>,
+  keys: readonly string[],
+  label: string,
+): { ok: true; value?: boolean } | { ok: false; response: Response } {
+  for (let i = 0; i < keys.length; i++) {
+    const val = body[keys[i]!];
+    if (val === undefined || val === null) continue;
+    if (typeof val !== "boolean") {
+      return { ok: false, response: Response.error(400, `${label} must be a boolean`) };
+    }
+    return { ok: true, value: val };
+  }
+  return { ok: true, value: undefined };
+}
+
+function parseOptionalIntField(
+  body: Record<string, unknown>,
+  keys: readonly string[],
+  label: string,
+): { ok: true; value?: number } | { ok: false; response: Response } {
+  for (let i = 0; i < keys.length; i++) {
+    const val = body[keys[i]!];
+    if (val === undefined || val === null) continue;
+    if (typeof val !== "number" || !Number.isInteger(val)) {
+      return { ok: false, response: Response.error(400, `${label} must be an integer`) };
+    }
+    return { ok: true, value: val };
+  }
+  return { ok: true, value: undefined };
+}
+
+function parseDeviceConfigInput(raw: unknown): ParseResult<DeviceConfigUpdateInput> {
+  if (!isRecord(raw)) {
+    return { ok: false, response: Response.error(400, "Expected JSON object") };
+  }
+  const clusterId = parseOptionalStringField(raw, ["clusterId", "cluster_id"], "clusterId");
+  if (!clusterId.ok) return clusterId;
+  const masterNodeId = parseOptionalStringField(raw, ["masterNodeId", "master_node_id"], "masterNodeId");
+  if (!masterNodeId.ok) return masterNodeId;
+  const relayUrl = parseOptionalStringField(raw, ["relayUrl", "relay_url"], "relayUrl");
+  if (!relayUrl.ok) return relayUrl;
+  const relaySecret = parseOptionalStringField(raw, ["relaySecret", "relay_secret"], "relaySecret");
+  if (!relaySecret.ok) return relaySecret;
+  const clusterSecret = parseOptionalStringField(raw, ["clusterSecret", "cluster_secret"], "clusterSecret");
+  if (!clusterSecret.ok) return clusterSecret;
+  const token = parseOptionalStringField(raw, ["token", "relayToken", "relay_token"], "token");
+  if (!token.ok) return token;
+  const e2eKey = parseOptionalStringField(raw, ["e2eKey", "e2e_key"], "e2eKey");
+  if (!e2eKey.ok) return e2eKey;
+  const tokenTtlSec = parseOptionalIntField(raw, ["tokenTtlSec", "token_ttl_sec"], "tokenTtlSec");
+  if (!tokenTtlSec.ok) return tokenTtlSec;
+  const autoDetectLocalRelay = parseOptionalBoolField(
+    raw,
+    ["autoDetectLocalRelay", "auto_detect_local_relay"],
+    "autoDetectLocalRelay",
+  );
+  if (!autoDetectLocalRelay.ok) return autoDetectLocalRelay;
+  const enabled = parseOptionalBoolField(raw, ["enabled"], "enabled");
+  if (!enabled.ok) return enabled;
+
+  return {
+    ok: true,
+    value: {
+      ...(clusterId.value !== undefined ? { clusterId: clusterId.value } : {}),
+      ...(masterNodeId.value !== undefined ? { masterNodeId: masterNodeId.value } : {}),
+      ...(relayUrl.value !== undefined ? { relayUrl: relayUrl.value } : {}),
+      ...(relaySecret.value !== undefined ? { relaySecret: relaySecret.value } : {}),
+      ...(clusterSecret.value !== undefined ? { clusterSecret: clusterSecret.value } : {}),
+      ...(token.value !== undefined ? { token: token.value } : {}),
+      ...(e2eKey.value !== undefined ? { e2eKey: e2eKey.value } : {}),
+      ...(tokenTtlSec.value !== undefined ? { tokenTtlSec: tokenTtlSec.value } : {}),
+      ...(autoDetectLocalRelay.value !== undefined
+        ? { autoDetectLocalRelay: autoDetectLocalRelay.value }
+        : {}),
+      ...(enabled.value !== undefined ? { enabled: enabled.value } : {}),
+    },
+  };
+}
+
+function parseEnrollmentCreateInput(raw: unknown): ParseResult<EnrollmentCreateInput> {
+  if (!isRecord(raw)) {
+    return { ok: false, response: Response.error(400, "Expected JSON object") };
+  }
+  const platform = parseOptionalStringField(raw, ["platform"], "platform");
+  if (!platform.ok) return platform;
+  const profile = parseOptionalStringField(raw, ["profile", "policyProfile", "policy_profile"], "profile");
+  if (!profile.ok) return profile;
+  const installMode = parseOptionalStringField(raw, ["installMode", "install_mode"], "installMode");
+  if (!installMode.ok) return installMode;
+  const deviceId = parseOptionalStringField(raw, ["deviceId", "device_id"], "deviceId");
+  if (!deviceId.ok) return deviceId;
+  const relayBridge = parseOptionalBoolField(raw, ["relayBridge", "relay_bridge"], "relayBridge");
+  if (!relayBridge.ok) return relayBridge;
+  const mqttBind = parseOptionalStringField(raw, ["mqttBind", "mqtt_bind"], "mqttBind");
+  if (!mqttBind.ok) return mqttBind;
+  const uartDevice = parseOptionalStringField(raw, ["uartDevice", "uart_device"], "uartDevice");
+  if (!uartDevice.ok) return uartDevice;
+  const cudaDevices = parseOptionalStringField(raw, ["cudaDevices", "cuda_devices"], "cudaDevices");
+  if (!cudaDevices.ok) return cudaDevices;
+  const memoryMax = parseOptionalStringField(raw, ["memoryMax", "memory_max"], "memoryMax");
+  if (!memoryMax.ok) return memoryMax;
+  const cpuQuota = parseOptionalStringField(raw, ["cpuQuota", "cpu_quota"], "cpuQuota");
+  if (!cpuQuota.ok) return cpuQuota;
+  const transportMode = parseOptionalStringField(raw, ["transportMode", "transport_mode"], "transportMode");
+  if (!transportMode.ok) return transportMode;
+  const masterPublicUrl = parseOptionalStringField(
+    raw,
+    ["masterPublicUrl", "master_public_url"],
+    "masterPublicUrl",
+  );
+  if (!masterPublicUrl.ok) return masterPublicUrl;
+  const ttlSec = parseOptionalIntField(raw, ["ttlSec", "ttl_sec"], "ttlSec");
+  if (!ttlSec.ok) return ttlSec;
+  const maxUses = parseOptionalIntField(raw, ["maxUses", "max_uses"], "maxUses");
+  if (!maxUses.ok) return maxUses;
+  const agentVersion = parseOptionalStringField(raw, ["agentVersion", "agent_version"], "agentVersion");
+  if (!agentVersion.ok) return agentVersion;
+
+  let workspaces: string[] | undefined;
+  const rawWorkspaces = raw.workspaces;
+  if (rawWorkspaces !== undefined && rawWorkspaces !== null) {
+    if (!Array.isArray(rawWorkspaces) || !rawWorkspaces.every((w) => typeof w === "string")) {
+      return { ok: false, response: Response.error(400, "workspaces must be an array of strings") };
+    }
+    workspaces = rawWorkspaces;
+  }
+
+  let downloadMirrors: string[] | undefined;
+  const rawMirrors = raw.downloadMirrors ?? raw.download_mirrors;
+  if (rawMirrors !== undefined && rawMirrors !== null) {
+    if (!Array.isArray(rawMirrors) || !rawMirrors.every((m) => typeof m === "string")) {
+      return { ok: false, response: Response.error(400, "downloadMirrors must be an array of strings") };
+    }
+    downloadMirrors = rawMirrors;
+  }
+
+  let checksums: Record<string, string> | undefined;
+  const rawChecksums = raw.checksums;
+  if (rawChecksums !== undefined && rawChecksums !== null) {
+    if (
+      !isRecord(rawChecksums) ||
+      !Object.values(rawChecksums).every((v) => typeof v === "string")
+    ) {
+      return { ok: false, response: Response.error(400, "checksums must be a map of strings") };
+    }
+    checksums = rawChecksums as Record<string, string>;
+  }
+
+  return {
+    ok: true,
+    value: {
+      ...(platform.value !== undefined ? { platform: platform.value as EnrollmentPlatform } : {}),
+      ...(profile.value !== undefined ? { profile: profile.value as EnrollmentProfile } : {}),
+      ...(installMode.value !== undefined ? { installMode: installMode.value as EnrollmentInstallMode } : {}),
+      ...(deviceId.value !== undefined ? { deviceId: deviceId.value } : {}),
+      ...(workspaces !== undefined ? { workspaces } : {}),
+      ...(relayBridge.value !== undefined ? { relayBridge: relayBridge.value } : {}),
+      ...(mqttBind.value !== undefined ? { mqttBind: mqttBind.value } : {}),
+      ...(uartDevice.value !== undefined ? { uartDevice: uartDevice.value } : {}),
+      ...(cudaDevices.value !== undefined ? { cudaDevices: cudaDevices.value } : {}),
+      ...(memoryMax.value !== undefined ? { memoryMax: memoryMax.value } : {}),
+      ...(cpuQuota.value !== undefined ? { cpuQuota: cpuQuota.value } : {}),
+      ...(transportMode.value !== undefined
+        ? { transportMode: transportMode.value as EnrollmentTransportMode }
+        : {}),
+      ...(masterPublicUrl.value !== undefined ? { masterPublicUrl: masterPublicUrl.value } : {}),
+      ...(ttlSec.value !== undefined ? { ttlSec: ttlSec.value } : {}),
+      ...(maxUses.value !== undefined ? { maxUses: maxUses.value } : {}),
+      ...(agentVersion.value !== undefined ? { agentVersion: agentVersion.value } : {}),
+      ...(downloadMirrors !== undefined ? { downloadMirrors } : {}),
+      ...(checksums !== undefined ? { checksums } : {}),
+    },
+  };
+}
+
+function parseMcuInstallInput(raw: unknown): ParseResult<McuInstallInput> {
+  if (!isRecord(raw)) {
+    return { ok: false, response: Response.error(400, "Expected JSON object") };
+  }
+  const mcuId = parseOptionalStringField(raw, ["mcuId", "mcu_id"], "mcuId");
+  if (!mcuId.ok) return mcuId;
+  if (!mcuId.value || mcuId.value.trim().length === 0) {
+    return { ok: false, response: Response.error(400, "mcuId is required") };
+  }
+  const relayDeviceId = parseOptionalStringField(
+    raw,
+    ["relayDeviceId", "relay_device_id"],
+    "relayDeviceId",
+  );
+  if (!relayDeviceId.ok) return relayDeviceId;
+  if (!relayDeviceId.value || relayDeviceId.value.trim().length === 0) {
+    return { ok: false, response: Response.error(400, "relayDeviceId is required") };
+  }
+  const transport = parseOptionalStringField(raw, ["transport"], "transport");
+  if (!transport.ok) return transport;
+  if (transport.value !== "mqtt" && transport.value !== "serial") {
+    return { ok: false, response: Response.error(400, "transport must be mqtt or serial") };
+  }
+  const mqttBroker = parseOptionalStringField(raw, ["mqttBroker", "mqtt_broker"], "mqttBroker");
+  if (!mqttBroker.ok) return mqttBroker;
+  const serialPort = parseOptionalStringField(raw, ["serialPort", "serial_port"], "serialPort");
+  if (!serialPort.ok) return serialPort;
+  const baudRate = parseOptionalIntField(raw, ["baudRate", "baud_rate"], "baudRate");
+  if (!baudRate.ok) return baudRate;
+  const chip = parseOptionalStringField(raw, ["chip"], "chip");
+  if (!chip.ok) return chip;
+  const autoDeploy = parseOptionalBoolField(raw, ["autoDeploy", "auto_deploy"], "autoDeploy");
+  if (!autoDeploy.ok) return autoDeploy;
+
+  let backupRelayDeviceIds: string[] | undefined;
+  const rawBackups = raw.backupRelayDeviceIds ?? raw.backup_relay_device_ids;
+  if (rawBackups !== undefined && rawBackups !== null) {
+    if (!Array.isArray(rawBackups) || !rawBackups.every((x) => typeof x === "string")) {
+      return {
+        ok: false,
+        response: Response.error(400, "backupRelayDeviceIds must be an array of strings"),
+      };
+    }
+    backupRelayDeviceIds = rawBackups;
+  }
+
+  return {
+    ok: true,
+    value: {
+      mcuId: mcuId.value.trim(),
+      relayDeviceId: relayDeviceId.value.trim(),
+      transport: transport.value as McuTransportKind,
+      ...(mqttBroker.value !== undefined ? { mqttBroker: mqttBroker.value } : {}),
+      ...(serialPort.value !== undefined ? { serialPort: serialPort.value } : {}),
+      ...(baudRate.value !== undefined ? { baudRate: baudRate.value } : {}),
+      ...(chip.value !== undefined ? { chip: chip.value } : {}),
+      ...(backupRelayDeviceIds !== undefined ? { backupRelayDeviceIds } : {}),
+      ...(autoDeploy.value !== undefined ? { autoDeploy: autoDeploy.value } : {}),
+    },
+  };
+}
 
 async function routeDevices(
   app: AppContext,
@@ -423,6 +712,13 @@ async function routeDevices(
       return Response.json(200, {
         config: app.devices.configView(),
         devices: app.devices.listDevices(),
+        approvals: app.devices.listApprovals(),
+        enrollments: app.devices.listEnrollments(),
+      });
+    }
+    if (reqPath === "/api/devices/config") {
+      return Response.json(200, {
+        config: app.devices.configView(),
       });
     }
     if (reqPath === "/api/devices/approvals") {
@@ -430,9 +726,28 @@ async function routeDevices(
         approvals: app.devices.listApprovals(),
       });
     }
+    if (reqPath === "/api/devices/enrollments") {
+      return Response.json(200, {
+        enrollments: app.devices.listEnrollments(),
+      });
+    }
+    if (reqPath.startsWith(DEVICE_ENROLLMENTS_PREFIX)) {
+      const id = safeDecodeSegment(reqPath.slice(DEVICE_ENROLLMENTS_PREFIX.length));
+      if (!id || id.includes("/")) {
+        return Response.error(404, "Enrollment not found");
+      }
+      const enrollment = await app.devices.getEnrollment(id, { syncRelay: true });
+      if (enrollment === null) {
+        return Response.error(404, "Enrollment not found");
+      }
+      const devices = enrollment.enrolledDeviceIds
+        .map((devId) => app.devices.getDevice(devId))
+        .filter((twin): twin is NonNullable<typeof twin> => twin !== null);
+      return Response.json(200, { enrollment, devices });
+    }
     if (reqPath.startsWith(DEVICES_PREFIX)) {
-      const id = decodeURIComponent(reqPath.slice(DEVICES_PREFIX.length));
-      if (id.length === 0 || id.includes("/")) {
+      const id = safeDecodeSegment(reqPath.slice(DEVICES_PREFIX.length));
+      if (!id || id.includes("/")) {
         return Response.error(404, "Device not found");
       }
       const twin = app.devices.getDevice(id);
@@ -445,6 +760,35 @@ async function routeDevices(
   }
 
   if (method === "POST") {
+    if (reqPath === "/api/devices/config/init") {
+      const parsed = optionalJsonBody(request);
+      if (!parsed.ok) return parsed.response;
+      const input = parseDeviceConfigInput(parsed.value);
+      if (!input.ok) return input.response;
+      return await done(async () => ({
+        config: await app.devices.initOrUpdateConfig(input.value),
+      }));
+    }
+
+    if (reqPath === "/api/devices/enrollments") {
+      const parsed = optionalJsonBody(request);
+      if (!parsed.ok) return parsed.response;
+      const input = parseEnrollmentCreateInput(parsed.value);
+      if (!input.ok) return input.response;
+      const origin = requestOrigin(request);
+      return await done(async () => ({
+        enrollment: await app.devices.createEnrollment(input.value, { requestOrigin: origin }),
+      }));
+    }
+
+    if (reqPath === "/api/devices/mcu/install") {
+      const parsed = jsonBody(request);
+      if (!parsed.ok) return parsed.response;
+      const input = parseMcuInstallInput(parsed.value);
+      if (!input.ok) return input.response;
+      return await done(async () => await app.devices.installMcuViaTier1(input.value));
+    }
+
     if (reqPath === "/api/devices/token") {
       const parsed = jsonBody(request);
       if (!parsed.ok) return parsed.response;
@@ -488,8 +832,8 @@ async function routeDevices(
       if (rest.endsWith("/approve") || rest.endsWith("/reject")) {
         const isApprove = rest.endsWith("/approve");
         const suffix = isApprove ? "/approve" : "/reject";
-        const id = decodeURIComponent(rest.slice(0, rest.length - suffix.length));
-        if (id.length === 0 || id.includes("/")) {
+        const id = safeDecodeSegment(rest.slice(0, rest.length - suffix.length));
+        if (!id || id.includes("/")) {
           return Response.error(404, "Approval not found");
         }
         const parsed = optionalJsonBody(request);
@@ -509,11 +853,24 @@ async function routeDevices(
       return Response.error(404, "Not found");
     }
 
+    if (reqPath.startsWith(DEVICES_PREFIX) && reqPath.endsWith("/ping")) {
+      const id = safeDecodeSegment(
+        reqPath.slice(DEVICES_PREFIX.length, reqPath.length - "/ping".length),
+      );
+      if (!id || id.includes("/")) {
+        return Response.error(404, "Device not found");
+      }
+      if (app.devices.getDevice(id) === null) {
+        return Response.error(404, "Device not found");
+      }
+      return await done(async () => await app.devices.pingDevice(id));
+    }
+
     if (reqPath.startsWith(DEVICES_PREFIX) && reqPath.endsWith("/invoke")) {
-      const id = decodeURIComponent(
+      const id = safeDecodeSegment(
         reqPath.slice(DEVICES_PREFIX.length, reqPath.length - "/invoke".length),
       );
-      if (id.length === 0 || id.includes("/")) {
+      if (!id || id.includes("/")) {
         return Response.error(404, "Device not found");
       }
       const parsed = jsonBody(request);
@@ -558,6 +915,45 @@ async function routeDevices(
       } catch (error) {
         return Response.error(400, errorMessage(error));
       }
+    }
+  }
+
+  if (method === "PUT") {
+    if (reqPath === "/api/devices/config") {
+      const parsed = jsonBody(request);
+      if (!parsed.ok) return parsed.response;
+      const input = parseDeviceConfigInput(parsed.value);
+      if (!input.ok) return input.response;
+      return await done(async () => ({
+        config: await app.devices.initOrUpdateConfig(input.value),
+      }));
+    }
+  }
+
+  if (method === "DELETE") {
+    if (reqPath.startsWith(DEVICE_ENROLLMENTS_PREFIX)) {
+      const id = safeDecodeSegment(reqPath.slice(DEVICE_ENROLLMENTS_PREFIX.length));
+      if (!id || id.includes("/")) {
+        return Response.error(404, "Enrollment not found");
+      }
+      try {
+        const enrollment = await app.devices.revokeEnrollment(id);
+        return Response.json(200, { enrollment });
+      } catch (error) {
+        const msg = errorMessage(error);
+        return Response.error(msg.startsWith("Enrollment not found:") ? 404 : 400, msg);
+      }
+    }
+    if (reqPath.startsWith(DEVICES_PREFIX)) {
+      const id = safeDecodeSegment(reqPath.slice(DEVICES_PREFIX.length));
+      if (!id || id.includes("/")) {
+        return Response.error(404, "Device not found");
+      }
+      const removed = app.devices.removeDevice(id);
+      if (!removed) {
+        return Response.error(404, "Device not found");
+      }
+      return Response.json(200, { removed: true, deviceId: id });
     }
   }
 
@@ -776,6 +1172,62 @@ export async function handle(
     }
     return await route(app, request);
   }
+
+  // Public Master Direct Mode enrollment endpoints (no access token required).
+  if (request.method === "POST" && request.path.startsWith(PUBLIC_ENROLL_CLAIM_PREFIX)) {
+    const id = safeDecodeSegment(request.path.slice(PUBLIC_ENROLL_CLAIM_PREFIX.length));
+    if (!id || id.includes("/")) {
+      return Response.error(404, "Enrollment ticket not found");
+    }
+    const claimed = app.devices.claimDirectEnrollment(id, peer.host);
+    if (claimed.ok) {
+      return Response.json(200, {
+        ticket_id: claimed.ticket_id,
+        ciphertext_b64: claimed.ciphertext_b64,
+        expires_at: claimed.expires_at,
+        expires_at_ms: claimed.expires_at_ms,
+      });
+    }
+    return Response.error(claimed.status, claimed.error);
+  }
+
+  if (request.method === "GET" || request.method === "HEAD") {
+    if (request.path === "/install.sh") {
+      const cfgView = app.devices.configView();
+      const script = renderDirectInstallSh({
+        origin: requestOrigin(request),
+        relayUrl: cfgView.relayUrl,
+        agentVersion: cfgView.agentVersion,
+      });
+      return new Response({
+        status: 200,
+        contentType: "text/x-shellscript; charset=utf-8",
+        body: textEncoder.encode(script),
+        headers: [
+          ["cache-control", "no-store"],
+          ["x-content-type-options", "nosniff"],
+        ],
+      });
+    }
+    if (request.path === "/install.ps1") {
+      const cfgView = app.devices.configView();
+      const script = renderDirectInstallPs1({
+        origin: requestOrigin(request),
+        relayUrl: cfgView.relayUrl,
+        agentVersion: cfgView.agentVersion,
+      });
+      return new Response({
+        status: 200,
+        contentType: "text/plain; charset=utf-8",
+        body: textEncoder.encode(script),
+        headers: [
+          ["cache-control", "no-store"],
+          ["x-content-type-options", "nosniff"],
+        ],
+      });
+    }
+  }
+
   if (request.method !== "GET" && request.method !== "HEAD") {
     return Response.error(404, "Not found");
   }

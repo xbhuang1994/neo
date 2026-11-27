@@ -77,14 +77,25 @@ describe("packaging/release.ts", () => {
     }
   });
 
-  test("bumps all three manifests and increments pubspec build number, including prerelease tags", () => {
+  test("bumps all manifests including Cargo.toml (when present) and increments pubspec build number", () => {
     const dir = makeTempRepo("0.6.0", 6);
     try {
+      fs.mkdirSync(path.join(dir, "agents", "neo-agent-os"), { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, "agents", "neo-agent-os", "Cargo.toml"),
+        `[package]\nname = "neo-agent-os"\nversion = "0.6.0"\nedition = "2021"\n\n[dependencies]\nserde = { version = "1" }\n`,
+        "utf8",
+      );
+
       const bumped = bumpReleaseVersions(dir, "0.7.0-rc.1");
       expect(bumped.backendPackage).toBe("0.7.0-rc.1");
       expect(bumped.backendSource).toBe("0.7.0-rc.1");
       expect(bumped.appPubspec).toBe("0.7.0-rc.1");
       expect(bumped.appBuildNumber).toBe(7);
+
+      const cargoRc = fs.readFileSync(path.join(dir, "agents", "neo-agent-os", "Cargo.toml"), "utf8");
+      expect(cargoRc).toContain('version = "0.7.0-rc.1"');
+      expect(cargoRc).toContain('serde = { version = "1" }');
 
       const checked = checkReleaseVersions(dir, "v0.7.0-rc.1");
       expect(checked.prerelease).toBe(true);
@@ -94,6 +105,8 @@ describe("packaging/release.ts", () => {
       const finalRel = bumpReleaseVersions(dir, "0.7.0");
       expect(finalRel.appBuildNumber).toBe(8);
       expect(readManifestVersions(dir).backendPackage).toBe("0.7.0");
+      const cargoFinal = fs.readFileSync(path.join(dir, "agents", "neo-agent-os", "Cargo.toml"), "utf8");
+      expect(cargoFinal).toContain('version = "0.7.0"');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -104,7 +117,11 @@ describe("packaging/release.ts", () => {
     try {
       const version = "0.7.0";
       const assets = expectedAssets(version);
-      expect(assets.length).toBe(13);
+      expect(assets.length).toBe(16);
+      const filenames = assets.map((a) => a.filename);
+      expect(filenames).toContain(`neo-agent-os-${version}-macos-arm64.tar.gz`);
+      expect(filenames).toContain(`neo-agent-os-${version}-macos-x64.tar.gz`);
+      expect(filenames).toContain(`neo-agent-os-${version}-windows-x64.zip`);
 
       expect(() => verifyDistArtifacts(version, dist)).toThrow(/Missing release artifacts/);
 
@@ -112,7 +129,7 @@ describe("packaging/release.ts", () => {
         fs.writeFileSync(path.join(dist, a.filename), "mock-artifact-bytes", "utf8");
       }
       const verified = verifyDistArtifacts(version, dist);
-      expect(verified.length).toBe(13);
+      expect(verified.length).toBe(16);
 
       const notes = renderReleaseNotes(version, dist);
       for (const a of assets) {
@@ -130,13 +147,17 @@ describe("packaging/release.ts", () => {
 });
 
 describe("GitHub Actions multi-platform workflow contracts", () => {
-  test("release.yml covers macOS arm64/x64, Windows installer/portable, Linux desktop deb/tar.gz, Linux server x64/arm64, and SHA256SUMS", () => {
+  test("release.yml covers macOS arm64/x64, Windows installer/portable, Linux desktop deb/tar.gz, Linux server x64/arm64, multi-platform neo-agent-os, and SHA256SUMS", () => {
     const releaseYml = fs.readFileSync(path.join(ROOT, ".github", "workflows", "release.yml"), "utf8");
     expect(releaseYml).toContain('tags: ["v*"]');
     expect(releaseYml).toContain("workflow_dispatch:");
     expect(releaseYml).toContain("packaging/release.ts check");
     expect(releaseYml).toContain("packaging/macos/build-dmg.sh --arch ${{ matrix.arch }}");
+    expect(releaseYml).toContain("packaging/macos/build-agent-os.sh --arch ${{ matrix.arch }}");
+    expect(releaseYml).toContain("dist/neo-agent-os-*-macos-${{ matrix.arch }}.tar.gz");
     expect(releaseYml).toContain("./packaging/windows/stage.ps1");
+    expect(releaseYml).toContain("./packaging/windows/build-agent-os.ps1");
+    expect(releaseYml).toContain("dist/neo-agent-os-*-windows-x64.zip");
     expect(releaseYml).toContain("packaging\\windows\\neo-agent.iss");
     expect(releaseYml).toContain("packaging/linux/build-desktop.sh --arch x64");
     expect(releaseYml).toContain("packaging/linux/build-server.sh --arch x64");

@@ -59,4 +59,29 @@ sudo ./deploy/multi-master/provision-cluster.sh \
 sudo systemctl enable --now neo-agent-os@corp.service
 ```
 
-Generated `.env` files are written with `0600` permissions and policy TOML files with `0444` permissions. Never commit generated cluster `.env` files, relay secret files, or minted `neo1` tokens to source control.
+Generated `.env` files are written with `0600` permissions and policy TOML files with `0444` permissions. Never commit generated cluster `.env` files, relay secret files, or minted `neo1` tokens to source control. Secrets (`NEO_TOKEN` / `NEO_RELAY_TOKEN` and `NEO_E2E_KEY`) are loaded via `EnvironmentFile` (systemd) or `--env-file` (macOS `launchd` / Windows Scheduled Tasks) and are never passed on `argv`.
+
+## One-click enrollment & cross-platform Tier 1 agents
+
+`neo-agent-os` runs natively on Linux (`x64`, `arm64`), macOS (`arm64`, `x64`), and Windows (`x64`), and includes built-in zero-trust `enroll` and `uninstall` commands:
+
+```sh
+# Enroll via stdin ticket (never exposes ticket on argv)
+printf '%s\n' "$NEO_ENROLL_TICKET" | neo-agent-os enroll \
+  --relay-url https://neo.1inch.cn:18443 \
+  --ticket-stdin \
+  --mode auto
+
+# Container / Docker foreground mode (writes policy + .env and runs immediately)
+neo-agent-os enroll --relay-url https://neo.1inch.cn:18443 --ticket-stdin --mode foreground
+
+# Clean teardown (preserves workspace unless --purge-workspace is specified)
+neo-agent-os uninstall --cluster personal
+```
+
+Enrollment flow:
+
+1. Parses `neo_enr_v1.<ticket_id>.<ephemeral_key>` and POSTs `/v1/enroll/claim/<ticket_id>` to fetch the one-time opaque ciphertext blob.
+2. Decrypts the `[0xE2][12B nonce][AES-256-GCM ciphertext || 16B tag]` envelope locally with key `SHA-256("neo-enroll-v1:<ticket_id>:<ephemeral_key>")` and AAD `"neo-enroll-v1|<ticket_id>"` so the relay never sees plaintext secrets.
+3. For `auth_mode = "bootstrap_exchange"`, connects briefly to `/v1/relay` and exchanges an E2E-encrypted `enroll_register` / `enroll_ack` handshake with Master Neo to obtain the permanent `device_id` and `relay_token`.
+4. Renders `{{WORKSPACE_DIR}}` into `policy-<cluster>.toml` (`0444`) and writes `cluster-<cluster>.env` (`0600`), sends an initial `manifest` containing `enroll_id`, and installs the native OS service (`systemd` system or user unit on Linux, `launchd` LaunchAgent on macOS, or Scheduled Task with restricted `.env` ACL on Windows).

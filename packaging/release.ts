@@ -71,13 +71,28 @@ export function expectedAssets(version: string): ExpectedAsset[] {
     },
     {
       filename: `neo-agent-os-${version}-linux-x64.tar.gz`,
-      platform: "Tier 1 Agent (`neo-agent-os` x64)",
+      platform: "Tier 1 Agent (`neo-agent-os` Linux x64)",
       description: "Static Rust Tier 1 OS agent + `--relay` bridge + multi-master templates",
     },
     {
       filename: `neo-agent-os-${version}-linux-arm64.tar.gz`,
-      platform: "Tier 1 Agent (`neo-agent-os` arm64)",
+      platform: "Tier 1 Agent (`neo-agent-os` Linux arm64)",
       description: "Static Rust Tier 1 OS agent for Raspberry Pi / ARM64 SBCs + `--relay`",
+    },
+    {
+      filename: `neo-agent-os-${version}-macos-arm64.tar.gz`,
+      platform: "Tier 1 Agent (`neo-agent-os` macOS arm64)",
+      description: "Rust Tier 1 OS agent for Apple Silicon Macs (`enroll` / `launchd`)",
+    },
+    {
+      filename: `neo-agent-os-${version}-macos-x64.tar.gz`,
+      platform: "Tier 1 Agent (`neo-agent-os` macOS x64)",
+      description: "Rust Tier 1 OS agent for Intel Macs (`enroll` / `launchd`)",
+    },
+    {
+      filename: `neo-agent-os-${version}-windows-x64.zip`,
+      platform: "Tier 1 Agent (`neo-agent-os` Windows x64)",
+      description: "Rust Tier 1 OS agent (`neo-agent-os.exe`) + `enroll` / Scheduled Task support",
     },
     {
       filename: `neo-relayd-${version}-linux-x64.tar.gz`,
@@ -229,6 +244,23 @@ export function bumpReleaseVersions(root: string, nextVersion: string): Manifest
     throw new Error(`Failed to update version in ${pubspecPath}`);
   }
   fs.writeFileSync(pubspecPath, pubUpdated, "utf8");
+
+  const cargoTomlPath = path.join(root, "agents", "neo-agent-os", "Cargo.toml");
+  if (fs.existsSync(cargoTomlPath)) {
+    const cargoRaw = fs.readFileSync(cargoTomlPath, "utf8");
+    const cargoUpdated = cargoRaw.replace(
+      /^(\[package\][\s\S]*?^version\s*=\s*)"[^"]+"/m,
+      `$1"${nextVersion}"`,
+    );
+    const escapedNext = nextVersion.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (
+      cargoUpdated === cargoRaw &&
+      !new RegExp(`^\\[package\\][\\s\\S]*?^version\\s*=\\s*"${escapedNext}"`, "m").test(cargoRaw)
+    ) {
+      throw new Error(`Failed to update version in ${cargoTomlPath}`);
+    }
+    fs.writeFileSync(cargoTomlPath, cargoUpdated, "utf8");
+  }
 
   return checkReleaseVersions(root, `v${nextVersion}`).versions;
 }

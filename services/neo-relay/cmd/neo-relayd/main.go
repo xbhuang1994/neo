@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"neo-relay/internal/auth"
+	"neo-relay/internal/enroll"
 	"neo-relay/internal/hub"
 	"neo-relay/internal/server"
 	"neo-relay/internal/stun"
@@ -59,8 +60,13 @@ func runDaemon() {
 	penaltyDur := envDuration("NEO_RELAY_PENALTY_DURATION", hub.DefaultPenaltyDuration)
 	maxFrame := int(envInt64("NEO_RELAY_MAX_FRAME_BYTES", 1<<20))
 	punchTimeoutMs := int(envInt64("NEO_PUNCH_TIMEOUT_MS", 2500))
+	dlCacheDir := envOr("NEO_RELAY_DL_CACHE_DIR", enroll.DefaultDLCacheDir)
+	releaseBaseURL := envOr("NEO_RELAY_RELEASE_BASE_URL", enroll.DefaultReleaseBaseURL)
+	githubAPIURL := envOr("NEO_RELAY_GITHUB_API_URL", enroll.DefaultGitHubAPIURL)
+	agentVersion := strings.TrimSpace(os.Getenv("NEO_RELAY_AGENT_VERSION"))
+	clusterSecretsFile := strings.TrimSpace(os.Getenv("NEO_RELAY_CLUSTER_SECRETS_FILE"))
 
-	kr := loadKeyRing(os.Getenv("NEO_RELAY_CLUSTER_SECRETS_FILE"))
+	kr := loadKeyRing(clusterSecretsFile)
 	var stunServers []string
 	for _, s := range strings.Split(stunRaw, ",") {
 		if t := strings.TrimSpace(s); t != "" {
@@ -91,13 +97,49 @@ func runDaemon() {
 		log.Printf("neo-relayd UDP STUN/Probe listening on %s", stunSrv.Addr())
 	}
 
+	enrollStore := enroll.NewStore()
+	enrollStore.StartGC(ctx, 5*time.Minute)
+
+	mirror := enroll.NewMirror(enroll.MirrorConfig{
+		CacheDir:       dlCacheDir,
+		ReleaseBaseURL: releaseBaseURL,
+		GitHubAPIURL:   githubAPIURL,
+		AgentVersion:   agentVersion,
+	})
+
 	srv := server.New(server.Config{
 		KeyRing:        kr,
 		PublicURL:      publicURL,
 		STUNServers:    stunServers,
 		PunchTimeoutMs: punchTimeoutMs,
 		MaxFrameBytes:  maxFrame,
+		EnrollStore:    enrollStore,
+		Mirror:         mirror,
 	}, h)
+
+	sighupCh := make(chan os.Signal, 1)
+	signal.Notify(sighupCh, syscall.SIGHUP)
+	defer signal.Stop(sighupCh)
+	rootSecret := append([]byte(nil), kr.RootSecret...)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-sighupCh:
+				clusterSecrets, err := loadClusterSecretsMapStrict(clusterSecretsFile)
+				if err != nil {
+					log.Printf("WARNING: SIGHUP keyring reload failed (keeping existing keyring): %v", err)
+					continue
+				}
+				srv.UpdateKeyRing(auth.KeyRing{
+					RootSecret:     rootSecret,
+					ClusterSecrets: clusterSecrets,
+				})
+				log.Printf("neo-relayd reloaded keyring via SIGHUP (clusters=%d)", len(clusterSecrets))
+			}
+		}
+	}()
 
 	httpSrv := &http.Server{
 		Addr:              listenAddr,
@@ -112,8 +154,8 @@ func runDaemon() {
 		_ = httpSrv.Shutdown(shCtx)
 	}()
 
-	log.Printf("neo-relayd HTTP/WS listening on %s (public_url=%s, node_rate=%dB/s, penalty=%dB/%ds->%dB/s for %s)",
-		listenAddr, publicURL, rateBPS, penaltyBytes, penaltyWinSec, penaltyRateBPS, penaltyDur)
+	log.Printf("neo-relayd HTTP/WS listening on %s (public_url=%s, dl_cache=%s, node_rate=%dB/s, penalty=%dB/%ds->%dB/s for %s)",
+		listenAddr, publicURL, dlCacheDir, rateBPS, penaltyBytes, penaltyWinSec, penaltyRateBPS, penaltyDur)
 	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("http server failed: %v", err)
 	}
@@ -416,17 +458,29 @@ func loadKeyRingFrom(secretFile, clusterSecretsFile string) auth.KeyRing {
 }
 
 func loadClusterSecretsMap(path string) map[string][]byte {
+	out, err := loadClusterSecretsMapStrict(path)
+	if err != nil {
+		log.Printf("WARNING: failed to load cluster secrets file %q: %v", path, err)
+		return nil
+	}
+	return out
+}
+
+func loadClusterSecretsMapStrict(path string) (map[string][]byte, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
-		return nil
+		return nil, nil
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
 	}
 	var raw map[string]string
 	if err := json.Unmarshal(b, &raw); err != nil {
-		return nil
+		return nil, err
 	}
 	out := make(map[string][]byte, len(raw))
 	for k, v := range raw {
@@ -434,7 +488,7 @@ func loadClusterSecretsMap(path string) map[string][]byte {
 			out[k] = []byte(v)
 		}
 	}
-	return out
+	return out, nil
 }
 
 func readSecretFromFile(path string) string {

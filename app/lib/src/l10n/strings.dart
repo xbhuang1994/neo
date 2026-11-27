@@ -19,6 +19,7 @@ abstract class Strings {
   // Navigation
   String get chat;
   String get workers;
+  String get devices;
   String get settings;
 
   // Connection
@@ -202,6 +203,156 @@ abstract class Strings {
   String get copied;
   String get notInstalledShort;
   String get loggedOut;
+
+  // Multi-Device Control Plane
+  String get multiDeviceControlPlane;
+  String get multiDeviceSettingsFooter;
+  String get manageDevices;
+  String get devicesNotConfigured;
+  String get relayConnected;
+  String get relayConnecting;
+  String get relayReconnecting;
+  String get relayOffline;
+  String devicesOnlineSummary(int online, int total);
+  String pendingApprovalsShort(int count);
+  String get devicesUnsupportedTitle;
+  String get devicesUnsupportedHint;
+  String get devicesConnectFirst;
+  String get deviceClusterSetup;
+  String get deviceClusterSetupIntro;
+  String get deviceClusterSetupFooter;
+  String get relayUrlLabel;
+  String get clusterIdLabel;
+  String get clusterIdPlaceholder;
+  String get clusterSecretLabel;
+  String get clusterSecretPlaceholder;
+  String get clusterSecretKeepPlaceholder;
+  String get localRelayDetectedBadge;
+  String get localRelayDetectedHint;
+  String get advancedOptions;
+  String get masterNodeIdLabel;
+  String get e2eKeyLabel;
+  String get e2eKeyPlaceholder;
+  String get initClusterAndConnect;
+  String get clusterStatus;
+  String get addDeviceShort;
+  String get addDeviceCta;
+  String get connectMcu;
+  String get clusterSettings;
+  String get clusterEnabled;
+  String get relayStatusLabel;
+  String get agentVersionLabel;
+  String get pendingApprovals;
+  String get approve;
+  String get reject;
+  String get approvalCode;
+  String get approvalApproved;
+  String get approvalRejected;
+  String get activeEnrollments;
+  String get viewCopyCommand;
+  String get revoke;
+  String get revokeImmediately;
+  String get enrollmentStatusPending;
+  String get enrollmentStatusClaimed;
+  String get enrollmentStatusCompleted;
+  String get enrollmentStatusExpired;
+  String get enrollmentStatusRevoked;
+  String remainingTime(String mmss);
+  String usesCount(int used, int max);
+  String get deviceFleet;
+  String get noDevicesTitle;
+  String get noDevicesHint;
+  String get generateFirstInstallCmd;
+  String get deviceStatusOnline;
+  String get deviceStatusOffline;
+  String get deviceStatusSleeping;
+  String get deviceStatusUnreachable;
+  String get deviceRouteP2p;
+  String get deviceRouteLan;
+  String get deviceRouteRelay;
+  String get deviceRouteViaTier1;
+  String get tier1Badge;
+  String get tier2Badge;
+  String get relayBridgeBadge;
+  String get ping;
+  String pingOk(int ms, String route);
+  String get pingFailed;
+  String get uninstallCommand;
+  String get uninstallCopied;
+  String get removeDevice;
+  String removeDeviceConfirmTitle(String id);
+  String get removeDeviceConfirmBody;
+  String lastSeen(String when);
+  String queuedCommands(int count);
+  String viaRelayDevice(String id);
+
+  // Device Enrollment & MCU Sheet
+  String get addDeviceSheetTitle;
+  String get close;
+  String get done;
+  String get policyPreset;
+  String get profilePersonalTitle;
+  String get profilePersonalDesc;
+  String get profileCorpTitle;
+  String get profileCorpDesc;
+  String get profileReadonlyTitle;
+  String get profileReadonlyDesc;
+  String get profileDesktopTitle;
+  String get profileDesktopDesc;
+  String get installMode;
+  String get installModeAuto;
+  String get installModeSystem;
+  String get installModeUser;
+  String get deviceIdLabel;
+  String get deviceIdPlaceholder;
+  String get workspacesLabel;
+  String get workspacesPlaceholder;
+  String get enableRelayBridge;
+  String get mqttBindLabel;
+  String get uartDeviceLabel;
+  String get cudaDevicesLabel;
+  String get memoryMaxLabel;
+  String get cpuQuotaLabel;
+  String get transportMode;
+  String get transportRelay;
+  String get transportDirect;
+  String get masterPublicUrlLabel;
+  String get ttlLabel;
+  String get maxUsesLabel;
+  String get generateInstallCmd;
+  String get linuxRootMode;
+  String get linuxUserMode;
+  String get copyCommand;
+  String get qrCode;
+  String get waitingForPaste;
+  String ticketClaimed(String? ip);
+  String deviceOnboarded(String ids);
+  String get ticketExpired;
+  String get ticketRevoked;
+  String get newCommand;
+  String get mcuIntro;
+  String get tier1RelayDevice;
+  String get manualEntry;
+  String get tier1DeviceIdPlaceholder;
+  String get mcuTransport;
+  String get mcuTransportMqtt;
+  String get mcuTransportSerial;
+  String get mcuIdLabel;
+  String get mcuChipLabel;
+  String get chipLinuxSim;
+  String get mqttBrokerLabel;
+  String get serialPortLabel;
+  String get baudRateLabel;
+  String get backupRelaysLabel;
+  String get installMcuCta;
+  String mcuDeployedTier1(String dir);
+  String get mcuStagedManual;
+  String get previewConfigHeader;
+  String get previewInstallScript;
+  String get copy;
+  String get mcuIdRequired;
+  String get relayDeviceRequired;
+  String get mcuE2eKeyLabel;
 }
 
 /// Gives the widgets below it their words.
@@ -222,6 +373,8 @@ class ZhStrings extends Strings {
   String get chat => '对话';
   @override
   String get workers => '任务';
+  @override
+  String get devices => '设备';
   @override
   String get settings => '设置';
 
@@ -552,6 +705,7 @@ class ZhStrings extends Strings {
     'effects' => '任务队列',
     'passes' => '调度',
     'wechat' => '微信',
+    'devices' => '设备控制面',
     _ => name,
   };
 
@@ -584,6 +738,301 @@ class ZhStrings extends Strings {
   String get notInstalledShort => '未安装';
   @override
   String get loggedOut => '已登出';
+
+  // Multi-Device Control Plane
+  @override
+  String get multiDeviceControlPlane => '多设备控制面';
+  @override
+  String get multiDeviceSettingsFooter => '通过端到端加密中继与 P2P 信道连接远程主机（Tier 1）与嵌入式 MCU（Tier 2）。';
+  @override
+  String get manageDevices => '管理设备';
+  @override
+  String get devicesNotConfigured => '未初始化';
+  @override
+  String get relayConnected => '已连接';
+  @override
+  String get relayConnecting => '连接中';
+  @override
+  String get relayReconnecting => '重连中';
+  @override
+  String get relayOffline => '离线';
+  @override
+  String devicesOnlineSummary(int online, int total) => '$online / $total 台在线';
+  @override
+  String pendingApprovalsShort(int count) => '$count 项待审批';
+  @override
+  String get devicesUnsupportedTitle => '当前后端未启用多设备控制面';
+  @override
+  String get devicesUnsupportedHint => '请升级 Master Neo 后端至支持多设备 API 的版本。';
+  @override
+  String get devicesConnectFirst => '请先连接到 Neo 后端后再管理设备。';
+  @override
+  String get deviceClusterSetup => '初始化多设备集群';
+  @override
+  String get deviceClusterSetupIntro => '配置中继地址与集群凭据，开启远程设备一键安装接入、端到端加密通信与高风险操作审批。';
+  @override
+  String get deviceClusterSetupFooter => '密钥仅保存在 Master Neo 本地存储中，中继服务器无法解密任何端到端通信载荷。';
+  @override
+  String get relayUrlLabel => '中继服务器地址';
+  @override
+  String get clusterIdLabel => '集群 ID';
+  @override
+  String get clusterIdPlaceholder => '留空自动生成（如 personal）';
+  @override
+  String get clusterSecretLabel => '集群密钥';
+  @override
+  String get clusterSecretPlaceholder => '输入中继集群密钥';
+  @override
+  String get clusterSecretKeepPlaceholder => '已配置 — 留空保持不变';
+  @override
+  String get localRelayDetectedBadge => '已自动探测本机中继';
+  @override
+  String get localRelayDetectedHint => '将自动读取本机 neo-relayd 密钥并建立连接。';
+  @override
+  String get advancedOptions => '高级选项';
+  @override
+  String get masterNodeIdLabel => '主控节点 ID';
+  @override
+  String get e2eKeyLabel => '端到端密钥 (E2E Key)';
+  @override
+  String get e2eKeyPlaceholder => '留空自动生成 256-bit 密钥';
+  @override
+  String get initClusterAndConnect => '一键初始化并连接中继';
+  @override
+  String get clusterStatus => '集群状态';
+  @override
+  String get addDeviceShort => '+ 添加设备';
+  @override
+  String get addDeviceCta => '+ 添加设备 / 生成安装命令';
+  @override
+  String get connectMcu => '接入 MCU';
+  @override
+  String get clusterSettings => '集群设置';
+  @override
+  String get clusterEnabled => '启用多设备控制面';
+  @override
+  String get relayStatusLabel => '中继状态';
+  @override
+  String get agentVersionLabel => 'Agent 版本';
+  @override
+  String get pendingApprovals => '待人工审批';
+  @override
+  String get approve => '批准';
+  @override
+  String get reject => '拒绝';
+  @override
+  String get approvalCode => '审批码';
+  @override
+  String get approvalApproved => '已批准并下发执行';
+  @override
+  String get approvalRejected => '已拒绝该操作';
+  @override
+  String get activeEnrollments => '进行中的安装票据';
+  @override
+  String get viewCopyCommand => '查看/复制命令';
+  @override
+  String get revoke => '作废';
+  @override
+  String get revokeImmediately => '立即作废';
+  @override
+  String get enrollmentStatusPending => '等待执行';
+  @override
+  String get enrollmentStatusClaimed => '已被认领';
+  @override
+  String get enrollmentStatusCompleted => '已上线';
+  @override
+  String get enrollmentStatusExpired => '已过期';
+  @override
+  String get enrollmentStatusRevoked => '已作废';
+  @override
+  String remainingTime(String mmss) => '剩余 $mmss';
+  @override
+  String usesCount(int used, int max) => '已用 $used/$max';
+  @override
+  String get deviceFleet => '设备列表';
+  @override
+  String get noDevicesTitle => '尚未接入任何远程设备';
+  @override
+  String get noDevicesHint => '生成一条一次性安装命令，在目标 Linux、macOS、Windows 或 Docker 主机粘贴执行即可自动上线。';
+  @override
+  String get generateFirstInstallCmd => '生成第一条安装命令';
+  @override
+  String get deviceStatusOnline => '在线';
+  @override
+  String get deviceStatusOffline => '离线';
+  @override
+  String get deviceStatusSleeping => '休眠';
+  @override
+  String get deviceStatusUnreachable => '中继不可达';
+  @override
+  String get deviceRouteP2p => 'P2P';
+  @override
+  String get deviceRouteLan => 'LAN';
+  @override
+  String get deviceRouteRelay => 'Relay';
+  @override
+  String get deviceRouteViaTier1 => 'via Tier1';
+  @override
+  String get tier1Badge => 'Tier 1 OS';
+  @override
+  String get tier2Badge => 'Tier 2 MCU';
+  @override
+  String get relayBridgeBadge => 'MCU 中继';
+  @override
+  String get ping => 'Ping';
+  @override
+  String pingOk(int ms, String route) => '延迟 ${ms}ms · $route';
+  @override
+  String get pingFailed => 'Ping 失败';
+  @override
+  String get uninstallCommand => '卸载命令';
+  @override
+  String get uninstallCopied => '已复制卸载命令';
+  @override
+  String get removeDevice => '移除';
+  @override
+  String removeDeviceConfirmTitle(String id) => '移除设备 $id？';
+  @override
+  String get removeDeviceConfirmBody => '将从主控设备列表中移除该记录；如需彻底清理远端程序，请先复制并运行卸载命令。';
+  @override
+  String lastSeen(String when) => '最近活跃 $when';
+  @override
+  String queuedCommands(int count) => '$count 条待下发';
+  @override
+  String viaRelayDevice(String id) => '经由 $id';
+
+  @override
+  String get addDeviceSheetTitle => '添加设备';
+  @override
+  String get close => '关闭';
+  @override
+  String get done => '完成';
+  @override
+  String get policyPreset => '安全策略预设';
+  @override
+  String get profilePersonalTitle => '个人开发 (personal)';
+  @override
+  String get profilePersonalDesc => '允许工作区读写与常用开发工具，拦截提权与破坏性命令。';
+  @override
+  String get profileCorpTitle => '企业受限 (corp)';
+  @override
+  String get profileCorpDesc => '严格命令白名单，禁止临时 Shell 与任意脚本解释器。';
+  @override
+  String get profileReadonlyTitle => '只读巡检 (readonly)';
+  @override
+  String get profileReadonlyDesc => '仅限状态探测与日志只读排查，禁止修改工作区。';
+  @override
+  String get profileDesktopTitle => '桌面协作 (desktop)';
+  @override
+  String get profileDesktopDesc => '面向个人桌面与开发机协作，允许构建与桌面环境交互。';
+  @override
+  String get installMode => '安装方式';
+  @override
+  String get installModeAuto => '自动检测';
+  @override
+  String get installModeSystem => '系统级隔离';
+  @override
+  String get installModeUser => '用户态';
+  @override
+  String get deviceIdLabel => '设备 ID';
+  @override
+  String get deviceIdPlaceholder => '留空自动使用远端主机名';
+  @override
+  String get workspacesLabel => '允许的工作区路径';
+  @override
+  String get workspacesPlaceholder => '多个路径用逗号分隔，如 /workspace, /data/proj';
+  @override
+  String get enableRelayBridge => '开启 Tier 2 MCU 中继 (--relay)';
+  @override
+  String get mqttBindLabel => 'MQTT 监听地址';
+  @override
+  String get uartDeviceLabel => '串口设备 (UART/RS485)';
+  @override
+  String get cudaDevicesLabel => 'CUDA_VISIBLE_DEVICES';
+  @override
+  String get memoryMaxLabel => '内存上限 (MemoryMax)';
+  @override
+  String get cpuQuotaLabel => 'CPU 配额 (CPUQuota)';
+  @override
+  String get transportMode => '传输信道';
+  @override
+  String get transportRelay => 'Relay 国内加速';
+  @override
+  String get transportDirect => '局域网直连';
+  @override
+  String get masterPublicUrlLabel => '主控访问地址';
+  @override
+  String get ttlLabel => '票据有效期';
+  @override
+  String get maxUsesLabel => '最大使用次数';
+  @override
+  String get generateInstallCmd => '生成远程安装命令';
+  @override
+  String get linuxRootMode => 'sudo 系统级隔离';
+  @override
+  String get linuxUserMode => '非 root 用户态';
+  @override
+  String get copyCommand => '复制命令';
+  @override
+  String get qrCode => '二维码';
+  @override
+  String get waitingForPaste => '等待在目标设备粘贴执行…';
+  @override
+  String ticketClaimed(String? ip) => ip != null ? '票据已被认领 (IP: $ip)，正在校验并启动服务…' : '票据已被认领，正在校验并启动服务…';
+  @override
+  String deviceOnboarded(String ids) => '设备 $ids 已成功上线！';
+  @override
+  String get ticketExpired => '安装票据已过期，请重新生成。';
+  @override
+  String get ticketRevoked => '安装票据已作废。';
+  @override
+  String get newCommand => '重新配置';
+  @override
+  String get mcuIntro => '由主控 Neo 通过已在线的 Tier 1 设备（MQTT 或串口）自动下发固件配置与安装脚本。';
+  @override
+  String get tier1RelayDevice => 'Tier 1 中继主机';
+  @override
+  String get manualEntry => '手动输入设备 ID';
+  @override
+  String get tier1DeviceIdPlaceholder => '输入 Tier 1 设备 ID（如 edge-pi-01）';
+  @override
+  String get mcuTransport => 'MCU 通信方式';
+  @override
+  String get mcuTransportMqtt => 'MQTT';
+  @override
+  String get mcuTransportSerial => '串口 (UART/RS485)';
+  @override
+  String get mcuIdLabel => 'MCU 设备 ID';
+  @override
+  String get mcuChipLabel => '芯片型号';
+  @override
+  String get chipLinuxSim => 'Linux 模拟器';
+  @override
+  String get mqttBrokerLabel => 'MQTT Broker 地址';
+  @override
+  String get serialPortLabel => '串口设备路径';
+  @override
+  String get baudRateLabel => '波特率';
+  @override
+  String get backupRelaysLabel => '备用 Tier 1 中继（可选）';
+  @override
+  String get installMcuCta => '由主控通过 Tier 1 自动安装';
+  @override
+  String mcuDeployedTier1(String dir) => '已通过加密信道下发至 Tier 1 工作区 $dir';
+  @override
+  String get mcuStagedManual => '已生成 MCU 配置（暂存手动部署模式）';
+  @override
+  String get previewConfigHeader => '预览 neo_mcu_config.h';
+  @override
+  String get previewInstallScript => '预览安装脚本';
+  @override
+  String get copy => '复制';
+  @override
+  String get mcuIdRequired => '请填写 MCU 设备 ID';
+  @override
+  String get relayDeviceRequired => '请选择或填写 Tier 1 中继主机 ID';
+  @override
+  String get mcuE2eKeyLabel => 'MCU E2E 密钥';
 }
 
 /// English.
@@ -594,6 +1043,8 @@ class EnStrings extends Strings {
   String get chat => 'Chat';
   @override
   String get workers => 'Tasks';
+  @override
+  String get devices => 'Devices';
   @override
   String get settings => 'Settings';
 
@@ -924,6 +1375,7 @@ class EnStrings extends Strings {
     'effects' => 'Queue',
     'passes' => 'Routing',
     'wechat' => 'WeChat',
+    'devices' => 'Devices',
     _ => name,
   };
 
@@ -956,4 +1408,299 @@ class EnStrings extends Strings {
   String get notInstalledShort => 'Not installed';
   @override
   String get loggedOut => 'Logged out';
+
+  // Multi-Device Control Plane
+  @override
+  String get multiDeviceControlPlane => 'Multi-device control plane';
+  @override
+  String get multiDeviceSettingsFooter => 'Connect remote hosts (Tier 1) and embedded MCUs (Tier 2) over encrypted relay and P2P channels.';
+  @override
+  String get manageDevices => 'Manage devices';
+  @override
+  String get devicesNotConfigured => 'Not configured';
+  @override
+  String get relayConnected => 'Connected';
+  @override
+  String get relayConnecting => 'Connecting';
+  @override
+  String get relayReconnecting => 'Reconnecting';
+  @override
+  String get relayOffline => 'Offline';
+  @override
+  String devicesOnlineSummary(int online, int total) => '$online / $total online';
+  @override
+  String pendingApprovalsShort(int count) => '$count pending';
+  @override
+  String get devicesUnsupportedTitle => 'Multi-device control plane unavailable';
+  @override
+  String get devicesUnsupportedHint => 'Upgrade the Master Neo backend to a version that supports the multi-device API.';
+  @override
+  String get devicesConnectFirst => 'Connect to a Neo backend first to manage devices.';
+  @override
+  String get deviceClusterSetup => 'Initialize multi-device cluster';
+  @override
+  String get deviceClusterSetupIntro => 'Configure your relay address and cluster credentials to enable one-click remote onboarding, E2E encrypted RPC, and risk approvals.';
+  @override
+  String get deviceClusterSetupFooter => 'Secrets stay in Master Neo\'s local store. The relay server cannot decrypt end-to-end payloads.';
+  @override
+  String get relayUrlLabel => 'Relay URL';
+  @override
+  String get clusterIdLabel => 'Cluster ID';
+  @override
+  String get clusterIdPlaceholder => 'Leave empty to auto-generate (e.g. personal)';
+  @override
+  String get clusterSecretLabel => 'Cluster secret';
+  @override
+  String get clusterSecretPlaceholder => 'Enter relay cluster secret';
+  @override
+  String get clusterSecretKeepPlaceholder => 'Configured — leave blank to keep';
+  @override
+  String get localRelayDetectedBadge => 'Local relay detected';
+  @override
+  String get localRelayDetectedHint => 'Automatically uses credentials from the local neo-relayd instance.';
+  @override
+  String get advancedOptions => 'Advanced options';
+  @override
+  String get masterNodeIdLabel => 'Master node ID';
+  @override
+  String get e2eKeyLabel => 'E2E Key';
+  @override
+  String get e2eKeyPlaceholder => 'Leave empty to generate a 256-bit key';
+  @override
+  String get initClusterAndConnect => 'Initialize & connect relay';
+  @override
+  String get clusterStatus => 'Cluster status';
+  @override
+  String get addDeviceShort => '+ Add device';
+  @override
+  String get addDeviceCta => '+ Add device / Install command';
+  @override
+  String get connectMcu => 'Connect MCU';
+  @override
+  String get clusterSettings => 'Cluster settings';
+  @override
+  String get clusterEnabled => 'Enable control plane';
+  @override
+  String get relayStatusLabel => 'Relay status';
+  @override
+  String get agentVersionLabel => 'Agent version';
+  @override
+  String get pendingApprovals => 'Pending approvals';
+  @override
+  String get approve => 'Approve';
+  @override
+  String get reject => 'Reject';
+  @override
+  String get approvalCode => 'Code';
+  @override
+  String get approvalApproved => 'Approved and dispatched';
+  @override
+  String get approvalRejected => 'Action rejected';
+  @override
+  String get activeEnrollments => 'Active enrollments';
+  @override
+  String get viewCopyCommand => 'View / Copy';
+  @override
+  String get revoke => 'Revoke';
+  @override
+  String get revokeImmediately => 'Revoke now';
+  @override
+  String get enrollmentStatusPending => 'Waiting';
+  @override
+  String get enrollmentStatusClaimed => 'Claimed';
+  @override
+  String get enrollmentStatusCompleted => 'Online';
+  @override
+  String get enrollmentStatusExpired => 'Expired';
+  @override
+  String get enrollmentStatusRevoked => 'Revoked';
+  @override
+  String remainingTime(String mmss) => '$mmss left';
+  @override
+  String usesCount(int used, int max) => '$used/$max used';
+  @override
+  String get deviceFleet => 'Device fleet';
+  @override
+  String get noDevicesTitle => 'No remote devices yet';
+  @override
+  String get noDevicesHint => 'Generate a one-click install command and paste it on a Linux, macOS, Windows, or Docker host to onboard automatically.';
+  @override
+  String get generateFirstInstallCmd => 'Generate first install command';
+  @override
+  String get deviceStatusOnline => 'Online';
+  @override
+  String get deviceStatusOffline => 'Offline';
+  @override
+  String get deviceStatusSleeping => 'Sleeping';
+  @override
+  String get deviceStatusUnreachable => 'Unreachable via relay';
+  @override
+  String get deviceRouteP2p => 'P2P';
+  @override
+  String get deviceRouteLan => 'LAN';
+  @override
+  String get deviceRouteRelay => 'Relay';
+  @override
+  String get deviceRouteViaTier1 => 'via Tier1';
+  @override
+  String get tier1Badge => 'Tier 1 OS';
+  @override
+  String get tier2Badge => 'Tier 2 MCU';
+  @override
+  String get relayBridgeBadge => 'MCU Bridge';
+  @override
+  String get ping => 'Ping';
+  @override
+  String pingOk(int ms, String route) => '${ms}ms · $route';
+  @override
+  String get pingFailed => 'Ping failed';
+  @override
+  String get uninstallCommand => 'Uninstall cmd';
+  @override
+  String get uninstallCopied => 'Uninstall command copied';
+  @override
+  String get removeDevice => 'Remove';
+  @override
+  String removeDeviceConfirmTitle(String id) => 'Remove device $id?';
+  @override
+  String get removeDeviceConfirmBody => 'This removes the device record from Master Neo. To clean up the remote host, copy and run its uninstall command first.';
+  @override
+  String lastSeen(String when) => 'Last seen $when';
+  @override
+  String queuedCommands(int count) => '$count queued';
+  @override
+  String viaRelayDevice(String id) => 'via $id';
+
+  @override
+  String get addDeviceSheetTitle => 'Add device';
+  @override
+  String get close => 'Close';
+  @override
+  String get done => 'Done';
+  @override
+  String get policyPreset => 'Security policy preset';
+  @override
+  String get profilePersonalTitle => 'Personal dev (personal)';
+  @override
+  String get profilePersonalDesc => 'Allows workspace access and dev tools; blocks privilege escalation and destructive commands.';
+  @override
+  String get profileCorpTitle => 'Corporate restricted (corp)';
+  @override
+  String get profileCorpDesc => 'Strict command allowlist; denies ad-hoc shells and arbitrary script interpreters.';
+  @override
+  String get profileReadonlyTitle => 'Read-only inspect (readonly)';
+  @override
+  String get profileReadonlyDesc => 'Diagnostics and log reading only; blocks workspace modifications.';
+  @override
+  String get profileDesktopTitle => 'Desktop collab (desktop)';
+  @override
+  String get profileDesktopDesc => 'Tailored for desktop workstations with workspace builds and collaboration tools.';
+  @override
+  String get installMode => 'Install mode';
+  @override
+  String get installModeAuto => 'Auto';
+  @override
+  String get installModeSystem => 'System';
+  @override
+  String get installModeUser => 'User';
+  @override
+  String get deviceIdLabel => 'Device ID';
+  @override
+  String get deviceIdPlaceholder => 'Leave empty to use remote hostname';
+  @override
+  String get workspacesLabel => 'Allowed workspaces';
+  @override
+  String get workspacesPlaceholder => 'Comma-separated paths, e.g. /workspace, /data/proj';
+  @override
+  String get enableRelayBridge => 'Enable Tier 2 MCU bridge (--relay)';
+  @override
+  String get mqttBindLabel => 'MQTT bind address';
+  @override
+  String get uartDeviceLabel => 'Serial UART device';
+  @override
+  String get cudaDevicesLabel => 'CUDA_VISIBLE_DEVICES';
+  @override
+  String get memoryMaxLabel => 'MemoryMax';
+  @override
+  String get cpuQuotaLabel => 'CPUQuota';
+  @override
+  String get transportMode => 'Transport';
+  @override
+  String get transportRelay => 'Relay (NAT traversal)';
+  @override
+  String get transportDirect => 'LAN direct';
+  @override
+  String get masterPublicUrlLabel => 'Master public URL';
+  @override
+  String get ttlLabel => 'Ticket TTL';
+  @override
+  String get maxUsesLabel => 'Max uses';
+  @override
+  String get generateInstallCmd => 'Generate install command';
+  @override
+  String get linuxRootMode => 'sudo system isolated';
+  @override
+  String get linuxUserMode => 'Non-root user mode';
+  @override
+  String get copyCommand => 'Copy command';
+  @override
+  String get qrCode => 'QR code';
+  @override
+  String get waitingForPaste => 'Waiting for target device to run command…';
+  @override
+  String ticketClaimed(String? ip) => ip != null ? 'Ticket claimed (IP: $ip), verifying and starting service…' : 'Ticket claimed, verifying and starting service…';
+  @override
+  String deviceOnboarded(String ids) => 'Device $ids is online!';
+  @override
+  String get ticketExpired => 'Enrollment ticket expired. Generate a new one.';
+  @override
+  String get ticketRevoked => 'Enrollment ticket revoked.';
+  @override
+  String get newCommand => 'Configure another';
+  @override
+  String get mcuIntro => 'Master Neo automatically deploys firmware config and install scripts through an online Tier 1 host (MQTT or Serial).';
+  @override
+  String get tier1RelayDevice => 'Tier 1 relay host';
+  @override
+  String get manualEntry => 'Enter device ID manually';
+  @override
+  String get tier1DeviceIdPlaceholder => 'Enter Tier 1 device ID (e.g. edge-pi-01)';
+  @override
+  String get mcuTransport => 'MCU transport';
+  @override
+  String get mcuTransportMqtt => 'MQTT';
+  @override
+  String get mcuTransportSerial => 'Serial (UART/RS485)';
+  @override
+  String get mcuIdLabel => 'MCU device ID';
+  @override
+  String get mcuChipLabel => 'Chip model';
+  @override
+  String get chipLinuxSim => 'Linux simulator';
+  @override
+  String get mqttBrokerLabel => 'MQTT broker address';
+  @override
+  String get serialPortLabel => 'Serial port path';
+  @override
+  String get baudRateLabel => 'Baud rate';
+  @override
+  String get backupRelaysLabel => 'Backup Tier 1 relays (optional)';
+  @override
+  String get installMcuCta => 'Auto-install via Tier 1';
+  @override
+  String mcuDeployedTier1(String dir) => 'Deployed over E2E channel to Tier 1 workspace $dir';
+  @override
+  String get mcuStagedManual => 'MCU config generated (staged manual mode)';
+  @override
+  String get previewConfigHeader => 'Preview neo_mcu_config.h';
+  @override
+  String get previewInstallScript => 'Preview install script';
+  @override
+  String get copy => 'Copy';
+  @override
+  String get mcuIdRequired => 'MCU device ID is required';
+  @override
+  String get relayDeviceRequired => 'Select or enter a Tier 1 relay device ID';
+  @override
+  String get mcuE2eKeyLabel => 'MCU E2E key';
 }

@@ -47,8 +47,15 @@ export interface RelayFrame {
 
 /** Inner E2E AEAD envelope version tag byte. */
 export const E2E_ENVELOPE_VERSION = 0xe1;
+/** Zero-trust enrollment AEAD envelope version tag byte. */
+export const ENROLL_ENVELOPE_VERSION = 0xe2;
 export const E2E_NONCE_BYTES = 12;
 export const E2E_TAG_BYTES = 16;
+
+/** Default public relay URL used when initializing a new cluster. */
+export const DEFAULT_RELAY_URL = "https://neo.1inch.cn:18443";
+/** Default co-located `neo-relayd` environment file path. */
+export const DEFAULT_LOCAL_RELAY_ENV_PATH = "/nvme/neo-relay/config/relay.env";
 
 /** Message kind inside an encrypted `DeviceMessage`. */
 export type DeviceMessageKind =
@@ -57,7 +64,9 @@ export type DeviceMessageKind =
   | "rpc_resp"
   | "heartbeat"
   | "relay_envelope"
-  | "event";
+  | "event"
+  | "enroll_register"
+  | "enroll_ack";
 
 /** Plaintext JSON payload inside the Master <-> Tier 1 OS Agent AEAD envelope. */
 export interface DeviceMessage {
@@ -232,6 +241,35 @@ export interface DeviceConfigView {
   hasClusterSecret: boolean;
   hasToken: boolean;
   hasE2eKey: boolean;
+  canMintTokens: boolean;
+  relayState: RelayConnectionState;
+  localRelayDetected: boolean;
+  defaultRelayUrl: string;
+  agentVersion: string;
+}
+
+/** Input to `DeviceManager.initOrUpdateConfig`. */
+export interface DeviceConfigUpdateInput {
+  clusterId?: string;
+  masterNodeId?: string;
+  relayUrl?: string;
+  relaySecret?: string;
+  clusterSecret?: string;
+  token?: string;
+  e2eKey?: string;
+  tokenTtlSec?: number;
+  autoDetectLocalRelay?: boolean;
+  enabled?: boolean;
+}
+
+/** Outcome of `DeviceManager.pingDevice`. */
+export interface DevicePingResult {
+  ok: boolean;
+  deviceId: string;
+  latencyMs: number;
+  status: DeviceStatus;
+  route: DeviceRouteKind;
+  error?: string;
 }
 
 /** Input to `DeviceManager.invoke`. */
@@ -325,3 +363,160 @@ export type S3PrefixValidation =
       ok: false;
       error: string;
     };
+
+/** Target OS / runtime platform for one-click agent enrollment. */
+export type EnrollmentPlatform = "linux" | "macos" | "windows" | "docker";
+
+/** Local read-only sandbox policy preset for enrolled Tier 1 OS agents. */
+export type EnrollmentProfile = "personal" | "corp" | "readonly" | "desktop";
+
+/** Installation privilege / service mode on the target host. */
+export type EnrollmentInstallMode = "auto" | "system" | "user" | "foreground";
+
+/** Ticket delivery transport: zero-trust relay pool or Master Direct Mode. */
+export type EnrollmentTransportMode = "relay" | "direct";
+
+/** Lifecycle status of an agent enrollment ticket. */
+export type EnrollmentStatus = "pending" | "claimed" | "completed" | "expired" | "revoked";
+
+/** Authentication handoff mode inside an encrypted `EnrollPayload`. */
+export type EnrollmentAuthMode = "direct" | "bootstrap_exchange";
+
+/** Decrypted enrollment parcel sealed with `0xE2` AES-256-GCM. */
+export interface EnrollPayload {
+  v: 1;
+  enroll_id: string;
+  cluster_id: string;
+  master_id: string;
+  relay_url: string;
+  device_id: string;
+  auth_mode: EnrollmentAuthMode;
+  relay_token: string;
+  e2e_key: string;
+  agent_version: string;
+  download_mirrors: string[];
+  checksums: Record<string, string>;
+  install_mode: EnrollmentInstallMode;
+  policy_profile: EnrollmentProfile;
+  policy_toml: string;
+  workspace_override: string;
+  relay_bridge: {
+    enabled: boolean;
+    mqtt_bind: string;
+    uart_device: string | null;
+  };
+  limits: {
+    memory_max: string;
+    cpu_quota: string;
+    cuda_devices: string;
+  };
+  expires_at: number;
+}
+
+/** Platform-specific one-line installation and uninstall commands. */
+export interface EnrollmentCommands {
+  linuxRoot: string;
+  linuxUser: string;
+  macos: string;
+  windows: string;
+  docker: string;
+  uninstall: string;
+}
+
+/** Input to `createEnrollment`. */
+export interface EnrollmentCreateInput {
+  platform?: EnrollmentPlatform;
+  profile?: EnrollmentProfile;
+  installMode?: EnrollmentInstallMode;
+  deviceId?: string;
+  workspaces?: string[];
+  relayBridge?: boolean;
+  mqttBind?: string;
+  uartDevice?: string | null;
+  cudaDevices?: string;
+  memoryMax?: string;
+  cpuQuota?: string;
+  transportMode?: EnrollmentTransportMode;
+  masterPublicUrl?: string;
+  ttlSec?: number;
+  maxUses?: number;
+  agentVersion?: string;
+  downloadMirrors?: string[];
+  checksums?: Record<string, string>;
+}
+
+/** Public view of an enrollment record (never exposes cluster `e2eKey` or long-lived tokens). */
+export interface EnrollmentView {
+  id: string;
+  ticketId: string;
+  clusterId: string;
+  status: EnrollmentStatus;
+  platform: EnrollmentPlatform;
+  profile: EnrollmentProfile;
+  installMode: EnrollmentInstallMode;
+  transportMode: EnrollmentTransportMode;
+  authMode: EnrollmentAuthMode;
+  requestedDeviceId?: string;
+  relayUrl?: string;
+  claimUrl?: string;
+  ttlSec: number;
+  maxUses: number;
+  usedCount: number;
+  claimedCount: number;
+  createdAt: string;
+  expiresAt: string;
+  expiresAtSec: number;
+  lastClaimedAt?: string;
+  lastClaimedIp?: string;
+  completedAt?: string;
+  revokedAt?: string;
+  enrolledDeviceIds: string[];
+  enrollCode?: string;
+  commands?: EnrollmentCommands;
+  qrPayload?: string;
+  policyPreview?: string;
+}
+
+/** Result of Master Direct Mode `POST /enroll/claim/:id`. */
+export type DirectClaimResult =
+  | {
+      ok: true;
+      status: 200;
+      ticket_id: string;
+      ciphertext_b64: string;
+      expires_at: number;
+      expires_at_ms: number;
+    }
+  | {
+      ok: false;
+      status: 404 | 410 | 429;
+      error: string;
+    };
+
+/** Physical/local transport linking a Tier 2 MCU to its Tier 1 `neo-agent-os` gateway. */
+export type McuTransportKind = "mqtt" | "serial";
+
+/** Input to `DeviceManager.installMcuViaTier1`. */
+export interface McuInstallInput {
+  mcuId: string;
+  relayDeviceId: string;
+  transport: McuTransportKind;
+  mqttBroker?: string;
+  serialPort?: string;
+  baudRate?: number;
+  chip?: string;
+  backupRelayDeviceIds?: string[];
+  autoDeploy?: boolean;
+}
+
+/** Output of `DeviceManager.installMcuViaTier1`. */
+export interface McuInstallResult {
+  twin: DeviceTwin;
+  deployed: boolean;
+  deployMethod: "tier1_rpc" | "staged_manual";
+  deployDetail: string;
+  workspaceDir: string;
+  configHeader: string;
+  installScript: string;
+  mcuE2eKeyHex: string;
+}

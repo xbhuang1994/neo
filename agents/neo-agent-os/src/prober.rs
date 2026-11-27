@@ -54,6 +54,7 @@ impl CapabilityProber {
             "transfer".to_string(),
             "ota".to_string(),
         ];
+        #[cfg(target_os = "linux")]
         if Path::new("/dev/nvidia0").exists() {
             capabilities.push("gpu".to_string());
         }
@@ -101,29 +102,77 @@ impl CapabilityProber {
 }
 
 fn read_total_ram_mb() -> u64 {
-    if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
-        for line in content.lines() {
-            if let Some(rest) = line.strip_prefix("MemTotal:") {
-                let kb: u64 = rest
-                    .split_whitespace()
-                    .next()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-                return kb / 1024;
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
+            for line in content.lines() {
+                if let Some(rest) = line.strip_prefix("MemTotal:") {
+                    let kb: u64 = rest
+                        .split_whitespace()
+                        .next()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    return kb / 1024;
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(out) = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+        {
+            if out.status.success() {
+                if let Ok(s) = std::str::from_utf8(&out.stdout) {
+                    if let Ok(bytes) = s.trim().parse::<u64>() {
+                        return bytes / (1024 * 1024);
+                    }
+                }
             }
         }
     }
     0
 }
 
-fn read_hostname() -> String {
-    if let Ok(h) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
-        let trimmed = h.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
+pub(crate) fn read_hostname() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(h) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
+            let trimmed = h.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
         }
     }
-    std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string())
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(out) = std::process::Command::new("hostname").output() {
+            if out.status.success() {
+                if let Ok(s) = std::str::from_utf8(&out.stdout) {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        return trimmed.to_string();
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(h) = std::env::var("COMPUTERNAME") {
+            let trimmed = h.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 #[cfg(test)]
@@ -133,7 +182,8 @@ mod tests {
     #[test]
     fn probes_manifest_with_sandbox_and_relay() {
         let ws = std::env::temp_dir();
-        let toml = format!("allowed_workspaces = [\"{}\"]\n", ws.display());
+        let ws_escaped = ws.display().to_string().replace('\\', "\\\\");
+        let toml = format!("allowed_workspaces = [\"{ws_escaped}\"]\n");
         let policy = Policy::from_toml_str(&toml).unwrap();
         let manifest = CapabilityProber::probe(
             &policy,
