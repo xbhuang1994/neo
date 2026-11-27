@@ -85,3 +85,11 @@ Enrollment flow:
 2. Decrypts the `[0xE2][12B nonce][AES-256-GCM ciphertext || 16B tag]` envelope locally with key `SHA-256("neo-enroll-v1:<ticket_id>:<ephemeral_key>")` and AAD `"neo-enroll-v1|<ticket_id>"` so the relay never sees plaintext secrets.
 3. For `auth_mode = "bootstrap_exchange"`, connects briefly to `/v1/relay` and exchanges an E2E-encrypted `enroll_register` / `enroll_ack` handshake with Master Neo to obtain the permanent `device_id` and `relay_token`.
 4. Renders `{{WORKSPACE_DIR}}` into `policy-<cluster>.toml` (`0444`) and writes `cluster-<cluster>.env` (`0600`), sends an initial `manifest` containing `enroll_id`, and installs the native OS service (`systemd` system or user unit on Linux, `launchd` LaunchAgent on macOS, or Scheduled Task with restricted `.env` ACL on Windows).
+
+## Custom device names
+
+Each `DeviceTwin` supports an optional user-defined display name (`customName`, up to 64 Unicode characters, no control characters) stored in Master Neo without altering the immutable protocol `deviceId` bound to `neo1` tokens, E2E AAD, and MQTT topics.
+
+- Set or clear a device's custom name from the Devices page (`Rename`), via `PATCH /api/devices/{deviceId}` (or `PUT /api/devices/{deviceId}` with `{ "customName": string | null }`), or via the `device_rename` tool.
+- Optional `customName` may also be supplied when creating an enrollment ticket (`POST /api/devices/enrollments`) or installing a Tier 2 MCU (`POST /api/devices/mcu/install` / `device_mcu_install`); subsequent manifests, heartbeats, and reconnects preserve the custom name.
+- `device_list` exposes `customName`, and `device_invoke` / `device_rename` accept either `deviceId` or a unique `customName`.

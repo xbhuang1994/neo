@@ -96,6 +96,7 @@ class FakeBackend {
   final List<String> revokedEnrollments = [];
   final List<String> removedDevices = [];
   final List<String> pingedDevices = [];
+  final List<(String, String?)> renamedDevices = [];
   final List<Map<String, dynamic>> mcuInstalls = [];
   final List<String> approvedApprovals = [];
   final List<String> rejectedApprovals = [];
@@ -128,6 +129,7 @@ class FakeBackend {
 
   void addDevice(
     String deviceId, {
+    String? customName,
     String tier = 'os',
     String status = 'online',
     String route = 'relay',
@@ -140,6 +142,7 @@ class FakeBackend {
     devices.add({
       'deviceId': deviceId,
       'clusterId': (deviceConfig['clusterId'] as String?)?.isNotEmpty == true ? deviceConfig['clusterId'] : 'personal',
+      if (customName != null && customName.trim().isNotEmpty) 'customName': customName.trim(),
       'tier': tier,
       'status': status,
       'route': route,
@@ -209,6 +212,7 @@ class FakeBackend {
     if (!ids.contains(deviceId)) ids.add(deviceId);
     addDevice(
       deviceId,
+      customName: enrollment['requestedCustomName'] as String?,
       status: 'online',
       route: route,
       manifest: {
@@ -520,6 +524,8 @@ class FakeBackend {
         'installMode': installMode,
         'transportMode': transportMode,
         'requestedDeviceId': req['deviceId'],
+        if (req['customName'] is String && (req['customName'] as String).trim().isNotEmpty)
+          'requestedCustomName': (req['customName'] as String).trim(),
         'status': 'pending',
         'createdAt': now.toIso8601String(),
         'expiresAt': now.add(Duration(seconds: ttlSec)).toIso8601String(),
@@ -561,11 +567,13 @@ class FakeBackend {
       final req = body is Map ? body.cast<String, dynamic>() : <String, dynamic>{};
       mcuInstalls.add(req);
       final mcuId = req['mcuId'] as String? ?? 'esp32-1';
+      final customName = req['customName'] as String?;
       final relayDeviceId = req['relayDeviceId'] as String? ?? 'edge-1';
       final chip = req['chip'] as String? ?? 'ESP32';
       final transport = req['transport'] as String? ?? 'mqtt';
       addDevice(
         mcuId,
+        customName: customName,
         tier: 'mcu',
         status: mcuAutoDeploySuccess ? 'online' : 'offline',
         route: 'via_tier1',
@@ -621,6 +629,29 @@ class FakeBackend {
         'status': device['status'],
         'route': device['route'],
       });
+    }
+    if ((method == 'PATCH' || method == 'PUT') && path.startsWith('/api/devices/') && path != '/api/devices/config') {
+      final id = Uri.decodeComponent(path.substring('/api/devices/'.length));
+      final index = devices.indexWhere((d) => d['deviceId'] == id);
+      if (index == -1) return _json(404, {'error': 'Device not found'});
+      final req = body is Map ? body.cast<String, dynamic>() : <String, dynamic>{};
+      final rawName = req['customName'] ?? req['custom_name'] ?? req['name'];
+      if (rawName != null && rawName is! String) {
+        return _json(400, {'error': 'customName must be a string or null'});
+      }
+      final trimmed = rawName is String ? rawName.trim() : null;
+      if (trimmed != null && trimmed.runes.length > 64) {
+        return _json(400, {'error': 'Device custom name must be at most 64 characters'});
+      }
+      final device = devices[index];
+      if (trimmed == null || trimmed.isEmpty) {
+        device.remove('customName');
+        renamedDevices.add((id, null));
+      } else {
+        device['customName'] = trimmed;
+        renamedDevices.add((id, trimmed));
+      }
+      return _json(200, device);
     }
     if (method == 'DELETE' && path.startsWith('/api/devices/')) {
       final id = Uri.decodeComponent(path.substring('/api/devices/'.length));

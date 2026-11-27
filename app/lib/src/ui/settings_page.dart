@@ -92,14 +92,27 @@ class Field extends StatelessWidget {
 
 /// A single-line or multi-line text box in the settings' style.
 class Box extends StatelessWidget {
-  const Box({super.key, required this.controller, this.placeholder, this.lines = 1, this.obscure = false, this.mono = false, this.onChanged, this.keyboard});
+  const Box({
+    super.key,
+    required this.controller,
+    this.placeholder,
+    this.lines = 1,
+    this.obscure = false,
+    this.mono = false,
+    this.autofocus = false,
+    this.onChanged,
+    this.onSubmitted,
+    this.keyboard,
+  });
 
   final TextEditingController controller;
   final String? placeholder;
   final int lines;
   final bool obscure;
   final bool mono;
+  final bool autofocus;
   final ValueChanged<String>? onChanged;
+  final ValueChanged<String>? onSubmitted;
   final TextInputType? keyboard;
 
   @override
@@ -112,10 +125,12 @@ class Box extends StatelessWidget {
       minLines: lines == 1 ? null : 2,
       maxLines: obscure ? 1 : lines,
       obscureText: obscure,
+      autofocus: autofocus,
       autocorrect: false,
       enableSuggestions: false,
       keyboardType: keyboard,
       onChanged: onChanged,
+      onSubmitted: onSubmitted,
       style: mono ? typo.mono.copyWith(color: palette.label, fontSize: 13) : typo.body,
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
       decoration: BoxDecoration(color: palette.fill, borderRadius: BorderRadius.circular(8)),

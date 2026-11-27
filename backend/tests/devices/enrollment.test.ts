@@ -1154,4 +1154,83 @@ describe("devices/enrollment protocol, config, flow, MCU install, and HTTP API",
       dir.cleanup();
     }
   });
+
+  test("enrollment and MCU installation propagate optional customName to onboarded device twins", async () => {
+    const store = Store.memory();
+    const manager = new DeviceManager({ store, masterId: "cust" });
+    await manager.initOrUpdateConfig(
+      { clusterId: "custom-name-cluster", relayUrl: "", clusterSecret: "sec-custom", e2eKey: "e2e-custom" },
+      { connect: false },
+    );
+
+    // 1. Single-use enrollment with customName applies customName on manifest arrival
+    const enr = await manager.createEnrollment({
+      platform: "linux",
+      profile: "personal",
+      transportMode: "direct",
+      customName: "书房工作站",
+      maxUses: 2,
+    });
+    expect(enr.requestedCustomName).toBe("书房工作站");
+
+    manager.handleDeviceMessage("os-workstation-1", {
+      v: 1,
+      kind: "manifest",
+      req_id: "m-enr-1",
+      cluster_id: "custom-name-cluster",
+      device_id: "os-workstation-1",
+      ts_ms: Date.now(),
+      body: {
+        device_id: "os-workstation-1",
+        tier: "os",
+        os: "linux",
+        arch: "amd64",
+        capabilities: ["exec", "relay"],
+        enroll_id: enr.id,
+      },
+    });
+    expect(manager.getDevice("os-workstation-1")?.customName).toBe("书房工作站");
+
+    // Second device on multi-use ticket receives #2 suffix automatically
+    manager.handleDeviceMessage("os-workstation-2", {
+      v: 1,
+      kind: "manifest",
+      req_id: "m-enr-2",
+      cluster_id: "custom-name-cluster",
+      device_id: "os-workstation-2",
+      ts_ms: Date.now(),
+      body: {
+        device_id: "os-workstation-2",
+        tier: "os",
+        os: "linux",
+        arch: "amd64",
+        capabilities: ["exec"],
+        enroll_id: enr.id,
+      },
+    });
+    expect(manager.getDevice("os-workstation-2")?.customName).toBe("书房工作站 #2");
+
+    // 2. MCU install with customName pre-registers twin with customName and preserves it on hello
+    const mcuRes = await manager.installMcuViaTier1({
+      mcuId: "mcu-balcony-01",
+      customName: "阳台浇花控制器",
+      relayDeviceId: "os-workstation-1",
+      transport: "mqtt",
+      autoDeploy: false,
+    });
+    expect(mcuRes.twin.customName).toBe("阳台浇花控制器");
+    expect(manager.getDevice("mcu-balcony-01")?.customName).toBe("阳台浇花控制器");
+
+    // Subsequent re-install without customName preserves existing customName
+    const mcuRes2 = await manager.installMcuViaTier1({
+      mcuId: "mcu-balcony-01",
+      relayDeviceId: "os-workstation-1",
+      transport: "mqtt",
+      autoDeploy: false,
+    });
+    expect(mcuRes2.twin.customName).toBe("阳台浇花控制器");
+
+    await manager.stop();
+    store.close();
+  });
 });

@@ -260,6 +260,7 @@ class ApiClient {
     required String profile,
     required String installMode,
     String? deviceId,
+    String? customName,
     List<String>? workspaces,
     bool? relayBridge,
     String? mqttBind,
@@ -281,6 +282,7 @@ class ApiClient {
         'installMode': installMode,
         'transportMode': transportMode,
         if (deviceId != null && deviceId.trim().isNotEmpty) 'deviceId': deviceId.trim(),
+        if (customName != null && customName.trim().isNotEmpty) 'customName': customName.trim(),
         if (workspaces != null && workspaces.isNotEmpty) 'workspaces': workspaces,
         'relayBridge': ?relayBridge,
         if (mqttBind != null && mqttBind.trim().isNotEmpty) 'mqttBind': mqttBind.trim(),
@@ -311,6 +313,17 @@ class ApiClient {
     final body = await _object('DELETE', '/api/devices/enrollments/${Uri.encodeComponent(id)}');
     final enrollment = body['enrollment'] is Map ? (body['enrollment'] as Map).cast<String, dynamic>() : body;
     return DeviceEnrollment.fromJson(enrollment);
+  }
+
+  Future<DeviceTwin> renameDevice(String id, String? customName) async {
+    final trimmed = customName?.trim();
+    final body = await _object(
+      'PATCH',
+      '/api/devices/${Uri.encodeComponent(id)}',
+      body: {'customName': (trimmed == null || trimmed.isEmpty) ? null : trimmed},
+    );
+    final device = body['device'] is Map ? (body['device'] as Map).cast<String, dynamic>() : body;
+    return DeviceTwin.fromJson(device);
   }
 
   Future<void> removeDevice(String id) async {
@@ -344,6 +357,7 @@ class ApiClient {
 
   Future<McuInstallResult> installMcu({
     required String mcuId,
+    String? customName,
     required String relayDeviceId,
     required String transport,
     String? mqttBroker,
@@ -358,6 +372,7 @@ class ApiClient {
       '/api/devices/mcu/install',
       body: {
         'mcuId': mcuId.trim(),
+        if (customName != null && customName.trim().isNotEmpty) 'customName': customName.trim(),
         'relayDeviceId': relayDeviceId.trim(),
         'transport': transport,
         if (mqttBroker != null && mqttBroker.trim().isNotEmpty) 'mqttBroker': mqttBroker.trim(),

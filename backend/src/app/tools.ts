@@ -106,8 +106,10 @@ const ALLOWED_DEVICE_INVOKE: readonly string[] = [
   "reason",
 ];
 const ALLOWED_DEVICE_APPROVE: readonly string[] = ["approval_id", "decision", "reason"];
+const ALLOWED_DEVICE_RENAME: readonly string[] = ["device_id", "name"];
 const ALLOWED_DEVICE_MCU_INSTALL: readonly string[] = [
   "mcu_id",
+  "custom_name",
   "relay_device_id",
   "transport",
   "mqtt_broker",
@@ -237,7 +239,7 @@ function deviceSpecs(): ToolSpec[] {
   return [
     spec(
       "device_list",
-      "List paired Tier 1 OS agents and Tier 2 MCUs with their online status, routing path, and capabilities.",
+      "List paired Tier 1 OS agents and Tier 2 MCUs with their custom display names, online status, routing path, and capabilities.",
       {
         tier: { type: ["string", "null"], enum: ["os", "mcu", null] },
         status: {
@@ -249,9 +251,12 @@ function deviceSpecs(): ToolSpec[] {
     ),
     spec(
       "device_invoke",
-      "Invoke a capability or action on a paired Tier 1 OS agent or Tier 2 MCU. Risky actions return pending_approval with a short code.",
+      "Invoke a capability or action on a paired Tier 1 OS agent or Tier 2 MCU. Accepts either device_id or a unique custom name. Risky actions return pending_approval with a short code.",
       {
-        device_id: { type: "string" },
+        device_id: {
+          type: "string",
+          description: "Target device ID or unique custom display name.",
+        },
         action: { type: "string" },
         params: { type: ["object", "null"] },
         timeout_ms: { type: ["integer", "null"], minimum: 100, maximum: 300000 },
@@ -270,10 +275,30 @@ function deviceSpecs(): ToolSpec[] {
       ["approval_id", "decision"],
     ),
     spec(
+      "device_rename",
+      "Set or clear a user-defined custom display name for a paired device (Tier 1 OS agent or Tier 2 MCU) without changing its protocol device_id.",
+      {
+        device_id: {
+          type: "string",
+          description: "Target device ID or unique current custom display name.",
+        },
+        name: {
+          type: ["string", "null"],
+          description:
+            "New custom display name (at most 64 characters), or null / empty string to clear and revert to device_id.",
+        },
+      },
+      ["device_id", "name"],
+    ),
+    spec(
       "device_mcu_install",
       "Install and provision a Tier 2 MCU through a paired Tier 1 neo-agent-os gateway over MQTT or Serial (UART/RS485). Pre-registers the MCU twin, derives its cluster MCU E2E key, generates neo_mcu_config.h + install-mcu.sh, and pushes them onto the Tier 1 workspace when online.",
       {
         mcu_id: { type: "string", description: "Unique Tier 2 MCU device ID (e.g. mcu-esp32-rack01)." },
+        custom_name: {
+          type: ["string", "null"],
+          description: "Optional user-defined display name for the MCU (at most 64 characters).",
+        },
         relay_device_id: { type: "string", description: "Paired Tier 1 neo-agent-os gateway device ID." },
         transport: { type: "string", enum: ["mqtt", "serial"] },
         mqtt_broker: {
@@ -1325,7 +1350,7 @@ async function runDeviceTool(
     }
     case "device_invoke": {
       const args = Args.of(argumentsValue, ALLOWED_DEVICE_INVOKE);
-      const deviceId = args.required("device_id").trim();
+      const rawTarget = args.required("device_id").trim();
       const action = args.required("action").trim();
       const rawParams = args.get("params");
       if (rawParams !== undefined && rawParams !== null && !isRecord(rawParams)) {
@@ -1339,13 +1364,44 @@ async function runDeviceTool(
         }
         timeoutMs = rawTimeout;
       }
-      const result = await app.devices.invoke(deviceId, {
+      let targetDeviceId = rawTarget;
+      try {
+        const resolved = app.devices.resolveDevice(rawTarget);
+        if (resolved !== null) {
+          targetDeviceId = resolved.deviceId;
+        }
+      } catch (error) {
+        return {
+          handled: true,
+          result: {
+            status: "rejected",
+            deviceId: rawTarget,
+            action,
+            error: errorMessage(error),
+          },
+        };
+      }
+      const result = await app.devices.invoke(targetDeviceId, {
         action,
         params: isRecord(rawParams) ? rawParams : {},
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
         ...(args.text("reason") !== undefined ? { reason: args.text("reason") } : {}),
       });
       return { handled: true, result };
+    }
+    case "device_rename": {
+      const args = Args.of(argumentsValue, ALLOWED_DEVICE_RENAME);
+      const rawTarget = args.required("device_id").trim();
+      const rawName = args.get("name");
+      if (rawName !== null && typeof rawName !== "string") {
+        throw new Error("name must be a string or null");
+      }
+      const resolved = app.devices.resolveDevice(rawTarget);
+      if (resolved === null) {
+        throw new Error(`Unknown device: ${rawTarget}`);
+      }
+      const device = app.devices.setDeviceName(resolved.deviceId, rawName);
+      return { handled: true, result: { device } };
     }
     case "device_approve": {
       const args = Args.of(argumentsValue, ALLOWED_DEVICE_APPROVE);
@@ -1390,6 +1446,7 @@ async function runDeviceTool(
       }
       const result = await app.devices.installMcuViaTier1({
         mcuId,
+        ...(args.text("custom_name") !== undefined ? { customName: args.text("custom_name") } : {}),
         relayDeviceId,
         transport: rawTransport as McuTransportKind,
         ...(args.text("mqtt_broker") !== undefined ? { mqttBroker: args.text("mqtt_broker") } : {}),

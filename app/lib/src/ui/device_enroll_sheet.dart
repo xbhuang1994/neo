@@ -80,6 +80,7 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
   String _profile = 'personal';
   String _installMode = 'auto';
   bool _showAdvanced = false;
+  final TextEditingController _customName = TextEditingController();
   final TextEditingController _deviceId = TextEditingController();
   final TextEditingController _workspaces = TextEditingController();
   bool _relayBridge = false;
@@ -112,6 +113,7 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
   final TextEditingController _mcuRelayId = TextEditingController();
   String _mcuTransport = 'mqtt';
   final TextEditingController _mcuId = TextEditingController();
+  final TextEditingController _mcuCustomName = TextEditingController();
   String _mcuChip = 'ESP32';
   final TextEditingController _mcuMqttBroker = TextEditingController();
   final TextEditingController _mcuSerialPort = TextEditingController();
@@ -177,6 +179,7 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
     _copyResetTimer?.cancel();
     _scroll.dispose();
     for (final controller in [
+      _customName,
       _deviceId,
       _workspaces,
       _mqttBind,
@@ -187,6 +190,7 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
       _masterPublicUrl,
       _mcuRelayId,
       _mcuId,
+      _mcuCustomName,
       _mcuMqttBroker,
       _mcuSerialPort,
       _mcuBaudRate,
@@ -254,6 +258,7 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
         profile: _profile,
         installMode: effectiveInstallMode,
         deviceId: _deviceId.text.trim().isEmpty ? null : _deviceId.text.trim(),
+        customName: _customName.text.trim().isEmpty ? null : _customName.text.trim(),
         workspaces: _parseList(_workspaces.text),
         relayBridge: _relayBridge ? true : null,
         mqttBind: _relayBridge ? _mqttBind.text.trim() : null,
@@ -312,6 +317,9 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
     });
   }
 
+  String _tier1DisplayLabel(DeviceTwin device) =>
+      device.hasCustomName ? '${device.displayName} (${device.deviceId})' : device.deviceId;
+
   Future<void> _pickTier1Device() async {
     final strings = Strings.read(context);
     final tier1 = _tier1Devices;
@@ -320,7 +328,7 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
         (
           d.deviceId,
           [
-            d.deviceId,
+            _tier1DisplayLabel(d),
             d.isOnline ? strings.deviceStatusOnline : strings.deviceStatusOffline,
             if (d.mqttBind != null) 'MQTT ${d.mqttBind}',
             if (d.uartDevice != null) 'UART ${d.uartDevice}',
@@ -369,6 +377,7 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
       final backups = _parseList(_mcuBackupRelays.text);
       final result = await widget.api.installMcu(
         mcuId: mcuId,
+        customName: _mcuCustomName.text.trim().isEmpty ? null : _mcuCustomName.text.trim(),
         relayDeviceId: relayId,
         transport: _mcuTransport,
         mqttBroker: _mcuTransport == 'mqtt' ? _mcuMqttBroker.text.trim() : null,
@@ -478,6 +487,13 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
             ),
           ),
         ],
+        const SizedBox(height: 14),
+        _sectionLabel(strings.deviceNameLabel),
+        Box(
+          key: const ValueKey('enroll-device-name'),
+          controller: _customName,
+          placeholder: strings.deviceNameOptionalPlaceholder,
+        ),
         const SizedBox(height: 14),
         Container(
           decoration: BoxDecoration(color: palette.grouped, borderRadius: BorderRadius.circular(10), border: Border.all(color: palette.separator.withValues(alpha: 0.4), width: 0.5)),
@@ -676,11 +692,17 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
     final command = enrollment.commands.forPlatform(enrollment.platform, linuxUseRoot: _linuxUseRoot);
     final remaining = formatRemainingTtl(enrollment.expiresAt);
 
+    final onboardedLabel = _onboardedDevices.isNotEmpty
+        ? _onboardedDevices.map((d) => d.displayName).join(', ')
+        : enrollment.enrolledDeviceIds.isNotEmpty
+        ? enrollment.enrolledDeviceIds.join(', ')
+        : (enrollment.requestedCustomName ?? enrollment.requestedDeviceId ?? enrollment.id);
+
     final (statusColor, statusText, showSpinner, statusIcon) = switch (enrollment.status) {
       'claimed' => (palette.accent, strings.ticketClaimed(enrollment.lastClaimedIp), true, null),
       'completed' => (
         palette.green,
-        strings.deviceOnboarded(enrollment.enrolledDeviceIds.isNotEmpty ? enrollment.enrolledDeviceIds.join(', ') : (enrollment.requestedDeviceId ?? enrollment.id)),
+        strings.deviceOnboarded(onboardedLabel),
         false,
         CupertinoIcons.checkmark_circle_fill,
       ),
@@ -699,6 +721,8 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
           children: [
             Pill(enrollment.platform.toUpperCase(), color: palette.accent),
             Pill(enrollment.profile, color: palette.secondary),
+            if (enrollment.requestedCustomName != null)
+              Pill(enrollment.requestedCustomName!, color: palette.accent),
             if (enrollment.isActive)
               Pill(strings.remainingTime(remaining), color: palette.orange, dot: true),
             if (enrollment.maxUses > 1)
@@ -846,7 +870,9 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
                       runSpacing: 4,
                       crossAxisAlignment: WrapCrossAlignment.center,
                       children: [
-                        Text(twin.deviceId, style: typo.mono.copyWith(color: palette.label, fontWeight: FontWeight.w600)),
+                        Text(twin.displayName, style: typo.headline.copyWith(fontSize: 13.5)),
+                        if (twin.hasCustomName)
+                          Text(twin.deviceId, style: typo.mono.copyWith(fontSize: 12, color: palette.secondary)),
                         Pill(_routeLabel(twin.route, strings), color: palette.green),
                         if (twin.manifest?.os != null)
                           Text(
@@ -909,7 +935,15 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
                 Field(
                   key: const ValueKey('mcu-relay-picker'),
                   label: strings.tier1RelayDevice,
-                  trailing: Choice(_manualTier1 ? strings.manualEntry : (_selectedTier1Id ?? strings.manualEntry)),
+                  trailing: Choice(
+                    _manualTier1
+                        ? strings.manualEntry
+                        : (() {
+                            final selected = tier1.where((d) => d.deviceId == _selectedTier1Id).firstOrNull;
+                            if (selected != null) return _tier1DisplayLabel(selected);
+                            return _selectedTier1Id ?? strings.manualEntry;
+                          })(),
+                  ),
                   onTap: () => unawaited(_pickTier1Device()),
                 ),
                 if (_manualTier1) ...[
@@ -946,6 +980,11 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
               Field(
                 label: strings.mcuIdLabel,
                 below: Box(key: const ValueKey('mcu-id-input'), controller: _mcuId, placeholder: 'esp32-rack-01', mono: true),
+              ),
+              Padding(padding: const EdgeInsets.only(left: 14), child: Container(height: 0.5, color: palette.separator)),
+              Field(
+                label: strings.deviceNameLabel,
+                below: Box(key: const ValueKey('mcu-device-name'), controller: _mcuCustomName, placeholder: strings.deviceNameOptionalPlaceholder),
               ),
               Padding(padding: const EdgeInsets.only(left: 14), child: Container(height: 0.5, color: palette.separator)),
               Field(
@@ -1061,7 +1100,8 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
             spacing: 8,
             runSpacing: 6,
             children: [
-              Pill(result.twin.deviceId, color: palette.purple),
+              Pill(result.twin.displayName, color: palette.purple),
+              if (result.twin.hasCustomName) Pill(result.twin.deviceId, color: palette.secondary),
               Pill(_routeLabel(result.twin.route, strings), color: palette.accent),
               if (result.mcuE2eKeyHex.isNotEmpty)
                 Pill('${strings.mcuE2eKeyLabel}: ${_shortHex(result.mcuE2eKeyHex)}', color: palette.secondary),

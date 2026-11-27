@@ -163,6 +163,24 @@ class _DevicesPageState extends State<DevicesPage> {
     );
   }
 
+  Future<void> _openRenameSheet(AppState state, DeviceTwin device) async {
+    final api = state.client;
+    if (api == null) return;
+    final strings = Strings.read(context);
+    final updated = await showCupertinoModalPopup<DeviceTwin>(
+      context: context,
+      builder: (sheet) => _RenameDeviceSheet(api: api, device: device),
+    );
+    if (updated == null || !mounted) return;
+    await state.refresh();
+    if (mounted) {
+      _showToast(
+        updated.hasCustomName ? strings.deviceRenamed(updated.displayName) : strings.deviceNameCleared,
+        good: true,
+      );
+    }
+  }
+
   Future<void> _handleApproval(AppState state, DeviceApproval approval, {required bool approve}) async {
     final api = state.client;
     if (api == null) return;
@@ -247,19 +265,20 @@ class _DevicesPageState extends State<DevicesPage> {
     final strings = Strings.read(context);
     final cmd = _uninstallCommandFor(device, enrollments);
     unawaited(Clipboard.setData(ClipboardData(text: cmd)));
-    _showToast('${strings.uninstallCopied} (${device.deviceId})', good: true);
+    _showToast('${strings.uninstallCopied} (${device.displayName})', good: true);
   }
 
   Future<void> _removeDevice(AppState state, DeviceTwin device) async {
     final api = state.client;
     if (api == null) return;
     final strings = Strings.read(context);
+    final deviceLabel = device.hasCustomName ? '${device.displayName} (${device.deviceId})' : device.deviceId;
     final confirmed = await showCupertinoDialog<bool>(
       context: context,
       builder: (dialog) {
         final fonts = fallbackFonts(dialog);
         return CupertinoAlertDialog(
-          title: Text(strings.removeDeviceConfirmTitle(device.deviceId), style: fonts),
+          title: Text(strings.removeDeviceConfirmTitle(deviceLabel), style: fonts),
           content: Text(strings.removeDeviceConfirmBody, style: fonts),
           actions: [
             CupertinoDialogAction(onPressed: () => Navigator.of(dialog).pop(false), child: Text(strings.cancel, style: fonts)),
@@ -441,6 +460,7 @@ class _DevicesPageState extends State<DevicesPage> {
         if (a.isOnline != b.isOnline) return a.isOnline ? -1 : 1;
         return a.deviceId.compareTo(b.deviceId);
       });
+    final deviceById = {for (final d in overview.devices) d.deviceId: d};
 
     return CupertinoScrollbar(
       controller: _scroll,
@@ -523,7 +543,7 @@ class _DevicesPageState extends State<DevicesPage> {
                     Group(
                       title: '${strings.pendingApprovals} (${pendingApprovals.length})',
                       children: [
-                        for (final approval in pendingApprovals) _buildApprovalRow(state, approval),
+                        for (final approval in pendingApprovals) _buildApprovalRow(state, approval, deviceById),
                       ],
                     ),
 
@@ -555,7 +575,7 @@ class _DevicesPageState extends State<DevicesPage> {
                           ),
                         )
                       else
-                        for (final device in sortedDevices) _buildDeviceRow(state, device, overview.enrollments),
+                        for (final device in sortedDevices) _buildDeviceRow(state, device, overview.enrollments, deviceById),
                     ],
                   ),
                 ],
@@ -567,12 +587,15 @@ class _DevicesPageState extends State<DevicesPage> {
     );
   }
 
-  Widget _buildApprovalRow(AppState state, DeviceApproval approval) {
+  Widget _buildApprovalRow(AppState state, DeviceApproval approval, Map<String, DeviceTwin> deviceById) {
     final strings = Strings.read(context);
     final palette = Palette.of(context);
     final typo = Typo.of(context);
     final busy = _busyApprovals.contains(approval.id);
     final paramsText = approval.params.isEmpty ? null : jsonEncode(approval.params);
+    final targetDevice = deviceById[approval.deviceId];
+    final targetLabel = targetDevice?.displayName ?? approval.deviceId;
+    final showRawId = targetDevice != null && targetDevice.hasCustomName;
 
     return Padding(
       key: ValueKey('approval-${approval.id}'),
@@ -586,7 +609,8 @@ class _DevicesPageState extends State<DevicesPage> {
             crossAxisAlignment: WrapCrossAlignment.center,
             children: [
               Pill(approval.shortCode, color: palette.orange, dot: true),
-              Text(approval.deviceId, style: typo.headline),
+              Text(targetLabel, style: typo.headline),
+              if (showRawId) Text(approval.deviceId, style: typo.mono.copyWith(fontSize: 12, color: palette.secondary)),
               Text(approval.action, style: typo.mono.copyWith(color: palette.accent, fontWeight: FontWeight.w600)),
               if (approval.createdAt != null) Text(clockTime(approval.createdAt!), style: typo.caption),
             ],
@@ -655,6 +679,7 @@ class _DevicesPageState extends State<DevicesPage> {
               Pill(enrollment.platform.toUpperCase(), color: palette.accent),
               Pill(statusLabel, color: statusColor, dot: true),
               Text(enrollment.profile, style: typo.footnote),
+              if (enrollment.requestedCustomName != null) Text(enrollment.requestedCustomName!, style: typo.headline.copyWith(fontSize: 13.5)),
               if (enrollment.requestedDeviceId != null) Text(enrollment.requestedDeviceId!, style: typo.mono.copyWith(color: palette.label)),
               Text(strings.remainingTime(ttl), style: typo.caption.copyWith(fontFeatures: const [FontFeature.tabularFigures()])),
               if (enrollment.maxUses > 1) Text(strings.usesCount(enrollment.usedCount, enrollment.maxUses), style: typo.caption),
@@ -700,7 +725,7 @@ class _DevicesPageState extends State<DevicesPage> {
     );
   }
 
-  Widget _buildDeviceRow(AppState state, DeviceTwin device, List<DeviceEnrollment> enrollments) {
+  Widget _buildDeviceRow(AppState state, DeviceTwin device, List<DeviceEnrollment> enrollments, Map<String, DeviceTwin> deviceById) {
     final strings = Strings.read(context);
     final palette = Palette.of(context);
     final typo = Typo.of(context);
@@ -722,7 +747,10 @@ class _DevicesPageState extends State<DevicesPage> {
     if (device.isMcu) {
       if (manifest?.chip != null) chips.add(manifest!.chip!);
       if (manifest?.fw != null) chips.add('fw ${manifest!.fw!}');
-      if (device.relayNodeId != null) chips.add(strings.viaRelayDevice(device.relayNodeId!));
+      if (device.relayNodeId != null) {
+        final relayDevice = deviceById[device.relayNodeId!];
+        chips.add(strings.viaRelayDevice(relayDevice?.displayName ?? device.relayNodeId!));
+      }
       if (device.pendingQueueLength > 0) chips.add(strings.queuedCommands(device.pendingQueueLength));
     } else {
       if (manifest?.os != null) {
@@ -772,8 +800,10 @@ class _DevicesPageState extends State<DevicesPage> {
                   runSpacing: 4,
                   crossAxisAlignment: WrapCrossAlignment.center,
                   children: [
-                    Text(device.deviceId, style: typo.headline),
-                    if (manifest?.hostname != null && manifest!.hostname != device.deviceId)
+                    Text(device.displayName, style: typo.headline),
+                    if (device.hasCustomName)
+                      Text(device.deviceId, style: typo.mono.copyWith(fontSize: 12, color: palette.secondary)),
+                    if (manifest?.hostname != null && manifest!.hostname != device.deviceId && manifest.hostname != device.customName)
                       Text(manifest.hostname!, style: typo.caption),
                     Pill(statusLabel, color: statusColor),
                     Pill(routeLabel, color: routeColor),
@@ -844,6 +874,12 @@ class _DevicesPageState extends State<DevicesPage> {
                 plain: true,
                 busy: pinging,
                 onPressed: pinging ? null : () => unawaited(_pingDevice(state, device)),
+              ),
+              ActionButton(
+                key: ValueKey('rename-${device.deviceId}'),
+                label: strings.renameDevice,
+                plain: true,
+                onPressed: () => unawaited(_openRenameSheet(state, device)),
               ),
               ActionButton(
                 key: ValueKey('uninstall-${device.deviceId}'),
@@ -1078,6 +1114,164 @@ class _ClusterSettingsSheetState extends State<_ClusterSettingsSheet> {
                           busy: _busy,
                           onPressed: () => unawaited(_save()),
                         ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Modal popup to set or clear a user-defined custom display name for a paired device.
+class _RenameDeviceSheet extends StatefulWidget {
+  const _RenameDeviceSheet({required this.api, required this.device});
+
+  final ApiClient api;
+  final DeviceTwin device;
+
+  @override
+  State<_RenameDeviceSheet> createState() => _RenameDeviceSheetState();
+}
+
+class _RenameDeviceSheetState extends State<_RenameDeviceSheet> {
+  late final TextEditingController _name;
+  bool _busy = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _name = TextEditingController(text: widget.device.customName ?? '');
+  }
+
+  @override
+  void dispose() {
+    _name.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save(String value) async {
+    if (_busy) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final trimmed = value.trim();
+      final updated = await widget.api.renameDevice(widget.device.deviceId, trimmed.isEmpty ? null : trimmed);
+      if (mounted) Navigator.of(context).pop(updated);
+    } on ApiException catch (error) {
+      if (mounted) setState(() => _error = error.message);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = Strings.read(context);
+    final palette = Palette.of(context);
+    final typo = Typo.of(context);
+
+    return Center(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxWidth: 440, maxHeight: MediaQuery.sizeOf(context).height * 0.8),
+        child: Container(
+          margin: const EdgeInsets.all(grid * 2),
+          decoration: BoxDecoration(
+            color: palette.surface,
+            borderRadius: BorderRadius.circular(14),
+            boxShadow: const [BoxShadow(color: Color(0x33000000), blurRadius: 30, offset: Offset(0, 10))],
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 14, 8, 10),
+                child: Row(
+                  children: [
+                    Expanded(child: Text(strings.renameDeviceTitle, style: typo.headline.copyWith(fontSize: 17))),
+                    CupertinoButton(
+                      key: const ValueKey('rename-device-cancel-btn'),
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      minimumSize: const Size(0, 30),
+                      onPressed: () => Navigator.of(context).pop(),
+                      child: Text(strings.cancel, style: typo.body.copyWith(color: palette.accent)),
+                    ),
+                  ],
+                ),
+              ),
+              Container(height: 0.5, color: palette.separator),
+              Flexible(
+                child: SingleChildScrollView(
+                  primary: false,
+                  padding: const EdgeInsets.all(14),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(14, 6, 14, 4),
+                        child: Row(
+                          children: [
+                            Text(strings.deviceIdLabel, style: typo.body),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Text(
+                                widget.device.deviceId,
+                                textAlign: TextAlign.right,
+                                style: typo.mono.copyWith(color: palette.secondary),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      Field(
+                        label: strings.deviceNameLabel,
+                        below: Box(
+                          key: const ValueKey('rename-device-input'),
+                          controller: _name,
+                          placeholder: strings.deviceNamePlaceholder,
+                          autofocus: true,
+                          onSubmitted: (_) => unawaited(_save(_name.text)),
+                        ),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(14, 4, 14, 8),
+                        child: Text(strings.deviceNameHint, style: typo.caption),
+                      ),
+                      if (_error != null) ...[
+                        const SizedBox(height: 4),
+                        Notice(_error!),
+                      ],
+                      const SizedBox(height: 12),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.end,
+                        children: [
+                          if (widget.device.hasCustomName) ...[
+                            ActionButton(
+                              key: const ValueKey('rename-device-reset-btn'),
+                              label: strings.resetDefaultName,
+                              plain: true,
+                              busy: _busy,
+                              onPressed: _busy ? null : () => unawaited(_save('')),
+                            ),
+                            const SizedBox(width: 8),
+                          ],
+                          ActionButton(
+                            key: const ValueKey('rename-device-save-btn'),
+                            label: strings.save,
+                            busy: _busy,
+                            onPressed: _busy ? null : () => unawaited(_save(_name.text)),
+                          ),
+                        ],
                       ),
                     ],
                   ),

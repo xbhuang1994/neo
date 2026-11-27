@@ -282,6 +282,15 @@ abstract class Strings {
   String get removeDevice;
   String removeDeviceConfirmTitle(String id);
   String get removeDeviceConfirmBody;
+  String get renameDevice;
+  String get renameDeviceTitle;
+  String get deviceNameLabel;
+  String get deviceNamePlaceholder;
+  String get deviceNameOptionalPlaceholder;
+  String get deviceNameHint;
+  String deviceRenamed(String name);
+  String get deviceNameCleared;
+  String get resetDefaultName;
   String lastSeen(String when);
   String queuedCommands(int count);
   String viaRelayDevice(String id);
@@ -894,6 +903,24 @@ class ZhStrings extends Strings {
   String removeDeviceConfirmTitle(String id) => '移除设备 $id？';
   @override
   String get removeDeviceConfirmBody => '将从主控设备列表中移除该记录；如需彻底清理远端程序，请先复制并运行卸载命令。';
+  @override
+  String get renameDevice => '重命名';
+  @override
+  String get renameDeviceTitle => '重命名设备';
+  @override
+  String get deviceNameLabel => '设备名称';
+  @override
+  String get deviceNamePlaceholder => '例如：客厅树莓派、实验室 GPU 机';
+  @override
+  String get deviceNameOptionalPlaceholder => '可选，如：客厅树莓派（留空默认显示设备 ID）';
+  @override
+  String get deviceNameHint => '自定义名称仅用于展示与对话识别，不会修改底层设备 ID；留空保存可恢复默认名称。';
+  @override
+  String deviceRenamed(String name) => '设备已重命名为「$name」';
+  @override
+  String get deviceNameCleared => '已恢复默认设备名称';
+  @override
+  String get resetDefaultName => '恢复默认';
   @override
   String lastSeen(String when) => '最近活跃 $when';
   @override
@@ -1564,6 +1591,24 @@ class EnStrings extends Strings {
   String removeDeviceConfirmTitle(String id) => 'Remove device $id?';
   @override
   String get removeDeviceConfirmBody => 'This removes the device record from Master Neo. To clean up the remote host, copy and run its uninstall command first.';
+  @override
+  String get renameDevice => 'Rename';
+  @override
+  String get renameDeviceTitle => 'Rename device';
+  @override
+  String get deviceNameLabel => 'Device name';
+  @override
+  String get deviceNamePlaceholder => 'e.g. Living Room Pi, Lab GPU Host';
+  @override
+  String get deviceNameOptionalPlaceholder => 'Optional, e.g. Lab GPU Host (defaults to device ID)';
+  @override
+  String get deviceNameHint => 'Custom names are for display and chat lookup without changing the underlying device ID. Leave blank to restore the default.';
+  @override
+  String deviceRenamed(String name) => 'Device renamed to "$name"';
+  @override
+  String get deviceNameCleared => 'Restored default device name';
+  @override
+  String get resetDefaultName => 'Reset to default';
   @override
   String lastSeen(String when) => 'Last seen $when';
   @override
