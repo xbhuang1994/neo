@@ -106,3 +106,11 @@ Master Neo and Tier 1 `neo-agent-os` nodes transfer files directly disk-to-disk 
 - **Control plane (`0xE1` RPC)**: `file.pull.open`, `file.push.open`, and `file.transfer.abort` enforce local sandbox policy, negotiate `chunk_size` (default `128 KiB`, clamped `4 KiB..512 KiB`) and sliding `window_bytes` (default `512 KiB`), and support resumable `.neo-part-<transfer_id>` staging files.
 - **Data plane (`0xE3` binary AEAD envelope)**: raw file chunks, cumulative `ACK`, `FINISH` (32-byte SHA-256), `DONE`, and `ABORT` frames are encrypted with the cluster E2E key (`AES-256-GCM`, AAD `file-v1|<cluster_id>|<src_id>|<dst_id>`) and forwarded opaquely inside `FLAG_DATA` relay frames with zero base64 overhead, sliding-window flow control, `FLAG_ERR_RATE` (`0x83`) adaptive backoff, end-to-end SHA-256 verification, and atomic rename commit.
 - **Interfaces**: exposed via the `device_file_transfer` tool (main and worker sessions), `DeviceManager.statFile` / `pullFile` / `pushFile` / `listTransfers` / `cancelTransfer`, and HTTP API endpoints (`/api/devices/:id/files/{stat,pull,push}`, `/api/devices/transfers`), with automatic `rpc_fallback` (`fs_read` / `transfer_chunk`) for legacy Tier 1 agents.
+
+## Custom device names
+
+Each `DeviceTwin` supports an optional user-defined display name (`customName`, up to 64 Unicode characters, no control characters) stored in Master Neo without altering the immutable protocol `deviceId` bound to `neo1` tokens, E2E AAD, and MQTT topics.
+
+- Set or clear a device's custom name from the Devices page (`Rename`), via `PATCH /api/devices/{deviceId}` (or `PUT /api/devices/{deviceId}` with `{ "customName": string | null }`), or via the `device_rename` tool.
+- Optional `customName` may also be supplied when creating an enrollment ticket (`POST /api/devices/enrollments`) or installing a Tier 2 MCU (`POST /api/devices/mcu/install` / `device_mcu_install`); subsequent manifests, heartbeats, and reconnects preserve the custom name.
+- `device_list` exposes `customName`, and `device_invoke` / `device_file_transfer` / `device_rename` accept either `deviceId` or a unique `customName`.

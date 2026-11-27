@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { App, defaultTimings } from "../../src/app/index.ts";
+import { App, defaultTimings, mainSpecs, workerSpecs } from "../../src/app/index.ts";
 import {
   DeviceManager,
   FLAG_DATA,
@@ -16,6 +16,7 @@ import {
   encodeRelayFrame,
   inferSandboxLevel,
   isVersionOlder,
+  normalizeDeviceCustomName,
   openDeviceMessage,
   openRelayEnvelope,
   renderDirectInstallPs1,
@@ -1656,6 +1657,224 @@ describe("devices/relay-client & manager", () => {
 
       await app.stop();
       app.close();
+    } finally {
+      dir.cleanup();
+    }
+  });
+
+  test("custom device names: validation, persistence across manifests/heartbeats, resolution, HTTP PATCH/PUT, and device_rename/device_invoke tools", async () => {
+    // 1. Validation unit checks
+    expect(normalizeDeviceCustomName(undefined)).toBeUndefined();
+    expect(normalizeDeviceCustomName(null)).toBeUndefined();
+    expect(normalizeDeviceCustomName("   ")).toBeUndefined();
+    expect(normalizeDeviceCustomName("  客厅树莓派 🍓  ")).toBe("客厅树莓派 🍓");
+    expect(normalizeDeviceCustomName("🚀".repeat(64))).toBe("🚀".repeat(64));
+    expect(() => normalizeDeviceCustomName("🚀".repeat(65))).toThrow("at most 64 characters");
+    expect(() => normalizeDeviceCustomName("bad\nname")).toThrow("control characters");
+    expect(() => normalizeDeviceCustomName("bad\u0000name")).toThrow("control characters");
+
+    // 2. DeviceManager persistence, manifest/heartbeat preservation, and resolveDevice
+    const dir = new TempDir("neo-device-custom-names");
+    try {
+      const scripted = new Scripted();
+      scripted.model = async () => "ok";
+      const app = App.open(
+        { stateDir: dir.path, wechat: new Protocol() },
+        new ScriptedKernels(scripted),
+        defaultTimings(),
+      );
+      await app.devices.configure(
+        {
+          clusterId: "cluster-names",
+          masterNodeId: "master-names",
+          relaySecret: "names-secret",
+          e2eKey: "names-e2e-key",
+        },
+        { persist: true, connect: false },
+      );
+
+      app.devices.upsertDeviceManifest(
+        { device_id: "os-gpu-01", tier: "os", hostname: "ubuntu-gpu", capabilities: ["exec", "relay"] },
+        { status: "online" },
+      );
+      app.devices.upsertDeviceManifest(
+        { device_id: "mcu-temp-01", tier: "mcu", chip: "esp32", acts: ["set_fan_pwm"] },
+        { status: "sleeping", relayNodeId: "os-gpu-01" },
+      );
+
+      // Set custom name via DeviceManager
+      const renamed = app.devices.setDeviceName("os-gpu-01", "  实验室 GPU 主机  ");
+      expect(renamed.customName).toBe("实验室 GPU 主机");
+      expect(renamed.deviceId).toBe("os-gpu-01");
+
+      // Subsequent manifest & heartbeat & disconnect preserve customName
+      app.devices.upsertDeviceManifest(
+        { device_id: "os-gpu-01", tier: "os", hostname: "ubuntu-gpu-v2", capabilities: ["exec", "relay"] },
+        { status: "online" },
+      );
+      expect(app.devices.getDevice("os-gpu-01")?.customName).toBe("实验室 GPU 主机");
+
+      app.devices.handleDeviceMessage("os-gpu-01", {
+        v: 1,
+        kind: "heartbeat",
+        req_id: "hb-1",
+        cluster_id: "cluster-names",
+        device_id: "os-gpu-01",
+        ts_ms: Date.now(),
+        body: { load: 0.5 },
+      });
+      expect(app.devices.getDevice("os-gpu-01")?.customName).toBe("实验室 GPU 主机");
+
+      app.devices.handleTier1Disconnect("os-gpu-01");
+      expect(app.devices.getDevice("os-gpu-01")?.customName).toBe("实验室 GPU 主机");
+      app.devices.setDeviceStatus("os-gpu-01", "online");
+
+      // resolveDevice: exact ID priority, exact customName, case-insensitive customName, ambiguity error
+      expect(app.devices.resolveDevice("os-gpu-01")?.deviceId).toBe("os-gpu-01");
+      expect(app.devices.resolveDevice("实验室 GPU 主机")?.deviceId).toBe("os-gpu-01");
+      expect(app.devices.resolveDevice("实验室 gpu 主机")?.deviceId).toBe("os-gpu-01");
+      expect(app.devices.resolveDevice("unknown-name")).toBeNull();
+
+      // Exact deviceId wins even if another device's customName equals it
+      app.devices.setDeviceName("mcu-temp-01", "os-gpu-01");
+      expect(app.devices.resolveDevice("os-gpu-01")?.deviceId).toBe("os-gpu-01");
+
+      // Ambiguous custom name throws descriptive error
+      app.devices.setDeviceName("mcu-temp-01", "实验室 GPU 主机");
+      expect(() => app.devices.resolveDevice("实验室 GPU 主机")).toThrow("Ambiguous device name");
+
+      // Tool schemas include device_rename in both mainSpecs and workerSpecs
+      expect(mainSpecs().some((s) => s.name === "device_rename")).toBe(true);
+      expect(workerSpecs().some((s) => s.name === "device_rename")).toBe(true);
+
+      // device_invoke returns rejected error on ambiguous custom name
+      const ambigInvoke = (await app.mainTool("device_invoke", {
+        device_id: "实验室 GPU 主机",
+        action: "set_fan_pwm",
+        params: { duty: 50 },
+      })) as { status: string; error: string };
+      expect(ambigInvoke.status).toBe("rejected");
+      expect(ambigInvoke.error).toContain("Ambiguous device name");
+
+      // Rename MCU via device_rename tool and invoke it by customName!
+      const renameToolRes = (await app.workerTool("t-rename", "device_rename", {
+        device_id: "mcu-temp-01",
+        name: "机房温湿度传感器",
+      })) as { device: { deviceId: string; customName?: string } };
+      expect(renameToolRes.device.deviceId).toBe("mcu-temp-01");
+      expect(renameToolRes.device.customName).toBe("机房温湿度传感器");
+
+      // Rename again referencing its current customName
+      const renameByNameRes = (await app.mainTool("device_rename", {
+        device_id: "机房温湿度传感器",
+        name: "机房主传感器",
+      })) as { device: { deviceId: string; customName?: string } };
+      expect(renameByNameRes.device.deviceId).toBe("mcu-temp-01");
+      expect(renameByNameRes.device.customName).toBe("机房主传感器");
+
+      // device_list exposes customName
+      const listed = (await app.mainTool("device_list", {})) as {
+        devices: Array<{ deviceId: string; customName?: string }>;
+      };
+      expect(listed.devices.find((d) => d.deviceId === "mcu-temp-01")?.customName).toBe("机房主传感器");
+
+      // device_invoke resolves unique customName -> targets canonical deviceId
+      const byNameInvoke = (await app.mainTool("device_invoke", {
+        device_id: "机房主传感器",
+        action: "set_fan_pwm",
+        params: { duty: 65 },
+      })) as { status: string; deviceId: string };
+      expect(byNameInvoke.status).toBe("pending_approval");
+      expect(byNameInvoke.deviceId).toBe("mcu-temp-01");
+
+      // HTTP API PATCH / PUT /api/devices/:id
+      const peer = { host: "127.0.0.1", port: 50011 };
+      const access = {};
+
+      const patchRes = await handle(
+        app,
+        access,
+        makeRequest("PATCH", "/api/devices/os-gpu-01", { customName: "主训练节点 A100" }),
+        peer,
+      );
+      expect(patchRes.status).toBe(200);
+      const patchJson = JSON.parse(new TextDecoder().decode(patchRes.body)) as {
+        deviceId: string;
+        customName?: string;
+      };
+      expect(patchJson.deviceId).toBe("os-gpu-01");
+      expect(patchJson.customName).toBe("主训练节点 A100");
+
+      // PUT with `name` alias also works
+      const putRes = await handle(
+        app,
+        access,
+        makeRequest("PUT", "/api/devices/os-gpu-01", { name: "办公台式机" }),
+        peer,
+      );
+      expect(putRes.status).toBe(200);
+      expect(JSON.parse(new TextDecoder().decode(putRes.body)).customName).toBe("办公台式机");
+
+      // Clearing via null removes customName property
+      const clearRes = await handle(
+        app,
+        access,
+        makeRequest("PATCH", "/api/devices/os-gpu-01", { customName: null }),
+        peer,
+      );
+      expect(clearRes.status).toBe(200);
+      const clearJson = JSON.parse(new TextDecoder().decode(clearRes.body)) as Record<string, unknown>;
+      expect("customName" in clearJson).toBe(false);
+
+      // Error responses: 400 invalid payload / too long / control chars, 404 unknown device or /config
+      expect(
+        (await handle(app, access, makeRequest("PATCH", "/api/devices/os-gpu-01", {}), peer)).status,
+      ).toBe(400);
+      expect(
+        (await handle(app, access, makeRequest("PATCH", "/api/devices/os-gpu-01", { customName: 123 }), peer)).status,
+      ).toBe(400);
+      expect(
+        (
+          await handle(
+            app,
+            access,
+            makeRequest("PATCH", "/api/devices/os-gpu-01", { customName: "a".repeat(65) }),
+            peer,
+          )
+        ).status,
+      ).toBe(400);
+      expect(
+        (
+          await handle(
+            app,
+            access,
+            makeRequest("PATCH", "/api/devices/os-gpu-01", { customName: "bad\tname" }),
+            peer,
+          )
+        ).status,
+      ).toBe(400);
+      expect(
+        (await handle(app, access, makeRequest("PATCH", "/api/devices/nonexistent", { customName: "X" }), peer)).status,
+      ).toBe(404);
+      expect(
+        (await handle(app, access, makeRequest("PATCH", "/api/devices/config", { customName: "X" }), peer)).status,
+      ).toBe(404);
+
+      // Verify persistence across App reopen (SQLite)
+      await handle(app, access, makeRequest("PATCH", "/api/devices/os-gpu-01", { customName: "持久化测试主机" }), peer);
+      await app.stop();
+      app.close();
+
+      const app2 = App.open(
+        { stateDir: dir.path, wechat: new Protocol() },
+        new ScriptedKernels(scripted),
+        defaultTimings(),
+      );
+      app2.devices.initFromEnv({});
+      expect(app2.devices.getDevice("os-gpu-01")?.customName).toBe("持久化测试主机");
+      expect(app2.devices.getDevice("mcu-temp-01")?.customName).toBe("机房主传感器");
+      await app2.stop();
+      app2.close();
     } finally {
       dir.cleanup();
     }

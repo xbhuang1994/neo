@@ -1126,5 +1126,137 @@ void main() {
       expect(find.text('中国 广东 广州'), findsOneWidget);
       await enApp.close();
     });
+
+    testWidgets('supports renaming devices, clearing back to default, and custom names across approvals, MCU relay chip, enrollment, and English dark mode', (tester) async {
+      final backend = FakeBackend()
+        ..configureDevices(clusterId: 'personal')
+        ..addDevice(
+          'os-gpu-01',
+          status: 'online',
+          route: 'p2p',
+          capabilities: ['exec', 'fs', 'relay', 'gpu'],
+        )
+        ..addDevice(
+          'mcu-esp32-01',
+          tier: 'mcu',
+          status: 'online',
+          route: 'via_tier1',
+          relayNodeId: 'os-gpu-01',
+        )
+        ..addDeviceApproval(
+          'apr-rename',
+          shortCode: 'R9N4M2',
+          deviceId: 'os-gpu-01',
+          action: 'reboot',
+        );
+
+      // Verify ApiClient.renameDevice directly too.
+      final api = backend.api();
+      final directRenamed = await api.renameDevice('os-gpu-01', '临时名');
+      expect((directRenamed.customName, directRenamed.hasCustomName, directRenamed.displayName), ('临时名', true, '临时名'));
+      final directCleared = await api.renameDevice('os-gpu-01', null);
+      expect((directCleared.customName, directCleared.hasCustomName, directCleared.displayName), (null, false, 'os-gpu-01'));
+      backend.renamedDevices.clear();
+
+      final app = await open(tester, backend);
+      await tester.tap(nav(2));
+      await settle(tester);
+
+      // Open Rename sheet for Tier 1 OS device.
+      final renameBtn = find.byKey(const ValueKey('rename-os-gpu-01'));
+      await show(tester, renameBtn);
+      await tester.tap(renameBtn);
+      await settle(tester);
+
+      expect(find.text('重命名设备'), findsOneWidget);
+      expect(find.byKey(const ValueKey('rename-device-reset-btn')), findsNothing);
+
+      // Overlong name displays backend validation error inline without closing modal.
+      await tester.enterText(find.byKey(const ValueKey('rename-device-input')), '名' * 65);
+      await tester.tap(find.byKey(const ValueKey('rename-device-save-btn')));
+      await settle(tester);
+      expect(find.textContaining('at most 64 characters'), findsOneWidget);
+      expect(find.text('重命名设备'), findsOneWidget);
+
+      // Valid Chinese custom name succeeds and propagates across fleet, approval row, and MCU relay chip.
+      await tester.enterText(find.byKey(const ValueKey('rename-device-input')), '实验室 GPU 主机');
+      await tester.tap(find.byKey(const ValueKey('rename-device-save-btn')));
+      await settle(tester);
+
+      expect(backend.renamedDevices.last, ('os-gpu-01', '实验室 GPU 主机'));
+      expect(find.text('设备已重命名为「实验室 GPU 主机」'), findsOneWidget);
+      expect(find.text('实验室 GPU 主机'), findsWidgets);
+      expect(find.text('经由 实验室 GPU 主机'), findsOneWidget);
+
+      // Remove confirmation dialog includes both custom name and underlying deviceId.
+      final removeBtn = find.byKey(const ValueKey('remove-os-gpu-01'));
+      await show(tester, removeBtn);
+      await tester.tap(removeBtn);
+      await settle(tester);
+      expect(find.text('移除设备 实验室 GPU 主机 (os-gpu-01)？'), findsOneWidget);
+      await tester.tap(find.text('取消'));
+      await settle(tester);
+
+      // Enrollment sheet supports setting custom name for new Tier 1 & Tier 2 MCU devices and shows renamed Tier 1 in MCU picker.
+      final addBtn = find.byKey(const ValueKey('add-device-btn'));
+      await show(tester, addBtn);
+      await tester.tap(addBtn);
+      await settle(tester);
+
+      await tester.enterText(find.byKey(const ValueKey('enroll-device-name')), '书房 Mac Studio');
+      final genBtn = find.byKey(const ValueKey('generate-install-cmd-btn'));
+      await show(tester, genBtn);
+      await tester.tap(genBtn);
+      await settle(tester);
+
+      expect(backend.createdEnrollments.last['customName'], '书房 Mac Studio');
+      expect(find.descendant(of: find.byType(DeviceEnrollSheet), matching: find.text('书房 Mac Studio')), findsOneWidget);
+
+      // Switch to MCU tab: Tier 1 picker shows custom name + ID, and MCU form sends customName.
+      await tester.tap(find.text('MCU'));
+      await settle(tester);
+      expect(find.text('实验室 GPU 主机 (os-gpu-01)'), findsOneWidget);
+      await tester.enterText(find.byKey(const ValueKey('mcu-id-input')), 'mcu-study-01');
+      await tester.enterText(find.byKey(const ValueKey('mcu-device-name')), '书房温湿度计');
+      final installMcuBtn = find.byKey(const ValueKey('install-mcu-btn'));
+      await show(tester, installMcuBtn);
+      await tester.tap(installMcuBtn);
+      await settle(tester);
+      expect(backend.mcuInstalls.last['customName'], '书房温湿度计');
+      expect(find.descendant(of: find.byKey(const ValueKey('mcu-install-result')), matching: find.text('书房温湿度计')), findsOneWidget);
+
+      await tester.tap(find.byKey(const ValueKey('enroll-close-btn')));
+      await settle(tester);
+      expect(find.text('书房温湿度计'), findsOneWidget);
+
+      // Reset custom name back to default using Reset button inside Rename modal.
+      await show(tester, renameBtn);
+      await tester.tap(renameBtn);
+      await settle(tester);
+      final resetBtn = find.byKey(const ValueKey('rename-device-reset-btn'));
+      expect(resetBtn, findsOneWidget);
+      await tester.tap(resetBtn);
+      await settle(tester);
+      expect(backend.renamedDevices.last, ('os-gpu-01', null));
+      expect(find.text('已恢复默认设备名称'), findsOneWidget);
+      expect(find.text('经由 os-gpu-01'), findsWidgets);
+
+      await app.close();
+
+      // English dark mode narrow layout check for Rename modal.
+      final appEn = await open(tester, backend, locale: const Locale('en'), size: narrow, brightness: Brightness.dark);
+      await tester.tap(nav(2));
+      await settle(tester);
+      final renameEn = find.byKey(const ValueKey('rename-os-gpu-01'));
+      await show(tester, renameEn);
+      await tester.tap(renameEn);
+      await settle(tester);
+      expect(find.text('Rename device'), findsOneWidget);
+      await tester.enterText(find.byKey(const ValueKey('rename-device-input')), 'Office GPU');
+      await tester.tap(find.byKey(const ValueKey('rename-device-save-btn')));
+      await settle(tester);
+      expect(find.text('Device renamed to "Office GPU"'), findsOneWidget);
+      await appEn.close();
+    });
   });
 }

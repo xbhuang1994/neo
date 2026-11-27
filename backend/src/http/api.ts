@@ -559,6 +559,12 @@ function parseEnrollmentCreateInput(raw: unknown): ParseResult<EnrollmentCreateI
   if (!installMode.ok) return installMode;
   const deviceId = parseOptionalStringField(raw, ["deviceId", "device_id"], "deviceId");
   if (!deviceId.ok) return deviceId;
+  const customName = parseOptionalStringField(
+    raw,
+    ["customName", "custom_name", "deviceName", "device_name"],
+    "customName",
+  );
+  if (!customName.ok) return customName;
   const relayBridge = parseOptionalBoolField(raw, ["relayBridge", "relay_bridge"], "relayBridge");
   if (!relayBridge.ok) return relayBridge;
   const mqttBind = parseOptionalStringField(raw, ["mqttBind", "mqtt_bind"], "mqttBind");
@@ -623,6 +629,7 @@ function parseEnrollmentCreateInput(raw: unknown): ParseResult<EnrollmentCreateI
       ...(profile.value !== undefined ? { profile: profile.value as EnrollmentProfile } : {}),
       ...(installMode.value !== undefined ? { installMode: installMode.value as EnrollmentInstallMode } : {}),
       ...(deviceId.value !== undefined ? { deviceId: deviceId.value } : {}),
+      ...(customName.value !== undefined ? { customName: customName.value } : {}),
       ...(workspaces !== undefined ? { workspaces } : {}),
       ...(relayBridge.value !== undefined ? { relayBridge: relayBridge.value } : {}),
       ...(mqttBind.value !== undefined ? { mqttBind: mqttBind.value } : {}),
@@ -652,6 +659,12 @@ function parseMcuInstallInput(raw: unknown): ParseResult<McuInstallInput> {
   if (!mcuId.value || mcuId.value.trim().length === 0) {
     return { ok: false, response: Response.error(400, "mcuId is required") };
   }
+  const customName = parseOptionalStringField(
+    raw,
+    ["customName", "custom_name", "deviceName", "device_name"],
+    "customName",
+  );
+  if (!customName.ok) return customName;
   const relayDeviceId = parseOptionalStringField(
     raw,
     ["relayDeviceId", "relay_device_id"],
@@ -693,6 +706,7 @@ function parseMcuInstallInput(raw: unknown): ParseResult<McuInstallInput> {
     ok: true,
     value: {
       mcuId: mcuId.value.trim(),
+      ...(customName.value !== undefined ? { customName: customName.value } : {}),
       relayDeviceId: relayDeviceId.value.trim(),
       transport: transport.value as McuTransportKind,
       ...(mqttBroker.value !== undefined ? { mqttBroker: mqttBroker.value } : {}),
@@ -1121,8 +1135,8 @@ async function routeDevices(
     }
   }
 
-  if (method === "PUT") {
-    if (reqPath === "/api/devices/config") {
+  if (method === "PUT" || method === "PATCH") {
+    if (method === "PUT" && reqPath === "/api/devices/config") {
       const parsed = jsonBody(request);
       if (!parsed.ok) return parsed.response;
       const input = parseDeviceConfigInput(parsed.value);
@@ -1131,7 +1145,6 @@ async function routeDevices(
         config: await app.devices.initOrUpdateConfig(input.value),
       }));
     }
-
     if (reqPath.startsWith(DEVICES_PREFIX) && reqPath.endsWith("/sandbox")) {
       const id =
         reqPath.length > DEVICES_PREFIX.length + "/sandbox".length
@@ -1192,6 +1205,37 @@ async function routeDevices(
             : 400;
         return Response.error(statusCode, msg);
       }
+    }
+
+    if (reqPath.startsWith(DEVICES_PREFIX)) {
+      const id = safeDecodeSegment(reqPath.slice(DEVICES_PREFIX.length));
+      if (!id || id.includes("/") || id === "config") {
+        return Response.error(404, "Device not found");
+      }
+      if (app.devices.getDevice(id) === null) {
+        return Response.error(404, "Device not found");
+      }
+      const parsed = jsonBody(request);
+      if (!parsed.ok) return parsed.response;
+      if (!isRecord(parsed.value)) {
+        return Response.error(400, "Expected JSON object");
+      }
+      const key =
+        "customName" in parsed.value
+          ? "customName"
+          : "custom_name" in parsed.value
+            ? "custom_name"
+            : "name" in parsed.value
+              ? "name"
+              : null;
+      if (key === null) {
+        return Response.error(400, "Expected { customName: string | null }");
+      }
+      const rawName = parsed.value[key];
+      if (rawName !== null && typeof rawName !== "string") {
+        return Response.error(400, "customName must be a string or null");
+      }
+      return await done(() => app.devices.setDeviceName(id, rawName));
     }
   }
 

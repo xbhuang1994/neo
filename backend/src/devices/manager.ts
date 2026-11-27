@@ -20,6 +20,7 @@ import {
   deriveMcuE2eKey,
   isVersionOlder,
   mintRelayToken,
+  normalizeDeviceCustomName,
   openDeviceMessage,
   openRelayEnvelope,
   sealDeviceMessage,
@@ -937,6 +938,56 @@ export class DeviceManager {
     return this.store.get<DeviceTwin>(`${DEVICE_KEY_PREFIX}${deviceId}`) ?? null;
   }
 
+  /**
+   * Resolve a device by exact `deviceId`, or (if no ID matches) by unique `customName`
+   * (exact match first, then case-insensitive). Throws if a custom name is ambiguous.
+   */
+  resolveDevice(idOrName: string): DeviceTwin | null {
+    const trimmed = idOrName.trim();
+    if (!trimmed) {
+      return null;
+    }
+    const direct = this.getDevice(trimmed);
+    if (direct) {
+      return direct;
+    }
+    const all = this.listDevices();
+    const exactMatches = all.filter((d) => d.customName === trimmed);
+    if (exactMatches.length === 1) {
+      return exactMatches[0]!;
+    }
+    if (exactMatches.length > 1) {
+      throw new Error(
+        `Ambiguous device name '${trimmed}' matches multiple devices: ${exactMatches.map((d) => d.deviceId).join(", ")}. Specify deviceId instead.`,
+      );
+    }
+    const lower = trimmed.toLowerCase();
+    const ciMatches = all.filter((d) => d.customName?.toLowerCase() === lower);
+    if (ciMatches.length === 1) {
+      return ciMatches[0]!;
+    }
+    if (ciMatches.length > 1) {
+      throw new Error(
+        `Ambiguous device name '${trimmed}' matches multiple devices: ${ciMatches.map((d) => d.deviceId).join(", ")}. Specify deviceId instead.`,
+      );
+    }
+    return null;
+  }
+
+  /** Set or clear (with `null` or blank string) a device's user-defined custom display name. */
+  setDeviceName(deviceId: string, name: string | null): DeviceTwin {
+    const twin = this.getDevice(deviceId);
+    if (!twin) {
+      throw new Error(`Unknown device: ${deviceId}`);
+    }
+    const normalized = normalizeDeviceCustomName(name);
+    if (normalized === undefined) {
+      const { customName: _removed, ...rest } = twin;
+      return this.saveDevice(rest);
+    }
+    return this.saveDevice({ ...twin, customName: normalized });
+  }
+
   /** Upsert a Device Twin in KV. */
   saveDevice(twin: DeviceTwin): DeviceTwin {
     const updated: DeviceTwin = { ...twin, updatedAt: nowIso() };
@@ -956,6 +1007,7 @@ export class DeviceManager {
       lanUrl?: string;
       relayNodeId?: string;
       backupRelayNodeIds?: string[];
+      customName?: string | null;
     } = {},
   ): DeviceTwin {
     const cfg = this.requireConfig();
@@ -972,6 +1024,10 @@ export class DeviceManager {
         : existing?.capabilities ?? []);
     const defaultRoute: DeviceRouteKind =
       baseManifest.tier === "mcu" ? "via_tier1" : opts.route ?? existing?.route ?? "relay";
+    const resolvedCustomName =
+      opts.customName !== undefined
+        ? normalizeDeviceCustomName(opts.customName)
+        : existing?.customName;
     const agentVersion =
       normalizeVersion(
         opts.agentVersion ?? baseManifest.agent_version ?? baseManifest.version ?? baseManifest.fw,
@@ -1032,6 +1088,7 @@ export class DeviceManager {
     const twin: DeviceTwin = {
       deviceId: normalizedManifest.device_id,
       clusterId: cfg.clusterId,
+      ...(resolvedCustomName !== undefined ? { customName: resolvedCustomName } : {}),
       tier: normalizedManifest.tier,
       status: opts.status ?? "online",
       route: opts.route ?? existing?.route ?? defaultRoute,
@@ -2094,6 +2151,8 @@ export class DeviceManager {
     if (!CHIP_RE.test(chip)) {
       throw new Error(`Invalid chip '${chip}': must match ${CHIP_RE.source}`);
     }
+    const customName =
+      input.customName !== undefined ? normalizeDeviceCustomName(input.customName) : undefined;
 
     const tier1 = this.getDevice(relayDeviceId);
     const mqttBroker =
@@ -2176,6 +2235,7 @@ export class DeviceManager {
         status: "sleeping",
         relayNodeId: relayDeviceId,
         ...(backupRelayDeviceIds !== undefined ? { backupRelayNodeIds: backupRelayDeviceIds } : {}),
+        ...(input.customName !== undefined ? { customName: customName ?? null } : {}),
       },
     );
     const twin = this.saveDevice({
@@ -3059,7 +3119,20 @@ export class DeviceManager {
           });
         }
         if (enrollId) {
-          this.enrollment.markEnrollmentCompleted(enrollId, manifest.device_id, fingerprint);
+          const completed = this.enrollment.markEnrollmentCompleted(enrollId, manifest.device_id, fingerprint);
+          if (completed?.requestedCustomName) {
+            const latest = this.getDevice(manifest.device_id) ?? twin;
+            if (!latest.customName) {
+              const idx = completed.enrolledDeviceIds.indexOf(manifest.device_id);
+              const baseName = completed.requestedCustomName;
+              const suffix = completed.maxUses > 1 && idx > 0 ? ` #${idx + 1}` : "";
+              const assignedName =
+                suffix && Array.from(baseName).length + suffix.length <= 64
+                  ? `${baseName}${suffix}`
+                  : baseName;
+              this.saveDevice({ ...latest, customName: assignedName });
+            }
+          }
         }
         if (
           twin.tier === "os" &&

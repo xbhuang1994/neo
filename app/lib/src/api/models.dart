@@ -718,6 +718,7 @@ class DeviceTwin {
   DeviceTwin.fromJson(Map<String, dynamic> json)
     : deviceId = json['deviceId'] as String? ?? '',
       clusterId = json['clusterId'] as String? ?? '',
+      customName = _text(json['customName'])?.trim(),
       tier = _text(json['tier']) ?? 'os',
       status = _text(json['status']) ?? 'offline',
       route = _text(json['route']) ?? 'relay',
@@ -745,6 +746,9 @@ class DeviceTwin {
 
   final String deviceId;
   final String clusterId;
+
+  /// Optional user-defined display name (does not change protocol [deviceId]).
+  final String? customName;
 
   /// `os` or `mcu`.
   final String tier;
@@ -776,6 +780,8 @@ class DeviceTwin {
   final DateTime? updatedAt;
   final String raw;
 
+  bool get hasCustomName => customName != null && customName!.isNotEmpty;
+  String get displayName => hasCustomName ? customName! : deviceId;
   bool get isOnline => status == 'online';
   bool get isMcu => tier == 'mcu';
   bool get isTier1 => tier == 'os';
@@ -914,6 +920,7 @@ class DeviceEnrollment {
       installMode = _text(json['installMode']) ?? 'auto',
       transportMode = _text(json['transportMode']) ?? 'relay',
       requestedDeviceId = _text(json['requestedDeviceId']),
+      requestedCustomName = _text(json['requestedCustomName']),
       status = _text(json['status']) ?? 'pending',
       createdAt = _time(json['createdAt']),
       expiresAt = _time(json['expiresAt']),
@@ -940,6 +947,7 @@ class DeviceEnrollment {
   /// `relay` or `direct`.
   final String transportMode;
   final String? requestedDeviceId;
+  final String? requestedCustomName;
 
   /// `pending`, `claimed`, `completed`, `expired`, or `revoked`.
   final String status;

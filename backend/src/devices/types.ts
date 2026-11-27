@@ -244,6 +244,8 @@ export interface PendingMcuCommand {
 export interface DeviceTwin {
   deviceId: string;
   clusterId: string;
+  /** Optional user-defined custom display name (does not alter protocol `deviceId`). */
+  customName?: string;
   tier: DeviceTier;
   status: DeviceStatus;
   route: DeviceRouteKind;
@@ -578,6 +580,7 @@ export interface EnrollmentCreateInput {
   profile?: EnrollmentProfile;
   installMode?: EnrollmentInstallMode;
   deviceId?: string;
+  customName?: string;
   workspaces?: string[];
   relayBridge?: boolean;
   mqttBind?: string;
@@ -606,6 +609,7 @@ export interface EnrollmentView {
   transportMode: EnrollmentTransportMode;
   authMode: EnrollmentAuthMode;
   requestedDeviceId?: string;
+  requestedCustomName?: string;
   relayUrl?: string;
   claimUrl?: string;
   ttlSec: number;
@@ -648,6 +652,7 @@ export type McuTransportKind = "mqtt" | "serial";
 /** Input to `DeviceManager.installMcuViaTier1`. */
 export interface McuInstallInput {
   mcuId: string;
+  customName?: string;
   relayDeviceId: string;
   transport: McuTransportKind;
   mqttBroker?: string;

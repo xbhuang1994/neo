@@ -990,3 +990,30 @@ export function openFileFrame(
     new Uint8Array(plaintext.buffer, plaintext.byteOffset, plaintext.byteLength),
   );
 }
+
+/** Maximum Unicode code points allowed in a user-defined custom device name. */
+export const MAX_DEVICE_CUSTOM_NAME_CHARS = 64;
+
+const DEVICE_NAME_CONTROL_RE = /[\u0000-\u001F\u007F]/;
+
+/**
+ * Validate and normalize an optional custom device display name.
+ * Returns `undefined` when empty/whitespace/null (meaning unset/default),
+ * or throws an `Error` if control characters or length limits are violated.
+ */
+export function normalizeDeviceCustomName(raw: string | null | undefined): string | undefined {
+  if (raw === null || raw === undefined) {
+    return undefined;
+  }
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    return undefined;
+  }
+  if (DEVICE_NAME_CONTROL_RE.test(trimmed)) {
+    throw new Error("Device custom name cannot contain control characters");
+  }
+  if (Array.from(trimmed).length > MAX_DEVICE_CUSTOM_NAME_CHARS) {
+    throw new Error(`Device custom name must be at most ${MAX_DEVICE_CUSTOM_NAME_CHARS} characters`);
+  }
+  return trimmed;
+}

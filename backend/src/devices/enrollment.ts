@@ -9,7 +9,7 @@
  */
 
 import type { Store } from "../store/index.ts";
-import { generateEnrollTicket, sealEnrollPayload } from "./protocol.ts";
+import { generateEnrollTicket, normalizeDeviceCustomName, sealEnrollPayload } from "./protocol.ts";
 import {
   SANDBOX_LEVELS,
   isSandboxLevel,
@@ -634,6 +634,7 @@ interface EnrollmentRecord {
   transportMode: EnrollmentTransportMode;
   authMode: EnrollmentAuthMode;
   requestedDeviceId?: string;
+  requestedCustomName?: string;
   relayUrl?: string;
   claimUrl?: string;
   ttlSec: number;
@@ -782,6 +783,9 @@ export class EnrollmentManager {
       transportMode: record.transportMode,
       authMode: record.authMode,
       ...(record.requestedDeviceId !== undefined ? { requestedDeviceId: record.requestedDeviceId } : {}),
+      ...(record.requestedCustomName !== undefined
+        ? { requestedCustomName: record.requestedCustomName }
+        : {}),
       ...(record.relayUrl !== undefined ? { relayUrl: record.relayUrl } : {}),
       ...(record.claimUrl !== undefined ? { claimUrl: record.claimUrl } : {}),
       ttlSec: record.ttlSec,
@@ -859,6 +863,7 @@ export class EnrollmentManager {
         `Invalid deviceId '${requestedDeviceId}': must match ${DEVICE_ID_RE.source}`,
       );
     }
+    const requestedCustomName = normalizeDeviceCustomName(input.customName);
 
     const workspaces = (input.workspaces ?? []).map(validateWorkspacePath);
     const mqttBind = input.mqttBind?.trim() || "127.0.0.1:1883";
@@ -1031,6 +1036,7 @@ export class EnrollmentManager {
       transportMode,
       authMode,
       ...(requestedDeviceId !== undefined ? { requestedDeviceId } : {}),
+      ...(requestedCustomName !== undefined ? { requestedCustomName } : {}),
       ...(relayBase ? { relayUrl: relayBase } : {}),
       ...(claimUrl !== undefined ? { claimUrl } : {}),
       ttlSec,
