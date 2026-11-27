@@ -39,7 +39,7 @@ import {
   type PendingClarification,
 } from "./clarification.ts";
 import { Args, WORKTREE_NAME_RULE, validWorktreeName, type AppContext } from "./context.ts";
-import type { DeviceStatus, DeviceTier } from "../devices/index.ts";
+import type { DeviceStatus, DeviceTier, McuTransportKind } from "../devices/index.ts";
 import { SIDECAR } from "./effects.ts";
 import { receiptNotice, reportRelay, threadFollowedNotice } from "./notices.ts";
 import { recallConfig, sanitizeCardText } from "./recall.ts";
@@ -106,6 +106,17 @@ const ALLOWED_DEVICE_INVOKE: readonly string[] = [
   "reason",
 ];
 const ALLOWED_DEVICE_APPROVE: readonly string[] = ["approval_id", "decision", "reason"];
+const ALLOWED_DEVICE_MCU_INSTALL: readonly string[] = [
+  "mcu_id",
+  "relay_device_id",
+  "transport",
+  "mqtt_broker",
+  "serial_port",
+  "baud_rate",
+  "chip",
+  "backup_relay_device_ids",
+  "auto_deploy",
+];
 const ALLOWED_ACK: readonly string[] = ["trigger_id", "text"];
 const ALLOWED_THREAD_REASON: readonly string[] = ["thread", "reason"];
 const ALLOWED_HANDBACK: readonly string[] = ["trigger_id", "reason"];
@@ -257,6 +268,35 @@ function deviceSpecs(): ToolSpec[] {
         reason: { type: ["string", "null"] },
       },
       ["approval_id", "decision"],
+    ),
+    spec(
+      "device_mcu_install",
+      "Install and provision a Tier 2 MCU through a paired Tier 1 neo-agent-os gateway over MQTT or Serial (UART/RS485). Pre-registers the MCU twin, derives its cluster MCU E2E key, generates neo_mcu_config.h + install-mcu.sh, and pushes them onto the Tier 1 workspace when online.",
+      {
+        mcu_id: { type: "string", description: "Unique Tier 2 MCU device ID (e.g. mcu-esp32-rack01)." },
+        relay_device_id: { type: "string", description: "Paired Tier 1 neo-agent-os gateway device ID." },
+        transport: { type: "string", enum: ["mqtt", "serial"] },
+        mqtt_broker: {
+          type: ["string", "null"],
+          description: "MQTT broker host:port on Tier 1 (e.g. 127.0.0.1:1883).",
+        },
+        serial_port: {
+          type: ["string", "null"],
+          description: "Serial/UART device path on Tier 1 (e.g. /dev/ttyUSB0).",
+        },
+        baud_rate: { type: ["integer", "null"], minimum: 1200, maximum: 4000000 },
+        chip: { type: ["string", "null"], description: "Target MCU chip (e.g. esp32, esp32s3, stm32)." },
+        backup_relay_device_ids: {
+          type: ["array", "null"],
+          items: { type: "string" },
+          description: "Optional backup Tier 1 relay device IDs for failover.",
+        },
+        auto_deploy: {
+          type: ["boolean", "null"],
+          description: "Push provisioning bundle to Tier 1 via encrypted fs_write RPC when online (default true).",
+        },
+      },
+      ["mcu_id", "relay_device_id", "transport"],
     ),
   ];
 }
@@ -1319,6 +1359,47 @@ async function runDeviceTool(
         return { handled: true, result: { approval } };
       }
       throw new Error("decision must be approve or reject");
+    }
+    case "device_mcu_install": {
+      const args = Args.of(argumentsValue, ALLOWED_DEVICE_MCU_INSTALL);
+      const mcuId = args.required("mcu_id").trim();
+      const relayDeviceId = args.required("relay_device_id").trim();
+      const rawTransport = args.required("transport").trim();
+      if (rawTransport !== "mqtt" && rawTransport !== "serial") {
+        throw new Error("transport must be mqtt or serial");
+      }
+      const rawBaud = args.get("baud_rate");
+      let baudRate: number | undefined;
+      if (rawBaud !== undefined && rawBaud !== null) {
+        if (typeof rawBaud !== "number" || !Number.isInteger(rawBaud) || rawBaud < 1200 || rawBaud > 4_000_000) {
+          throw new Error("baud_rate must be an integer between 1200 and 4000000");
+        }
+        baudRate = rawBaud;
+      }
+      const rawBackups = args.get("backup_relay_device_ids");
+      let backupRelayDeviceIds: string[] | undefined;
+      if (rawBackups !== undefined && rawBackups !== null) {
+        if (!Array.isArray(rawBackups) || !rawBackups.every((x) => typeof x === "string")) {
+          throw new Error("backup_relay_device_ids must be an array of strings");
+        }
+        backupRelayDeviceIds = rawBackups;
+      }
+      const rawAutoDeploy = args.get("auto_deploy");
+      if (rawAutoDeploy !== undefined && rawAutoDeploy !== null && typeof rawAutoDeploy !== "boolean") {
+        throw new Error("auto_deploy must be a boolean");
+      }
+      const result = await app.devices.installMcuViaTier1({
+        mcuId,
+        relayDeviceId,
+        transport: rawTransport as McuTransportKind,
+        ...(args.text("mqtt_broker") !== undefined ? { mqttBroker: args.text("mqtt_broker") } : {}),
+        ...(args.text("serial_port") !== undefined ? { serialPort: args.text("serial_port") } : {}),
+        ...(baudRate !== undefined ? { baudRate } : {}),
+        ...(args.text("chip") !== undefined ? { chip: args.text("chip") } : {}),
+        ...(backupRelayDeviceIds !== undefined ? { backupRelayDeviceIds } : {}),
+        ...(typeof rawAutoDeploy === "boolean" ? { autoDeploy: rawAutoDeploy } : {}),
+      });
+      return { handled: true, result };
     }
     default:
       return { handled: false };

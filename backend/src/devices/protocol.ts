@@ -21,12 +21,14 @@ import {
   E2E_ENVELOPE_VERSION,
   E2E_NONCE_BYTES,
   E2E_TAG_BYTES,
+  ENROLL_ENVELOPE_VERSION,
   RELAY_HEADER_BYTES,
   RELAY_MAGIC_0,
   RELAY_MAGIC_1,
   RELAY_VERSION,
   type DeviceMessage,
   type DeviceMessageKind,
+  type EnrollPayload,
   type RelayDirection,
   type RelayEnvelope,
   type RelayFrame,
@@ -44,7 +46,11 @@ const VALID_MESSAGE_KINDS: ReadonlySet<string> = new Set([
   "heartbeat",
   "relay_envelope",
   "event",
+  "enroll_register",
+  "enroll_ack",
 ]);
+
+export const ENROLL_TICKET_PREFIX = "neo_enr_v1";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -586,4 +592,130 @@ export function validateS3ClusterArtifactUri(
     taskId,
     objectKey,
   };
+}
+
+/**
+ * Generate a zero-trust enrollment ticket string:
+ * `neo_enr_v1.<ticketId>.<ephemeralKey>`
+ * where `ticketId` = 8 random bytes base64url no-pad (11 chars)
+ * and `ephemeralKey` = 16 random bytes base64url no-pad (22 chars).
+ */
+export function generateEnrollTicket(): {
+  ticketId: string;
+  ephemeralKey: string;
+  enrollCode: string;
+} {
+  const ticketId = base64UrlEncodeNoPad(randomBytes(8));
+  const ephemeralKey = base64UrlEncodeNoPad(randomBytes(16));
+  return {
+    ticketId,
+    ephemeralKey,
+    enrollCode: `${ENROLL_TICKET_PREFIX}.${ticketId}.${ephemeralKey}`,
+  };
+}
+
+/** Parse and validate an enrollment ticket `neo_enr_v1.<ticketId>.<ephemeralKey>`. */
+export function parseEnrollTicket(enrollCode: string): {
+  ticketId: string;
+  ephemeralKey: string;
+} {
+  const parts = enrollCode.trim().split(".");
+  if (parts.length !== 3 || parts[0] !== ENROLL_TICKET_PREFIX) {
+    throw new Error("Invalid enrollment ticket format");
+  }
+  const ticketId = parts[1]!;
+  const ephemeralKey = parts[2]!;
+  if (!/^[A-Za-z0-9_-]{8,32}$/.test(ticketId)) {
+    throw new Error("Invalid enrollment ticketId");
+  }
+  if (!/^[A-Za-z0-9_-]{16,64}$/.test(ephemeralKey)) {
+    throw new Error("Invalid enrollment ephemeralKey");
+  }
+  return { ticketId, ephemeralKey };
+}
+
+/** Derive the 32-byte AES-256-GCM key for enrollment sealing: `SHA-256("neo-enroll-v1:" + ticketId + ":" + ephemeralKey)`. */
+export function deriveEnrollKey(ticketId: string, ephemeralKey: string): Uint8Array {
+  if (!ticketId || !ephemeralKey) {
+    throw new Error("ticketId and ephemeralKey are required");
+  }
+  const digest = createHash("sha256")
+    .update(`neo-enroll-v1:${ticketId}:${ephemeralKey}`, "utf8")
+    .digest();
+  return new Uint8Array(digest.buffer, digest.byteOffset, digest.byteLength);
+}
+
+/** Build the enrollment AES-256-GCM AAD `UTF8("neo-enroll-v1|" + ticketId)`. */
+export function buildEnrollAad(ticketId: string): Uint8Array {
+  if (!ticketId) {
+    throw new Error("ticketId is required");
+  }
+  const buf = Buffer.from(`neo-enroll-v1|${ticketId}`, "utf8");
+  return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+}
+
+/**
+ * Encrypt and authenticate an enrollment payload into standard base64 (`ciphertext_b64`):
+ * Wire bytes: `[0xE2][12B random nonce][AES-256-GCM ciphertext || 16B tag]`.
+ */
+export function sealEnrollPayload(
+  payload: unknown,
+  ticketId: string,
+  ephemeralKey: string,
+  nonceOverride?: Uint8Array,
+): string {
+  const key = deriveEnrollKey(ticketId, ephemeralKey);
+  const nonce = nonceOverride ?? new Uint8Array(randomBytes(E2E_NONCE_BYTES));
+  if (nonce.byteLength !== E2E_NONCE_BYTES) {
+    throw new Error(`Enrollment nonce must be ${E2E_NONCE_BYTES} bytes`);
+  }
+  const aad = buildEnrollAad(ticketId);
+  const plaintext = Buffer.from(JSON.stringify(payload), "utf8");
+  const cipher = createCipheriv("aes-256-gcm", key, nonce);
+  cipher.setAAD(aad);
+  const ciphertext = cipher.update(plaintext);
+  const final = cipher.final();
+  const tag = cipher.getAuthTag();
+  const out = new Uint8Array(1 + E2E_NONCE_BYTES + ciphertext.byteLength + final.byteLength + tag.byteLength);
+  out[0] = ENROLL_ENVELOPE_VERSION;
+  out.set(nonce, 1);
+  let pos = 1 + E2E_NONCE_BYTES;
+  out.set(ciphertext, pos);
+  pos += ciphertext.byteLength;
+  out.set(final, pos);
+  pos += final.byteLength;
+  out.set(tag, pos);
+  return Buffer.from(out).toString("base64");
+}
+
+/**
+ * Decrypt and verify a base64-encoded `0xE2` enrollment parcel using `(ticketId, ephemeralKey)`.
+ */
+export function openEnrollPayload<T = EnrollPayload>(
+  ciphertextB64: string,
+  ticketId: string,
+  ephemeralKey: string,
+): T {
+  const wire = decodeStandardBase64(ciphertextB64);
+  const minBytes = 1 + E2E_NONCE_BYTES + E2E_TAG_BYTES;
+  if (wire.byteLength < minBytes) {
+    throw new Error(`Enrollment envelope too short: ${wire.byteLength} < ${minBytes}`);
+  }
+  if (wire[0] !== ENROLL_ENVELOPE_VERSION) {
+    throw new Error(`Unsupported enrollment envelope version: 0x${wire[0]!.toString(16)}`);
+  }
+  const nonce = wire.subarray(1, 1 + E2E_NONCE_BYTES);
+  const tagStart = wire.byteLength - E2E_TAG_BYTES;
+  const ciphertext = wire.subarray(1 + E2E_NONCE_BYTES, tagStart);
+  const tag = wire.subarray(tagStart);
+  const key = deriveEnrollKey(ticketId, ephemeralKey);
+  const aad = buildEnrollAad(ticketId);
+
+  const decipher = createDecipheriv("aes-256-gcm", key, nonce);
+  decipher.setAAD(aad);
+  decipher.setAuthTag(tag);
+  const part1 = decipher.update(ciphertext);
+  const part2 = decipher.final();
+  const plaintext = Buffer.concat([part1, part2]);
+  return JSON.parse(utf8FatalDecoder.decode(plaintext)) as T;
 }

@@ -5,9 +5,14 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +20,7 @@ import (
 	"time"
 
 	"neo-relay/internal/auth"
+	"neo-relay/internal/enroll"
 	"neo-relay/internal/hub"
 	"neo-relay/internal/server"
 	"neo-relay/internal/stun"
@@ -594,4 +600,497 @@ func TestPenaltyThrottleAndReconnectPersistence(t *testing.T) {
 	// 5. Advance clock by 1h + 1s -> penalty expires automatically
 	advance(1*time.Hour + time.Second)
 	checkPeer("heavy-node", false, 5<<20)
+}
+
+func TestEnrollTicketHTTPFlow(t *testing.T) {
+	secret := []byte("unit-test-secret-32-bytes-minimum!!")
+	var clockMu sync.Mutex
+	fakeNow := time.Date(2026, 11, 27, 14, 0, 0, 0, time.UTC)
+	getNow := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return fakeNow
+	}
+	advance := func(d time.Duration) {
+		clockMu.Lock()
+		fakeNow = fakeNow.Add(d)
+		clockMu.Unlock()
+	}
+
+	store := enroll.NewStore()
+	store.SetClock(getNow)
+
+	h := hub.New(10<<20, 1<<20)
+	srv := server.New(server.Config{
+		KeyRing:       auth.KeyRing{RootSecret: secret},
+		PublicURL:     "https://neo.1inch.cn:18443",
+		MaxFrameBytes: 1 << 20,
+		EnrollStore:   store,
+	}, h)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	tokMasterA, _ := auth.MintToken(secret, "cluster-a", "master-a", "master", time.Hour, time.Now())
+	tokMasterB, _ := auth.MintToken(secret, "cluster-b", "master-b", "master", time.Hour, time.Now())
+	tokOSA, _ := auth.MintToken(secret, "cluster-a", "node-os-1", "os", time.Hour, time.Now())
+	tokAdmin, _ := auth.MintToken(secret, "*", "admin-1", "admin", time.Hour, time.Now())
+
+	doReq := func(method, path, token, xff string, body any) *http.Response {
+		var rdr io.Reader
+		if body != nil {
+			b, err := json.Marshal(body)
+			if err != nil {
+				t.Fatalf("marshal req: %v", err)
+			}
+			rdr = bytes.NewReader(b)
+		}
+		req, err := http.NewRequest(method, ts.URL+path, rdr)
+		if err != nil {
+			t.Fatalf("new req: %v", err)
+		}
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		if xff != "" {
+			req.Header.Set("X-Forwarded-For", xff)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s err: %v", method, path, err)
+		}
+		return resp
+	}
+
+	// 1. Auth & tier enforcement: unauth -> 401, os -> 403, wildcard admin -> 403
+	rUnauth := doReq(http.MethodPost, "/v1/enroll/tickets", "", "", map[string]any{"ticket_id": "unauth_001", "ciphertext_b64": "YWFh"})
+	_ = rUnauth.Body.Close()
+	if rUnauth.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauth create: got %d, want 401", rUnauth.StatusCode)
+	}
+	for name, tok := range map[string]string{"os": tokOSA, "admin-wildcard": tokAdmin} {
+		r := doReq(http.MethodPost, "/v1/enroll/tickets", tok, "", map[string]any{"ticket_id": "forbid_001", "ciphertext_b64": "YWFh"})
+		_ = r.Body.Close()
+		if r.StatusCode != http.StatusForbidden {
+			t.Fatalf("%s create: got %d, want 403", name, r.StatusCode)
+		}
+	}
+
+	// 2. Oversized ciphertext -> 400, invalid ticket_id -> 400
+	rBig := doReq(http.MethodPost, "/v1/enroll/tickets", tokMasterA, "", map[string]any{
+		"ticket_id":      "oversize01",
+		"ciphertext_b64": strings.Repeat("X", enroll.MaxCiphertextLen+1),
+	})
+	_ = rBig.Body.Close()
+	if rBig.StatusCode != http.StatusBadRequest {
+		t.Fatalf("oversized ciphertext: got %d, want 400", rBig.StatusCode)
+	}
+	rBadID := doReq(http.MethodPost, "/v1/enroll/tickets", tokMasterA, "", map[string]any{
+		"ticket_id":      "bad!id",
+		"ciphertext_b64": "YWFh",
+	})
+	_ = rBadID.Body.Close()
+	if rBadID.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad ticket_id: got %d, want 400", rBadID.StatusCode)
+	}
+
+	// 3. Single-use create -> 201, cross-cluster status/delete -> 403, public claim -> 200 then 410
+	rCreate := doReq(http.MethodPost, "/v1/enroll/tickets", tokMasterA, "", map[string]any{
+		"ticket_id":      "ticket_one_01",
+		"ciphertext_b64": "b3BhcXVlLWNpcGhlci0x",
+		"ttl_sec":        300,
+		"max_uses":       1,
+	})
+	if rCreate.StatusCode != http.StatusCreated {
+		bodyBytes, _ := io.ReadAll(rCreate.Body)
+		_ = rCreate.Body.Close()
+		t.Fatalf("create single-use: got %d (%s), want 201", rCreate.StatusCode, string(bodyBytes))
+	}
+	var created enroll.CreateResponse
+	_ = json.NewDecoder(rCreate.Body).Decode(&created)
+	_ = rCreate.Body.Close()
+	if created.TicketID != "ticket_one_01" || created.ClusterID != "cluster-a" || created.Status != "pending" || created.MaxUses != 1 || created.RemainingUses != 1 {
+		t.Fatalf("unexpected create response: %+v", created)
+	}
+
+	// Cross-cluster 403 on status and delete
+	rCrossStatus := doReq(http.MethodGet, "/v1/enroll/tickets/ticket_one_01/status", tokMasterB, "", nil)
+	_ = rCrossStatus.Body.Close()
+	if rCrossStatus.StatusCode != http.StatusForbidden {
+		t.Fatalf("cross-cluster status: got %d, want 403", rCrossStatus.StatusCode)
+	}
+	rCrossDel := doReq(http.MethodDelete, "/v1/enroll/tickets/ticket_one_01", tokMasterB, "", nil)
+	_ = rCrossDel.Body.Close()
+	if rCrossDel.StatusCode != http.StatusForbidden {
+		t.Fatalf("cross-cluster delete: got %d, want 403", rCrossDel.StatusCode)
+	}
+
+	// Public claim (NO Bearer token!) -> 200
+	rClaim1 := doReq(http.MethodPost, "/v1/enroll/claim/ticket_one_01", "", "203.0.113.10", nil)
+	if rClaim1.StatusCode != http.StatusOK {
+		_ = rClaim1.Body.Close()
+		t.Fatalf("first claim: got %d, want 200", rClaim1.StatusCode)
+	}
+	var claimed enroll.ClaimResponse
+	_ = json.NewDecoder(rClaim1.Body).Decode(&claimed)
+	_ = rClaim1.Body.Close()
+	if claimed.TicketID != "ticket_one_01" || claimed.CiphertextB64 != "b3BhcXVlLWNpcGhlci0x" || claimed.ExpiresAtMs != created.ExpiresAtMs {
+		t.Fatalf("unexpected claim response: %+v", claimed)
+	}
+
+	// Second claim on single-use ticket -> 410
+	rClaim2 := doReq(http.MethodPost, "/v1/enroll/claim/ticket_one_01", "", "203.0.113.11", nil)
+	_ = rClaim2.Body.Close()
+	if rClaim2.StatusCode != http.StatusGone {
+		t.Fatalf("second claim: got %d, want 410", rClaim2.StatusCode)
+	}
+
+	// Status reflects claimed state + IP + timestamp
+	rStatus := doReq(http.MethodGet, "/v1/enroll/tickets/ticket_one_01/status", tokMasterA, "", nil)
+	if rStatus.StatusCode != http.StatusOK {
+		_ = rStatus.Body.Close()
+		t.Fatalf("status after claim: got %d, want 200", rStatus.StatusCode)
+	}
+	var st enroll.TicketStatus
+	_ = json.NewDecoder(rStatus.Body).Decode(&st)
+	_ = rStatus.Body.Close()
+	if st.Status != "claimed" || st.ClaimedCount != 1 || st.RemainingUses != 0 || st.LastClaimedIP != "203.0.113.10" || st.LastClaimedAtMs != fakeNow.UnixMilli() {
+		t.Fatalf("unexpected status: %+v", st)
+	}
+
+	// 4. Multi-use countdown (max_uses=3 -> 3 claims succeed, 4th -> 410)
+	rMulti := doReq(http.MethodPost, "/v1/enroll/tickets", tokMasterA, "", map[string]any{
+		"ticket_id":      "ticket_multi_03",
+		"ciphertext_b64": "bXVsdGktc2VjcmV0",
+		"ttl_sec":        300,
+		"max_uses":       3,
+	})
+	_ = rMulti.Body.Close()
+	if rMulti.StatusCode != http.StatusCreated {
+		t.Fatalf("create multi-use: got %d, want 201", rMulti.StatusCode)
+	}
+	for i := 1; i <= 3; i++ {
+		rc := doReq(http.MethodPost, "/v1/enroll/claim/ticket_multi_03", "", fmt.Sprintf("198.51.100.%d", i), nil)
+		_ = rc.Body.Close()
+		if rc.StatusCode != http.StatusOK {
+			t.Fatalf("multi-use claim %d: got %d, want 200", i, rc.StatusCode)
+		}
+	}
+	rMultiGone := doReq(http.MethodPost, "/v1/enroll/claim/ticket_multi_03", "", "198.51.100.4", nil)
+	_ = rMultiGone.Body.Close()
+	if rMultiGone.StatusCode != http.StatusGone {
+		t.Fatalf("4th multi-use claim: got %d, want 410", rMultiGone.StatusCode)
+	}
+
+	// 5. Revoke -> 200, subsequent claim -> 410
+	rRevCreate := doReq(http.MethodPost, "/v1/enroll/tickets", tokMasterA, "", map[string]any{
+		"ticket_id":      "ticket_revoke_1",
+		"ciphertext_b64": "cmV2b2tlLWNpcGhlcg==",
+		"ttl_sec":        300,
+		"max_uses":       2,
+	})
+	_ = rRevCreate.Body.Close()
+	rDel := doReq(http.MethodDelete, "/v1/enroll/tickets/ticket_revoke_1", tokMasterA, "", nil)
+	if rDel.StatusCode != http.StatusOK {
+		_ = rDel.Body.Close()
+		t.Fatalf("delete revoke: got %d, want 200", rDel.StatusCode)
+	}
+	var delResp enroll.RevokeResponse
+	_ = json.NewDecoder(rDel.Body).Decode(&delResp)
+	_ = rDel.Body.Close()
+	if delResp.TicketID != "ticket_revoke_1" || delResp.Status != "revoked" {
+		t.Fatalf("unexpected revoke response: %+v", delResp)
+	}
+	rRevClaim := doReq(http.MethodPost, "/v1/enroll/claim/ticket_revoke_1", "", "198.51.100.5", nil)
+	_ = rRevClaim.Body.Close()
+	if rRevClaim.StatusCode != http.StatusGone {
+		t.Fatalf("claim after revoke: got %d, want 410", rRevClaim.StatusCode)
+	}
+
+	// 6. TTL expiration -> status "expired" & claim -> 410
+	rExpCreate := doReq(http.MethodPost, "/v1/enroll/tickets", tokMasterA, "", map[string]any{
+		"ticket_id":      "ticket_expire_1",
+		"ciphertext_b64": "ZXhwaXJlLWNpcGhlcg==",
+		"ttl_sec":        60,
+		"max_uses":       1,
+	})
+	_ = rExpCreate.Body.Close()
+	advance(61 * time.Second)
+	rExpClaim := doReq(http.MethodPost, "/v1/enroll/claim/ticket_expire_1", "", "198.51.100.6", nil)
+	_ = rExpClaim.Body.Close()
+	if rExpClaim.StatusCode != http.StatusGone {
+		t.Fatalf("claim after TTL expiry: got %d, want 410", rExpClaim.StatusCode)
+	}
+
+	// 7. Missing ticket claim -> 404
+	rMiss := doReq(http.MethodPost, "/v1/enroll/claim/does_not_exist1", "", "198.51.100.7", nil)
+	_ = rMiss.Body.Close()
+	if rMiss.StatusCode != http.StatusNotFound {
+		t.Fatalf("missing ticket claim: got %d, want 404", rMiss.StatusCode)
+	}
+
+	// 8. Per-cluster active ticket cap (20 active -> 21st returns 429)
+	for i := 0; i < enroll.MaxActiveTicketsPerCluster; i++ {
+		rc := doReq(http.MethodPost, "/v1/enroll/tickets", tokMasterB, "", map[string]any{
+			"ticket_id":      fmt.Sprintf("cap_b_ticket_%02d", i),
+			"ciphertext_b64": "Y2FwLXRlc3Q=",
+			"ttl_sec":        300,
+		})
+		_ = rc.Body.Close()
+		if rc.StatusCode != http.StatusCreated {
+			t.Fatalf("cap create %d: got %d, want 201", i, rc.StatusCode)
+		}
+	}
+	rCapOver := doReq(http.MethodPost, "/v1/enroll/tickets", tokMasterB, "", map[string]any{
+		"ticket_id":      "cap_b_ticket_21",
+		"ciphertext_b64": "Y2FwLXRlc3Q=",
+		"ttl_sec":        300,
+	})
+	_ = rCapOver.Body.Close()
+	if rCapOver.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("21st active ticket: got %d, want 429", rCapOver.StatusCode)
+	}
+
+	// 9. Public claim IP rate limit -> 20 req/min/IP, 21st returns 429
+	const floodIP = "203.0.113.200"
+	for i := 0; i < enroll.DefaultClaimRatePerMin; i++ {
+		rf := doReq(http.MethodPost, "/v1/enroll/claim/nonexistent_rl1", "", floodIP, nil)
+		_ = rf.Body.Close()
+		if rf.StatusCode == http.StatusTooManyRequests {
+			t.Fatalf("rate limited too early on req %d", i+1)
+		}
+	}
+	rRateLimited := doReq(http.MethodPost, "/v1/enroll/claim/nonexistent_rl1", "", floodIP, nil)
+	_ = rRateLimited.Body.Close()
+	if rRateLimited.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("21st claim from same IP: got %d, want 429", rRateLimited.StatusCode)
+	}
+}
+
+func TestMirrorAndBootstrapScriptsHTTP(t *testing.T) {
+	var upstreamHits atomic.Int32
+	fakeTar := []byte("neo-agent-os-release-tarball-bytes")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		switch r.URL.Path {
+		case "/v0.9.1/neo-agent-os-0.9.1-linux-x64.tar.gz":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(fakeTar)
+		case "/v0.9.1/SHA256SUMS.txt":
+			_, _ = w.Write([]byte("abcd  neo-agent-os-0.9.1-linux-x64.tar.gz\n"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer upstream.Close()
+
+	ghAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{"tag_name": "v0.9.1"})
+	}))
+	defer ghAPI.Close()
+
+	mirror := enroll.NewMirror(enroll.MirrorConfig{
+		CacheDir:       t.TempDir(),
+		ReleaseBaseURL: upstream.URL,
+		GitHubAPIURL:   ghAPI.URL,
+	})
+
+	h := hub.New(10<<20, 1<<20)
+	srv := server.New(server.Config{
+		KeyRing:   auth.KeyRing{RootSecret: []byte("unit-test-secret-32-bytes-minimum!!")},
+		PublicURL: "https://neo.1inch.cn:18443",
+		Mirror:    mirror,
+	}, h)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 1. /dl/latest.json
+	rLatest, err := http.Get(ts.URL + "/dl/latest.json")
+	if err != nil {
+		t.Fatalf("get latest.json: %v", err)
+	}
+	var latest enroll.LatestResponse
+	_ = json.NewDecoder(rLatest.Body).Decode(&latest)
+	_ = rLatest.Body.Close()
+	if rLatest.StatusCode != http.StatusOK || latest.Version != "0.9.1" || latest.Tag != "v0.9.1" {
+		t.Fatalf("unexpected latest.json: code=%d body=%+v", rLatest.StatusCode, latest)
+	}
+
+	// 2. /dl/{tag}/{filename} caches from mock upstream (MISS then HIT)
+	r1, err := http.Get(ts.URL + "/dl/v0.9.1/neo-agent-os-0.9.1-linux-x64.tar.gz")
+	if err != nil {
+		t.Fatalf("first dl err: %v", err)
+	}
+	b1, _ := io.ReadAll(r1.Body)
+	_ = r1.Body.Close()
+	if r1.StatusCode != http.StatusOK || !bytes.Equal(b1, fakeTar) || r1.Header.Get("X-Neo-Cache") != "MISS" {
+		t.Fatalf("first dl unexpected: code=%d cache=%q len=%d", r1.StatusCode, r1.Header.Get("X-Neo-Cache"), len(b1))
+	}
+
+	r2, err := http.Get(ts.URL + "/dl/v0.9.1/neo-agent-os-0.9.1-linux-x64.tar.gz")
+	if err != nil {
+		t.Fatalf("second dl err: %v", err)
+	}
+	b2, _ := io.ReadAll(r2.Body)
+	_ = r2.Body.Close()
+	if r2.StatusCode != http.StatusOK || !bytes.Equal(b2, fakeTar) || r2.Header.Get("X-Neo-Cache") != "HIT" {
+		t.Fatalf("second dl unexpected: code=%d cache=%q", r2.StatusCode, r2.Header.Get("X-Neo-Cache"))
+	}
+	if upstreamHits.Load() != 1 {
+		t.Fatalf("expected 1 upstream fetch, got %d", upstreamHits.Load())
+	}
+
+	// 3. Allowlist / path traversal rejection directly against Handler() (ensuring NO 301 redirect!)
+	for _, badPath := range []string{
+		"/dl/v0.9.1/../../.env",
+		"/dl/v0.9.1/..%2F.env",
+		"/dl/v0.9.1/.env",
+		"/dl/v0.9.1/arbitrary-binary.bin",
+		"/dl/badtag/SHA256SUMS.txt",
+	} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "http://neo.1inch.cn"+badPath, nil)
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden && rec.Code != http.StatusBadRequest {
+			t.Fatalf("bad path %q: got %d, want 400 or 403", badPath, rec.Code)
+		}
+	}
+
+	// 4. GET /install.sh with configured PublicURL + sh -n syntax check
+	rSh, err := http.Get(ts.URL + "/install.sh")
+	if err != nil {
+		t.Fatalf("get install.sh: %v", err)
+	}
+	shBody, _ := io.ReadAll(rSh.Body)
+	_ = rSh.Body.Close()
+	if rSh.StatusCode != http.StatusOK {
+		t.Fatalf("install.sh status=%d", rSh.StatusCode)
+	}
+	if ct := rSh.Header.Get("Content-Type"); ct != "text/x-shellscript; charset=utf-8" {
+		t.Fatalf("install.sh content-type=%q", ct)
+	}
+	if !strings.Contains(string(shBody), `RELAY_URL="https://neo.1inch.cn:18443"`) {
+		t.Fatalf("install.sh missing PublicURL substitution")
+	}
+	shFile := filepath.Join(t.TempDir(), "install.sh")
+	if err := os.WriteFile(shFile, shBody, 0o644); err != nil {
+		t.Fatalf("write temp install.sh: %v", err)
+	}
+	if out, err := exec.Command("sh", "-n", shFile).CombinedOutput(); err != nil {
+		t.Fatalf("rendered install.sh failed sh -n: %v\n%s", err, string(out))
+	}
+
+	// 5. GET /install.ps1 with configured PublicURL
+	rPs1, err := http.Get(ts.URL + "/install.ps1")
+	if err != nil {
+		t.Fatalf("get install.ps1: %v", err)
+	}
+	ps1Body, _ := io.ReadAll(rPs1.Body)
+	_ = rPs1.Body.Close()
+	if rPs1.StatusCode != http.StatusOK {
+		t.Fatalf("install.ps1 status=%d", rPs1.StatusCode)
+	}
+	if ct := rPs1.Header.Get("Content-Type"); ct != "text/plain; charset=utf-8" {
+		t.Fatalf("install.ps1 content-type=%q", ct)
+	}
+	if !strings.Contains(string(ps1Body), "function Install-NeoAgent") ||
+		!strings.Contains(string(ps1Body), `[string]$RelayUrl = "https://neo.1inch.cn:18443"`) {
+		t.Fatalf("install.ps1 missing function or PublicURL substitution")
+	}
+
+	// 6. Dynamic PublicURL fallback from r.Host + X-Forwarded-Proto when cfg.PublicURL == ""
+	srvDyn := server.New(server.Config{
+		KeyRing: auth.KeyRing{RootSecret: []byte("unit-test-secret-32-bytes-minimum!!")},
+	}, h)
+	recDyn := httptest.NewRecorder()
+	reqDyn := httptest.NewRequest(http.MethodGet, "http://relay.example.org:8443/install.sh", nil)
+	reqDyn.Header.Set("X-Forwarded-Proto", "https")
+	srvDyn.Handler().ServeHTTP(recDyn, reqDyn)
+	if !strings.Contains(recDyn.Body.String(), `RELAY_URL="https://relay.example.org:8443"`) {
+		t.Fatalf("dynamic PublicURL fallback failed: %s", recDyn.Body.String()[:200])
+	}
+}
+
+func TestKeyRingHotReloadPreservesWebSockets(t *testing.T) {
+	rootSecret := []byte("root-secret-32-bytes-minimum-test!!")
+	gammaSecret := []byte("gamma-cluster-independent-secret-32!")
+
+	h := hub.New(10<<20, 1<<20)
+	srv := server.New(server.Config{
+		KeyRing:       auth.KeyRing{RootSecret: rootSecret},
+		MaxFrameBytes: 1 << 20,
+	}, h)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	wsBase := "ws" + strings.TrimPrefix(ts.URL, "http")
+
+	tokAlpha1, _ := auth.MintToken(rootSecret, "cluster-alpha", "master-a", "master", time.Hour, time.Now())
+	tokAlpha2, _ := auth.MintToken(rootSecret, "cluster-alpha", "agent-a", "os", time.Hour, time.Now())
+	tokGamma, _ := auth.MintTokenWithKeyRing(auth.KeyRing{
+		ClusterSecrets: map[string][]byte{"cluster-gamma": gammaSecret},
+	}, "cluster-gamma", "master-g", "master", time.Hour, time.Now())
+
+	// Open active relay WebSockets for cluster-alpha before reload
+	relA1, _, err := ws.Dial(wsBase+"/v1/relay", http.Header{"Authorization": []string{"Bearer " + tokAlpha1}}, nil, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial relA1: %v", err)
+	}
+	defer relA1.Close()
+	relA2, _, err := ws.Dial(wsBase+"/v1/relay", http.Header{"Authorization": []string{"Bearer " + tokAlpha2}}, nil, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial relA2: %v", err)
+	}
+	defer relA2.Close()
+
+	// Before reload: cluster-gamma token signed with independent secret is rejected (401)
+	reqBefore, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/whoami", nil)
+	reqBefore.Header.Set("Authorization", "Bearer "+tokGamma)
+	rBefore, err := http.DefaultClient.Do(reqBefore)
+	if err != nil {
+		t.Fatalf("whoami before reload: %v", err)
+	}
+	_ = rBefore.Body.Close()
+	if rBefore.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 before keyring reload, got %d", rBefore.StatusCode)
+	}
+
+	// Hot-reload KeyRing to add cluster-gamma's independent secret
+	srv.UpdateKeyRing(auth.KeyRing{
+		RootSecret: rootSecret,
+		ClusterSecrets: map[string][]byte{
+			"cluster-gamma": gammaSecret,
+		},
+	})
+
+	// After reload: cluster-gamma token succeeds immediately
+	reqAfter, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/whoami", nil)
+	reqAfter.Header.Set("Authorization", "Bearer "+tokGamma)
+	rAfter, err := http.DefaultClient.Do(reqAfter)
+	if err != nil {
+		t.Fatalf("whoami after reload: %v", err)
+	}
+	_ = rAfter.Body.Close()
+	if rAfter.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 after keyring reload, got %d", rAfter.StatusCode)
+	}
+
+	// Existing cluster-alpha WebSocket remains open and functional without interruption
+	if err := relA1.WriteBinary(hub.EncodeRelayFrame(hub.RelayFrame{
+		Flags:   hub.FlagData,
+		SrcID:   "master-a",
+		DstID:   "agent-a",
+		Payload: []byte("still-alive-after-sighup"),
+	})); err != nil {
+		t.Fatalf("write after reload: %v", err)
+	}
+	_, rawGot, err := relA2.ReadMessage()
+	if err != nil {
+		t.Fatalf("read after reload: %v", err)
+	}
+	gotFrame, err := hub.DecodeRelayFrame(rawGot)
+	if err != nil || string(gotFrame.Payload) != "still-alive-after-sighup" {
+		t.Fatalf("unexpected payload after reload: %+v err=%v", gotFrame, err)
+	}
 }

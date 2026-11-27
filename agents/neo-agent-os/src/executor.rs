@@ -19,6 +19,8 @@ const BLOCKED_ENV_VARS: &[&str] = &[
     "LD_AUDIT",
     "LD_DEBUG",
     "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
 ];
 
 #[derive(Debug, Clone)]
@@ -104,10 +106,32 @@ impl Executor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
-            .env_clear()
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-            .env("HOME", cwd.to_string_lossy().as_ref())
-            .env("LANG", "C.UTF-8");
+            .env_clear();
+
+        #[cfg(target_os = "macos")]
+        {
+            cmd.env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+                .env("HOME", cwd.to_string_lossy().as_ref())
+                .env("LANG", "C.UTF-8");
+        }
+        #[cfg(target_os = "windows")]
+        {
+            for key in ["PATH", "SystemRoot", "COMSPEC", "PATHEXT"] {
+                if let Ok(val) = std::env::var(key) {
+                    if !BLOCKED_ENV_VARS.iter().any(|b| b.eq_ignore_ascii_case(key)) {
+                        cmd.env(key, val);
+                    }
+                }
+            }
+            cmd.env("USERPROFILE", cwd.to_string_lossy().as_ref())
+                .env("HOME", cwd.to_string_lossy().as_ref());
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                .env("HOME", cwd.to_string_lossy().as_ref())
+                .env("LANG", "C.UTF-8");
+        }
 
         if let Some(env_map) = params.get("env").and_then(|v| v.as_object()) {
             for (k, v) in env_map {
@@ -119,37 +143,38 @@ impl Executor {
             }
         }
 
-        let mem_limit_bytes = self
-            .policy
-            .config()
-            .max_child_mem_mb
-            .saturating_mul(1024 * 1024);
-
         // Best-effort Linux RLIMIT_AS memory cap in child pre_exec.
         #[cfg(target_os = "linux")]
-        unsafe {
-            cmd.pre_exec(move || {
-                if mem_limit_bytes > 0 {
-                    let mut cur = libc::rlimit {
-                        rlim_cur: 0,
-                        rlim_max: 0,
-                    };
-                    if libc::getrlimit(libc::RLIMIT_AS, &mut cur) == 0 {
-                        let target = mem_limit_bytes as libc::rlim_t;
-                        let clamped = if cur.rlim_max == libc::RLIM_INFINITY {
-                            target
-                        } else {
-                            target.min(cur.rlim_max)
+        {
+            let mem_limit_bytes = self
+                .policy
+                .config()
+                .max_child_mem_mb
+                .saturating_mul(1024 * 1024);
+            unsafe {
+                cmd.pre_exec(move || {
+                    if mem_limit_bytes > 0 {
+                        let mut cur = libc::rlimit {
+                            rlim_cur: 0,
+                            rlim_max: 0,
                         };
-                        let new_lim = libc::rlimit {
-                            rlim_cur: clamped,
-                            rlim_max: cur.rlim_max,
-                        };
-                        let _ = libc::setrlimit(libc::RLIMIT_AS, &new_lim);
+                        if libc::getrlimit(libc::RLIMIT_AS, &mut cur) == 0 {
+                            let target = mem_limit_bytes as libc::rlim_t;
+                            let clamped = if cur.rlim_max == libc::RLIM_INFINITY {
+                                target
+                            } else {
+                                target.min(cur.rlim_max)
+                            };
+                            let new_lim = libc::rlimit {
+                                rlim_cur: clamped,
+                                rlim_max: cur.rlim_max,
+                            };
+                            let _ = libc::setrlimit(libc::RLIMIT_AS, &new_lim);
+                        }
                     }
-                }
-                Ok(())
-            });
+                    Ok(())
+                });
+            }
         }
 
         let mut child = cmd

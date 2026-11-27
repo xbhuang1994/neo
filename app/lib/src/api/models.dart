@@ -467,3 +467,431 @@ class AccountsView {
   final String? note;
   final LoginRun? login;
 }
+
+List<String> _strings(Object? value) => [for (final item in _list(value)) if (item is String && item.isNotEmpty) item];
+
+/// Public configuration and relay connectivity state for the Master Neo device control plane.
+class DeviceControlConfig {
+  const DeviceControlConfig({
+    this.enabled = false,
+    this.configured = false,
+    this.clusterId = '',
+    this.masterNodeId = '',
+    this.relayUrl,
+    this.hasRelaySecret = false,
+    this.hasClusterSecret = false,
+    this.hasToken = false,
+    this.hasE2eKey = false,
+    this.canMintTokens = false,
+    this.relayState = 'idle',
+    this.localRelayDetected = false,
+    this.defaultRelayUrl,
+    this.agentVersion,
+  });
+
+  DeviceControlConfig.fromJson(Map<String, dynamic> json)
+    : enabled = json['enabled'] == true,
+      configured = json['configured'] == true,
+      clusterId = json['clusterId'] as String? ?? '',
+      masterNodeId = json['masterNodeId'] as String? ?? '',
+      relayUrl = _text(json['relayUrl']),
+      hasRelaySecret = json['hasRelaySecret'] == true,
+      hasClusterSecret = json['hasClusterSecret'] == true,
+      hasToken = json['hasToken'] == true,
+      hasE2eKey = json['hasE2eKey'] == true,
+      canMintTokens = json['canMintTokens'] == true,
+      relayState = _text(json['relayState']) ?? 'idle',
+      localRelayDetected = json['localRelayDetected'] == true,
+      defaultRelayUrl = _text(json['defaultRelayUrl']),
+      agentVersion = _text(json['agentVersion']);
+
+  final bool enabled;
+  final bool configured;
+  final String clusterId;
+  final String masterNodeId;
+  final String? relayUrl;
+  final bool hasRelaySecret;
+  final bool hasClusterSecret;
+  final bool hasToken;
+  final bool hasE2eKey;
+  final bool canMintTokens;
+
+  /// `idle`, `connecting`, `connected`, `reconnecting` or `closed`.
+  final String relayState;
+  final bool localRelayDetected;
+  final String? defaultRelayUrl;
+  final String? agentVersion;
+}
+
+/// Optional Tier 2 MCU bridge settings advertised by a Tier 1 OS agent.
+class DeviceRelayConfig {
+  const DeviceRelayConfig({this.enabled = false, this.mqttBind, this.uartDevice});
+
+  DeviceRelayConfig.fromJson(Map<String, dynamic> json)
+    : enabled = json['enabled'] == true,
+      mqttBind = _text(json['mqtt_bind']) ?? _text(json['mqttBind']),
+      uartDevice = _text(json['uart_device']) ?? _text(json['uartDevice']);
+
+  final bool enabled;
+  final String? mqttBind;
+  final String? uartDevice;
+}
+
+/// A declared action in a device's capability manifest.
+class DeviceActionSpec {
+  const DeviceActionSpec({required this.name, this.description, this.risk});
+
+  DeviceActionSpec.fromJson(Map<String, dynamic> json)
+    : name = json['name'] as String? ?? '',
+      description = _text(json['description']),
+      risk = _text(json['risk']);
+
+  final String name;
+  final String? description;
+  final String? risk;
+}
+
+/// Hardware, sandbox, and capability manifest reported by a Tier 1 OS agent or Tier 2 MCU.
+class DeviceManifest {
+  DeviceManifest.fromJson(Map<String, dynamic> json)
+    : deviceId = _text(json['device_id']) ?? _text(json['deviceId']) ?? '',
+      tier = _text(json['tier']) ?? 'os',
+      os = _text(json['os']),
+      arch = _text(json['arch']),
+      hostname = _text(json['hostname']),
+      cpus = (json['cpus'] as num?)?.toInt(),
+      ramMb = (json['ram_mb'] as num?)?.toInt() ?? (json['ramMb'] as num?)?.toInt(),
+      gpus = _parseGpus(json),
+      capabilities = _strings(json['capabilities']),
+      actions = [for (final item in _list(json['actions'])) DeviceActionSpec.fromJson(_map(item))],
+      sandbox = _map(json['sandbox']),
+      relayConfig = json['relay_config'] is Map
+          ? DeviceRelayConfig.fromJson(_map(json['relay_config']))
+          : json['relayConfig'] is Map
+          ? DeviceRelayConfig.fromJson(_map(json['relayConfig']))
+          : null,
+      chip = _text(json['chip']),
+      fw = _text(json['fw']),
+      acts = _strings(json['acts']);
+
+  static List<String> _parseGpus(Map<String, dynamic> json) {
+    final gpus = _strings(json['gpus']);
+    if (gpus.isNotEmpty) return gpus;
+    final gpu = _text(json['gpu']);
+    if (gpu != null) return [gpu];
+    final cuda = _text(json['cuda_devices']) ?? _text(_map(json['sandbox'])['cuda_devices']);
+    if (cuda != null) return ['CUDA $cuda'];
+    return const [];
+  }
+
+  final String deviceId;
+  final String tier;
+  final String? os;
+  final String? arch;
+  final String? hostname;
+  final int? cpus;
+  final int? ramMb;
+  final List<String> gpus;
+  final List<String> capabilities;
+  final List<DeviceActionSpec> actions;
+  final Map<String, dynamic> sandbox;
+  final DeviceRelayConfig? relayConfig;
+  final String? chip;
+  final String? fw;
+  final List<String> acts;
+
+  /// Canonical workspace paths permitted by the agent's local sandbox policy.
+  List<String> get workspaces {
+    for (final key in const ['allowed_workspaces', 'allowedWorkspaces', 'workspaces']) {
+      final raw = sandbox[key];
+      if (raw is List) {
+        final paths = _strings(raw);
+        if (paths.isNotEmpty) return paths;
+      } else if (raw is String && raw.isNotEmpty) {
+        return [raw];
+      }
+    }
+    final single = _text(sandbox['workspace']) ?? _text(sandbox['root']);
+    return single == null ? const [] : [single];
+  }
+
+  bool get hasGpu => gpus.isNotEmpty || capabilities.contains('gpu');
+}
+
+/// A persisted Device Twin for a Tier 1 OS agent or Tier 2 MCU.
+class DeviceTwin {
+  DeviceTwin.fromJson(Map<String, dynamic> json)
+    : deviceId = json['deviceId'] as String? ?? '',
+      clusterId = json['clusterId'] as String? ?? '',
+      tier = _text(json['tier']) ?? 'os',
+      status = _text(json['status']) ?? 'offline',
+      route = _text(json['route']) ?? 'relay',
+      lanUrl = _text(json['lanUrl']),
+      relayNodeId = _text(json['relayNodeId']),
+      backupRelayNodeIds = _strings(json['backupRelayNodeIds']),
+      alertSuppressed = json['alertSuppressed'] == true,
+      manifest = json['manifest'] is Map ? DeviceManifest.fromJson(_map(json['manifest'])) : null,
+      capabilities = _strings(json['capabilities']),
+      desiredState = _map(json['desiredState']),
+      reportedState = _map(json['reportedState']),
+      pendingQueueLength = _list(json['pendingQueue']).length,
+      lastSeqId = (json['lastSeqId'] as num?)?.toInt() ?? 0,
+      lastAckedSeqId = (json['lastAckedSeqId'] as num?)?.toInt() ?? 0,
+      lastSeenAt = _time(json['lastSeenAt']) ?? _time(json['lastSeenMs']),
+      updatedAt = _time(json['updatedAt']),
+      raw = jsonEncode(json);
+
+  final String deviceId;
+  final String clusterId;
+
+  /// `os` or `mcu`.
+  final String tier;
+
+  /// `online`, `offline`, `sleeping`, or `unreachable_via_relay`.
+  final String status;
+
+  /// `lan`, `p2p`, `relay`, or `via_tier1`.
+  final String route;
+  final String? lanUrl;
+  final String? relayNodeId;
+  final List<String> backupRelayNodeIds;
+  final bool alertSuppressed;
+  final DeviceManifest? manifest;
+  final List<String> capabilities;
+  final Map<String, dynamic> desiredState;
+  final Map<String, dynamic> reportedState;
+  final int pendingQueueLength;
+  final int lastSeqId;
+  final int lastAckedSeqId;
+  final DateTime? lastSeenAt;
+  final DateTime? updatedAt;
+  final String raw;
+
+  bool get isOnline => status == 'online';
+  bool get isMcu => tier == 'mcu';
+  bool get isTier1 => tier == 'os';
+  bool get hasGpu => manifest?.hasGpu == true || capabilities.contains('gpu');
+  List<String> get workspaces => manifest?.workspaces ?? const [];
+  String? get mqttBind => manifest?.relayConfig?.mqttBind;
+  String? get uartDevice => manifest?.relayConfig?.uartDevice;
+  bool get isRelayCapable =>
+      manifest?.relayConfig?.enabled == true ||
+      capabilities.contains('relay') ||
+      (mqttBind != null && mqttBind!.isNotEmpty) ||
+      (uartDevice != null && uartDevice!.isNotEmpty);
+}
+
+/// A risk-gated device invocation awaiting human approval.
+class DeviceApproval {
+  DeviceApproval.fromJson(Map<String, dynamic> json)
+    : id = json['id'] as String? ?? '',
+      shortCode = json['shortCode'] as String? ?? '',
+      clusterId = json['clusterId'] as String? ?? '',
+      deviceId = json['deviceId'] as String? ?? '',
+      action = json['action'] as String? ?? '',
+      params = _map(json['params']),
+      timeoutMs = (json['timeoutMs'] as num?)?.toInt(),
+      reason = _text(json['reason']),
+      status = _text(json['status']) ?? 'pending',
+      createdAt = _time(json['createdAt']),
+      decidedAt = _time(json['decidedAt']),
+      decidedBy = _text(json['decidedBy']),
+      result = json['result'],
+      error = _text(json['error']);
+
+  final String id;
+  final String shortCode;
+  final String clusterId;
+  final String deviceId;
+  final String action;
+  final Map<String, dynamic> params;
+  final int? timeoutMs;
+  final String? reason;
+
+  /// `pending`, `approved`, or `rejected`.
+  final String status;
+  final DateTime? createdAt;
+  final DateTime? decidedAt;
+  final String? decidedBy;
+  final Object? result;
+  final String? error;
+
+  bool get isPending => status == 'pending';
+}
+
+/// Platform-specific one-click install and uninstall commands for a device enrollment.
+class EnrollmentCommands {
+  const EnrollmentCommands({
+    this.linuxRoot = '',
+    this.linuxUser = '',
+    this.macos = '',
+    this.windows = '',
+    this.docker = '',
+    this.uninstall = '',
+  });
+
+  EnrollmentCommands.fromJson(Map<String, dynamic> json)
+    : linuxRoot = json['linuxRoot'] as String? ?? '',
+      linuxUser = json['linuxUser'] as String? ?? '',
+      macos = json['macos'] as String? ?? '',
+      windows = json['windows'] as String? ?? '',
+      docker = json['docker'] as String? ?? '',
+      uninstall = json['uninstall'] as String? ?? '';
+
+  final String linuxRoot;
+  final String linuxUser;
+  final String macos;
+  final String windows;
+  final String docker;
+  final String uninstall;
+
+  String forPlatform(String platform, {bool linuxUseRoot = true}) {
+    final chosen = switch (platform) {
+      'linux' => linuxUseRoot ? (linuxRoot.isNotEmpty ? linuxRoot : linuxUser) : (linuxUser.isNotEmpty ? linuxUser : linuxRoot),
+      'macos' => macos,
+      'windows' => windows,
+      'docker' => docker,
+      _ => linuxRoot,
+    };
+    if (chosen.isNotEmpty) return chosen;
+    for (final candidate in [linuxRoot, linuxUser, macos, windows, docker]) {
+      if (candidate.isNotEmpty) return candidate;
+    }
+    return '';
+  }
+}
+
+/// A short-lived enrollment ticket that generates one-click agent install commands.
+class DeviceEnrollment {
+  DeviceEnrollment.fromJson(Map<String, dynamic> json)
+    : id = json['id'] as String? ?? '',
+      clusterId = json['clusterId'] as String? ?? '',
+      platform = _text(json['platform']) ?? 'linux',
+      profile = _text(json['profile']) ?? 'personal',
+      installMode = _text(json['installMode']) ?? 'auto',
+      transportMode = _text(json['transportMode']) ?? 'relay',
+      requestedDeviceId = _text(json['requestedDeviceId']),
+      status = _text(json['status']) ?? 'pending',
+      createdAt = _time(json['createdAt']),
+      expiresAt = _time(json['expiresAt']),
+      maxUses = (json['maxUses'] as num?)?.toInt() ?? 1,
+      usedCount = (json['usedCount'] as num?)?.toInt() ?? 0,
+      lastClaimedIp = _text(json['lastClaimedIp']),
+      lastClaimedAt = _time(json['lastClaimedAt']),
+      enrolledDeviceIds = _strings(json['enrolledDeviceIds']),
+      enrollCode = json['enrollCode'] as String? ?? '',
+      commands = EnrollmentCommands.fromJson(_map(json['commands']));
+
+  final String id;
+  final String clusterId;
+
+  /// `linux`, `macos`, `windows`, or `docker`.
+  final String platform;
+
+  /// `personal`, `corp`, `readonly`, or `desktop`.
+  final String profile;
+
+  /// `auto`, `system`, `user`, or `foreground`.
+  final String installMode;
+
+  /// `relay` or `direct`.
+  final String transportMode;
+  final String? requestedDeviceId;
+
+  /// `pending`, `claimed`, `completed`, `expired`, or `revoked`.
+  final String status;
+  final DateTime? createdAt;
+  final DateTime? expiresAt;
+  final int maxUses;
+  final int usedCount;
+  final String? lastClaimedIp;
+  final DateTime? lastClaimedAt;
+  final List<String> enrolledDeviceIds;
+  final String enrollCode;
+  final EnrollmentCommands commands;
+
+  bool get isActive => status == 'pending' || status == 'claimed';
+}
+
+/// Snapshot returned by `GET /api/devices`.
+class DevicesOverview {
+  const DevicesOverview({
+    this.config = const DeviceControlConfig(),
+    this.devices = const [],
+    this.approvals = const [],
+    this.enrollments = const [],
+    this.raw = '',
+  });
+
+  DevicesOverview.fromJson(Map<String, dynamic> json)
+    : config = DeviceControlConfig.fromJson(_map(json['config'])),
+      devices = [for (final item in _list(json['devices'])) DeviceTwin.fromJson(_map(item))],
+      approvals = [for (final item in _list(json['approvals'])) DeviceApproval.fromJson(_map(item))],
+      enrollments = [for (final item in _list(json['enrollments'])) DeviceEnrollment.fromJson(_map(item))],
+      raw = jsonEncode(json);
+
+  final DeviceControlConfig config;
+  final List<DeviceTwin> devices;
+  final List<DeviceApproval> approvals;
+  final List<DeviceEnrollment> enrollments;
+  final String raw;
+
+  List<DeviceApproval> get pendingApprovals => [for (final item in approvals) if (item.isPending) item];
+  int get pendingApprovalsCount => pendingApprovals.length;
+  int get onlineDevicesCount => devices.where((device) => device.isOnline).length;
+  List<DeviceEnrollment> get activeEnrollments => [for (final item in enrollments) if (item.isActive) item];
+  List<DeviceTwin> get tier1Devices => [for (final device in devices) if (device.isTier1) device];
+  List<DeviceTwin> get mcuDevices => [for (final device in devices) if (device.isMcu) device];
+}
+
+/// Live enrollment status and newly onboarded device twins returned by `GET /api/devices/enrollments/:id`.
+class DeviceEnrollmentDetail {
+  DeviceEnrollmentDetail.fromJson(Map<String, dynamic> json)
+    : enrollment = DeviceEnrollment.fromJson(_map(json['enrollment'])),
+      devices = [for (final item in _list(json['devices'])) DeviceTwin.fromJson(_map(item))];
+
+  final DeviceEnrollment enrollment;
+  final List<DeviceTwin> devices;
+}
+
+/// Result of `POST /api/devices/:id/ping`.
+class DevicePingResult {
+  DevicePingResult.fromJson(Map<String, dynamic> json)
+    : ok = json['ok'] == true,
+      deviceId = json['deviceId'] as String? ?? '',
+      latencyMs = (json['latencyMs'] as num?)?.toInt() ?? 0,
+      status = _text(json['status']) ?? 'offline',
+      route = _text(json['route']) ?? 'relay',
+      error = _text(json['error']);
+
+  final bool ok;
+  final String deviceId;
+  final int latencyMs;
+  final String status;
+  final String route;
+  final String? error;
+}
+
+/// Result of Tier 1-driven Tier 2 MCU installation returned by `POST /api/devices/mcu/install`.
+class McuInstallResult {
+  McuInstallResult.fromJson(Map<String, dynamic> json)
+    : twin = DeviceTwin.fromJson(_map(json['twin'])),
+      deployed = json['deployed'] == true,
+      deployMethod = _text(json['deployMethod']) ?? 'staged_manual',
+      deployDetail = json['deployDetail'] as String? ?? '',
+      workspaceDir = json['workspaceDir'] as String? ?? '',
+      configHeader = json['configHeader'] as String? ?? '',
+      installScript = json['installScript'] as String? ?? '',
+      mcuE2eKeyHex = json['mcuE2eKeyHex'] as String? ?? '';
+
+  final DeviceTwin twin;
+  final bool deployed;
+
+  /// `tier1_rpc` or `staged_manual`.
+  final String deployMethod;
+  final String deployDetail;
+  final String workspaceDir;
+  final String configHeader;
+  final String installScript;
+  final String mcuE2eKeyHex;
+}

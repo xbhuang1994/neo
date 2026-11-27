@@ -1,0 +1,1092 @@
+/// Multi-device control plane page: cluster setup, relay status, risk approvals, active enrollments, and device fleet.
+library;
+
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:cupertino_ui/cupertino_ui.dart';
+import 'package:flutter/services.dart';
+
+import '../api/client.dart';
+import '../api/models.dart';
+import '../l10n/strings.dart';
+import '../state/app_state.dart';
+import 'device_enroll_sheet.dart';
+import 'format.dart';
+import 'scope.dart';
+import 'settings_page.dart';
+import 'theme.dart';
+import 'widgets.dart';
+
+/// Relay status label and tint color shared between [DevicesPage] and [SettingsPage].
+(String, Color) relayStatusAppearance(DeviceControlConfig? config, Strings strings, Palette palette) {
+  if (config == null || !config.configured) {
+    return (strings.devicesNotConfigured, palette.gray);
+  }
+  return switch (config.relayState) {
+    'connected' => (strings.relayConnected, palette.green),
+    'connecting' => (strings.relayConnecting, palette.orange),
+    'reconnecting' => (strings.relayReconnecting, palette.orange),
+    _ => (strings.relayOffline, palette.gray),
+  };
+}
+
+/// The Devices tab: cluster initialization, live relay bar, approvals, active enrollment tickets, and fleet management.
+class DevicesPage extends StatefulWidget {
+  const DevicesPage({super.key, required this.onOpenSettings});
+
+  final VoidCallback onOpenSettings;
+
+  @override
+  State<DevicesPage> createState() => _DevicesPageState();
+}
+
+class _DevicesPageState extends State<DevicesPage> {
+  final ScrollController _scroll = ScrollController();
+
+  // Uninitialized setup form controllers.
+  final TextEditingController _initRelayUrl = TextEditingController();
+  final TextEditingController _initClusterId = TextEditingController();
+  final TextEditingController _initClusterSecret = TextEditingController();
+  final TextEditingController _initMasterNodeId = TextEditingController();
+  final TextEditingController _initE2eKey = TextEditingController();
+  ApiClient? _seededClient;
+  bool _initShowAdvanced = false;
+  bool _initBusy = false;
+  String? _initError;
+
+  // Per-row action state on the configured view.
+  final Set<String> _busyApprovals = {};
+  final Set<String> _busyEnrollments = {};
+  final Set<String> _pingingDevices = {};
+  final Set<String> _removingDevices = {};
+  final Map<String, DevicePingResult> _pingResults = {};
+  final Map<String, String> _pingErrors = {};
+
+  String? _toast;
+  bool _toastGood = true;
+  Timer? _toastTimer;
+  Timer? _ttlTimer;
+
+  @override
+  void dispose() {
+    _toastTimer?.cancel();
+    _ttlTimer?.cancel();
+    _scroll.dispose();
+    for (final c in [_initRelayUrl, _initClusterId, _initClusterSecret, _initMasterNodeId, _initE2eKey]) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  void _syncTtlTimer(bool hasActiveEnrollments) {
+    if (hasActiveEnrollments) {
+      _ttlTimer ??= Timer.periodic(const Duration(seconds: 1), (_) {
+        if (mounted) setState(() {});
+      });
+    } else {
+      _ttlTimer?.cancel();
+      _ttlTimer = null;
+    }
+  }
+
+  void _showToast(String message, {bool good = true}) {
+    _toastTimer?.cancel();
+    setState(() {
+      _toast = message;
+      _toastGood = good;
+    });
+    _toastTimer = Timer(const Duration(seconds: 4), () {
+      if (mounted) setState(() => _toast = null);
+    });
+  }
+
+  void _seedInitFields(ApiClient? client, DeviceControlConfig config) {
+    if (identical(_seededClient, client)) return;
+    _seededClient = client;
+    _initRelayUrl.text = (config.defaultRelayUrl != null && config.defaultRelayUrl!.isNotEmpty)
+        ? config.defaultRelayUrl!
+        : (config.relayUrl ?? '');
+    _initClusterId.text = config.clusterId;
+    _initMasterNodeId.text = config.masterNodeId;
+  }
+
+  Future<void> _initCluster(AppState state, DeviceControlConfig config) async {
+    final api = state.client;
+    if (api == null) return;
+    setState(() {
+      _initBusy = true;
+      _initError = null;
+    });
+    try {
+      final secret = _initClusterSecret.text.trim();
+      await api.initDeviceConfig(
+        relayUrl: _initRelayUrl.text.trim(),
+        clusterId: _initClusterId.text.trim(),
+        clusterSecret: secret.isEmpty ? null : secret,
+        masterNodeId: _initMasterNodeId.text.trim(),
+        e2eKey: _initE2eKey.text.trim(),
+        autoDetectLocalRelay: config.localRelayDetected && secret.isEmpty,
+        enabled: true,
+      );
+      await state.refresh();
+    } on ApiException catch (error) {
+      if (mounted) setState(() => _initError = error.message);
+    } finally {
+      if (mounted) setState(() => _initBusy = false);
+    }
+  }
+
+  Future<void> _openEnrollSheet(AppState state, {String initialTab = 'linux', DeviceEnrollment? existingEnrollment}) async {
+    final api = state.client;
+    if (api == null) return;
+    await showDeviceEnrollSheet(
+      context,
+      api: api,
+      devices: state.devices,
+      initialTab: initialTab,
+      existingEnrollment: existingEnrollment,
+      onChanged: () => unawaited(state.refresh()),
+    );
+  }
+
+  Future<void> _openClusterSettings(AppState state, DeviceControlConfig config) async {
+    final api = state.client;
+    if (api == null) return;
+    await showCupertinoModalPopup<void>(
+      context: context,
+      builder: (sheet) => _ClusterSettingsSheet(
+        api: api,
+        config: config,
+        onSaved: () => unawaited(state.refresh()),
+      ),
+    );
+  }
+
+  Future<void> _handleApproval(AppState state, DeviceApproval approval, {required bool approve}) async {
+    final api = state.client;
+    if (api == null) return;
+    final strings = Strings.read(context);
+    setState(() => _busyApprovals.add(approval.id));
+    try {
+      if (approve) {
+        await api.approveDeviceApproval(approval.id);
+      } else {
+        await api.rejectDeviceApproval(approval.id);
+      }
+      await state.refresh();
+      if (mounted) {
+        _showToast(approve ? strings.approvalApproved : strings.approvalRejected, good: true);
+      }
+    } on ApiException catch (error) {
+      if (mounted) _showToast(error.message, good: false);
+    } finally {
+      if (mounted) setState(() => _busyApprovals.remove(approval.id));
+    }
+  }
+
+  Future<void> _revokeEnrollment(AppState state, DeviceEnrollment enrollment) async {
+    final api = state.client;
+    if (api == null) return;
+    final strings = Strings.read(context);
+    setState(() => _busyEnrollments.add(enrollment.id));
+    try {
+      await api.revokeDeviceEnrollment(enrollment.id);
+      await state.refresh();
+      if (mounted) _showToast(strings.ticketRevoked, good: true);
+    } on ApiException catch (error) {
+      if (mounted) _showToast(error.message, good: false);
+    } finally {
+      if (mounted) setState(() => _busyEnrollments.remove(enrollment.id));
+    }
+  }
+
+  Future<void> _pingDevice(AppState state, DeviceTwin device) async {
+    final api = state.client;
+    if (api == null) return;
+    setState(() {
+      _pingingDevices.add(device.deviceId);
+      _pingErrors.remove(device.deviceId);
+    });
+    try {
+      final result = await api.pingDevice(device.deviceId);
+      if (!mounted) return;
+      setState(() {
+        _pingResults[device.deviceId] = result;
+        if (!result.ok && result.error != null) {
+          _pingErrors[device.deviceId] = result.error!;
+        }
+      });
+      unawaited(state.refresh());
+    } on ApiException catch (error) {
+      if (mounted) {
+        setState(() {
+          _pingResults.remove(device.deviceId);
+          _pingErrors[device.deviceId] = error.message;
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _pingingDevices.remove(device.deviceId));
+    }
+  }
+
+  String _uninstallCommandFor(DeviceTwin device, List<DeviceEnrollment> enrollments) {
+    for (final enrollment in enrollments) {
+      if (enrollment.enrolledDeviceIds.contains(device.deviceId) && enrollment.commands.uninstall.isNotEmpty) {
+        return enrollment.commands.uninstall;
+      }
+    }
+    if (device.isMcu) {
+      return '# MCU ${device.deviceId}: re-flash firmware or remove from Master Neo';
+    }
+    final cluster = device.clusterId.isNotEmpty ? device.clusterId : 'default';
+    return 'neo-agent-os uninstall --cluster $cluster';
+  }
+
+  void _copyUninstall(DeviceTwin device, List<DeviceEnrollment> enrollments) {
+    final strings = Strings.read(context);
+    final cmd = _uninstallCommandFor(device, enrollments);
+    unawaited(Clipboard.setData(ClipboardData(text: cmd)));
+    _showToast('${strings.uninstallCopied} (${device.deviceId})', good: true);
+  }
+
+  Future<void> _removeDevice(AppState state, DeviceTwin device) async {
+    final api = state.client;
+    if (api == null) return;
+    final strings = Strings.read(context);
+    final confirmed = await showCupertinoDialog<bool>(
+      context: context,
+      builder: (dialog) {
+        final fonts = fallbackFonts(dialog);
+        return CupertinoAlertDialog(
+          title: Text(strings.removeDeviceConfirmTitle(device.deviceId), style: fonts),
+          content: Text(strings.removeDeviceConfirmBody, style: fonts),
+          actions: [
+            CupertinoDialogAction(onPressed: () => Navigator.of(dialog).pop(false), child: Text(strings.cancel, style: fonts)),
+            CupertinoDialogAction(isDestructiveAction: true, onPressed: () => Navigator.of(dialog).pop(true), child: Text(strings.removeDevice, style: fonts)),
+          ],
+        );
+      },
+    );
+    if (confirmed != true || !mounted) return;
+    setState(() => _removingDevices.add(device.deviceId));
+    try {
+      await api.removeDevice(device.deviceId);
+      _pingResults.remove(device.deviceId);
+      _pingErrors.remove(device.deviceId);
+      await state.refresh();
+    } on ApiException catch (error) {
+      if (mounted) _showToast(error.message, good: false);
+    } finally {
+      if (mounted) setState(() => _removingDevices.remove(device.deviceId));
+    }
+  }
+
+  Widget _buildUninitialized(AppState state, DeviceControlConfig config) {
+    _seedInitFields(state.client, config);
+    final strings = Strings.read(context);
+    final palette = Palette.of(context);
+    final typo = Typo.of(context);
+
+    return CupertinoScrollbar(
+      controller: _scroll,
+      child: ListView(
+        controller: _scroll,
+        primary: false,
+        padding: const EdgeInsets.symmetric(horizontal: grid * 2.5, vertical: grid * 3),
+        children: [
+          Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 640),
+              child: Group(
+                title: strings.deviceClusterSetup,
+                footer: strings.deviceClusterSetupFooter,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(14, 14, 14, 12),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Container(
+                          width: 36,
+                          height: 36,
+                          decoration: BoxDecoration(color: palette.accent.withValues(alpha: 0.14), borderRadius: BorderRadius.circular(9)),
+                          child: Icon(CupertinoIcons.desktopcomputer, size: 19, color: palette.accent),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(child: Text(strings.deviceClusterSetupIntro, style: typo.footnote)),
+                      ],
+                    ),
+                  ),
+                  Field(
+                    label: strings.relayUrlLabel,
+                    below: Box(
+                      key: const ValueKey('init-relay-url'),
+                      controller: _initRelayUrl,
+                      placeholder: config.defaultRelayUrl ?? 'https://neo.1inch.cn:18443',
+                      mono: true,
+                      keyboard: TextInputType.url,
+                    ),
+                  ),
+                  Field(
+                    label: strings.clusterIdLabel,
+                    below: Box(
+                      key: const ValueKey('init-cluster-id'),
+                      controller: _initClusterId,
+                      placeholder: strings.clusterIdPlaceholder,
+                      mono: true,
+                    ),
+                  ),
+                  if (config.localRelayDetected)
+                    Field(
+                      label: strings.clusterSecretLabel,
+                      trailing: Pill(strings.localRelayDetectedBadge, color: palette.green, dot: true),
+                      below: Text(strings.localRelayDetectedHint, style: typo.caption),
+                    )
+                  else
+                    Field(
+                      label: strings.clusterSecretLabel,
+                      below: Box(
+                        key: const ValueKey('init-cluster-secret'),
+                        controller: _initClusterSecret,
+                        placeholder: strings.clusterSecretPlaceholder,
+                        obscure: true,
+                        mono: true,
+                      ),
+                    ),
+                  Tappable(
+                    key: const ValueKey('init-advanced-toggle'),
+                    borderRadius: 0,
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+                    onTap: () => setState(() => _initShowAdvanced = !_initShowAdvanced),
+                    child: Row(
+                      children: [
+                        Icon(CupertinoIcons.slider_horizontal_3, size: 16, color: palette.accent),
+                        const SizedBox(width: 8),
+                        Expanded(child: Text(strings.advancedOptions, style: typo.body.copyWith(color: palette.accent))),
+                        Icon(_initShowAdvanced ? CupertinoIcons.chevron_up : CupertinoIcons.chevron_down, size: 15, color: palette.secondary),
+                      ],
+                    ),
+                  ),
+                  if (_initShowAdvanced) ...[
+                    Field(
+                      label: strings.masterNodeIdLabel,
+                      below: Box(
+                        key: const ValueKey('init-master-node-id'),
+                        controller: _initMasterNodeId,
+                        placeholder: config.masterNodeId.isNotEmpty ? config.masterNodeId : 'master-1',
+                        mono: true,
+                      ),
+                    ),
+                    Field(
+                      label: strings.e2eKeyLabel,
+                      below: Box(
+                        key: const ValueKey('init-e2e-key'),
+                        controller: _initE2eKey,
+                        placeholder: strings.e2eKeyPlaceholder,
+                        obscure: true,
+                        mono: true,
+                      ),
+                    ),
+                    if (config.localRelayDetected)
+                      Field(
+                        label: strings.clusterSecretLabel,
+                        below: Box(
+                          key: const ValueKey('init-cluster-secret'),
+                          controller: _initClusterSecret,
+                          placeholder: strings.clusterSecretPlaceholder,
+                          obscure: true,
+                          mono: true,
+                        ),
+                      ),
+                  ],
+                  Padding(
+                    padding: const EdgeInsets.all(14),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        if (_initError != null) ...[
+                          Notice(_initError!),
+                          const SizedBox(height: 12),
+                        ],
+                        ActionButton(
+                          key: const ValueKey('init-cluster-btn'),
+                          label: strings.initClusterAndConnect,
+                          busy: _initBusy,
+                          onPressed: () => unawaited(_initCluster(state, config)),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildConfigured(AppState state, DevicesOverview overview) {
+    final strings = Strings.read(context);
+    final palette = Palette.of(context);
+    final typo = Typo.of(context);
+    final config = overview.config;
+    final (relayLabel, relayColor) = relayStatusAppearance(config, strings, palette);
+    final pendingApprovals = overview.pendingApprovals;
+    final activeEnrollments = overview.activeEnrollments;
+    final sortedDevices = List<DeviceTwin>.from(overview.devices)
+      ..sort((a, b) {
+        if (a.isTier1 != b.isTier1) return a.isTier1 ? -1 : 1;
+        if (a.isOnline != b.isOnline) return a.isOnline ? -1 : 1;
+        return a.deviceId.compareTo(b.deviceId);
+      });
+
+    return CupertinoScrollbar(
+      controller: _scroll,
+      child: ListView(
+        controller: _scroll,
+        primary: false,
+        padding: const EdgeInsets.symmetric(horizontal: grid * 2.5, vertical: grid * 3),
+        children: [
+          Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 760),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  if (_toast != null) ...[
+                    Notice(_toast!, good: _toastGood),
+                    const SizedBox(height: grid * 2),
+                  ],
+
+                  // Cluster Status Bar Group
+                  Group(
+                    title: strings.clusterStatus,
+                    children: [
+                      Padding(
+                        padding: const EdgeInsets.all(14),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Wrap(
+                              spacing: 10,
+                              runSpacing: 8,
+                              crossAxisAlignment: WrapCrossAlignment.center,
+                              children: [
+                                Pill(relayLabel, color: relayColor, dot: true),
+                                Text(config.clusterId, style: typo.mono.copyWith(color: palette.label, fontWeight: FontWeight.w600)),
+                                Text(
+                                  strings.devicesOnlineSummary(overview.onlineDevicesCount, overview.devices.length),
+                                  style: typo.footnote,
+                                ),
+                                if (config.agentVersion != null)
+                                  Text('v${config.agentVersion}', style: typo.caption),
+                              ],
+                            ),
+                            if (config.relayUrl != null && config.relayUrl!.isNotEmpty) ...[
+                              const SizedBox(height: 6),
+                              Text(config.relayUrl!, style: typo.mono.copyWith(fontSize: 12, color: palette.secondary)),
+                            ],
+                            const SizedBox(height: 14),
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 8,
+                              children: [
+                                ActionButton(
+                                  key: const ValueKey('add-device-btn'),
+                                  label: strings.addDeviceCta,
+                                  onPressed: () => unawaited(_openEnrollSheet(state, initialTab: 'linux')),
+                                ),
+                                ActionButton(
+                                  key: const ValueKey('add-mcu-btn'),
+                                  label: strings.connectMcu,
+                                  plain: true,
+                                  onPressed: () => unawaited(_openEnrollSheet(state, initialTab: 'mcu')),
+                                ),
+                                ActionButton(
+                                  key: const ValueKey('cluster-settings-btn'),
+                                  label: strings.clusterSettings,
+                                  plain: true,
+                                  onPressed: () => unawaited(_openClusterSettings(state, config)),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+
+                  // Pending Approvals Group
+                  if (pendingApprovals.isNotEmpty)
+                    Group(
+                      title: '${strings.pendingApprovals} (${pendingApprovals.length})',
+                      children: [
+                        for (final approval in pendingApprovals) _buildApprovalRow(state, approval),
+                      ],
+                    ),
+
+                  // Active Enrollments Group
+                  if (activeEnrollments.isNotEmpty)
+                    Group(
+                      title: '${strings.activeEnrollments} (${activeEnrollments.length})',
+                      children: [
+                        for (final enrollment in activeEnrollments) _buildEnrollmentRow(state, enrollment),
+                      ],
+                    ),
+
+                  // Device Fleet Group
+                  Group(
+                    title: '${strings.deviceFleet} (${sortedDevices.length})',
+                    children: [
+                      if (sortedDevices.isEmpty)
+                        Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 12),
+                          child: EmptyState(
+                            icon: CupertinoIcons.desktopcomputer,
+                            title: strings.noDevicesTitle,
+                            hint: strings.noDevicesHint,
+                            action: ActionButton(
+                              key: const ValueKey('empty-add-device-btn'),
+                              label: strings.generateFirstInstallCmd,
+                              onPressed: () => unawaited(_openEnrollSheet(state, initialTab: 'linux')),
+                            ),
+                          ),
+                        )
+                      else
+                        for (final device in sortedDevices) _buildDeviceRow(state, device, overview.enrollments),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildApprovalRow(AppState state, DeviceApproval approval) {
+    final strings = Strings.read(context);
+    final palette = Palette.of(context);
+    final typo = Typo.of(context);
+    final busy = _busyApprovals.contains(approval.id);
+    final paramsText = approval.params.isEmpty ? null : jsonEncode(approval.params);
+
+    return Padding(
+      key: ValueKey('approval-${approval.id}'),
+      padding: const EdgeInsets.all(14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Wrap(
+            spacing: 8,
+            runSpacing: 6,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              Pill(approval.shortCode, color: palette.orange, dot: true),
+              Text(approval.deviceId, style: typo.headline),
+              Text(approval.action, style: typo.mono.copyWith(color: palette.accent, fontWeight: FontWeight.w600)),
+              if (approval.createdAt != null) Text(clockTime(approval.createdAt!), style: typo.caption),
+            ],
+          ),
+          if (paramsText != null) ...[
+            const SizedBox(height: 6),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: BoxDecoration(color: palette.code, borderRadius: BorderRadius.circular(7)),
+              child: Selectable(child: Text(paramsText, style: typo.mono.copyWith(fontSize: 12, color: palette.secondary))),
+            ),
+          ],
+          if (approval.reason != null) ...[
+            const SizedBox(height: 4),
+            Text(approval.reason!, style: typo.footnote),
+          ],
+          const SizedBox(height: 10),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              ActionButton(
+                key: ValueKey('reject-${approval.id}'),
+                label: strings.reject,
+                plain: true,
+                destructive: true,
+                busy: busy,
+                onPressed: busy ? null : () => unawaited(_handleApproval(state, approval, approve: false)),
+              ),
+              const SizedBox(width: 8),
+              ActionButton(
+                key: ValueKey('approve-${approval.id}'),
+                label: strings.approve,
+                busy: busy,
+                onPressed: busy ? null : () => unawaited(_handleApproval(state, approval, approve: true)),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildEnrollmentRow(AppState state, DeviceEnrollment enrollment) {
+    final strings = Strings.read(context);
+    final palette = Palette.of(context);
+    final typo = Typo.of(context);
+    final busy = _busyEnrollments.contains(enrollment.id);
+    final (statusLabel, statusColor) = switch (enrollment.status) {
+      'claimed' => (strings.enrollmentStatusClaimed, palette.accent),
+      _ => (strings.enrollmentStatusPending, palette.orange),
+    };
+    final ttl = formatRemainingTtl(enrollment.expiresAt);
+
+    return Padding(
+      key: ValueKey('enrollment-${enrollment.id}'),
+      padding: const EdgeInsets.all(14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Wrap(
+            spacing: 8,
+            runSpacing: 6,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              Pill(enrollment.platform.toUpperCase(), color: palette.accent),
+              Pill(statusLabel, color: statusColor, dot: true),
+              Text(enrollment.profile, style: typo.footnote),
+              if (enrollment.requestedDeviceId != null) Text(enrollment.requestedDeviceId!, style: typo.mono.copyWith(color: palette.label)),
+              Text(strings.remainingTime(ttl), style: typo.caption.copyWith(fontFeatures: const [FontFeature.tabularFigures()])),
+              if (enrollment.maxUses > 1) Text(strings.usesCount(enrollment.usedCount, enrollment.maxUses), style: typo.caption),
+            ],
+          ),
+          if (enrollment.lastClaimedIp != null) ...[
+            const SizedBox(height: 4),
+            Text('IP: ${enrollment.lastClaimedIp}', style: typo.caption),
+          ],
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              ActionButton(
+                key: ValueKey('view-enrollment-${enrollment.id}'),
+                label: strings.viewCopyCommand,
+                plain: true,
+                onPressed: () => unawaited(_openEnrollSheet(state, existingEnrollment: enrollment)),
+              ),
+              ActionButton(
+                key: ValueKey('revoke-enrollment-${enrollment.id}'),
+                label: strings.revoke,
+                plain: true,
+                destructive: true,
+                busy: busy,
+                onPressed: busy ? null : () => unawaited(_revokeEnrollment(state, enrollment)),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _chip(String label) {
+    final palette = Palette.of(context);
+    final typo = Typo.of(context);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+      decoration: BoxDecoration(color: palette.fill, borderRadius: BorderRadius.circular(6)),
+      child: Text(label, style: typo.caption.copyWith(color: palette.label, fontSize: 11.5)),
+    );
+  }
+
+  Widget _buildDeviceRow(AppState state, DeviceTwin device, List<DeviceEnrollment> enrollments) {
+    final strings = Strings.read(context);
+    final palette = Palette.of(context);
+    final typo = Typo.of(context);
+    final (statusLabel, statusColor) = switch (device.status) {
+      'online' => (strings.deviceStatusOnline, palette.green),
+      'sleeping' => (strings.deviceStatusSleeping, palette.orange),
+      'unreachable_via_relay' => (strings.deviceStatusUnreachable, palette.red),
+      _ => (strings.deviceStatusOffline, palette.gray),
+    };
+    final (routeLabel, routeColor) = switch (device.route) {
+      'p2p' => (strings.deviceRouteP2p, palette.green),
+      'lan' => (strings.deviceRouteLan, palette.green),
+      'via_tier1' => (strings.deviceRouteViaTier1, palette.purple),
+      _ => (strings.deviceRouteRelay, palette.accent),
+    };
+
+    final manifest = device.manifest;
+    final chips = <String>[];
+    if (device.isMcu) {
+      if (manifest?.chip != null) chips.add(manifest!.chip!);
+      if (manifest?.fw != null) chips.add('fw ${manifest!.fw!}');
+      if (device.relayNodeId != null) chips.add(strings.viaRelayDevice(device.relayNodeId!));
+      if (device.pendingQueueLength > 0) chips.add(strings.queuedCommands(device.pendingQueueLength));
+    } else {
+      if (manifest?.os != null) {
+        chips.add(manifest?.arch != null ? '${manifest!.os}/${manifest.arch}' : manifest!.os!);
+      }
+      if (manifest?.cpus != null && manifest!.cpus! > 0) {
+        chips.add('${manifest.cpus} CPU');
+      }
+      if (manifest?.ramMb != null && manifest!.ramMb! > 0) {
+        final mb = manifest.ramMb!;
+        chips.add(mb >= 1024 ? '${(mb / 1024).toStringAsFixed(1)} GB RAM' : '$mb MB RAM');
+      }
+      if (manifest != null && manifest.gpus.isNotEmpty) {
+        for (final gpu in manifest.gpus) {
+          chips.add('GPU $gpu');
+        }
+      } else if (device.hasGpu) {
+        chips.add('GPU');
+      }
+      if (device.mqttBind != null) chips.add('MQTT ${device.mqttBind}');
+      if (device.uartDevice != null) chips.add('UART ${device.uartDevice}');
+    }
+
+    final pinging = _pingingDevices.contains(device.deviceId);
+    final removing = _removingDevices.contains(device.deviceId);
+    final pingResult = _pingResults[device.deviceId];
+    final pingError = _pingErrors[device.deviceId];
+
+    return Padding(
+      key: ValueKey('device-${device.deviceId}'),
+      padding: const EdgeInsets.all(14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Container(
+                width: 9,
+                height: 9,
+                decoration: BoxDecoration(color: statusColor, shape: BoxShape.circle),
+              ),
+              const SizedBox(width: 9),
+              Expanded(
+                child: Wrap(
+                  spacing: 7,
+                  runSpacing: 4,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    Text(device.deviceId, style: typo.headline),
+                    if (manifest?.hostname != null && manifest!.hostname != device.deviceId)
+                      Text(manifest.hostname!, style: typo.caption),
+                    Pill(statusLabel, color: statusColor),
+                    Pill(routeLabel, color: routeColor),
+                    if (device.isMcu)
+                      Pill(strings.tier2Badge, color: palette.purple)
+                    else if (device.isRelayCapable)
+                      Pill(strings.relayBridgeBadge, color: palette.accent),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          if (chips.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Wrap(spacing: 6, runSpacing: 6, children: [for (final c in chips) _chip(c)]),
+          ],
+          if (device.workspaces.isNotEmpty) ...[
+            const SizedBox(height: 7),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.only(top: 2, right: 6),
+                  child: Icon(CupertinoIcons.folder, size: 13, color: palette.secondary),
+                ),
+                Expanded(
+                  child: Text(device.workspaces.join(', '), style: typo.mono.copyWith(fontSize: 12, color: palette.secondary)),
+                ),
+              ],
+            ),
+          ],
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: Wrap(
+                  spacing: 10,
+                  runSpacing: 4,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    if (device.lastSeenAt != null)
+                      Text(strings.lastSeen(clockTime(device.lastSeenAt!)), style: typo.caption),
+                    if (pingResult != null && pingResult.ok)
+                      Text(
+                        strings.pingOk(pingResult.latencyMs, pingResult.route),
+                        key: ValueKey('ping-result-${device.deviceId}'),
+                        style: typo.caption.copyWith(color: palette.green, fontWeight: FontWeight.w600),
+                      )
+                    else if (pingError != null)
+                      Text(
+                        '${strings.pingFailed}: $pingError',
+                        key: ValueKey('ping-result-${device.deviceId}'),
+                        style: typo.caption.copyWith(color: palette.red),
+                      ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              ActionButton(
+                key: ValueKey('ping-${device.deviceId}'),
+                label: strings.ping,
+                plain: true,
+                busy: pinging,
+                onPressed: pinging ? null : () => unawaited(_pingDevice(state, device)),
+              ),
+              ActionButton(
+                key: ValueKey('uninstall-${device.deviceId}'),
+                label: strings.uninstallCommand,
+                plain: true,
+                onPressed: () => _copyUninstall(device, enrollments),
+              ),
+              ActionButton(
+                key: ValueKey('remove-${device.deviceId}'),
+                label: strings.removeDevice,
+                plain: true,
+                destructive: true,
+                busy: removing,
+                onPressed: removing ? null : () => unawaited(_removeDevice(state, device)),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final state = AppScope.of(context);
+    final strings = Strings.read(context);
+    final palette = Palette.of(context);
+    final online = state.link == Link.online && state.client != null;
+    final overview = state.devicesOverview;
+    final config = overview?.config;
+    final configured = config != null && config.configured;
+    _syncTtlTimer(online && overview != null && overview.activeEnrollments.isNotEmpty);
+
+    return ColoredBox(
+      color: palette.grouped,
+      child: Column(
+        children: [
+          PageHeader(
+            title: strings.devices,
+            subtitle: const LinkPill(),
+            actions: [
+              if (online && configured)
+                ActionButton(
+                  key: const ValueKey('header-add-device-btn'),
+                  label: strings.addDeviceShort,
+                  onPressed: () => unawaited(_openEnrollSheet(state, initialTab: 'linux')),
+                ),
+            ],
+          ),
+          LinkNotice(onOpenSettings: widget.onOpenSettings),
+          Expanded(
+            child: !online
+                ? EmptyState(icon: CupertinoIcons.desktopcomputer, title: strings.devices, hint: strings.devicesConnectFirst)
+                : state.devicesUnsupported
+                ? EmptyState(icon: CupertinoIcons.desktopcomputer, title: strings.devicesUnsupportedTitle, hint: strings.devicesUnsupportedHint)
+                : overview == null
+                ? Center(
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const CupertinoActivityIndicator(radius: 9),
+                        const SizedBox(width: 10),
+                        Text(strings.loading, style: Typo.of(context).footnote),
+                      ],
+                    ),
+                  )
+                : !configured
+                ? _buildUninitialized(state, overview.config)
+                : _buildConfigured(state, overview),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Modal popup to edit relay URL, cluster secret, E2E key, and enabled flag on an already configured cluster.
+class _ClusterSettingsSheet extends StatefulWidget {
+  const _ClusterSettingsSheet({required this.api, required this.config, required this.onSaved});
+
+  final ApiClient api;
+  final DeviceControlConfig config;
+  final VoidCallback onSaved;
+
+  @override
+  State<_ClusterSettingsSheet> createState() => _ClusterSettingsSheetState();
+}
+
+class _ClusterSettingsSheetState extends State<_ClusterSettingsSheet> {
+  late final TextEditingController _relayUrl;
+  late final TextEditingController _clusterId;
+  late final TextEditingController _masterNodeId;
+  final TextEditingController _clusterSecret = TextEditingController();
+  final TextEditingController _e2eKey = TextEditingController();
+  late bool _enabled;
+  bool _busy = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _relayUrl = TextEditingController(text: widget.config.relayUrl ?? widget.config.defaultRelayUrl ?? '');
+    _clusterId = TextEditingController(text: widget.config.clusterId);
+    _masterNodeId = TextEditingController(text: widget.config.masterNodeId);
+    _enabled = widget.config.enabled;
+  }
+
+  @override
+  void dispose() {
+    for (final c in [_relayUrl, _clusterId, _masterNodeId, _clusterSecret, _e2eKey]) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      await widget.api.updateDeviceConfig(
+        relayUrl: _relayUrl.text.trim(),
+        clusterId: _clusterId.text.trim(),
+        masterNodeId: _masterNodeId.text.trim(),
+        clusterSecret: _clusterSecret.text.trim().isEmpty ? null : _clusterSecret.text.trim(),
+        e2eKey: _e2eKey.text.trim().isEmpty ? null : _e2eKey.text.trim(),
+        enabled: _enabled,
+      );
+      widget.onSaved();
+      if (mounted) Navigator.of(context).pop();
+    } on ApiException catch (error) {
+      if (mounted) setState(() => _error = error.message);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = Strings.read(context);
+    final palette = Palette.of(context);
+    final typo = Typo.of(context);
+    final hasSecret = widget.config.hasClusterSecret || widget.config.hasRelaySecret;
+
+    return Center(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxWidth: 500, maxHeight: MediaQuery.sizeOf(context).height * 0.85),
+        child: Container(
+          margin: const EdgeInsets.all(grid * 2),
+          decoration: BoxDecoration(
+            color: palette.surface,
+            borderRadius: BorderRadius.circular(14),
+            boxShadow: const [BoxShadow(color: Color(0x33000000), blurRadius: 30, offset: Offset(0, 10))],
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 14, 8, 10),
+                child: Row(
+                  children: [
+                    Expanded(child: Text(strings.clusterSettings, style: typo.headline.copyWith(fontSize: 17))),
+                    CupertinoButton(
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      minimumSize: const Size(0, 30),
+                      onPressed: () => Navigator.of(context).pop(),
+                      child: Text(strings.cancel, style: typo.body.copyWith(color: palette.accent)),
+                    ),
+                  ],
+                ),
+              ),
+              Container(height: 0.5, color: palette.separator),
+              Flexible(
+                child: SingleChildScrollView(
+                  primary: false,
+                  padding: const EdgeInsets.all(14),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Field(
+                        label: strings.clusterEnabled,
+                        trailing: CupertinoSwitch(
+                          key: const ValueKey('cluster-enabled-switch'),
+                          value: _enabled,
+                          onChanged: (value) => setState(() => _enabled = value),
+                        ),
+                      ),
+                      Field(
+                        label: strings.relayUrlLabel,
+                        below: Box(key: const ValueKey('edit-relay-url'), controller: _relayUrl, placeholder: 'https://neo.1inch.cn:18443', mono: true, keyboard: TextInputType.url),
+                      ),
+                      Field(
+                        label: strings.clusterIdLabel,
+                        below: Box(key: const ValueKey('edit-cluster-id'), controller: _clusterId, mono: true),
+                      ),
+                      Field(
+                        label: strings.masterNodeIdLabel,
+                        below: Box(key: const ValueKey('edit-master-node-id'), controller: _masterNodeId, mono: true),
+                      ),
+                      Field(
+                        label: strings.clusterSecretLabel,
+                        below: Box(
+                          key: const ValueKey('edit-cluster-secret'),
+                          controller: _clusterSecret,
+                          placeholder: hasSecret ? strings.clusterSecretKeepPlaceholder : strings.clusterSecretPlaceholder,
+                          obscure: true,
+                          mono: true,
+                        ),
+                      ),
+                      Field(
+                        label: strings.e2eKeyLabel,
+                        below: Box(
+                          key: const ValueKey('edit-e2e-key'),
+                          controller: _e2eKey,
+                          placeholder: widget.config.hasE2eKey ? strings.clusterSecretKeepPlaceholder : strings.e2eKeyPlaceholder,
+                          obscure: true,
+                          mono: true,
+                        ),
+                      ),
+                      if (_error != null) ...[
+                        const SizedBox(height: 8),
+                        Notice(_error!),
+                      ],
+                      const SizedBox(height: 12),
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: ActionButton(
+                          key: const ValueKey('save-cluster-settings-btn'),
+                          label: strings.save,
+                          busy: _busy,
+                          onPressed: () => unawaited(_save()),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}

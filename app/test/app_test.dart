@@ -350,7 +350,7 @@ void main() {
   testWidgets('chooses Antigravity models, applies them when saved, and installs agy with progress', (tester) async {
     final backend = FakeBackend()..antigravityProblem = 'The Antigravity CLI (agy) was not found.';
     final app = await open(tester, backend);
-    await tester.tap(nav(2));
+    await tester.tap(nav(3));
     await settle(tester);
     expect(find.text('Antigravity'), findsWidgets);
     expect(find.text('跟随内核默认'), findsNWidgets(2));
@@ -406,7 +406,7 @@ void main() {
   testWidgets('polls until Antigravity finishes listing its models', (tester) async {
     final backend = FakeBackend()..antigravityListing = true;
     final app = await open(tester, backend);
-    await tester.tap(nav(2));
+    await tester.tap(nav(3));
     await settle(tester);
     expect(find.text('正在读取模型列表…'), findsOneWidget);
     backend.antigravityListing = false;
@@ -430,7 +430,7 @@ void main() {
   testWidgets('logs Antigravity in with a pasted code, shows the Google account, and logs out', (tester) async {
     final backend = FakeBackend();
     final app = await open(tester, backend);
-    await tester.tap(nav(2));
+    await tester.tap(nav(3));
     await settle(tester);
 
     // Logging in shows the link and passes back the pasted code.
@@ -460,7 +460,7 @@ void main() {
   testWidgets('changes the general settings', (tester) async {
     final backend = FakeBackend();
     final app = await open(tester, backend);
-    await tester.tap(nav(2));
+    await tester.tap(nav(3));
     await settle(tester);
     // The pause applies at once.
     final pause = find.byType(CupertinoSwitch).first;
@@ -528,7 +528,7 @@ void main() {
   testWidgets('binds WeChat by QR code and verification code', (tester) async {
     final backend = FakeBackend();
     final app = await open(tester, backend);
-    await tester.tap(nav(2));
+    await tester.tap(nav(3));
     await settle(tester);
     final connect = find.widgetWithText(CupertinoButton, '连接微信');
     await show(tester, connect);
@@ -591,7 +591,7 @@ void main() {
     expect(find.text('Neo 已在运行'), findsWidgets);
     expect(find.text('同一台电脑只能运行一个 Neo。请切换到已打开的窗口，或先退出正在运行的服务。'), findsOneWidget);
     // The connection can be pointed at a server instead.
-    await tester.tap(nav(2));
+    await tester.tap(nav(3));
     await settle(tester);
     await tester.tap(find.text('远程服务器'));
     await settle(tester);

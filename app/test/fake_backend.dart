@@ -69,6 +69,165 @@ class FakeBackend {
   Map<String, dynamic> wechat = {'state': 'disconnected', 'message': '尚未连接微信。'};
   String? kernelProblem;
 
+  // Multi-device control plane fixture state.
+  bool devicesSupported = true;
+  Map<String, dynamic> deviceConfig = {
+    'enabled': false,
+    'configured': false,
+    'clusterId': '',
+    'masterNodeId': 'master-local',
+    'relayUrl': null,
+    'hasRelaySecret': false,
+    'hasClusterSecret': false,
+    'hasToken': false,
+    'hasE2eKey': false,
+    'canMintTokens': false,
+    'relayState': 'idle',
+    'localRelayDetected': false,
+    'defaultRelayUrl': 'https://neo.1inch.cn:18443',
+    'agentVersion': '0.9.0',
+  };
+  final List<Map<String, dynamic>> devices = [];
+  final List<Map<String, dynamic>> deviceApprovals = [];
+  final List<Map<String, dynamic>> deviceEnrollments = [];
+  final List<Map<String, dynamic>> deviceConfigInits = [];
+  final List<Map<String, dynamic>> deviceConfigUpdates = [];
+  final List<Map<String, dynamic>> createdEnrollments = [];
+  final List<String> revokedEnrollments = [];
+  final List<String> removedDevices = [];
+  final List<String> pingedDevices = [];
+  final List<Map<String, dynamic>> mcuInstalls = [];
+  final List<String> approvedApprovals = [];
+  final List<String> rejectedApprovals = [];
+  bool mcuAutoDeploySuccess = true;
+  int _enrollmentSeq = 0;
+
+  void configureDevices({
+    String clusterId = 'personal',
+    String masterNodeId = 'master-1',
+    String relayUrl = 'https://neo.1inch.cn:18443',
+    String relayState = 'connected',
+    bool localRelayDetected = false,
+  }) {
+    deviceConfig = {
+      ...deviceConfig,
+      'enabled': true,
+      'configured': true,
+      'clusterId': clusterId,
+      'masterNodeId': masterNodeId,
+      'relayUrl': relayUrl,
+      'hasRelaySecret': true,
+      'hasClusterSecret': true,
+      'hasToken': true,
+      'hasE2eKey': true,
+      'canMintTokens': true,
+      'relayState': relayState,
+      'localRelayDetected': localRelayDetected,
+    };
+  }
+
+  void addDevice(
+    String deviceId, {
+    String tier = 'os',
+    String status = 'online',
+    String route = 'relay',
+    String? relayNodeId,
+    Map<String, dynamic>? manifest,
+    List<String> capabilities = const ['exec', 'fs'],
+    List<Map<String, dynamic>> pendingQueue = const [],
+  }) {
+    devices.removeWhere((d) => d['deviceId'] == deviceId);
+    devices.add({
+      'deviceId': deviceId,
+      'clusterId': (deviceConfig['clusterId'] as String?)?.isNotEmpty == true ? deviceConfig['clusterId'] : 'personal',
+      'tier': tier,
+      'status': status,
+      'route': route,
+      'relayNodeId': ?relayNodeId,
+      'manifest': manifest ??
+          (tier == 'mcu'
+              ? {'device_id': deviceId, 'tier': 'mcu', 'chip': 'ESP32', 'fw': '0.1.0', 'acts': ['get_temp']}
+              : {
+                  'device_id': deviceId,
+                  'tier': 'os',
+                  'os': 'linux',
+                  'arch': 'amd64',
+                  'hostname': deviceId,
+                  'cpus': 8,
+                  'ram_mb': 16384,
+                  'capabilities': capabilities,
+                  'sandbox': {
+                    'allowed_workspaces': ['/home/neo-personal/work'],
+                    'max_child_mem_mb': 2048,
+                    'max_exec_timeout_sec': 120,
+                  },
+                }),
+      'capabilities': capabilities,
+      'desiredState': <String, dynamic>{},
+      'reportedState': <String, dynamic>{},
+      'pendingQueue': pendingQueue,
+      'lastSeqId': 1,
+      'lastAckedSeqId': 1,
+      'lastSeenAt': '2026-05-01T09:42:00.000Z',
+      'updatedAt': '2026-05-01T09:42:00.000Z',
+    });
+  }
+
+  void addDeviceApproval(
+    String id, {
+    required String shortCode,
+    required String deviceId,
+    required String action,
+    Map<String, dynamic> params = const {},
+    String? reason,
+  }) {
+    deviceApprovals.add({
+      'id': id,
+      'shortCode': shortCode,
+      'clusterId': (deviceConfig['clusterId'] as String?)?.isNotEmpty == true ? deviceConfig['clusterId'] : 'personal',
+      'deviceId': deviceId,
+      'action': action,
+      'params': params,
+      'reason': ?reason,
+      'status': 'pending',
+      'createdAt': '2026-05-01T09:45:00.000Z',
+    });
+  }
+
+  void claimEnrollment(String id, {String ip = '192.168.1.88'}) {
+    final enrollment = deviceEnrollments.firstWhere((e) => e['id'] == id);
+    enrollment['status'] = 'claimed';
+    enrollment['lastClaimedIp'] = ip;
+    enrollment['lastClaimedAt'] = DateTime.now().toIso8601String();
+  }
+
+  void completeEnrollment(String id, {required String deviceId, String os = 'linux', String arch = 'amd64', String route = 'p2p'}) {
+    final enrollment = deviceEnrollments.firstWhere((e) => e['id'] == id);
+    enrollment['status'] = 'completed';
+    enrollment['usedCount'] = ((enrollment['usedCount'] as int?) ?? 0) + 1;
+    final ids = (enrollment['enrolledDeviceIds'] as List).cast<String>();
+    if (!ids.contains(deviceId)) ids.add(deviceId);
+    addDevice(
+      deviceId,
+      status: 'online',
+      route: route,
+      manifest: {
+        'device_id': deviceId,
+        'tier': 'os',
+        'os': os,
+        'arch': arch,
+        'hostname': deviceId,
+        'cpus': 16,
+        'ram_mb': 32768,
+        'capabilities': ['exec', 'fs', 'gpu'],
+        'sandbox': {
+          'allowed_workspaces': ['/workspace'],
+        },
+      },
+      capabilities: ['exec', 'fs', 'gpu'],
+    );
+  }
+
   http.Client get client => MockClient(_handle);
 
   ApiClient api([String? withToken]) => ApiClient(Uri.parse('http://backend.test'), token: withToken ?? token, client: client);
@@ -283,6 +442,193 @@ class FakeBackend {
     if (request.method == 'GET' && path.startsWith('/api/workers/')) {
       final detail = details[Uri.decodeComponent(path.substring('/api/workers/'.length))];
       return detail == null ? _json(404, {'error': 'Worker not found'}) : _json(200, detail);
+    }
+    if (path == '/api/devices' || path.startsWith('/api/devices/')) {
+      return _handleDevices(request.method, path, body);
+    }
+    return _json(404, {'error': 'Not found'});
+  }
+
+  http.Response _handleDevices(String method, String path, Object? body) {
+    if (!devicesSupported) return _json(404, {'error': 'Not found'});
+    if (method == 'GET' && path == '/api/devices') {
+      return _json(200, {
+        'config': deviceConfig,
+        'devices': devices,
+        'approvals': deviceApprovals,
+        'enrollments': deviceEnrollments,
+      });
+    }
+    if (method == 'GET' && path == '/api/devices/config') {
+      return _json(200, {'config': deviceConfig});
+    }
+    if ((method == 'POST' && path == '/api/devices/config/init') || (method == 'PUT' && path == '/api/devices/config')) {
+      final req = body is Map ? body.cast<String, dynamic>() : <String, dynamic>{};
+      if (method == 'POST') {
+        deviceConfigInits.add(req);
+      } else {
+        deviceConfigUpdates.add(req);
+      }
+      final clusterId = (req['clusterId'] as String?)?.trim();
+      final relayUrl = (req['relayUrl'] as String?)?.trim();
+      final masterNodeId = (req['masterNodeId'] as String?)?.trim();
+      final enabled = req['enabled'] is bool ? req['enabled'] as bool : true;
+      final hasSecret = (req['clusterSecret'] as String?)?.isNotEmpty == true ||
+          (req['relaySecret'] as String?)?.isNotEmpty == true ||
+          req['autoDetectLocalRelay'] == true ||
+          deviceConfig['hasClusterSecret'] == true;
+      deviceConfig = {
+        ...deviceConfig,
+        'enabled': enabled,
+        'configured': true,
+        'clusterId': (clusterId != null && clusterId.isNotEmpty)
+            ? clusterId
+            : ((deviceConfig['clusterId'] as String?)?.isNotEmpty == true ? deviceConfig['clusterId'] : 'personal'),
+        'masterNodeId': (masterNodeId != null && masterNodeId.isNotEmpty) ? masterNodeId : deviceConfig['masterNodeId'],
+        'relayUrl': (relayUrl != null && relayUrl.isNotEmpty) ? relayUrl : (deviceConfig['relayUrl'] ?? deviceConfig['defaultRelayUrl']),
+        'hasRelaySecret': hasSecret,
+        'hasClusterSecret': hasSecret,
+        'hasToken': true,
+        'hasE2eKey': true,
+        'canMintTokens': hasSecret,
+        'relayState': enabled ? 'connected' : 'idle',
+      };
+      return _json(200, {'config': deviceConfig});
+    }
+    if (method == 'GET' && path == '/api/devices/enrollments') {
+      return _json(200, {'enrollments': deviceEnrollments});
+    }
+    if (method == 'POST' && path == '/api/devices/enrollments') {
+      final req = body is Map ? body.cast<String, dynamic>() : <String, dynamic>{};
+      createdEnrollments.add(req);
+      _enrollmentSeq++;
+      final id = 'enr-$_enrollmentSeq';
+      final platform = req['platform'] as String? ?? 'linux';
+      final profile = req['profile'] as String? ?? 'personal';
+      final installMode = req['installMode'] as String? ?? 'auto';
+      final transportMode = req['transportMode'] as String? ?? 'relay';
+      final ttlSec = (req['ttlSec'] as num?)?.toInt() ?? 600;
+      final maxUses = (req['maxUses'] as num?)?.toInt() ?? 1;
+      final clusterId = (deviceConfig['clusterId'] as String?)?.isNotEmpty == true ? deviceConfig['clusterId'] as String : 'personal';
+      final enrollCode = 'neo-enr-$id-secret';
+      final now = DateTime.now();
+      final enrollment = <String, dynamic>{
+        'id': id,
+        'clusterId': clusterId,
+        'platform': platform,
+        'profile': profile,
+        'installMode': installMode,
+        'transportMode': transportMode,
+        'requestedDeviceId': req['deviceId'],
+        'status': 'pending',
+        'createdAt': now.toIso8601String(),
+        'expiresAt': now.add(Duration(seconds: ttlSec)).toIso8601String(),
+        'maxUses': maxUses,
+        'usedCount': 0,
+        'lastClaimedIp': null,
+        'lastClaimedAt': null,
+        'enrolledDeviceIds': <String>[],
+        'enrollCode': enrollCode,
+        'commands': {
+          'linuxRoot': 'curl -fsSL https://neo.1inch.cn:18443/install.sh | sudo sh -s -- --enroll $enrollCode --profile $profile',
+          'linuxUser': 'curl -fsSL https://neo.1inch.cn:18443/install.sh | sh -s -- --enroll $enrollCode --profile $profile --user',
+          'macos': 'curl -fsSL https://neo.1inch.cn:18443/install.sh | sh -s -- --enroll $enrollCode --profile $profile --macos',
+          'windows': 'irm https://neo.1inch.cn:18443/install.ps1 | iex; neo-agent-install -Enroll $enrollCode -Profile $profile',
+          'docker': 'docker run -d --name neo-agent-$clusterId -e NEO_ENROLL=$enrollCode ghcr.io/neo/neo-agent-os:latest',
+          'uninstall': 'sudo neo-agent-os uninstall --cluster $clusterId',
+        },
+      };
+      deviceEnrollments.add(enrollment);
+      return _json(200, {'enrollment': enrollment});
+    }
+    if (path.startsWith('/api/devices/enrollments/')) {
+      final id = Uri.decodeComponent(path.substring('/api/devices/enrollments/'.length));
+      final index = deviceEnrollments.indexWhere((e) => e['id'] == id);
+      if (index == -1) return _json(404, {'error': 'Enrollment not found'});
+      final enrollment = deviceEnrollments[index];
+      if (method == 'GET') {
+        final enrolledIds = (enrollment['enrolledDeviceIds'] as List).cast<String>().toSet();
+        final matched = [for (final d in devices) if (enrolledIds.contains(d['deviceId'])) d];
+        return _json(200, {'enrollment': enrollment, 'devices': matched});
+      }
+      if (method == 'DELETE') {
+        enrollment['status'] = 'revoked';
+        revokedEnrollments.add(id);
+        return _json(200, {'enrollment': enrollment});
+      }
+    }
+    if (method == 'POST' && path == '/api/devices/mcu/install') {
+      final req = body is Map ? body.cast<String, dynamic>() : <String, dynamic>{};
+      mcuInstalls.add(req);
+      final mcuId = req['mcuId'] as String? ?? 'esp32-1';
+      final relayDeviceId = req['relayDeviceId'] as String? ?? 'edge-1';
+      final chip = req['chip'] as String? ?? 'ESP32';
+      final transport = req['transport'] as String? ?? 'mqtt';
+      addDevice(
+        mcuId,
+        tier: 'mcu',
+        status: mcuAutoDeploySuccess ? 'online' : 'offline',
+        route: 'via_tier1',
+        relayNodeId: relayDeviceId,
+        manifest: {'device_id': mcuId, 'tier': 'mcu', 'chip': chip, 'fw': '0.9.0', 'acts': ['get_temp', 'set_gpio']},
+        capabilities: ['gpio', 'sensor'],
+      );
+      final twin = devices.firstWhere((d) => d['deviceId'] == mcuId);
+      final workspaceDir = '/home/neo-personal/work/mcu/$mcuId';
+      return _json(200, {
+        'twin': twin,
+        'deployed': mcuAutoDeploySuccess,
+        'deployMethod': mcuAutoDeploySuccess ? 'tier1_rpc' : 'staged_manual',
+        'deployDetail': mcuAutoDeploySuccess
+            ? 'Wrote neo_mcu_config.h and install.sh on $relayDeviceId ($transport).'
+            : 'Tier 1 device $relayDeviceId is offline; staged config locally.',
+        'workspaceDir': workspaceDir,
+        'configHeader': '#pragma once\n#define NEO_MCU_ID "$mcuId"\n#define NEO_MCU_CHIP "$chip"\n#define NEO_MCU_TRANSPORT "$transport"\n',
+        'installScript': '#!/bin/sh\necho "Flashing $mcuId via $transport"\n',
+        'mcuE2eKeyHex': 'a1b2c3d4e5f60708192a3b4c5d6e7f80a1b2c3d4e5f60708192a3b4c5d6e7f80',
+      });
+    }
+    if (method == 'POST' && path.startsWith('/api/devices/approvals/')) {
+      final rest = path.substring('/api/devices/approvals/'.length);
+      final isApprove = rest.endsWith('/approve');
+      final isReject = rest.endsWith('/reject');
+      if (isApprove || isReject) {
+        final suffix = isApprove ? '/approve' : '/reject';
+        final id = Uri.decodeComponent(rest.substring(0, rest.length - suffix.length));
+        final index = deviceApprovals.indexWhere((a) => a['id'] == id);
+        if (index == -1) return _json(404, {'error': 'Approval not found'});
+        final approval = deviceApprovals[index];
+        approval['status'] = isApprove ? 'approved' : 'rejected';
+        approval['decidedAt'] = DateTime.now().toIso8601String();
+        if (isApprove) {
+          approvedApprovals.add(id);
+        } else {
+          rejectedApprovals.add(id);
+        }
+        return _json(200, {'approval': approval});
+      }
+    }
+    if (method == 'POST' && path.startsWith('/api/devices/') && path.endsWith('/ping')) {
+      final id = Uri.decodeComponent(path.substring('/api/devices/'.length, path.length - '/ping'.length));
+      final index = devices.indexWhere((d) => d['deviceId'] == id);
+      if (index == -1) return _json(404, {'error': 'Device not found'});
+      pingedDevices.add(id);
+      final device = devices[index];
+      return _json(200, {
+        'ok': true,
+        'deviceId': id,
+        'latencyMs': 18,
+        'status': device['status'],
+        'route': device['route'],
+      });
+    }
+    if (method == 'DELETE' && path.startsWith('/api/devices/')) {
+      final id = Uri.decodeComponent(path.substring('/api/devices/'.length));
+      final before = devices.length;
+      devices.removeWhere((d) => d['deviceId'] == id);
+      if (devices.length == before) return _json(404, {'error': 'Device not found'});
+      removedDevices.add(id);
+      return _json(200, {'removed': true, 'deviceId': id});
     }
     return _json(404, {'error': 'Not found'});
   }

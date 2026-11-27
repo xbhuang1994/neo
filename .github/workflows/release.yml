@@ -5,7 +5,7 @@ name: Release
 #   - Windows Desktop:    Neo-<version>-windows-x64-setup.exe, Neo-<version>-windows-x64-portable.zip
 #   - Linux Desktop:      Neo-<version>-linux-x64.deb, Neo-<version>-linux-x64.tar.gz
 #   - Linux Server:       neo-agent-<version>-linux-x64.tar.gz, neo-agent-<version>-linux-arm64.tar.gz
-#   - Multi-Device:       neo-agent-os-<version>-linux-{x64,arm64}.tar.gz, neo-relayd-<version>-linux-{x64,arm64}.tar.gz, neo-agent-mcu-<version>-sdk.tar.gz
+#   - Multi-Device:       neo-agent-os-<version>-{linux-{x64,arm64},macos-{arm64,x64}}.tar.gz, neo-agent-os-<version>-windows-x64.zip, neo-relayd-<version>-linux-{x64,arm64}.tar.gz, neo-agent-mcu-<version>-sdk.tar.gz
 #   - Checksums:          SHA256SUMS.txt
 #
 # Each package bundles the pure-TypeScript (Bun-compiled) neo-agent backend (and neo-recovery on Linux server).
@@ -154,6 +154,9 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
       - name: Import the signing certificate
         if: env.CERTIFICATE != ''
         env:
@@ -181,6 +184,9 @@ jobs:
         run: |
           xcrun notarytool submit dist/*.dmg --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
           xcrun stapler staple dist/*.dmg
+      - name: Build Tier 1 OS agent (neo-agent-os)
+        run: |
+          packaging/macos/build-agent-os.sh --arch ${{ matrix.arch }} --version "${{ needs.prepare.outputs.version }}"
       - name: Clean up signing keychain
         if: always()
         run: |
@@ -189,7 +195,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: macos-${{ matrix.arch }}
-          path: dist/Neo-*-macos-${{ matrix.arch }}.dmg
+          path: |
+            dist/Neo-*-macos-${{ matrix.arch }}.dmg
+            dist/neo-agent-os-*-macos-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
 
   windows:
@@ -206,6 +214,7 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
+      - uses: dtolnay/rust-toolchain@stable
       - name: Stage desktop app and build portable archive
         shell: pwsh
         run: |
@@ -222,12 +231,17 @@ jobs:
           }
           & $iscc "/DAppVersion=$env:APP_VERSION" "/DStage=$PWD\dist\windows-stage" packaging\windows\neo-agent.iss
           if ($LASTEXITCODE -ne 0) { throw "the installer did not build" }
+      - name: Build Tier 1 OS agent (neo-agent-os.exe)
+        shell: pwsh
+        run: |
+          ./packaging/windows/build-agent-os.ps1 -Version "${{ needs.prepare.outputs.version }}"
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64
           path: |
             dist/Neo-*-windows-x64-setup.exe
             dist/Neo-*-windows-x64-portable.zip
+            dist/neo-agent-os-*-windows-x64.zip
           if-no-files-found: error
 
   linux-desktop:

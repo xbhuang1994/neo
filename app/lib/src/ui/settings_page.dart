@@ -11,6 +11,7 @@ import '../l10n/strings.dart';
 import '../qr/qr_view.dart';
 import '../state/app_state.dart';
 import 'accounts_settings.dart';
+import 'devices_page.dart';
 import 'scope.dart';
 import 'theme.dart';
 import 'widgets.dart';
@@ -30,13 +31,15 @@ class Group extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.only(bottom: grid * 3),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           if (title != null) Padding(padding: const EdgeInsets.only(left: 14, bottom: 7), child: Text(title!.toUpperCase(), style: typo.section.copyWith(fontSize: 12, letterSpacing: 0.3))),
           Container(
+            width: double.infinity,
             decoration: BoxDecoration(color: palette.surface, borderRadius: BorderRadius.circular(radius)),
             clipBehavior: Clip.antiAlias,
             child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 for (final (index, child) in children.indexed) ...[
                   if (index > 0) Padding(padding: const EdgeInsets.only(left: 14), child: Container(height: 0.5, color: palette.separator)),
@@ -266,7 +269,9 @@ class ActionButton extends StatelessWidget {
 
 /// The settings page.
 class SettingsPage extends StatelessWidget {
-  const SettingsPage({super.key});
+  const SettingsPage({super.key, this.onOpenDevices});
+
+  final VoidCallback? onOpenDevices;
 
   @override
   Widget build(BuildContext context) {
@@ -297,6 +302,7 @@ class SettingsPage extends StatelessWidget {
                             AccountsSettings(key: ValueKey(('accounts', state.client)), api: state.client!),
                             GeneralSettingsSection(key: ValueKey(('general', state.client)), api: state.client!),
                             WeChatSettings(key: ValueKey(('wechat', state.client)), api: state.client!),
+                            if (!state.devicesUnsupported) DevicesSummarySection(onOpenDevices: onOpenDevices),
                             const AboutSection(),
                           ],
                         ],
@@ -1005,6 +1011,78 @@ class _WeChatSettingsState extends LoadingState<WeChatSettings, WeChatStatus> {
                     ActionButton(label: status.loggingIn || status.state == 'error' ? strings.wechatNewCode : strings.wechatConnect, busy: busy, onPressed: () => unawaited(run(widget.api.wechatConnect))),
                 ],
               ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// Compact summary card linking to the Multi-Device Control Plane page.
+class DevicesSummarySection extends StatelessWidget {
+  const DevicesSummarySection({super.key, this.onOpenDevices});
+
+  final VoidCallback? onOpenDevices;
+
+  @override
+  Widget build(BuildContext context) {
+    final state = AppScope.of(context);
+    final strings = Strings.read(context);
+    final palette = Palette.of(context);
+    final typo = Typo.of(context);
+    final config = state.deviceConfig;
+    final (relayLabel, relayColor) = relayStatusAppearance(config, strings, palette);
+    final onlineCount = state.onlineDevices;
+    final totalCount = state.devices.length;
+    final pendingApprovals = state.pendingDeviceApprovals;
+
+    return Group(
+      title: strings.multiDeviceControlPlane,
+      footer: strings.multiDeviceSettingsFooter,
+      children: [
+        Padding(
+          key: const ValueKey('settings-devices-card'),
+          padding: const EdgeInsets.all(14),
+          child: Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 6,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        Pill(relayLabel, color: relayColor, dot: true),
+                        if (config != null && config.configured)
+                          Text(strings.devicesOnlineSummary(onlineCount, totalCount), style: typo.footnote),
+                        if (pendingApprovals > 0)
+                          Pill(strings.pendingApprovalsShort(pendingApprovals), color: palette.orange),
+                      ],
+                    ),
+                    if (config != null && config.configured && config.clusterId.isNotEmpty) ...[
+                      const SizedBox(height: 6),
+                      Text(
+                        config.relayUrl != null ? '${config.clusterId} · ${config.relayUrl}' : config.clusterId,
+                        style: typo.mono.copyWith(fontSize: 12, color: palette.secondary),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              if (onOpenDevices != null) ...[
+                const SizedBox(width: 10),
+                ActionButton(
+                  key: const ValueKey('settings-open-devices'),
+                  label: strings.manageDevices,
+                  plain: true,
+                  onPressed: onOpenDevices,
+                ),
+              ],
             ],
           ),
         ),

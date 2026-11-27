@@ -2,15 +2,20 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"neo-relay/internal/auth"
+	"neo-relay/internal/enroll"
 	"neo-relay/internal/hub"
 	"neo-relay/internal/ws"
 )
+
+const maxEnrollCreateBodyBytes = 128 << 10 // 128 KiB (well above 24 KiB ciphertext cap)
 
 type Config struct {
 	KeyRing        auth.KeyRing
@@ -18,12 +23,17 @@ type Config struct {
 	STUNServers    []string
 	PunchTimeoutMs int
 	MaxFrameBytes  int
+	EnrollStore    *enroll.Store
+	Mirror         *enroll.Mirror
 }
 
 type Server struct {
-	cfg Config
-	hub *hub.Hub
-	mux *http.ServeMux
+	cfg         Config
+	keyRing     atomic.Pointer[auth.KeyRing]
+	hub         *hub.Hub
+	enrollStore *enroll.Store
+	mirror      *enroll.Mirror
+	mux         *http.ServeMux
 }
 
 func New(cfg Config, h *hub.Hub) *Server {
@@ -33,27 +43,77 @@ func New(cfg Config, h *hub.Hub) *Server {
 	if cfg.MaxFrameBytes <= 0 {
 		cfg.MaxFrameBytes = 1 << 20
 	}
-	s := &Server{
-		cfg: cfg,
-		hub: h,
-		mux: http.NewServeMux(),
+	enrollStore := cfg.EnrollStore
+	if enrollStore == nil {
+		enrollStore = enroll.NewStore()
 	}
+	mirror := cfg.Mirror
+	if mirror == nil {
+		mirror = enroll.NewMirror(enroll.MirrorConfig{})
+	}
+	s := &Server{
+		cfg:         cfg,
+		hub:         h,
+		enrollStore: enrollStore,
+		mirror:      mirror,
+		mux:         http.NewServeMux(),
+	}
+	s.UpdateKeyRing(cfg.KeyRing)
 	s.routes()
 	return s
 }
 
+// UpdateKeyRing atomically swaps the active KeyRing without disrupting active WebSocket connections.
+func (s *Server) UpdateKeyRing(kr auth.KeyRing) {
+	cp := cloneKeyRing(kr)
+	s.keyRing.Store(&cp)
+}
+
+func (s *Server) currentKeyRing() auth.KeyRing {
+	if kr := s.keyRing.Load(); kr != nil {
+		return *kr
+	}
+	return auth.KeyRing{}
+}
+
+func cloneKeyRing(kr auth.KeyRing) auth.KeyRing {
+	out := auth.KeyRing{}
+	if len(kr.RootSecret) > 0 {
+		out.RootSecret = append([]byte(nil), kr.RootSecret...)
+	}
+	if len(kr.ClusterSecrets) > 0 {
+		out.ClusterSecrets = make(map[string][]byte, len(kr.ClusterSecrets))
+		for k, v := range kr.ClusterSecrets {
+			out.ClusterSecrets[k] = append([]byte(nil), v...)
+		}
+	}
+	return out
+}
+
 func (s *Server) Handler() http.Handler {
-	return s.mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/dl/") || strings.HasPrefix(r.URL.EscapedPath(), "/dl/") {
+			s.mirror.ServeHTTP(w, r)
+			return
+		}
+		s.mux.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("/healthz", s.handleHealthz)
+	s.mux.HandleFunc("/install.sh", s.handleInstallSh)
+	s.mux.HandleFunc("/install.ps1", s.handleInstallPs1)
 	s.mux.HandleFunc("/v1/bootstrap", s.withAuth(s.handleBootstrap))
 	s.mux.HandleFunc("/v1/whoami", s.withAuth(s.handleWhoAmI))
 	s.mux.HandleFunc("/v1/peers", s.withAuth(s.handlePeers))
 	s.mux.HandleFunc("/v1/stats", s.withAuth(s.handleStats))
 	s.mux.HandleFunc("/v1/signal", s.withAuth(s.handleSignal))
 	s.mux.HandleFunc("/v1/relay", s.withAuth(s.handleRelay))
+	s.mux.HandleFunc("POST /v1/enroll/tickets", s.withAuth(s.handleEnrollCreate))
+	s.mux.HandleFunc("GET /v1/enroll/tickets/{id}/status", s.withAuth(s.handleEnrollStatus))
+	s.mux.HandleFunc("DELETE /v1/enroll/tickets/{id}", s.withAuth(s.handleEnrollDelete))
+	s.mux.HandleFunc("POST /v1/enroll/claim/{id}", s.handleEnrollClaim)
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -67,6 +127,34 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleInstallSh(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	script := enroll.RenderInstallSh(s.publicBaseURL(r))
+	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write([]byte(script))
+	}
+}
+
+func (s *Server) handleInstallPs1(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	script := enroll.RenderInstallPs1(s.publicBaseURL(r))
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write([]byte(script))
+	}
+}
+
 func (s *Server) withAuth(next func(http.ResponseWriter, *http.Request, auth.Claims)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tok, err := auth.ExtractRequestToken(r)
@@ -74,13 +162,127 @@ func (s *Server) withAuth(next func(http.ResponseWriter, *http.Request, auth.Cla
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
 			return
 		}
-		claims, err := auth.VerifyTokenWithKeyRing(s.cfg.KeyRing, tok, time.Now())
+		claims, err := auth.VerifyTokenWithKeyRing(s.currentKeyRing(), tok, time.Now())
 		if err != nil {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
 			return
 		}
 		next(w, r, claims)
 	}
+}
+
+func (s *Server) handleEnrollCreate(w http.ResponseWriter, r *http.Request, claims auth.Claims) {
+	w.Header().Set("Cache-Control", "no-store")
+	if claims.Tier != "master" || claims.ClusterID == "*" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "master tier with explicit cluster_id required"})
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxEnrollCreateBodyBytes)
+	var req struct {
+		TicketID      string `json:"ticket_id"`
+		CiphertextB64 string `json:"ciphertext_b64"`
+		TTLSec        int    `json:"ttl_sec"`
+		MaxUses       int    `json:"max_uses"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+
+	resp, err := s.enrollStore.Create(claims.ClusterID, req.TicketID, req.CiphertextB64, req.TTLSec, req.MaxUses)
+	if err != nil {
+		switch {
+		case errors.Is(err, enroll.ErrInvalidTicketID),
+			errors.Is(err, enroll.ErrInvalidCiphertext),
+			errors.Is(err, enroll.ErrInvalidTTL),
+			errors.Is(err, enroll.ErrInvalidMaxUses):
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		case errors.Is(err, enroll.ErrTicketExists):
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		case errors.Is(err, enroll.ErrClusterTicketLimit):
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": err.Error()})
+		default:
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		}
+		return
+	}
+	writeJSON(w, http.StatusCreated, resp)
+}
+
+func (s *Server) handleEnrollStatus(w http.ResponseWriter, r *http.Request, claims auth.Claims) {
+	w.Header().Set("Cache-Control", "no-store")
+	if claims.Tier != "master" || claims.ClusterID == "*" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "master tier with explicit cluster_id required"})
+		return
+	}
+	id := r.PathValue("id")
+	if !enroll.ValidTicketID(id) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": enroll.ErrInvalidTicketID.Error()})
+		return
+	}
+
+	status, err := s.enrollStore.Status(claims.ClusterID, id)
+	if err != nil {
+		switch {
+		case errors.Is(err, enroll.ErrTicketNotFound):
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		case errors.Is(err, enroll.ErrForbiddenCluster):
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+		default:
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) handleEnrollDelete(w http.ResponseWriter, r *http.Request, claims auth.Claims) {
+	w.Header().Set("Cache-Control", "no-store")
+	if claims.Tier != "master" || claims.ClusterID == "*" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "master tier with explicit cluster_id required"})
+		return
+	}
+	id := r.PathValue("id")
+	if !enroll.ValidTicketID(id) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": enroll.ErrInvalidTicketID.Error()})
+		return
+	}
+
+	resp, err := s.enrollStore.Revoke(claims.ClusterID, id)
+	if err != nil {
+		switch {
+		case errors.Is(err, enroll.ErrTicketNotFound):
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		case errors.Is(err, enroll.ErrForbiddenCluster):
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+		default:
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleEnrollClaim(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	id := r.PathValue("id")
+	resp, err := s.enrollStore.Claim(id, clientIP(r))
+	if err != nil {
+		switch {
+		case errors.Is(err, enroll.ErrRateLimited):
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": err.Error()})
+		case errors.Is(err, enroll.ErrTicketNotFound):
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		case errors.Is(err, enroll.ErrTicketExpired),
+			errors.Is(err, enroll.ErrTicketRevoked),
+			errors.Is(err, enroll.ErrTicketClaimed):
+			writeJSON(w, http.StatusGone, map[string]string{"error": err.Error()})
+		default:
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request, claims auth.Claims) {
@@ -159,6 +361,18 @@ func (s *Server) handleRelay(w http.ResponseWriter, r *http.Request, claims auth
 		return
 	}
 	s.hub.ServeRelay(claims.ClusterID, claims.NodeID, claims.Tier, conn)
+}
+
+func (s *Server) publicBaseURL(r *http.Request) string {
+	base := strings.TrimRight(strings.TrimSpace(s.cfg.PublicURL), "/")
+	if base != "" {
+		return base
+	}
+	scheme := "http"
+	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host
 }
 
 func (s *Server) wsBaseURL(r *http.Request) string {

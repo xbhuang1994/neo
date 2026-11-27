@@ -194,15 +194,18 @@ impl Policy {
         if prog_path
             .components()
             .any(|c| matches!(c, Component::ParentDir))
+            || program.split(['/', '\\']).any(|seg| seg == "..")
         {
             return Err(format!("command path cannot contain '..': {program}"));
         }
         let basename = prog_path
             .file_name()
             .and_then(|s| s.to_str())
+            .and_then(|s| s.rsplit(['/', '\\']).next())
+            .filter(|s| !s.is_empty())
             .ok_or_else(|| format!("invalid command basename: {program}"))?;
 
-        let canon_basename = if program.contains('/') {
+        let canon_basename = if program.contains('/') || program.contains('\\') {
             std::fs::canonicalize(prog_path)
                 .ok()
                 .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
@@ -211,9 +214,11 @@ impl Policy {
         };
 
         let is_denied = self.config.denied_commands.iter().any(|d| {
-            d == program
-                || d == basename
-                || canon_basename.as_deref().is_some_and(|cb| cb == d)
+            cmd_matches(d, program)
+                || cmd_matches(d, basename)
+                || canon_basename
+                    .as_deref()
+                    .is_some_and(|cb| cmd_matches(d, cb))
         });
         if is_denied {
             return Err(format!("command '{program}' is denied by local policy"));
@@ -224,7 +229,7 @@ impl Policy {
                 .config
                 .allowed_commands
                 .iter()
-                .any(|a| a == program || a == basename);
+                .any(|a| cmd_matches(a, program) || cmd_matches(a, basename));
             if !is_allowed {
                 return Err(format!(
                     "command '{program}' is not in local allowed_commands"
@@ -236,9 +241,30 @@ impl Policy {
     }
 }
 
+#[cfg(windows)]
+fn strip_exe(s: &str) -> &str {
+    s.strip_suffix(".exe")
+        .or_else(|| s.strip_suffix(".EXE"))
+        .unwrap_or(s)
+}
+
+#[cfg(windows)]
+fn cmd_matches(policy_entry: &str, candidate: &str) -> bool {
+    if policy_entry.eq_ignore_ascii_case(candidate) {
+        return true;
+    }
+    strip_exe(policy_entry).eq_ignore_ascii_case(strip_exe(candidate))
+}
+
+#[cfg(not(windows))]
+fn cmd_matches(policy_entry: &str, candidate: &str) -> bool {
+    policy_entry == candidate
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -255,14 +281,22 @@ mod tests {
         base
     }
 
+    fn toml_escape(path: &Path) -> String {
+        path.display().to_string().replace('\\', "\\\\")
+    }
+
     #[test]
     fn blocks_dotdot_and_symlink_escapes() {
         let ws = temp_dir("ws");
         let outside = temp_dir("outside");
         let outside_file = outside.join("secret.txt");
         std::fs::write(&outside_file, "top-secret").unwrap();
-        let evil_link = ws.join("escape_link");
-        symlink(&outside_file, &evil_link).unwrap();
+        #[cfg(unix)]
+        let evil_link = {
+            let link = ws.join("escape_link");
+            symlink(&outside_file, &link).unwrap();
+            link
+        };
 
         let toml = format!(
             r#"
@@ -272,20 +306,26 @@ denied_commands = ["rm", "sudo"]
 max_child_mem_mb = 512
 max_exec_timeout_sec = 30
 "#,
-            ws.display()
+            toml_escape(&ws)
         );
         let policy = Policy::from_toml_str(&toml).unwrap();
 
-        assert!(policy.validate_path("/etc/passwd", true).is_err());
+        assert!(policy
+            .validate_path(&outside_file.to_string_lossy(), true)
+            .is_err());
         assert!(policy
             .validate_path(&format!("{}/../etc/passwd", ws.display()), false)
             .is_err());
-        assert!(policy
-            .validate_path(&evil_link.to_string_lossy(), true)
-            .is_err());
-        assert!(policy
-            .validate_path(&evil_link.to_string_lossy(), false)
-            .is_err());
+        #[cfg(unix)]
+        {
+            assert!(policy.validate_path("/etc/passwd", true).is_err());
+            assert!(policy
+                .validate_path(&evil_link.to_string_lossy(), true)
+                .is_err());
+            assert!(policy
+                .validate_path(&evil_link.to_string_lossy(), false)
+                .is_err());
+        }
 
         let valid_new = ws.join("sub/file.txt");
         let resolved = policy
@@ -306,12 +346,15 @@ allowed_workspaces = ["{}"]
 allowed_commands = ["echo", "rm"]
 denied_commands = ["rm", "sudo"]
 "#,
-            ws.display()
+            toml_escape(&ws)
         );
         let policy = Policy::from_toml_str(&toml).unwrap();
         assert!(policy.validate_command("echo").is_ok());
         assert!(policy.validate_command("/bin/echo").is_ok());
+        assert!(policy.validate_command(r"C:\Tools\echo").is_ok());
         assert!(policy.validate_command("rm").is_err()); // denied overrides allowed
+        assert!(policy.validate_command(r"C:\Windows\System32\rm").is_err());
+        assert!(policy.validate_command(r"foo\..\echo").is_err());
         assert!(policy.validate_command("cat").is_err()); // not in allowlist
         assert!(policy.validate_command("echo;rm").is_err());
         let _ = std::fs::remove_dir_all(&ws);

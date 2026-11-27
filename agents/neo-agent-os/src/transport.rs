@@ -1,6 +1,6 @@
 use crate::executor::Executor;
 use crate::policy::Policy;
-use crate::prober::CapabilityProber;
+use crate::prober::{CapabilityManifest, CapabilityProber};
 use crate::protocol::{
     derive_e2e_key, open_device_message, seal_device_message, stun_probe, udp_punch_peer,
     BootstrapResponse, DeviceMessage, RelayEnvelope, RelayFlags, RelayFrame, SignalMessage,
@@ -34,6 +34,7 @@ pub struct AgentConfig {
     pub relay_url: String,
     pub token: String,
     pub e2e_secret: String,
+    pub enroll_id: Option<String>,
     pub relay_enabled: bool,
     pub mqtt_bind: String,
     pub uart_device: Option<PathBuf>,
@@ -82,61 +83,111 @@ fn build_tls_connector() -> TlsConnector {
     TlsConnector::from(Arc::new(config))
 }
 
-/// Minimal HTTP/1.1 GET over `tokio-rustls` (or plain TCP for `http://` local tests),
+/// Minimal HTTP/1.1 client over `tokio-rustls` (or plain TCP for `http://` local tests),
 /// avoiding heavy `reqwest` dependencies to keep single binary size ~3-6 MB.
-pub async fn fetch_bootstrap(bootstrap_url: &str, token: &str) -> Result<BootstrapResponse, String> {
-    let url = Url::parse(bootstrap_url).map_err(|e| format!("invalid bootstrap url: {e}"))?;
-    let host = url.host_str().ok_or("bootstrap url missing host")?.to_string();
-    let use_tls = url.scheme() == "https";
-    let port = url.port_or_known_default().unwrap_or(if use_tls { 443 } else { 80 });
-    let path_and_query = match url.query() {
-        Some(q) => format!("{}?{q}", url.path()),
-        None => url.path().to_string(),
+pub async fn http_request(
+    method: &str,
+    url_str: &str,
+    bearer_token: Option<&str>,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> Result<(u16, Vec<u8>), String> {
+    let url = Url::parse(url_str).map_err(|e| format!("invalid HTTP URL '{url_str}': {e}"))?;
+    let raw_host = url.host_str().ok_or("HTTP URL missing host")?;
+    let host_for_dial = raw_host.trim_start_matches('[').trim_end_matches(']').to_string();
+    let use_tls = match url.scheme() {
+        "https" => true,
+        "http" => false,
+        other => return Err(format!("unsupported HTTP URL scheme: {other}")),
     };
-    let req = format!(
-        "GET {path_and_query} HTTP/1.1\r\nHost: {host}:{port}\r\nAuthorization: Bearer {token}\r\nUser-Agent: neo-agent-os/0.1\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+    let port = url
+        .port_or_known_default()
+        .unwrap_or(if use_tls { 443 } else { 80 });
+    let host_header = match url.port() {
+        Some(p) => format!("{raw_host}:{p}"),
+        None => raw_host.to_string(),
+    };
+    let path_str = if url.path().is_empty() { "/" } else { url.path() };
+    let path_and_query = match url.query() {
+        Some(q) => format!("{path_str}?{q}"),
+        None => path_str.to_string(),
+    };
+
+    let mut req = format!(
+        "{method} {path_and_query} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: neo-agent-os/{}\r\nAccept: application/json\r\nConnection: close\r\n",
+        env!("CARGO_PKG_VERSION")
     );
+    if let Some(tok) = bearer_token {
+        req.push_str(&format!("Authorization: Bearer {tok}\r\n"));
+    }
+    if let Some(ct) = content_type {
+        req.push_str(&format!("Content-Type: {ct}\r\n"));
+    }
+    if !body.is_empty() || method.eq_ignore_ascii_case("POST") || method.eq_ignore_ascii_case("PUT") {
+        req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    req.push_str("\r\n");
 
     let tcp = tokio::time::timeout(
         Duration::from_secs(10),
-        TcpStream::connect((host.as_str(), port)),
+        TcpStream::connect((host_for_dial.as_str(), port)),
     )
     .await
-    .map_err(|_| "bootstrap TCP connect timed out".to_string())?
-    .map_err(|e| format!("bootstrap TCP connect failed: {e}"))?;
+    .map_err(|_| format!("HTTP TCP connect timed out: {url_str}"))?
+    .map_err(|e| format!("HTTP TCP connect failed ({url_str}): {e}"))?;
 
     let raw_resp = if use_tls {
         let connector = build_tls_connector();
-        let server_name = ServerName::try_from(host.clone())
-            .map_err(|_| format!("invalid TLS server name: {host}"))?;
-        let mut tls = tokio::time::timeout(Duration::from_secs(10), connector.connect(server_name, tcp))
-            .await
-            .map_err(|_| "bootstrap TLS handshake timed out".to_string())?
-            .map_err(|e| format!("bootstrap TLS handshake failed: {e}"))?;
+        let server_name = ServerName::try_from(host_for_dial.clone())
+            .map_err(|_| format!("invalid TLS server name: {host_for_dial}"))?;
+        let mut tls =
+            tokio::time::timeout(Duration::from_secs(10), connector.connect(server_name, tcp))
+                .await
+                .map_err(|_| "HTTP TLS handshake timed out".to_string())?
+                .map_err(|e| format!("HTTP TLS handshake failed: {e}"))?;
         tls.write_all(req.as_bytes())
             .await
-            .map_err(|e| format!("bootstrap write failed: {e}"))?;
+            .map_err(|e| format!("HTTP header write failed: {e}"))?;
+        if !body.is_empty() {
+            tls.write_all(body)
+                .await
+                .map_err(|e| format!("HTTP body write failed: {e}"))?;
+        }
         tls.flush().await.ok();
         let mut buf = Vec::new();
-        tokio::time::timeout(Duration::from_secs(10), tls.read_to_end(&mut buf))
+        tokio::time::timeout(Duration::from_secs(15), tls.read_to_end(&mut buf))
             .await
-            .map_err(|_| "bootstrap read timed out".to_string())?
-            .map_err(|e| format!("bootstrap read failed: {e}"))?;
+            .map_err(|_| "HTTP response read timed out".to_string())?
+            .map_err(|e| format!("HTTP response read failed: {e}"))?;
         buf
     } else {
         let mut tcp = tcp;
         tcp.write_all(req.as_bytes())
             .await
-            .map_err(|e| format!("bootstrap write failed: {e}"))?;
+            .map_err(|e| format!("HTTP header write failed: {e}"))?;
+        if !body.is_empty() {
+            tcp.write_all(body)
+                .await
+                .map_err(|e| format!("HTTP body write failed: {e}"))?;
+        }
+        tcp.flush().await.ok();
         let mut buf = Vec::new();
-        tokio::time::timeout(Duration::from_secs(10), tcp.read_to_end(&mut buf))
+        tokio::time::timeout(Duration::from_secs(15), tcp.read_to_end(&mut buf))
             .await
-            .map_err(|_| "bootstrap read timed out".to_string())?
-            .map_err(|e| format!("bootstrap read failed: {e}"))?;
+            .map_err(|_| "HTTP response read timed out".to_string())?
+            .map_err(|e| format!("HTTP response read failed: {e}"))?;
         buf
     };
 
-    let (status, body) = parse_http_response(&raw_resp)?;
+    parse_http_response(&raw_resp)
+}
+
+pub async fn http_post_json(url_str: &str, body: &[u8]) -> Result<(u16, Vec<u8>), String> {
+    http_request("POST", url_str, None, Some("application/json"), body).await
+}
+
+pub async fn fetch_bootstrap(bootstrap_url: &str, token: &str) -> Result<BootstrapResponse, String> {
+    let (status, body) = http_request("GET", bootstrap_url, Some(token), None, &[]).await?;
     if status < 200 || status >= 300 {
         return Err(format!(
             "bootstrap HTTP {status}: {}",
@@ -204,7 +255,7 @@ fn decode_chunked(mut data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-async fn connect_ws_bearer(
+pub(crate) async fn connect_ws_bearer(
     ws_url: &str,
     token: &str,
 ) -> Result<
@@ -230,6 +281,23 @@ async fn connect_ws_bearer(
     .map_err(|_| format!("WS connect timed out: {ws_url}"))?
     .map_err(|e| format!("WS connect failed ({ws_url}): {e}"))?;
     Ok(stream)
+}
+
+fn build_manifest_body(
+    manifest: &CapabilityManifest,
+    enroll_id: Option<&str>,
+) -> serde_json::Value {
+    let mut body = serde_json::to_value(manifest).unwrap_or_else(|_| json!({}));
+    if let Some(eid) = enroll_id.filter(|s| !s.is_empty()) {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("enroll_id".to_string(), json!(eid));
+            obj.insert(
+                "fingerprint".to_string(),
+                json!(crate::enroll::compute_host_fingerprint()),
+            );
+        }
+    }
+    body
 }
 
 pub async fn run_one_shot_check(cfg: &AgentConfig, policy: &Policy) -> Result<(), String> {
@@ -283,7 +351,7 @@ pub async fn run_one_shot_check(cfg: &AgentConfig, policy: &Policy) -> Result<()
         cluster_id: cfg.cluster_id.clone(),
         device_id: cfg.device_id.clone(),
         ts_ms: now_ms(),
-        body: serde_json::to_value(&manifest).unwrap(),
+        body: build_manifest_body(&manifest, cfg.enroll_id.as_deref()),
     };
     let sealed = seal_device_message(&e2e_key, &cfg.device_id, &cfg.master_id, &manifest_msg)?;
     let frame = RelayFrame {
@@ -418,7 +486,7 @@ pub async fn run_agent(cfg: AgentConfig, policy: Arc<Policy>) -> Result<(), Stri
                     cluster_id: cfg.cluster_id.clone(),
                     device_id: cfg.device_id.clone(),
                     ts_ms: now_ms(),
-                    body: serde_json::to_value(&manifest).unwrap(),
+                    body: build_manifest_body(&manifest, cfg.enroll_id.as_deref()),
                 };
                 if let Err(e) =
                     send_encrypted_frame(&mut ws_sink, &e2e_key, &cfg.device_id, &init_master, &manifest_msg)
@@ -805,7 +873,7 @@ async fn push_ring(
     guard.push_back(item);
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -880,6 +948,10 @@ mod tests {
                                     open_device_message(&e2e_key, cluster_id, "os-1", "master-1", &rf.payload)
                                         .unwrap();
                                 assert_eq!(manifest_msg.kind, "manifest");
+                                assert_eq!(
+                                    manifest_msg.body.get("enroll_id").and_then(|v| v.as_str()),
+                                    Some("enr-test-01")
+                                );
 
                                 let req = DeviceMessage {
                                     v: 1,
@@ -936,6 +1008,7 @@ mod tests {
             relay_url: format!("http://{addr}"),
             token: "neo1.dummy.sig".to_string(),
             e2e_secret: e2e_secret.to_string(),
+            enroll_id: Some("enr-test-01".to_string()),
             relay_enabled: false,
             mqtt_bind: "127.0.0.1:0".to_string(),
             uart_device: None,

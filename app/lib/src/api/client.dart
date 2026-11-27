@@ -166,4 +166,208 @@ class ApiClient {
 
   Future<AccountsView> logout() async =>
       AccountsView.fromJson(await _object('POST', '/api/settings/accounts/logout', body: const <String, dynamic>{}, timeout: const Duration(seconds: 90)));
+
+  // Multi-Device Control Plane
+
+  Future<DevicesOverview> devicesOverview() async => DevicesOverview.fromJson(await _object('GET', '/api/devices'));
+
+  Future<DeviceControlConfig> deviceConfig() async {
+    final body = await _object('GET', '/api/devices/config');
+    final cfg = body['config'] is Map ? (body['config'] as Map).cast<String, dynamic>() : body;
+    return DeviceControlConfig.fromJson(cfg);
+  }
+
+  Map<String, dynamic> _deviceConfigBody({
+    String? clusterId,
+    String? masterNodeId,
+    String? relayUrl,
+    String? relaySecret,
+    String? clusterSecret,
+    String? e2eKey,
+    bool? autoDetectLocalRelay,
+    bool? enabled,
+  }) => {
+    if (clusterId != null && clusterId.trim().isNotEmpty) 'clusterId': clusterId.trim(),
+    if (masterNodeId != null && masterNodeId.trim().isNotEmpty) 'masterNodeId': masterNodeId.trim(),
+    if (relayUrl != null && relayUrl.trim().isNotEmpty) 'relayUrl': relayUrl.trim(),
+    if (relaySecret != null && relaySecret.trim().isNotEmpty) 'relaySecret': relaySecret.trim(),
+    if (clusterSecret != null && clusterSecret.trim().isNotEmpty) 'clusterSecret': clusterSecret.trim(),
+    if (e2eKey != null && e2eKey.trim().isNotEmpty) 'e2eKey': e2eKey.trim(),
+    'autoDetectLocalRelay': ?autoDetectLocalRelay,
+    'enabled': ?enabled,
+  };
+
+  Future<DeviceControlConfig> initDeviceConfig({
+    String? clusterId,
+    String? masterNodeId,
+    String? relayUrl,
+    String? relaySecret,
+    String? clusterSecret,
+    String? e2eKey,
+    bool? autoDetectLocalRelay,
+    bool? enabled,
+  }) async {
+    final body = await _object(
+      'POST',
+      '/api/devices/config/init',
+      body: _deviceConfigBody(
+        clusterId: clusterId,
+        masterNodeId: masterNodeId,
+        relayUrl: relayUrl,
+        relaySecret: relaySecret,
+        clusterSecret: clusterSecret,
+        e2eKey: e2eKey,
+        autoDetectLocalRelay: autoDetectLocalRelay,
+        enabled: enabled,
+      ),
+      timeout: const Duration(seconds: 30),
+    );
+    final cfg = body['config'] is Map ? (body['config'] as Map).cast<String, dynamic>() : body;
+    return DeviceControlConfig.fromJson(cfg);
+  }
+
+  Future<DeviceControlConfig> updateDeviceConfig({
+    String? clusterId,
+    String? masterNodeId,
+    String? relayUrl,
+    String? relaySecret,
+    String? clusterSecret,
+    String? e2eKey,
+    bool? autoDetectLocalRelay,
+    bool? enabled,
+  }) async {
+    final body = await _object(
+      'PUT',
+      '/api/devices/config',
+      body: _deviceConfigBody(
+        clusterId: clusterId,
+        masterNodeId: masterNodeId,
+        relayUrl: relayUrl,
+        relaySecret: relaySecret,
+        clusterSecret: clusterSecret,
+        e2eKey: e2eKey,
+        autoDetectLocalRelay: autoDetectLocalRelay,
+        enabled: enabled,
+      ),
+      timeout: const Duration(seconds: 30),
+    );
+    final cfg = body['config'] is Map ? (body['config'] as Map).cast<String, dynamic>() : body;
+    return DeviceControlConfig.fromJson(cfg);
+  }
+
+  Future<DeviceEnrollment> createDeviceEnrollment({
+    required String platform,
+    required String profile,
+    required String installMode,
+    String? deviceId,
+    List<String>? workspaces,
+    bool? relayBridge,
+    String? mqttBind,
+    String? uartDevice,
+    String? cudaDevices,
+    String? memoryMax,
+    String? cpuQuota,
+    required String transportMode,
+    String? masterPublicUrl,
+    int? ttlSec,
+    int? maxUses,
+  }) async {
+    final body = await _object(
+      'POST',
+      '/api/devices/enrollments',
+      body: {
+        'platform': platform,
+        'profile': profile,
+        'installMode': installMode,
+        'transportMode': transportMode,
+        if (deviceId != null && deviceId.trim().isNotEmpty) 'deviceId': deviceId.trim(),
+        if (workspaces != null && workspaces.isNotEmpty) 'workspaces': workspaces,
+        'relayBridge': ?relayBridge,
+        if (mqttBind != null && mqttBind.trim().isNotEmpty) 'mqttBind': mqttBind.trim(),
+        if (uartDevice != null && uartDevice.trim().isNotEmpty) 'uartDevice': uartDevice.trim(),
+        if (cudaDevices != null && cudaDevices.trim().isNotEmpty) 'cudaDevices': cudaDevices.trim(),
+        if (memoryMax != null && memoryMax.trim().isNotEmpty) 'memoryMax': memoryMax.trim(),
+        if (cpuQuota != null && cpuQuota.trim().isNotEmpty) 'cpuQuota': cpuQuota.trim(),
+        if (masterPublicUrl != null && masterPublicUrl.trim().isNotEmpty) 'masterPublicUrl': masterPublicUrl.trim(),
+        'ttlSec': ?ttlSec,
+        'maxUses': ?maxUses,
+      },
+      timeout: const Duration(seconds: 30),
+    );
+    final enrollment = body['enrollment'] is Map ? (body['enrollment'] as Map).cast<String, dynamic>() : body;
+    return DeviceEnrollment.fromJson(enrollment);
+  }
+
+  Future<List<DeviceEnrollment>> deviceEnrollments() async {
+    final body = await _object('GET', '/api/devices/enrollments');
+    final list = body['enrollments'] is List ? body['enrollments'] as List<dynamic> : const <dynamic>[];
+    return [for (final item in list) DeviceEnrollment.fromJson((item as Map).cast<String, dynamic>())];
+  }
+
+  Future<DeviceEnrollmentDetail> deviceEnrollment(String id) async =>
+      DeviceEnrollmentDetail.fromJson(await _object('GET', '/api/devices/enrollments/${Uri.encodeComponent(id)}'));
+
+  Future<DeviceEnrollment> revokeDeviceEnrollment(String id) async {
+    final body = await _object('DELETE', '/api/devices/enrollments/${Uri.encodeComponent(id)}');
+    final enrollment = body['enrollment'] is Map ? (body['enrollment'] as Map).cast<String, dynamic>() : body;
+    return DeviceEnrollment.fromJson(enrollment);
+  }
+
+  Future<void> removeDevice(String id) async {
+    await _object('DELETE', '/api/devices/${Uri.encodeComponent(id)}');
+  }
+
+  Future<DevicePingResult> pingDevice(String id) async =>
+      DevicePingResult.fromJson(await _object('POST', '/api/devices/${Uri.encodeComponent(id)}/ping', body: const <String, dynamic>{}, timeout: const Duration(seconds: 30)));
+
+  Future<DeviceApproval> approveDeviceApproval(String id, {String? reason}) async {
+    final body = await _object(
+      'POST',
+      '/api/devices/approvals/${Uri.encodeComponent(id)}/approve',
+      body: {if (reason != null && reason.trim().isNotEmpty) 'reason': reason.trim()},
+      timeout: const Duration(seconds: 60),
+    );
+    final approval = body['approval'] is Map ? (body['approval'] as Map).cast<String, dynamic>() : body;
+    return DeviceApproval.fromJson(approval);
+  }
+
+  Future<DeviceApproval> rejectDeviceApproval(String id, {String? reason}) async {
+    final body = await _object(
+      'POST',
+      '/api/devices/approvals/${Uri.encodeComponent(id)}/reject',
+      body: {if (reason != null && reason.trim().isNotEmpty) 'reason': reason.trim()},
+      timeout: const Duration(seconds: 30),
+    );
+    final approval = body['approval'] is Map ? (body['approval'] as Map).cast<String, dynamic>() : body;
+    return DeviceApproval.fromJson(approval);
+  }
+
+  Future<McuInstallResult> installMcu({
+    required String mcuId,
+    required String relayDeviceId,
+    required String transport,
+    String? mqttBroker,
+    String? serialPort,
+    int? baudRate,
+    String? chip,
+    List<String>? backupRelayDeviceIds,
+    bool autoDeploy = true,
+  }) async => McuInstallResult.fromJson(
+    await _object(
+      'POST',
+      '/api/devices/mcu/install',
+      body: {
+        'mcuId': mcuId.trim(),
+        'relayDeviceId': relayDeviceId.trim(),
+        'transport': transport,
+        if (mqttBroker != null && mqttBroker.trim().isNotEmpty) 'mqttBroker': mqttBroker.trim(),
+        if (serialPort != null && serialPort.trim().isNotEmpty) 'serialPort': serialPort.trim(),
+        'baudRate': ?baudRate,
+        if (chip != null && chip.trim().isNotEmpty) 'chip': chip.trim(),
+        if (backupRelayDeviceIds != null && backupRelayDeviceIds.isNotEmpty) 'backupRelayDeviceIds': backupRelayDeviceIds,
+        'autoDeploy': autoDeploy,
+      },
+      timeout: const Duration(seconds: 60),
+    ),
+  );
 }

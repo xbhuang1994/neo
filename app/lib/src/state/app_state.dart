@@ -94,6 +94,10 @@ class AppState extends ChangeNotifier {
   Worker? detail;
   String? selectedWorkerId;
 
+  /// The multi-device control plane snapshot, when supported by the backend.
+  DevicesOverview? devicesOverview;
+  bool devicesUnsupported = false;
+
   LocalBackend? _backend;
   Timer? _timer;
   Future<void>? _running;
@@ -101,9 +105,16 @@ class AppState extends ChangeNotifier {
   int _epoch = 0;
   String _messagesRaw = '';
   String _workersRaw = '';
+  String _devicesRaw = '';
   bool _disposed = false;
 
   int get activeWorkers => workers.where((worker) => worker.active).length;
+  DeviceControlConfig? get deviceConfig => devicesOverview?.config;
+  List<DeviceTwin> get devices => devicesOverview?.devices ?? const [];
+  List<DeviceApproval> get deviceApprovals => devicesOverview?.approvals ?? const [];
+  List<DeviceEnrollment> get deviceEnrollments => devicesOverview?.enrollments ?? const [];
+  int get pendingDeviceApprovals => devicesOverview?.pendingApprovalsCount ?? 0;
+  int get onlineDevices => devicesOverview?.onlineDevicesCount ?? 0;
 
   /// Read how to connect, and connect.
   Future<void> start() async {
@@ -140,8 +151,11 @@ class AppState extends ChangeNotifier {
     health = null;
     activity = const Activity.idle();
     detail = null;
+    devicesOverview = null;
+    devicesUnsupported = false;
     _messagesRaw = '';
     _workersRaw = '';
+    _devicesRaw = '';
   }
 
   void _connect() {
@@ -221,6 +235,16 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  /// Softly fetch the multi-device snapshot; returns null if an older backend answers 404.
+  Future<(DevicesOverview?, bool)> _fetchDevicesOverview(ApiClient api) async {
+    try {
+      return (await api.devicesOverview(), false);
+    } on ApiException catch (error) {
+      if (error.status == 404) return (null, true);
+      rethrow;
+    }
+  }
+
   Future<void> _refresh() async {
     final api = client;
     if (api == null) return;
@@ -235,12 +259,14 @@ class AppState extends ChangeNotifier {
       final activityFuture = api.activity();
       final healthFuture = wantHealth ? api.health() : Future<Health?>.value(null);
       final detailFuture = selected != null ? _fetchSelectedWorker(api, selected) : Future<Worker?>.value(null);
-      await Future.wait<Object?>([messagesFuture, workersFuture, activityFuture, healthFuture, detailFuture]);
+      final devicesFuture = _fetchDevicesOverview(api);
+      await Future.wait<Object?>([messagesFuture, workersFuture, activityFuture, healthFuture, detailFuture, devicesFuture]);
       final (fetched, raw) = await messagesFuture;
       final fetchedWorkers = await workersFuture;
       final fetchedActivity = await activityFuture;
       final fetchedHealth = await healthFuture;
       final fetchedDetail = await detailFuture;
+      final (fetchedDevices, unsupported) = await devicesFuture;
       if (epoch != _epoch) return;
       if (raw != _messagesRaw) {
         _messagesRaw = raw;
@@ -263,6 +289,19 @@ class AppState extends ChangeNotifier {
       }
       if (selected != null && selected == selectedWorkerId && fetchedDetail?.raw != detail?.raw) {
         detail = fetchedDetail;
+        changed = true;
+      }
+      if (unsupported != devicesUnsupported) {
+        devicesUnsupported = unsupported;
+        if (unsupported) {
+          devicesOverview = null;
+          _devicesRaw = '';
+        }
+        changed = true;
+      }
+      if (fetchedDevices != null && fetchedDevices.raw != _devicesRaw) {
+        _devicesRaw = fetchedDevices.raw;
+        devicesOverview = fetchedDevices;
         changed = true;
       }
       if (link != Link.online) {

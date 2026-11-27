@@ -22,12 +22,12 @@ EnvironmentFile=/etc/neo-agent/cluster-%i.env
 # Optional default; override in cluster-%i.env or systemd drop-in when GPU isolation is needed.
 # Environment=CUDA_VISIBLE_DEVICES=0
 
+# Secrets (NEO_TOKEN / NEO_RELAY_TOKEN, NEO_E2E_KEY) and optional NEO_ENROLL_ID are
+# inherited from EnvironmentFile above and never passed on argv (no `ps aux` exposure).
 ExecStart=/usr/local/bin/neo-agent-os \
   --cluster ${NEO_CLUSTER_ID} \
   --device-id ${NEO_DEVICE_ID} \
   --relay-url ${NEO_RELAY_URL} \
-  --token ${NEO_RELAY_TOKEN} \
-  --e2e-key ${NEO_E2E_KEY} \
   --master-id ${NEO_MASTER_ID} \
   --policy /etc/neo-agent/policy-%i.toml \
   --ota-cache-dir /var/lib/neo-agent/%i/ota \
