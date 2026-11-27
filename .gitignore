@@ -7,3 +7,9 @@ backend/target/
 recovery/dist/
 recovery/node_modules/
 service-restart.log
+agents/neo-agent-os/target/
+agents/neo-agent-mcu/build/
+agents/neo-agent-mcu/*.o
+agents/neo-agent-mcu/*.a
+agents/neo-agent-mcu/test_neo_mcu
+agents/neo-agent-mcu/esp32_rack01_sim

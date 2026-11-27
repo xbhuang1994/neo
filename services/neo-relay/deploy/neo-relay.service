@@ -1,0 +1,16 @@
+[Unit]
+Description=Neo Dedicated P2P-First & Relay-Fallback Companion Service (neo.1inch.cn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/nvme/neo-relay
+ExecStart=/nvme/neo-relay/scripts/run_neo_relay.sh
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

@@ -10,6 +10,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { StopWorkerError } from "../app/context.ts";
 import type { AppContext, ChatAttachment } from "../app/context.ts";
+import type { TokenTier } from "../devices/index.ts";
 import { VERSION } from "../version.ts";
 import { Response, isLoopbackIp } from "./server.ts";
 import type { Request, SocketAddr } from "./server.ts";
@@ -407,9 +408,170 @@ async function done(work: () => unknown | Promise<unknown>): Promise<Response> {
 
 const WORKERS_PREFIX = "/api/workers/";
 const STOP_SUFFIX = "/stop";
+const DEVICES_PREFIX = "/api/devices/";
+const DEVICE_APPROVALS_PREFIX = "/api/devices/approvals/";
+const VALID_TOKEN_TIERS: ReadonlySet<string> = new Set(["master", "os", "relay", "admin"]);
+
+async function routeDevices(
+  app: AppContext,
+  method: string,
+  reqPath: string,
+  request: Request,
+): Promise<Response | null> {
+  if (method === "GET") {
+    if (reqPath === "/api/devices") {
+      return Response.json(200, {
+        config: app.devices.configView(),
+        devices: app.devices.listDevices(),
+      });
+    }
+    if (reqPath === "/api/devices/approvals") {
+      return Response.json(200, {
+        approvals: app.devices.listApprovals(),
+      });
+    }
+    if (reqPath.startsWith(DEVICES_PREFIX)) {
+      const id = decodeURIComponent(reqPath.slice(DEVICES_PREFIX.length));
+      if (id.length === 0 || id.includes("/")) {
+        return Response.error(404, "Device not found");
+      }
+      const twin = app.devices.getDevice(id);
+      if (twin === null) {
+        return Response.error(404, "Device not found");
+      }
+      return Response.json(200, twin);
+    }
+    return null;
+  }
+
+  if (method === "POST") {
+    if (reqPath === "/api/devices/token") {
+      const parsed = jsonBody(request);
+      if (!parsed.ok) return parsed.response;
+      if (!isRecord(parsed.value)) {
+        return Response.error(400, "Expected JSON object");
+      }
+      const rawNodeId = parsed.value.nodeId ?? parsed.value.node_id;
+      const rawTier = parsed.value.tier;
+      const rawClusterId = parsed.value.clusterId ?? parsed.value.cluster_id;
+      const rawTtl = parsed.value.ttlSec ?? parsed.value.ttl_sec;
+      if (typeof rawNodeId !== "string" || rawNodeId.trim().length === 0) {
+        return Response.error(400, "nodeId is required");
+      }
+      if (typeof rawTier !== "string" || !VALID_TOKEN_TIERS.has(rawTier)) {
+        return Response.error(400, "tier must be master, os, relay, or admin");
+      }
+      if (rawClusterId !== undefined && (typeof rawClusterId !== "string" || rawClusterId.trim().length === 0)) {
+        return Response.error(400, "clusterId must be a non-empty string");
+      }
+      if (rawTtl !== undefined && (typeof rawTtl !== "number" || !Number.isInteger(rawTtl) || rawTtl <= 0)) {
+        return Response.error(400, "ttlSec must be a positive integer");
+      }
+      return await done(() => {
+        const token = app.devices.mintToken({
+          nodeId: rawNodeId.trim(),
+          tier: rawTier as TokenTier,
+          ...(typeof rawClusterId === "string" ? { clusterId: rawClusterId.trim() } : {}),
+          ...(typeof rawTtl === "number" ? { ttlSec: rawTtl } : {}),
+        });
+        return {
+          token,
+          nodeId: rawNodeId.trim(),
+          tier: rawTier,
+          clusterId: typeof rawClusterId === "string" ? rawClusterId.trim() : app.devices.configView().clusterId,
+        };
+      });
+    }
+
+    if (reqPath.startsWith(DEVICE_APPROVALS_PREFIX)) {
+      const rest = reqPath.slice(DEVICE_APPROVALS_PREFIX.length);
+      if (rest.endsWith("/approve") || rest.endsWith("/reject")) {
+        const isApprove = rest.endsWith("/approve");
+        const suffix = isApprove ? "/approve" : "/reject";
+        const id = decodeURIComponent(rest.slice(0, rest.length - suffix.length));
+        if (id.length === 0 || id.includes("/")) {
+          return Response.error(404, "Approval not found");
+        }
+        const parsed = optionalJsonBody(request);
+        if (!parsed.ok) return parsed.response;
+        const body = isRecord(parsed.value) ? parsed.value : {};
+        const reason = typeof body.reason === "string" ? body.reason : undefined;
+        try {
+          if (isApprove) {
+            return Response.json(200, await app.devices.approve(id, "http"));
+          }
+          return Response.json(200, { approval: app.devices.reject(id, reason, "http") });
+        } catch (error) {
+          const msg = errorMessage(error);
+          return Response.error(msg.startsWith("Approval not found:") ? 404 : 400, msg);
+        }
+      }
+      return Response.error(404, "Not found");
+    }
+
+    if (reqPath.startsWith(DEVICES_PREFIX) && reqPath.endsWith("/invoke")) {
+      const id = decodeURIComponent(
+        reqPath.slice(DEVICES_PREFIX.length, reqPath.length - "/invoke".length),
+      );
+      if (id.length === 0 || id.includes("/")) {
+        return Response.error(404, "Device not found");
+      }
+      const parsed = jsonBody(request);
+      if (!parsed.ok) return parsed.response;
+      if (!isRecord(parsed.value) || typeof parsed.value.action !== "string" || parsed.value.action.trim().length === 0) {
+        return Response.error(400, "Expected { action: string }");
+      }
+      const rawParams = parsed.value.params;
+      if (rawParams !== undefined && rawParams !== null && !isRecord(rawParams)) {
+        return Response.error(400, "params must be an object");
+      }
+      const rawTimeout = parsed.value.timeoutMs ?? parsed.value.timeout_ms;
+      if (rawTimeout !== undefined && (typeof rawTimeout !== "number" || !Number.isInteger(rawTimeout) || rawTimeout <= 0)) {
+        return Response.error(400, "timeoutMs must be a positive integer");
+      }
+      const forceQueue = parsed.value.forceQueue ?? parsed.value.force_queue;
+      if (forceQueue !== undefined && typeof forceQueue !== "boolean") {
+        return Response.error(400, "forceQueue must be a boolean");
+      }
+      const reason = typeof parsed.value.reason === "string" ? parsed.value.reason : undefined;
+
+      try {
+        const result = await app.devices.invoke(id, {
+          action: parsed.value.action.trim(),
+          params: isRecord(rawParams) ? rawParams : {},
+          ...(typeof rawTimeout === "number" ? { timeoutMs: rawTimeout } : {}),
+          ...(typeof forceQueue === "boolean" ? { forceQueue } : {}),
+          ...(reason !== undefined ? { reason } : {}),
+        });
+        if (result.status === "ok") {
+          return Response.json(200, result);
+        }
+        if (result.status === "queued" || result.status === "pending_approval") {
+          return Response.json(202, result);
+        }
+        const statusCode = result.error.startsWith("Unknown device:")
+          ? 404
+          : result.error.includes("forbidden") || result.error.includes("Cross-cluster")
+            ? 403
+            : 400;
+        return Response.json(statusCode, result);
+      } catch (error) {
+        return Response.error(400, errorMessage(error));
+      }
+    }
+  }
+
+  return null;
+}
 
 async function route(app: AppContext, request: Request): Promise<Response> {
   const { method, path: reqPath } = request;
+  if (reqPath === "/api/devices" || reqPath.startsWith(DEVICES_PREFIX)) {
+    const deviceResponse = await routeDevices(app, method, reqPath, request);
+    if (deviceResponse !== null) {
+      return deviceResponse;
+    }
+  }
 
   if (method === "GET") {
     switch (reqPath) {

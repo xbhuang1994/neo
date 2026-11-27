@@ -1,0 +1,64 @@
+# Read-only local execution policy for a corporate Neo OS agent instance.
+# Mounted/installed at /etc/neo-agent/policy-corp.toml with mode 0444 (root:root).
+# Disjoint workspace and stricter command allowlist compared to personal instances.
+
+allowed_workspaces = [
+  "/home/neo-corp/work",
+]
+
+allowed_commands = [
+  "ls",
+  "cat",
+  "head",
+  "tail",
+  "grep",
+  "rg",
+  "find",
+  "pwd",
+  "uname",
+  "echo",
+  "git",
+  "cargo",
+  "bun",
+]
+
+# denied_commands always overrides allowed_commands.
+denied_commands = [
+  "rm",
+  "sudo",
+  "su",
+  "doas",
+  "dd",
+  "mkfs",
+  "fdisk",
+  "parted",
+  "shutdown",
+  "reboot",
+  "poweroff",
+  "halt",
+  "mount",
+  "umount",
+  "iptables",
+  "ip6tables",
+  "nft",
+  "systemctl",
+  "chmod",
+  "chown",
+  "chgrp",
+  "curl",
+  "wget",
+  "ssh",
+  "scp",
+  "sftp",
+  "nc",
+  "ncat",
+  "python3",
+  "perl",
+  "ruby",
+  "bash",
+  "sh",
+]
+
+max_child_mem_mb = 4096
+max_exec_timeout_sec = 90
+max_output_bytes = 1048576

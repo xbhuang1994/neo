@@ -1,0 +1,61 @@
+# Read-only local execution policy for a personal Neo OS agent instance.
+# Mounted/installed at /etc/neo-agent/policy-personal.toml with mode 0444 (root:root).
+# The Master Neo control plane and neo-relay cannot modify this file at runtime.
+
+allowed_workspaces = [
+  "/home/neo-personal/work",
+]
+
+allowed_commands = [
+  "ls",
+  "cat",
+  "head",
+  "tail",
+  "grep",
+  "rg",
+  "find",
+  "pwd",
+  "uname",
+  "echo",
+  "git",
+  "cargo",
+  "bun",
+  "python3",
+  "make",
+]
+
+# denied_commands always overrides allowed_commands.
+denied_commands = [
+  "rm",
+  "sudo",
+  "su",
+  "doas",
+  "dd",
+  "mkfs",
+  "fdisk",
+  "parted",
+  "shutdown",
+  "reboot",
+  "poweroff",
+  "halt",
+  "mount",
+  "umount",
+  "iptables",
+  "ip6tables",
+  "nft",
+  "systemctl",
+  "chmod",
+  "chown",
+  "chgrp",
+  "curl",
+  "wget",
+  "ssh",
+  "scp",
+  "sftp",
+  "nc",
+  "ncat",
+]
+
+max_child_mem_mb = 2048
+max_exec_timeout_sec = 120
+max_output_bytes = 1048576

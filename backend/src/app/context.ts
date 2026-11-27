@@ -16,6 +16,7 @@ import type {
   Ticket,
 } from "../core/index.ts";
 import type { Block, Entry, JobKind, KernelEvent, Session, ToolSpec } from "../kernel/index.ts";
+import type { DeviceManager } from "../devices/index.ts";
 import type { Store } from "../store/index.ts";
 import type { AccountsState, AccountsView, LoginView } from "./accounts.ts";
 import type { Effects, Failure } from "./effects.ts";
@@ -312,6 +313,7 @@ export interface AppContext {
   readonly jobsCache: Map<string, { at: number; jobs: WorkerJob[] }>;
   readonly modelLists: Map<Kernel, ModelListEntry>;
   readonly accounts: AccountsState;
+  readonly devices: DeviceManager;
   readonly stopSignal: AbortSignal;
   readonly sidecarSlowHintMs: number;
 

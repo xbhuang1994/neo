@@ -1,0 +1,20 @@
+# Layer 3 cgroup v2 isolation slice template for Neo multi-master OS agents.
+# Install to /etc/systemd/system/neo-agent-slice@.slice
+# Customize per instance (%i) via /etc/systemd/system/neo-agent-slice@<cluster>.slice.d/10-limits.conf
+
+[Unit]
+Description=Neo Multi-Master Isolation Slice (%i)
+Before=slices.target
+
+[Slice]
+MemoryAccounting=true
+MemoryHigh=6G
+MemoryMax=8G
+
+CPUAccounting=true
+CPUQuota=400%
+
+TasksAccounting=true
+TasksMax=512
+
+IOAccounting=true
