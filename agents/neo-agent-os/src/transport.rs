@@ -59,6 +59,7 @@ pub enum AgentExit {
 #[derive(Debug, Clone)]
 pub struct RelayEndpoints {
     pub bootstrap_url: String,
+    pub whoami_url: String,
     pub signal_url: String,
     pub relay_url: String,
 }
@@ -83,6 +84,7 @@ pub fn derive_endpoints(base_url: &str) -> Result<RelayEndpoints, String> {
     let base_ws = url.to_string().trim_end_matches('/').to_string();
     Ok(RelayEndpoints {
         bootstrap_url: format!("{base_http}/v1/bootstrap"),
+        whoami_url: format!("{base_http}/v1/whoami"),
         signal_url: format!("{base_ws}/v1/signal"),
         relay_url: format!("{base_ws}/v1/relay"),
     })
@@ -326,6 +328,41 @@ pub async fn fetch_bootstrap(bootstrap_url: &str, token: &str) -> Result<Bootstr
     serde_json::from_slice(&body).map_err(|e| format!("invalid bootstrap JSON: {e}"))
 }
 
+fn clean_ip(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+pub async fn fetch_whoami_ip(whoami_url: &str, token: &str) -> Option<String> {
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(2),
+        http_request("GET", whoami_url, Some(token), None, &[]),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !(200..300).contains(&status) {
+        return None;
+    }
+    let val: serde_json::Value = serde_json::from_slice(&body).ok()?;
+    clean_ip(val.get("observed_ip").and_then(|v| v.as_str()))
+}
+
+async fn resolve_observed_ip(endpoints: &RelayEndpoints, token: &str) -> Option<String> {
+    if let Ok(Ok(boot)) = tokio::time::timeout(
+        Duration::from_secs(2),
+        fetch_bootstrap(&endpoints.bootstrap_url, token),
+    )
+    .await
+    {
+        if let Some(ip) = clean_ip(boot.observed_ip.as_deref()) {
+            return Some(ip);
+        }
+    }
+    fetch_whoami_ip(&endpoints.whoami_url, token).await
+}
+
 fn parse_http_response(raw: &[u8]) -> Result<(u16, Vec<u8>), String> {
     let (status, _loc, body) = parse_http_response_with_location(raw)?;
     Ok((status, body))
@@ -442,7 +479,7 @@ fn build_manifest_body(
 
 pub async fn run_one_shot_check(cfg: &AgentConfig, policy: &Policy) -> Result<(), String> {
     let endpoints = derive_endpoints(&cfg.relay_url)?;
-    let manifest = CapabilityProber::probe(
+    let mut manifest = CapabilityProber::probe(
         policy,
         &cfg.device_id,
         cfg.relay_enabled,
@@ -450,6 +487,7 @@ pub async fn run_one_shot_check(cfg: &AgentConfig, policy: &Policy) -> Result<()
         cfg.uart_device.as_deref(),
     );
     let bootstrap = fetch_bootstrap(&endpoints.bootstrap_url, &cfg.token).await?;
+    manifest.public_ip = clean_ip(bootstrap.observed_ip.as_deref());
     eprintln!(
         "[one-shot-check] bootstrap ok (stun_servers={:?})",
         bootstrap.stun_servers
@@ -573,6 +611,7 @@ pub async fn run_agent(
     };
 
     let active_master = Arc::new(Mutex::new(cfg.master_id.clone()));
+    let observed_public_ip = Arc::new(Mutex::new(None::<String>));
     let offline_ring = Arc::new(Mutex::new(VecDeque::<(String, DeviceMessage)>::with_capacity(
         OFFLINE_RING_CAP,
     )));
@@ -604,8 +643,9 @@ pub async fn run_agent(
     {
         let cfg_sig = cfg.clone();
         let endpoints_sig = endpoints.clone();
+        let public_ip_sig = Arc::clone(&observed_public_ip);
         tokio::spawn(async move {
-            run_signal_loop(cfg_sig, endpoints_sig).await;
+            run_signal_loop(cfg_sig, endpoints_sig, public_ip_sig).await;
         });
     }
 
@@ -628,14 +668,18 @@ pub async fn run_agent(
                 }
 
                 let (mut ws_sink, mut ws_stream) = ws.split();
+                if let Some(ip) = resolve_observed_ip(&endpoints, &cfg.token).await {
+                    *observed_public_ip.lock().await = Some(ip);
+                }
                 let policy_snap = policy.read().unwrap_or_else(|e| e.into_inner()).clone();
-                let manifest = CapabilityProber::probe(
+                let mut manifest = CapabilityProber::probe(
                     &policy_snap,
                     &cfg.device_id,
                     cfg.relay_enabled,
                     Some(&cfg.mqtt_bind),
                     cfg.uart_device.as_deref(),
                 );
+                manifest.public_ip = observed_public_ip.lock().await.clone();
                 let init_master = active_master.lock().await.clone();
                 let manifest_msg = DeviceMessage {
                     v: 1,
@@ -699,6 +743,15 @@ pub async fn run_agent(
                                 }
                             }
                             let dst = active_master.lock().await.clone();
+                            let current_ip = observed_public_ip.lock().await.clone();
+                            let mut hb_body = json!({
+                                "status": "online",
+                                "version": env!("CARGO_PKG_VERSION"),
+                                "agent_version": env!("CARGO_PKG_VERSION"),
+                            });
+                            if let (Some(ip), Some(obj)) = (current_ip, hb_body.as_object_mut()) {
+                                obj.insert("public_ip".to_string(), json!(ip));
+                            }
                             let hb = DeviceMessage {
                                 v: 1,
                                 kind: "heartbeat".to_string(),
@@ -706,7 +759,7 @@ pub async fn run_agent(
                                 cluster_id: cfg.cluster_id.clone(),
                                 device_id: cfg.device_id.clone(),
                                 ts_ms: now_ms(),
-                                body: json!({ "status": "online", "version": env!("CARGO_PKG_VERSION") }),
+                                body: hb_body,
                             };
                             if send_encrypted_frame(&mut ws_sink, &e2e_key, &cfg.device_id, &dst, &hb).await.is_err() {
                                 break;
@@ -779,6 +832,7 @@ pub async fn run_agent(
                                                                         &executor,
                                                                         &file_transfers,
                                                                         &relay_bridge,
+                                                                        &observed_public_ip,
                                                                         &outbound_tx,
                                                                         &updating_flag,
                                                                         &restart_slot,
@@ -860,6 +914,7 @@ async fn handle_device_message(
     executor: &Arc<Executor>,
     file_transfers: &Arc<FileTransferManager>,
     relay_bridge: &Option<Arc<RelayBridge>>,
+    observed_public_ip: &Arc<Mutex<Option<String>>>,
     outbound_tx: &mpsc::Sender<(String, DeviceMessage)>,
     updating_flag: &Arc<AtomicBool>,
     restart_slot: &Arc<Mutex<Option<oneshot::Sender<RestartPlan>>>>,
@@ -1074,13 +1129,14 @@ async fn handle_device_message(
 
             if method == "probe" {
                 let policy_snap = policy.read().unwrap_or_else(|e| e.into_inner()).clone();
-                let manifest = CapabilityProber::probe(
+                let mut manifest = CapabilityProber::probe(
                     &policy_snap,
                     &cfg.device_id,
                     cfg.relay_enabled,
                     Some(&cfg.mqtt_bind),
                     cfg.uart_device.as_deref(),
                 );
+                manifest.public_ip = observed_public_ip.lock().await.clone();
                 let resp = DeviceMessage {
                     v: 1,
                     kind: "rpc_resp".to_string(),
@@ -1098,13 +1154,14 @@ async fn handle_device_message(
                 match executor.apply_sandbox_level(&params) {
                     Ok(mut result_val) => {
                         let policy_snap = executor.policy_snapshot();
-                        let manifest = CapabilityProber::probe(
+                        let mut manifest = CapabilityProber::probe(
                             &policy_snap,
                             &cfg.device_id,
                             cfg.relay_enabled,
                             Some(&cfg.mqtt_bind),
                             cfg.uart_device.as_deref(),
                         );
+                        manifest.public_ip = observed_public_ip.lock().await.clone();
                         if let Some(obj) = result_val.as_object_mut() {
                             obj.insert(
                                 "manifest".to_string(),
@@ -1257,11 +1314,20 @@ async fn handle_device_message(
     }
 }
 
-async fn run_signal_loop(cfg: AgentConfig, endpoints: RelayEndpoints) {
+async fn run_signal_loop(
+    cfg: AgentConfig,
+    endpoints: RelayEndpoints,
+    observed_public_ip: Arc<Mutex<Option<String>>>,
+) {
     let mut backoff_ms = 1000u64;
     loop {
         let stun_servers = match fetch_bootstrap(&endpoints.bootstrap_url, &cfg.token).await {
-            Ok(b) => b.stun_servers,
+            Ok(b) => {
+                if let Some(ip) = clean_ip(b.observed_ip.as_deref()) {
+                    *observed_public_ip.lock().await = Some(ip);
+                }
+                b.stun_servers
+            }
             Err(_) => Vec::new(),
         };
 
@@ -1271,6 +1337,13 @@ async fn run_signal_loop(cfg: AgentConfig, endpoints: RelayEndpoints) {
             if let Some(stun_srv) = stun_servers.first() {
                 if let Ok(sock) = UdpSocket::bind("0.0.0.0:0").await {
                     if let Ok(addr) = stun_probe(&sock, stun_srv, Duration::from_millis(1500)).await {
+                        let ip_str = addr.ip().to_string();
+                        {
+                            let mut guard = observed_public_ip.lock().await;
+                            if guard.is_none() {
+                                *guard = Some(ip_str);
+                            }
+                        }
                         public_addr = Some(addr.to_string());
                     }
                 }
@@ -1456,7 +1529,7 @@ mod tests {
                             if head.starts_with("GET /v1/bootstrap ") {
                                 let mut sink = [0u8; 1024];
                                 let _ = stream.read(&mut sink).await;
-                                let body = br#"{"stun_servers":[]}"#;
+                                let body = br#"{"stun_servers":[],"observed_ip":"113.87.160.22"}"#;
                                 let resp = format!(
                                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                                     body.len()
@@ -1492,6 +1565,14 @@ mod tests {
                                 assert_eq!(
                                     manifest_msg.body.get("enroll_id").and_then(|v| v.as_str()),
                                     Some("enr-test-01")
+                                );
+                                assert_eq!(
+                                    manifest_msg.body.get("agent_version").and_then(|v| v.as_str()),
+                                    Some(env!("CARGO_PKG_VERSION"))
+                                );
+                                assert_eq!(
+                                    manifest_msg.body.get("public_ip").and_then(|v| v.as_str()),
+                                    Some("113.87.160.22")
                                 );
 
                                 let req = DeviceMessage {

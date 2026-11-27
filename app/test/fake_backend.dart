@@ -142,6 +142,9 @@ class FakeBackend {
     String tier = 'os',
     String status = 'online',
     String route = 'relay',
+    String? agentVersion,
+    String? publicIp,
+    String? location,
     String? relayNodeId,
     String? version,
     bool omitVersion = false,
@@ -162,13 +165,18 @@ class FakeBackend {
       _ => (2048, 120),
     };
     devices.removeWhere((d) => d['deviceId'] == deviceId);
-    final effectiveVer = omitVersion ? null : (version ?? (tier == 'mcu' ? '0.1.0' : (deviceConfig['masterVersion'] as String? ?? '0.9.1')));
+    final effectiveVer = omitVersion
+        ? null
+        : (version ?? agentVersion ?? (tier == 'mcu' ? '0.1.0' : (deviceConfig['masterVersion'] as String? ?? '0.9.1')));
     devices.add({
       'deviceId': deviceId,
       'clusterId': (deviceConfig['clusterId'] as String?)?.isNotEmpty == true ? deviceConfig['clusterId'] : 'personal',
       'tier': tier,
       'status': status,
       'route': route,
+      'agentVersion': ?effectiveVer,
+      'publicIp': ?publicIp,
+      'location': ?location,
       'relayNodeId': ?relayNodeId,
       'sandboxLevel': ?sandboxLevel,
       'desiredSandboxLevel': ?desiredSandboxLevel,
@@ -181,9 +189,12 @@ class FakeBackend {
                   'device_id': deviceId,
                   'tier': 'os',
                   'version': ?effectiveVer,
+                  'agent_version': ?effectiveVer,
                   'os': 'linux',
                   'arch': 'amd64',
                   'hostname': deviceId,
+                  'public_ip': ?publicIp,
+                  'location': ?location,
                   'cpus': 8,
                   'ram_mb': 16384,
                   'capabilities': capabilities,

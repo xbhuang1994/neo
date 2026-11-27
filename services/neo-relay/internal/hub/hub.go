@@ -86,6 +86,7 @@ type PeerInfo struct {
 	ClusterID        string   `json:"cluster_id"`
 	NodeID           string   `json:"node_id"`
 	Tier             string   `json:"tier"`
+	ObservedIP       string   `json:"observed_ip,omitempty"`
 	LANAddrs         []string `json:"lan_addrs,omitempty"`
 	ReflexiveUDP     string   `json:"reflexive_udp,omitempty"`
 	NATType          string   `json:"nat_type,omitempty"`
@@ -104,6 +105,7 @@ type SignalMsg struct {
 	From         string   `json:"from,omitempty"`
 	To           string   `json:"to,omitempty"`
 	SessionID    string   `json:"session_id,omitempty"`
+	Addr         string   `json:"addr,omitempty"`
 	LANAddrs     []string `json:"lan_addrs,omitempty"`
 	ReflexiveUDP string   `json:"reflexive_udp,omitempty"`
 	NATType      string   `json:"nat_type,omitempty"`
@@ -487,6 +489,10 @@ func accumulateCluster(snap *StatsSnapshot, c *clusterBucket, now time.Time) {
 }
 
 func (h *Hub) ServeSignal(clusterID, nodeID, tier string, conn *ws.Conn) {
+	h.ServeSignalWithIP(clusterID, nodeID, tier, "", conn)
+}
+
+func (h *Hub) ServeSignalWithIP(clusterID, nodeID, tier, observedIP string, conn *ws.Conn) {
 	now := h.now()
 	nowMs := now.UnixMilli()
 	var oldConn *ws.Conn
@@ -503,6 +509,9 @@ func (h *Hub) ServeSignal(clusterID, nodeID, tier string, conn *ws.Conn) {
 	oldConn = p.signalConn
 	p.signalConn = conn
 	p.info.SignalOnline = true
+	if observedIP != "" {
+		p.info.ObservedIP = observedIP
+	}
 	p.info.LastSeen = nowMs
 	h.mu.Unlock()
 
@@ -551,6 +560,8 @@ func (h *Hub) handleSignalMessage(clusterID, nodeID, tier string, conn *ws.Conn,
 		}
 		if msg.ReflexiveUDP != "" {
 			p.info.ReflexiveUDP = msg.ReflexiveUDP
+		} else if msg.Addr != "" {
+			p.info.ReflexiveUDP = msg.Addr
 		}
 		if msg.NATType != "" {
 			p.info.NATType = msg.NATType
@@ -714,6 +725,10 @@ func (h *Hub) handleSignalMessage(clusterID, nodeID, tier string, conn *ws.Conn,
 }
 
 func (h *Hub) ServeRelay(clusterID, nodeID, tier string, conn *ws.Conn) {
+	h.ServeRelayWithIP(clusterID, nodeID, tier, "", conn)
+}
+
+func (h *Hub) ServeRelayWithIP(clusterID, nodeID, tier, observedIP string, conn *ws.Conn) {
 	now := h.now()
 	nowMs := now.UnixMilli()
 	var oldConn *ws.Conn
@@ -735,6 +750,9 @@ func (h *Hub) ServeRelay(clusterID, nodeID, tier string, conn *ws.Conn) {
 	oldConn = p.relayConn
 	p.relayConn = conn
 	p.info.RelayOnline = true
+	if observedIP != "" {
+		p.info.ObservedIP = observedIP
+	}
 	if p.info.PathMode == "" || p.info.PathMode == "init" {
 		p.info.PathMode = "relay"
 	}

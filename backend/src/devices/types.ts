@@ -207,10 +207,13 @@ export interface SandboxSummary {
 export interface CapabilityManifest {
   device_id: string;
   tier: DeviceTier;
+  agent_version?: string;
   version?: string;
   os?: string;
   arch?: string;
   hostname?: string;
+  public_ip?: string;
+  location?: string;
   cpus?: number;
   ram_mb?: number;
   capabilities?: string[];
@@ -244,6 +247,10 @@ export interface DeviceTwin {
   tier: DeviceTier;
   status: DeviceStatus;
   route: DeviceRouteKind;
+  agentVersion?: string;
+  publicIp?: string;
+  location?: string;
+  locationIp?: string;
   lanUrl?: string;
   relayNodeId?: string;
   backupRelayNodeIds?: string[];
@@ -440,10 +447,27 @@ export type DeviceInvokeResult =
       error: string;
     };
 
+/** Peer summary item returned by `neo-relayd` `GET /v1/peers`. */
+export interface RelayPeerInfo {
+  cluster_id?: string;
+  node_id?: string;
+  tier?: string;
+  observed_ip?: string;
+  lan_addrs?: string[];
+  reflexive_udp?: string;
+  nat_type?: string;
+  path_mode?: string;
+  signal_online?: boolean;
+  relay_online?: boolean;
+  last_seen_ms?: number;
+  [key: string]: unknown;
+}
+
 /** Response shape returned by `neo-relayd` `GET /v1/bootstrap`. */
 export interface RelayBootstrapResponse {
   cluster_id?: string;
   node_id?: string;
+  observed_ip?: string;
   relay_url?: string;
   relay_ws_url?: string;
   signal_url?: string;

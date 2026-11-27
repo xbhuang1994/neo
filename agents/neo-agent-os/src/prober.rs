@@ -48,10 +48,15 @@ pub struct RelayConfigSummary {
 pub struct CapabilityManifest {
     pub device_id: String,
     pub tier: String,
+    #[serde(default)]
     pub version: String,
+    #[serde(default)]
+    pub agent_version: String,
     pub os: String,
     pub arch: String,
     pub hostname: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_ip: Option<String>,
     pub cpus: usize,
     pub ram_mb: u64,
     pub capabilities: Vec<String>,
@@ -114,9 +119,11 @@ impl CapabilityProber {
             device_id: device_id.to_string(),
             tier: "os".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            agent_version: env!("CARGO_PKG_VERSION").to_string(),
             os,
             arch,
             hostname,
+            public_ip: None,
             cpus,
             ram_mb,
             capabilities,
@@ -220,6 +227,7 @@ mod tests {
         assert_eq!(manifest.device_id, "os-node-test");
         assert_eq!(manifest.tier, "os");
         assert_eq!(manifest.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(manifest.agent_version, env!("CARGO_PKG_VERSION"));
         assert!(manifest.cpus >= 1);
         assert!(manifest.capabilities.contains(&"relay".to_string()));
         assert!(manifest.capabilities.contains(&"exec".to_string()));

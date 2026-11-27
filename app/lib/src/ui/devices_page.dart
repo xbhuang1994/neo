@@ -805,9 +805,12 @@ class _DevicesPageState extends State<DevicesPage> {
 
     final manifest = device.manifest;
     final outdated = device.needsUpdate(masterVersion);
+    final rawVer = device.version;
     final versionText = device.isMcu
-        ? (device.version != null ? 'fw ${device.version!}' : null)
-        : (device.version != null ? 'v${device.version!}' : (outdated ? strings.legacyVersion : null));
+        ? (rawVer != null ? 'fw $rawVer' : null)
+        : (rawVer != null
+              ? (rawVer.startsWith('v') || rawVer.startsWith('V') ? rawVer : 'v$rawVer')
+              : (outdated ? strings.legacyVersion : null));
 
     final chips = <(String, Color?)>[];
     if (device.isMcu) {
@@ -932,6 +935,46 @@ class _DevicesPageState extends State<DevicesPage> {
           if (chips.isNotEmpty) ...[
             const SizedBox(height: 8),
             Wrap(spacing: 6, runSpacing: 6, children: [for (final (label, accent) in chips) _chip(label, accent: accent)]),
+          ],
+          if (device.effectivePublicIp != null || device.effectiveLocation != null) ...[
+            const SizedBox(height: 7),
+            Wrap(
+              spacing: 14,
+              runSpacing: 5,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                if (device.effectivePublicIp != null)
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(CupertinoIcons.globe, size: 13, color: palette.secondary),
+                      const SizedBox(width: 5),
+                      Text(strings.publicIpLabel, style: typo.caption),
+                      const SizedBox(width: 5),
+                      Text(
+                        device.effectivePublicIp!,
+                        key: ValueKey('device-ip-${device.deviceId}'),
+                        style: typo.mono.copyWith(fontSize: 12, color: palette.label),
+                      ),
+                    ],
+                  ),
+                if (device.effectiveLocation != null)
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(CupertinoIcons.location, size: 13, color: palette.secondary),
+                      const SizedBox(width: 5),
+                      Text(strings.locationLabel, style: typo.caption),
+                      const SizedBox(width: 5),
+                      Text(
+                        device.effectiveLocation!,
+                        key: ValueKey('device-location-${device.deviceId}'),
+                        style: typo.caption.copyWith(color: palette.label),
+                      ),
+                    ],
+                  ),
+              ],
+            ),
           ],
           if (!device.isMcu && device.isUnrestricted) ...[
             const SizedBox(height: 7),

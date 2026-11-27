@@ -713,6 +713,7 @@ async function routeDevices(
 ): Promise<Response | null> {
   if (method === "GET") {
     if (reqPath === "/api/devices") {
+      app.devices.triggerBackgroundSync();
       return Response.json(200, {
         config: app.devices.configView(),
         devices: app.devices.listDevices(),

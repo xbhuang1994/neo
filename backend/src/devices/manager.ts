@@ -14,6 +14,7 @@ import type { Store } from "../store/index.ts";
 import { VERSION } from "../version.ts";
 import { EnrollmentManager, validateWorkspacePath } from "./enrollment.ts";
 import { FileTransferManager } from "./file-transfer.ts";
+import { IpGeoResolver, type IpGeoLookupFn } from "./geo.ts";
 import {
   compareSemver,
   deriveMcuE2eKey,
@@ -64,6 +65,7 @@ import {
   type PendingMcuCommand,
   type RelayEnvelope,
   type RelayFrame,
+  type RelayPeerInfo,
   type S3PrefixValidation,
   type SandboxLevel,
   type SandboxSummary,
@@ -77,6 +79,7 @@ const APPROVAL_KEY_PREFIX = "device-approval:";
 const CONFIG_KEY = "device-config";
 
 const DEFAULT_RPC_TIMEOUT_MS = 30_000;
+const DEFAULT_PEER_SYNC_INTERVAL_MS = 15_000;
 const MAX_UPLINK_SEQ_HISTORY = 64;
 
 const FORBIDDEN_ACTIONS: ReadonlySet<string> = new Set([
@@ -195,6 +198,49 @@ export function inferSandboxLevel(
     return "personal";
   }
   return undefined;
+}
+
+function normalizeVersion(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim().replace(/^[vV](?=\d)/, "");
+  return trimmed.length > 0 && trimmed.length <= 64 ? trimmed : undefined;
+}
+
+function normalizeIp(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  let value = raw.trim();
+  if (!value) return undefined;
+  // Strip IPv4-mapped IPv6 prefix ::ffff:
+  if (value.toLowerCase().startsWith("::ffff:")) {
+    value = value.slice(7);
+  }
+  return value.length > 0 && value.length <= 64 ? value : undefined;
+}
+
+function normalizeLocation(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim().replace(/\s+/g, " ");
+  return trimmed.length > 0 && trimmed.length <= 128 ? trimmed : undefined;
+}
+
+function extractHostFromAddr(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.startsWith("[")) {
+    const close = trimmed.indexOf("]");
+    if (close > 1) {
+      return normalizeIp(trimmed.slice(1, close));
+    }
+    return undefined;
+  }
+  const firstColon = trimmed.indexOf(":");
+  const lastColon = trimmed.lastIndexOf(":");
+  if (firstColon !== -1 && firstColon === lastColon) {
+    // IPv4:port
+    return normalizeIp(trimmed.slice(0, firstColon));
+  }
+  return normalizeIp(trimmed);
 }
 
 function generateId(prefix: string): string {
@@ -421,6 +467,8 @@ export interface DeviceManagerOptions {
   localRelayEnvPath?: string;
   agentVersion?: string;
   masterVersion?: string;
+  peerSyncIntervalMs?: number;
+  geoLookupFn?: IpGeoLookupFn;
   nowMs?: () => number;
 }
 
@@ -441,6 +489,8 @@ export class DeviceManager {
   private readonly localRelayEnvPathOverride?: string;
   private readonly agentVersion: string;
   private readonly masterVersion: string;
+  private readonly peerSyncIntervalMs: number;
+  private readonly geoResolver: IpGeoResolver;
   private readonly enrollment: EnrollmentManager;
   private readonly fileTransfer: FileTransferManager;
 
@@ -450,6 +500,9 @@ export class DeviceManager {
   private readonly pendingMcuRpcs = new Map<string, PendingRpc>();
   private readonly actionRiskOverrides = new Map<string, DeviceRiskLevel>();
   private readonly syncingSandboxDevices = new Set<string>();
+  private readonly locationLookups = new Map<string, Promise<string | null>>();
+  private lastPeerSyncMs = 0;
+  private peerSyncInFlight: Promise<number> | null = null;
   private closed = false;
 
   constructor(options: DeviceManagerOptions) {
@@ -465,6 +518,12 @@ export class DeviceManager {
     this.localRelayEnvPathOverride = options.localRelayEnvPath;
     this.masterVersion = options.masterVersion?.trim() || VERSION;
     this.agentVersion = options.agentVersion?.trim() || process.env.NEO_AGENT_VERSION?.trim() || this.masterVersion;
+    this.peerSyncIntervalMs = options.peerSyncIntervalMs ?? DEFAULT_PEER_SYNC_INTERVAL_MS;
+    this.geoResolver = new IpGeoResolver({
+      fetchFn: this.fetchFn,
+      lookupFn: options.geoLookupFn,
+      nowMs: options.nowMs,
+    });
     this.enrollment = new EnrollmentManager({
       store: this.store,
       getConfig: () => this.config,
@@ -796,6 +855,7 @@ export class DeviceManager {
       onStateChange: (state) => {
         if (state === "connected") {
           this.updateBoard("ready", `Connected to relay (${cfg.clusterId})`);
+          void this.syncRelayPeers({ force: true });
         } else if (state === "reconnecting") {
           this.updateBoard("waiting", "Reconnecting to relay");
         } else if (state === "closed") {
@@ -890,6 +950,9 @@ export class DeviceManager {
     opts: {
       route?: DeviceRouteKind;
       status?: DeviceStatus;
+      agentVersion?: string;
+      publicIp?: string;
+      location?: string;
       lanUrl?: string;
       relayNodeId?: string;
       backupRelayNodeIds?: string[];
@@ -898,17 +961,44 @@ export class DeviceManager {
     const cfg = this.requireConfig();
     const existing = this.getDevice(manifest.device_id);
     const now = nowIso();
-    const normalizedManifest: CapabilityManifest = isRecord(manifest.sandbox)
+    const baseManifest: CapabilityManifest = isRecord(manifest.sandbox)
       ? { ...manifest, sandbox: normalizeSandboxSummary(manifest.sandbox) }
       : manifest;
     const capabilities =
-      normalizedManifest.capabilities ??
-      normalizedManifest.acts ??
-      (normalizedManifest.actions
-        ? normalizedManifest.actions.map((a) => a.name)
+      baseManifest.capabilities ??
+      baseManifest.acts ??
+      (baseManifest.actions
+        ? baseManifest.actions.map((a) => a.name)
         : existing?.capabilities ?? []);
     const defaultRoute: DeviceRouteKind =
-      normalizedManifest.tier === "mcu" ? "via_tier1" : opts.route ?? existing?.route ?? "relay";
+      baseManifest.tier === "mcu" ? "via_tier1" : opts.route ?? existing?.route ?? "relay";
+    const agentVersion =
+      normalizeVersion(
+        opts.agentVersion ?? baseManifest.agent_version ?? baseManifest.version ?? baseManifest.fw,
+      ) ?? existing?.agentVersion;
+    const publicIp =
+      normalizeIp(opts.publicIp ?? baseManifest.public_ip) ?? existing?.publicIp;
+    const explicitLocation = normalizeLocation(opts.location ?? baseManifest.location);
+    const ipUnchanged = publicIp !== undefined && publicIp === existing?.publicIp;
+    const location =
+      explicitLocation ??
+      (ipUnchanged || (publicIp === undefined && existing?.publicIp === undefined)
+        ? existing?.location
+        : undefined);
+    const locationIp =
+      explicitLocation !== undefined && publicIp !== undefined
+        ? publicIp
+        : ipUnchanged
+          ? existing?.locationIp
+          : undefined;
+    const normalizedManifest: CapabilityManifest = {
+      ...baseManifest,
+      ...(agentVersion !== undefined && baseManifest.tier !== "mcu"
+        ? { version: agentVersion, agent_version: agentVersion }
+        : {}),
+      ...(publicIp !== undefined && baseManifest.tier !== "mcu" ? { public_ip: publicIp } : {}),
+      ...(location !== undefined && baseManifest.tier !== "mcu" ? { location } : {}),
+    };
 
     let sandboxLevel: SandboxLevel | undefined;
     let desiredSandboxLevel: SandboxLevel | undefined = existing?.desiredSandboxLevel;
@@ -945,6 +1035,10 @@ export class DeviceManager {
       tier: normalizedManifest.tier,
       status: opts.status ?? "online",
       route: opts.route ?? existing?.route ?? defaultRoute,
+      ...(agentVersion !== undefined ? { agentVersion } : {}),
+      ...(publicIp !== undefined ? { publicIp } : {}),
+      ...(location !== undefined ? { location } : {}),
+      ...(locationIp !== undefined ? { locationIp } : {}),
       ...(opts.lanUrl !== undefined
         ? { lanUrl: opts.lanUrl }
         : existing?.lanUrl !== undefined
@@ -978,7 +1072,165 @@ export class DeviceManager {
       lastSeenMs: Date.now(),
       updatedAt: now,
     };
-    return this.saveDevice(twin);
+    const saved = this.saveDevice(twin);
+    if (
+      saved.tier === "os" &&
+      saved.publicIp &&
+      (!saved.location || saved.locationIp !== saved.publicIp)
+    ) {
+      this.scheduleLocationLookup(saved.deviceId, saved.publicIp);
+    }
+    return saved;
+  }
+
+  /** Trigger a throttled background sync of live peer metadata (external IPs & IP geolocation). */
+  triggerBackgroundSync(): void {
+    if (this.closed || !this.config?.enabled) return;
+    // Schedule location lookups for any OS device that already has a public IP without a resolved location.
+    const devices = this.listDevices();
+    for (let i = 0; i < devices.length; i++) {
+      const dev = devices[i]!;
+      if (dev.tier === "os" && dev.publicIp && (!dev.location || dev.locationIp !== dev.publicIp)) {
+        this.scheduleLocationLookup(dev.deviceId, dev.publicIp);
+      }
+    }
+    if (!this.relayClient) return;
+    const now = Date.now();
+    if (this.peerSyncInFlight !== null || now - this.lastPeerSyncMs < this.peerSyncIntervalMs) {
+      return;
+    }
+    void this.syncRelayPeers();
+  }
+
+  private scheduleLocationLookup(deviceId: string, ip: string): void {
+    if (this.closed) return;
+    void this.resolveDeviceLocation(deviceId, ip);
+  }
+
+  /** Resolve and persist the physical geographic location (IP geolocation) for a device's external IP. */
+  async resolveDeviceLocation(deviceId: string, ipOverride?: string): Promise<string | null> {
+    if (this.closed) return null;
+    const existing = this.getDevice(deviceId);
+    if (!existing) return null;
+    const targetIp = normalizeIp(ipOverride ?? existing.publicIp);
+    if (!targetIp) return null;
+    if (existing.location && existing.locationIp === targetIp) {
+      return existing.location;
+    }
+
+    const key = `${deviceId}:${targetIp}`;
+    const inflight = this.locationLookups.get(key);
+    if (inflight) {
+      return await inflight;
+    }
+
+    const run = (async (): Promise<string | null> => {
+      try {
+        const resolved = await this.geoResolver.lookup(targetIp);
+        if (this.closed || !resolved) return resolved;
+        const latest = this.getDevice(deviceId);
+        if (!latest) return resolved;
+        if (latest.publicIp && latest.publicIp !== targetIp) {
+          return resolved;
+        }
+        const nextManifest = latest.manifest
+          ? { ...latest.manifest, public_ip: targetIp, location: resolved }
+          : undefined;
+        this.saveDevice({
+          ...latest,
+          publicIp: latest.publicIp ?? targetIp,
+          location: resolved,
+          locationIp: targetIp,
+          ...(nextManifest ? { manifest: nextManifest } : {}),
+        });
+        return resolved;
+      } catch {
+        return null;
+      } finally {
+        if (this.locationLookups.get(key) === run) {
+          this.locationLookups.delete(key);
+        }
+      }
+    })();
+    this.locationLookups.set(key, run);
+    return await run;
+  }
+
+  /** Fetch `/v1/peers` from `neo-relayd` and enrich persisted Device Twins with observed external IPs and locations. */
+  async syncRelayPeers(opts: { force?: boolean } = {}): Promise<number> {
+    if (this.closed) return 0;
+    const client = this.relayClient;
+    const cfg = this.config;
+    if (!client || !cfg || !cfg.enabled) return 0;
+    const now = Date.now();
+    if (!opts.force && this.peerSyncInFlight !== null) {
+      return await this.peerSyncInFlight;
+    }
+    if (!opts.force && now - this.lastPeerSyncMs < this.peerSyncIntervalMs) {
+      return 0;
+    }
+
+    this.lastPeerSyncMs = now;
+    const run = (async (): Promise<number> => {
+      try {
+        const raw = await client.fetchPeers();
+        if (this.closed) return 0;
+        const peersList: RelayPeerInfo[] = Array.isArray(raw)
+          ? (raw as RelayPeerInfo[])
+          : isRecord(raw) && Array.isArray(raw.peers)
+            ? (raw.peers as RelayPeerInfo[])
+            : [];
+        let updatedCount = 0;
+        const locationJobs: Array<Promise<string | null>> = [];
+        for (let i = 0; i < peersList.length; i++) {
+          const peer = peersList[i];
+          if (!isRecord(peer)) continue;
+          const nodeId = typeof peer.node_id === "string" ? peer.node_id.trim() : "";
+          if (!nodeId || nodeId === cfg.masterNodeId) continue;
+          const existing = this.getDevice(nodeId);
+          if (!existing || existing.clusterId !== cfg.clusterId) continue;
+          const observedIp =
+            normalizeIp(peer.observed_ip) ?? extractHostFromAddr(peer.reflexive_udp);
+          if (!observedIp) continue;
+          const ipChanged = existing.publicIp !== observedIp;
+          if (ipChanged) {
+            let nextManifest: CapabilityManifest | undefined;
+            if (existing.manifest) {
+              nextManifest = { ...existing.manifest, public_ip: observedIp };
+              if (existing.locationIp && existing.locationIp !== observedIp) {
+                delete nextManifest.location;
+              }
+            }
+            const updated: DeviceTwin = {
+              ...existing,
+              publicIp: observedIp,
+              ...(nextManifest ? { manifest: nextManifest } : {}),
+            };
+            if (existing.locationIp !== observedIp) {
+              delete updated.location;
+              delete updated.locationIp;
+            }
+            this.saveDevice(updated);
+            updatedCount += 1;
+          }
+          if (ipChanged || !existing.location || existing.locationIp !== observedIp) {
+            locationJobs.push(this.resolveDeviceLocation(nodeId, observedIp));
+          }
+        }
+        if (locationJobs.length > 0) {
+          await Promise.allSettled(locationJobs);
+        }
+        return updatedCount;
+      } catch {
+        return 0;
+      } finally {
+        if (this.peerSyncInFlight === run) {
+          this.peerSyncInFlight = null;
+        }
+      }
+    })();
+    this.peerSyncInFlight = run;
+    return await run;
   }
 
   /**
@@ -2754,19 +3006,21 @@ export class DeviceManager {
     switch (msg.kind) {
       case "manifest": {
         const body = msg.body;
-        const manifestVersion =
-          typeof body.version === "string" && body.version.trim().length > 0
-            ? body.version.trim()
-            : typeof body.agent_version === "string" && body.agent_version.trim().length > 0
-              ? body.agent_version.trim()
-              : undefined;
+        const enrollId = typeof body.enroll_id === "string" ? body.enroll_id.trim() : "";
+        const agentVersion = normalizeVersion(body.agent_version ?? body.version ?? body.fw);
+        const reportedPublicIp =
+          normalizeIp(body.public_ip ?? body.observed_ip) ??
+          (enrollId ? normalizeIp(this.enrollment.getLastClaimedIp(enrollId)) : undefined);
+        const reportedLocation = normalizeLocation(body.location);
         const manifest: CapabilityManifest = {
           device_id: typeof body.device_id === "string" ? body.device_id : msg.device_id || srcNodeId,
           tier: body.tier === "mcu" ? "mcu" : "os",
-          ...(manifestVersion ? { version: manifestVersion } : {}),
+          ...(agentVersion !== undefined ? { version: agentVersion, agent_version: agentVersion } : {}),
           ...(typeof body.os === "string" ? { os: body.os } : {}),
           ...(typeof body.arch === "string" ? { arch: body.arch } : {}),
           ...(typeof body.hostname === "string" ? { hostname: body.hostname } : {}),
+          ...(reportedPublicIp !== undefined ? { public_ip: reportedPublicIp } : {}),
+          ...(reportedLocation !== undefined ? { location: reportedLocation } : {}),
           ...(typeof body.cpus === "number" ? { cpus: body.cpus } : {}),
           ...(typeof body.ram_mb === "number" ? { ram_mb: body.ram_mb } : {}),
           ...(Array.isArray(body.capabilities)
@@ -2781,23 +3035,25 @@ export class DeviceManager {
         const routeHint = this.relayClient?.getPeerRouteHint(manifest.device_id);
         let twin = this.upsertDeviceManifest(manifest, {
           status: "online",
+          ...(agentVersion !== undefined ? { agentVersion } : {}),
+          ...(reportedPublicIp !== undefined ? { publicIp: reportedPublicIp } : {}),
+          ...(reportedLocation !== undefined ? { location: reportedLocation } : {}),
           ...(routeHint ? { route: routeHint } : {}),
         });
         const fingerprint =
           typeof body.fingerprint === "string" && body.fingerprint.trim().length > 0
             ? body.fingerprint.trim()
             : undefined;
-        if (fingerprint || manifestVersion) {
+        if (fingerprint || agentVersion) {
           twin = this.saveDevice({
             ...twin,
             reportedState: {
               ...twin.reportedState,
               ...(fingerprint ? { fingerprint } : {}),
-              ...(manifestVersion ? { version: manifestVersion } : {}),
+              ...(agentVersion ? { version: agentVersion } : {}),
             },
           });
         }
-        const enrollId = typeof body.enroll_id === "string" ? body.enroll_id.trim() : "";
         if (enrollId) {
           this.enrollment.markEnrollmentCompleted(enrollId, manifest.device_id, fingerprint);
         }
@@ -2810,6 +3066,9 @@ export class DeviceManager {
           twin.sandboxSyncState === "pending"
         ) {
           void this.syncDesiredSandbox(twin.deviceId);
+        }
+        if (manifest.tier === "os" && !twin.publicIp && this.relayClient?.isRelayConnected()) {
+          void this.syncRelayPeers({ force: true });
         }
         break;
       }
@@ -2835,23 +3094,53 @@ export class DeviceManager {
         const devId = msg.device_id || srcNodeId;
         const existing = this.getDevice(devId);
         if (existing) {
-          const hbVersion =
-            typeof msg.body.version === "string" && msg.body.version.trim().length > 0
-              ? msg.body.version.trim()
-              : undefined;
-          const nextManifest =
-            hbVersion && existing.manifest && existing.manifest.version !== hbVersion
-              ? { ...existing.manifest, version: hbVersion }
-              : existing.manifest;
-          this.saveDevice({
+          const hbVersion = normalizeVersion(msg.body.agent_version ?? msg.body.version);
+          const hbIp = normalizeIp(msg.body.public_ip ?? msg.body.observed_ip);
+          const hbLocation = normalizeLocation(msg.body.location);
+          const ipChanged = hbIp !== undefined && hbIp !== existing.publicIp;
+          const effectiveIp = hbIp ?? existing.publicIp;
+          let nextManifest: CapabilityManifest | undefined;
+          if (existing.manifest) {
+            nextManifest = {
+              ...existing.manifest,
+              ...(hbVersion !== undefined && existing.tier !== "mcu"
+                ? { version: hbVersion, agent_version: hbVersion }
+                : {}),
+              ...(hbIp !== undefined && existing.tier !== "mcu" ? { public_ip: hbIp } : {}),
+              ...(hbLocation !== undefined && existing.tier !== "mcu"
+                ? { location: hbLocation }
+                : {}),
+            };
+            if (ipChanged && hbLocation === undefined && existing.tier !== "mcu") {
+              delete nextManifest.location;
+            }
+          }
+          const nextTwin: DeviceTwin = {
             ...existing,
             status: "online",
             alertSuppressed: false,
+            ...(hbVersion !== undefined ? { agentVersion: hbVersion } : {}),
+            ...(hbIp !== undefined ? { publicIp: hbIp } : {}),
+            ...(hbLocation !== undefined
+              ? { location: hbLocation, ...(effectiveIp ? { locationIp: effectiveIp } : {}) }
+              : {}),
             ...(nextManifest ? { manifest: nextManifest } : {}),
             lastSeenAt: nowIso(),
             lastSeenMs: Date.now(),
             reportedState: { ...existing.reportedState, ...msg.body },
-          });
+          };
+          if (ipChanged && hbLocation === undefined) {
+            delete nextTwin.location;
+            delete nextTwin.locationIp;
+          }
+          const saved = this.saveDevice(nextTwin);
+          if (
+            saved.tier === "os" &&
+            saved.publicIp &&
+            (!saved.location || saved.locationIp !== saved.publicIp)
+          ) {
+            this.scheduleLocationLookup(saved.deviceId, saved.publicIp);
+          }
         }
         break;
       }

@@ -295,6 +295,7 @@ func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request, claims 
 		"cluster_id":       claims.ClusterID,
 		"node_id":          claims.NodeID,
 		"tier":             claims.Tier,
+		"observed_ip":      clientIP(r),
 		"signal_url":       wsBase + "/v1/signal",
 		"relay_url":        wsBase + "/v1/relay",
 		"stun_servers":     s.cfg.STUNServers,
@@ -344,11 +345,12 @@ func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request, claims aut
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "wildcard cluster cannot join signal"})
 		return
 	}
+	observedIP := clientIP(r)
 	conn, err := ws.Accept(w, r, s.cfg.MaxFrameBytes)
 	if err != nil {
 		return
 	}
-	s.hub.ServeSignal(claims.ClusterID, claims.NodeID, claims.Tier, conn)
+	s.hub.ServeSignalWithIP(claims.ClusterID, claims.NodeID, claims.Tier, observedIP, conn)
 }
 
 func (s *Server) handleRelay(w http.ResponseWriter, r *http.Request, claims auth.Claims) {
@@ -356,11 +358,12 @@ func (s *Server) handleRelay(w http.ResponseWriter, r *http.Request, claims auth
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "wildcard cluster cannot join relay"})
 		return
 	}
+	observedIP := clientIP(r)
 	conn, err := ws.Accept(w, r, s.cfg.MaxFrameBytes)
 	if err != nil {
 		return
 	}
-	s.hub.ServeRelay(claims.ClusterID, claims.NodeID, claims.Tier, conn)
+	s.hub.ServeRelayWithIP(claims.ClusterID, claims.NodeID, claims.Tier, observedIP, conn)
 }
 
 func (s *Server) publicBaseURL(r *http.Request) string {

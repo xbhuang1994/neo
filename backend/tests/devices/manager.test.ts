@@ -920,6 +920,194 @@ describe("devices/relay-client & manager", () => {
     store.close();
   });
 
+  test("DeviceManager tracks agentVersion and publicIp from manifest, heartbeat, MCU hello, and relay /v1/peers sync", async () => {
+    const store = Store.memory();
+    const { wsFactory } = makeMockSockets();
+    const clusterId = "cluster-meta";
+    const e2eKey = "meta-e2e-key";
+
+    let peersPayload: unknown = {
+      cluster_id: clusterId,
+      count: 2,
+      peers: [
+        {
+          cluster_id: clusterId,
+          node_id: "os-legacy",
+          tier: "os",
+          observed_ip: "113.87.160.22",
+          relay_online: true,
+        },
+        {
+          cluster_id: clusterId,
+          node_id: "os-stun-only",
+          tier: "os",
+          reflexive_udp: "58.248.102.18:54321",
+          relay_online: true,
+        },
+      ],
+    };
+
+    const geoByIp: Record<string, string> = {
+      "203.0.113.45": "美国 加利福尼亚 圣何塞",
+      "198.51.100.77": "新加坡",
+      "113.87.160.22": "中国 广东 深圳",
+      "58.248.102.18": "中国 广东 广州",
+      "120.24.10.5": "中国 浙江 杭州",
+    };
+
+    const manager = new DeviceManager({
+      store,
+      masterId: "meta",
+      peerSyncIntervalMs: 0,
+      geoLookupFn: async (ip) => geoByIp[ip] ?? null,
+      fetchFn: (async (url: string | URL) => {
+        const s = String(url);
+        if (s.endsWith("/v1/peers")) {
+          return new Response(JSON.stringify(peersPayload), { status: 200 });
+        }
+        return new Response(JSON.stringify({ cluster_id: clusterId }), { status: 200 });
+      }) as unknown as typeof fetch,
+      wsFactory,
+      pingIntervalMs: 0,
+    });
+
+    await manager.configure(
+      {
+        clusterId,
+        masterNodeId: "master-meta",
+        relayUrl: "https://relay.meta.test:18443",
+        relaySecret: "meta-relay-secret",
+        e2eKey,
+      },
+      { persist: true, connect: true },
+    );
+
+    // 1. New agent reports agent_version and public_ip in manifest
+    const newManifestWire = sealDeviceMessage(
+      {
+        v: 1,
+        kind: "manifest",
+        req_id: "m-new",
+        cluster_id: clusterId,
+        device_id: "os-modern",
+        ts_ms: Date.now(),
+        body: {
+          device_id: "os-modern",
+          tier: "os",
+          agent_version: "v0.9.2",
+          os: "macos",
+          arch: "aarch64",
+          hostname: "m3pro.local",
+          public_ip: "203.0.113.45",
+          capabilities: ["exec", "fs"],
+        },
+      },
+      e2eKey,
+      "os-modern",
+      "master-meta",
+    );
+    manager.handleRelayFrame({
+      flags: FLAG_DATA,
+      src: "os-modern",
+      dst: "master-meta",
+      payload: newManifestWire,
+    });
+
+    const modern = manager.getDevice("os-modern");
+    expect(modern?.agentVersion).toBe("0.9.2");
+    expect(modern?.publicIp).toBe("203.0.113.45");
+    expect(modern?.manifest?.agent_version).toBe("0.9.2");
+    expect(modern?.manifest?.public_ip).toBe("203.0.113.45");
+    expect(await manager.resolveDeviceLocation("os-modern")).toBe("美国 加利福尼亚 圣何塞");
+    expect(manager.getDevice("os-modern")?.location).toBe("美国 加利福尼亚 圣何塞");
+    expect(manager.getDevice("os-modern")?.locationIp).toBe("203.0.113.45");
+
+    // 2. Heartbeat updates version and IP dynamically and re-resolves physical location
+    const hbWire = sealDeviceMessage(
+      {
+        v: 1,
+        kind: "heartbeat",
+        req_id: "hb-1",
+        cluster_id: clusterId,
+        device_id: "os-modern",
+        ts_ms: Date.now(),
+        body: {
+          status: "online",
+          agent_version: "0.9.3",
+          public_ip: "198.51.100.77",
+        },
+      },
+      e2eKey,
+      "os-modern",
+      "master-meta",
+    );
+    manager.handleRelayFrame({
+      flags: FLAG_DATA,
+      src: "os-modern",
+      dst: "master-meta",
+      payload: hbWire,
+    });
+    expect(manager.getDevice("os-modern")?.agentVersion).toBe("0.9.3");
+    expect(manager.getDevice("os-modern")?.publicIp).toBe("198.51.100.77");
+    expect(await manager.resolveDeviceLocation("os-modern")).toBe("新加坡");
+    expect(manager.getDevice("os-modern")?.location).toBe("新加坡");
+    expect(manager.getDevice("os-modern")?.locationIp).toBe("198.51.100.77");
+
+    // 3. Legacy agents without public_ip in manifest get enriched via /v1/peers observed_ip & reflexive_udp + GeoIP
+    manager.upsertDeviceManifest({ device_id: "os-legacy", tier: "os", os: "windows" });
+    manager.upsertDeviceManifest({ device_id: "os-stun-only", tier: "os", os: "linux" });
+    const synced = await manager.syncRelayPeers({ force: true });
+    expect(synced).toBe(2);
+    expect(manager.getDevice("os-legacy")?.publicIp).toBe("113.87.160.22");
+    expect(manager.getDevice("os-legacy")?.location).toBe("中国 广东 深圳");
+    expect(manager.getDevice("os-stun-only")?.publicIp).toBe("58.248.102.18");
+    expect(manager.getDevice("os-stun-only")?.location).toBe("中国 广东 广州");
+
+    // 4. MCU hello populates agentVersion from fw
+    const mcuHello = sealRelayEnvelope({
+      clusterId,
+      relayNodeId: "os-modern",
+      targetMcuId: "mcu-meta-1",
+      direction: "uplink",
+      seqId: 0,
+      payload: { t: "hello", chip: "esp32s3", fw: "1.2.3", acts: ["ping"] },
+      e2eMasterSecret: e2eKey,
+    });
+    manager.handleRelayFrame({
+      flags: FLAG_DATA,
+      src: "os-modern",
+      dst: "master-meta",
+      payload: sealDeviceMessage(
+        {
+          v: 1,
+          kind: "relay_envelope",
+          req_id: "mcu-h",
+          cluster_id: clusterId,
+          device_id: "os-modern",
+          ts_ms: Date.now(),
+          body: mcuHello as unknown as Record<string, unknown>,
+        },
+        e2eKey,
+        "os-modern",
+        "master-meta",
+      ),
+    });
+    expect(manager.getDevice("mcu-meta-1")?.agentVersion).toBe("1.2.3");
+
+    // Verify peer IP & location update on subsequent sync
+    peersPayload = {
+      cluster_id: clusterId,
+      count: 1,
+      peers: [{ cluster_id: clusterId, node_id: "os-legacy", observed_ip: "::ffff:120.24.10.5" }],
+    };
+    expect(await manager.syncRelayPeers({ force: true })).toBe(1);
+    expect(manager.getDevice("os-legacy")?.publicIp).toBe("120.24.10.5");
+    expect(manager.getDevice("os-legacy")?.location).toBe("中国 浙江 杭州");
+
+    await manager.stop();
+    store.close();
+  });
+
   test("inferSandboxLevel handles explicit levels, boolean flags, fallback, and legacy mem/timeout heuristics", () => {
     expect(inferSandboxLevel({ level: "unrestricted", read_only: true }, "corp")).toBe("unrestricted");
     expect(inferSandboxLevel({ level: "desktop" })).toBe("desktop");

@@ -297,6 +297,8 @@ abstract class Strings {
   String lastSeen(String when);
   String queuedCommands(int count);
   String viaRelayDevice(String id);
+  String get publicIpLabel;
+  String get locationLabel;
 
   // Device Enrollment & MCU Sheet
   String get addDeviceSheetTitle;
@@ -958,6 +960,10 @@ class ZhStrings extends Strings {
   String queuedCommands(int count) => '$count 条待下发';
   @override
   String viaRelayDevice(String id) => '经由 $id';
+  @override
+  String get publicIpLabel => '外网 IP';
+  @override
+  String get locationLabel => '物理地址';
 
   @override
   String get addDeviceSheetTitle => '添加设备';
@@ -1707,6 +1713,10 @@ class EnStrings extends Strings {
   String queuedCommands(int count) => '$count queued';
   @override
   String viaRelayDevice(String id) => 'via $id';
+  @override
+  String get publicIpLabel => 'Public IP';
+  @override
+  String get locationLabel => 'Location';
 
   @override
   String get addDeviceSheetTitle => 'Add device';
