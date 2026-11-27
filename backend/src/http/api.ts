@@ -8,6 +8,7 @@ import { Buffer } from "node:buffer";
 import { timingSafeEqual } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as zlib from "node:zlib";
 import { StopWorkerError } from "../app/context.ts";
 import type { AppContext, ChatAttachment } from "../app/context.ts";
 import {
@@ -69,6 +70,192 @@ const MIME_TYPES: Readonly<Record<string, string>> = {
   woff2: "font/woff2",
   txt: "text/plain; charset=utf-8",
 };
+
+const MIN_COMPRESS_BYTES = 512;
+const MAX_STATIC_CACHE_BYTES = 64 * 1024 * 1024;
+const BROTLI_OPTIONS: zlib.BrotliOptions = {
+  params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 5 },
+};
+const GZIP_OPTIONS: zlib.ZlibOptions = { level: 6 };
+const EMPTY_BODY = new Uint8Array(0);
+
+type ContentEncoding = "br" | "gzip";
+
+interface StaticCacheEntry {
+  mtimeMs: number;
+  size: number;
+  contentType: string;
+  etag: string;
+  raw: Uint8Array;
+  gzip?: Uint8Array | null;
+  br?: Uint8Array | null;
+  totalBytes: number;
+}
+
+const staticFileCache = new Map<string, StaticCacheEntry>();
+let staticCacheTotalBytes = 0;
+
+function evictStaticCache(incomingBytes: number): void {
+  if (incomingBytes > MAX_STATIC_CACHE_BYTES) return;
+  while (staticCacheTotalBytes + incomingBytes > MAX_STATIC_CACHE_BYTES && staticFileCache.size > 0) {
+    const oldestKey = staticFileCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    const evicted = staticFileCache.get(oldestKey);
+    staticFileCache.delete(oldestKey);
+    if (evicted) staticCacheTotalBytes -= evicted.totalBytes;
+  }
+}
+
+function isCompressibleMime(mime: string): boolean {
+  return (
+    mime.startsWith("text/") ||
+    mime.startsWith("application/json") ||
+    mime === "application/wasm" ||
+    mime === "image/svg+xml" ||
+    mime === "font/ttf" ||
+    mime === "font/otf"
+  );
+}
+
+/** Pick `br` or `gzip` from an `Accept-Encoding` header (respecting `q=0` exclusions). */
+export function negotiateEncoding(acceptEncoding: string | undefined): ContentEncoding | null {
+  if (!acceptEncoding) return null;
+  let brQ = -1;
+  let gzipQ = -1;
+  const parts = acceptEncoding.split(",");
+  for (let i = 0; i < parts.length; i++) {
+    const raw = parts[i]!.trim();
+    if (raw.length === 0) continue;
+    const semi = raw.indexOf(";");
+    const token = (semi === -1 ? raw : raw.slice(0, semi)).trim().toLowerCase();
+    if (token !== "br" && token !== "gzip") continue;
+    let q = 1;
+    if (semi !== -1) {
+      const params = raw.slice(semi + 1).split(";");
+      for (let j = 0; j < params.length; j++) {
+        const param = params[j]!.trim().toLowerCase();
+        if (param.startsWith("q=")) {
+          const parsed = Number(param.slice(2).trim());
+          if (!Number.isNaN(parsed)) q = parsed;
+        }
+      }
+    }
+    if (token === "br") brQ = q;
+    else gzipQ = q;
+  }
+  if (brQ > 0 && brQ >= gzipQ) return "br";
+  if (gzipQ > 0) return "gzip";
+  return null;
+}
+
+function fastSliceTag(data: Uint8Array | string): string {
+  const len = typeof data === "string" ? data.length : data.byteLength;
+  const hash = typeof Bun !== "undefined" ? Bun.hash(data).toString(36) : Buffer.from(data).length.toString(36);
+  return `${len.toString(36)}-${hash}`;
+}
+
+function weakEtag(data: Uint8Array | string): string {
+  return `W/"${fastSliceTag(data)}"`;
+}
+
+function stripWeakPrefix(tag: string): string {
+  const trimmed = tag.trim();
+  return trimmed.startsWith("W/") || trimmed.startsWith("w/") ? trimmed.slice(2).trim() : trimmed;
+}
+
+/** RFC 9110 weak ETag comparison for `If-None-Match`. */
+export function etagMatches(ifNoneMatch: string | undefined, etag: string): boolean {
+  if (!ifNoneMatch) return false;
+  const trimmed = ifNoneMatch.trim();
+  if (trimmed === "*") return true;
+  const target = stripWeakPrefix(etag);
+  let start = 0;
+  let inQuotes = false;
+  for (let i = 0; i <= trimmed.length; i++) {
+    const ch = i < trimmed.length ? trimmed.charCodeAt(i) : 0x2c /* ',' */;
+    if (ch === 0x22 /* '"' */) {
+      inQuotes = !inQuotes;
+    } else if (ch === 0x2c /* ',' */ && !inQuotes) {
+      const candidate = trimmed.slice(start, i).trim();
+      if (candidate.length > 0 && stripWeakPrefix(candidate) === target) {
+        return true;
+      }
+      start = i + 1;
+    }
+  }
+  return false;
+}
+
+function compressBytes(raw: Uint8Array, encoding: ContentEncoding): Uint8Array | null {
+  const compressed =
+    encoding === "br"
+      ? zlib.brotliCompressSync(raw, BROTLI_OPTIONS)
+      : zlib.gzipSync(raw, GZIP_OPTIONS);
+  if (compressed.byteLength >= raw.byteLength) {
+    return null;
+  }
+  return new Uint8Array(compressed.buffer, compressed.byteOffset, compressed.byteLength);
+}
+
+function maybeCompressApiResponse(request: Request, response: Response): Response {
+  if (
+    response.status === 204 ||
+    response.status === 304 ||
+    response.body.byteLength < MIN_COMPRESS_BYTES ||
+    !isCompressibleMime(response.contentType)
+  ) {
+    return response;
+  }
+  const encoding = negotiateEncoding(request.header("accept-encoding"));
+  if (encoding === null) {
+    return response;
+  }
+  const compressed = compressBytes(response.body, encoding);
+  if (compressed === null) {
+    return response;
+  }
+  return new Response({
+    status: response.status,
+    contentType: response.contentType,
+    body: compressed,
+    headers: [...response.headers, ["content-encoding", encoding], ["vary", "accept-encoding"]],
+  });
+}
+
+function jsonWithEtag(request: Request, value: unknown): Response {
+  const raw = textEncoder.encode(JSON.stringify(value));
+  const etag = weakEtag(raw);
+  if (etagMatches(request.header("if-none-match"), etag)) {
+    return new Response({
+      status: 304,
+      contentType: "application/json; charset=utf-8",
+      body: EMPTY_BODY,
+      headers: [
+        ["etag", etag],
+        ["cache-control", "no-store"],
+      ],
+    });
+  }
+  const res = new Response({
+    status: 200,
+    contentType: "application/json; charset=utf-8",
+    body: raw,
+    headers: [
+      ["cache-control", "no-store"],
+      ["etag", etag],
+    ],
+  });
+  return maybeCompressApiResponse(request, res);
+}
+
+function isImmutableWebAsset(parts: readonly string[]): boolean {
+  // Self-hosted Google Fonts fallback files use content-hashed versioned paths (`fonts/fallback/<family>/<ver>/<hash>.woff2`).
+  if (parts.length >= 4 && parts[0] === "fonts" && parts[1] === "fallback") {
+    const fileName = parts[parts.length - 1] ?? "";
+    return fileName.endsWith(".woff2");
+  }
+  return false;
+}
 
 const B64_DECODE = new Int8Array(128).fill(-1);
 for (let i = 0; i < 26; i++) {
@@ -728,7 +915,7 @@ async function routeDevices(
   if (method === "GET") {
     if (reqPath === "/api/devices") {
       app.devices.triggerBackgroundSync();
-      return Response.json(200, {
+      return jsonWithEtag(request, {
         config: app.devices.configView(),
         devices: app.devices.listDevices(),
         approvals: app.devices.listApprovals(),
@@ -1280,6 +1467,88 @@ async function routeDevices(
   return null;
 }
 
+async function pollSnapshot(app: AppContext, request: Request): Promise<Response> {
+  const params = new URLSearchParams(request.query);
+  const rawInclude = params.get("include");
+  const include = new Set<string>(
+    rawInclude
+      ? rawInclude
+          .split(",")
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0)
+      : ["m", "w", "a", "d"],
+  );
+  const workerId = params.get("worker")?.trim() || undefined;
+  if (workerId && rawInclude === null) include.add("wd");
+  if (params.get("health") === "1") include.add("h");
+
+  const wantMessages = include.has("m");
+  const wantWorkers = include.has("w");
+  const wantActivity = include.has("a");
+  const wantDevices = include.has("d") && app.devices !== undefined;
+  const wantDetail = include.has("wd") && workerId !== undefined && workerId.length > 0;
+  const wantHealth = include.has("h");
+
+  if (wantDevices) {
+    app.devices.triggerBackgroundSync();
+  }
+
+  const [workersValue, activityValue, detailValue] = await Promise.all([
+    wantWorkers ? app.workerCards() : Promise.resolve(undefined),
+    wantActivity ? app.activityView() : Promise.resolve(undefined),
+    wantDetail ? app.workerDetail(workerId) : Promise.resolve(undefined),
+  ]);
+
+  const changed: Record<string, unknown> = {};
+  const etags: Record<string, string> = {};
+  let anyChanged = false;
+
+  const checkSlice = (key: string, payloadKey: string, value: unknown): void => {
+    const serialized = JSON.stringify(value);
+    const tag = fastSliceTag(serialized);
+    etags[key] = tag;
+    if (params.get(key) !== tag) {
+      changed[payloadKey] = value;
+      anyChanged = true;
+    }
+  };
+
+  if (wantMessages) {
+    checkSlice("m", "messages", app.panelMessages());
+  }
+  if (wantWorkers) {
+    checkSlice("w", "workers", workersValue);
+  }
+  if (wantActivity) {
+    checkSlice("a", "activity", activityValue);
+  }
+  if (wantDevices) {
+    checkSlice("d", "devices", {
+      config: app.devices.configView(),
+      devices: app.devices.listDevices(),
+      approvals: app.devices.listApprovals(),
+      enrollments: app.devices.listEnrollments(),
+    });
+  }
+  if (wantDetail) {
+    checkSlice("wd", "workerDetail", detailValue ?? null);
+  }
+  if (wantHealth) {
+    checkSlice("h", "health", app.healthView());
+  }
+
+  if (!anyChanged) {
+    return new Response({
+      status: 304,
+      contentType: "application/json; charset=utf-8",
+      body: EMPTY_BODY,
+      headers: [["cache-control", "no-store"]],
+    });
+  }
+
+  return maybeCompressApiResponse(request, Response.json(200, { changed, etags }));
+}
+
 async function route(app: AppContext, request: Request): Promise<Response> {
   const { method, path: reqPath } = request;
   if (reqPath === "/api/devices" || reqPath.startsWith(DEVICES_PREFIX)) {
@@ -1291,29 +1560,31 @@ async function route(app: AppContext, request: Request): Promise<Response> {
 
   if (method === "GET") {
     switch (reqPath) {
+      case "/api/poll":
+        return await pollSnapshot(app, request);
       case "/api/health":
-        return Response.json(200, app.healthView());
+        return jsonWithEtag(request, app.healthView());
       case "/api/messages":
-        return Response.json(200, { messages: app.panelMessages() });
+        return jsonWithEtag(request, { messages: app.panelMessages() });
       case "/api/workers":
-        return Response.json(200, { workers: await app.workerCards() });
+        return jsonWithEtag(request, { workers: await app.workerCards() });
       case "/api/activity":
-        return Response.json(200, await app.activityView());
+        return jsonWithEtag(request, await app.activityView());
       case "/api/settings/models":
-        return Response.json(200, await app.modelsView());
+        return maybeCompressApiResponse(request, Response.json(200, await app.modelsView()));
       case "/api/settings/accounts":
-        return Response.json(200, await app.accountsView());
+        return maybeCompressApiResponse(request, Response.json(200, await app.accountsView()));
       case "/api/settings/accounts/login":
-        return Response.json(200, { login: app.loginView() });
+        return maybeCompressApiResponse(request, Response.json(200, { login: app.loginView() }));
       case "/api/settings/general":
-        return Response.json(200, app.generalView());
+        return maybeCompressApiResponse(request, Response.json(200, app.generalView()));
       case "/api/wechat":
-        return Response.json(200, app.wechatStatus());
+        return maybeCompressApiResponse(request, Response.json(200, app.wechatStatus()));
       default:
         if (reqPath.startsWith(WORKERS_PREFIX)) {
           const worker = await app.workerDetail(reqPath.slice(WORKERS_PREFIX.length));
           if (worker !== null && worker !== undefined) {
-            return Response.json(200, worker);
+            return jsonWithEtag(request, worker);
           }
           return Response.error(404, "Worker not found");
         }
@@ -1425,16 +1696,47 @@ export function contentType(filePath: string): string {
   return MIME_TYPES[lower] ?? "application/octet-stream";
 }
 
-async function isRegularFile(filePath: string): Promise<boolean> {
+async function statRegularFile(filePath: string): Promise<fs.Stats | null> {
   try {
-    return (await fs.promises.stat(filePath)).isFile();
+    const st = await fs.promises.stat(filePath);
+    return st.isFile() ? st : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
+async function loadStaticEntry(file: string, stat: fs.Stats): Promise<StaticCacheEntry> {
+  const cached = staticFileCache.get(file);
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+    // Refresh LRU order.
+    staticFileCache.delete(file);
+    staticFileCache.set(file, cached);
+    return cached;
+  }
+  const buf = await fs.promises.readFile(file);
+  const raw = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+  const entry: StaticCacheEntry = {
+    mtimeMs: stat.mtimeMs,
+    size: stat.size,
+    contentType: contentType(file),
+    etag: weakEtag(raw),
+    raw,
+    totalBytes: raw.byteLength,
+  };
+  if (cached) {
+    staticFileCache.delete(file);
+    staticCacheTotalBytes -= cached.totalBytes;
+  }
+  if (entry.totalBytes <= MAX_STATIC_CACHE_BYTES) {
+    evictStaticCache(entry.totalBytes);
+    staticFileCache.set(file, entry);
+    staticCacheTotalBytes += entry.totalBytes;
+  }
+  return entry;
+}
+
 /** A file of the web build; any path that names no file is the app itself, which routes within the page. */
-export async function webFile(webDir: string, reqPath: string): Promise<Response> {
+export async function webFile(webDir: string, reqPath: string, request?: Request): Promise<Response> {
   const parts = reqPath.split("/").filter((part) => part.length > 0);
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
@@ -1444,26 +1746,86 @@ export async function webFile(webDir: string, reqPath: string): Promise<Response
   }
 
   let file = parts.length === 0 ? webDir : path.join(webDir, ...parts);
-  if (!(await isRegularFile(file))) {
+  let stat = parts.length === 0 ? null : await statRegularFile(file);
+  let isSpaFallback = false;
+  if (stat === null) {
     // A missing asset is an error; a missing page is a route of the app.
     if (parts.length > 0 && parts[parts.length - 1].includes(".")) {
       return Response.error(404, "Not found");
     }
     file = path.join(webDir, "index.html");
+    stat = await statRegularFile(file);
+    if (stat === null) {
+      return Response.error(404, "Not found");
+    }
+    isSpaFallback = true;
   }
 
   try {
-    const buf = await fs.promises.readFile(file);
+    const entry = await loadStaticEntry(file, stat);
+    const cacheControl =
+      !isSpaFallback && isImmutableWebAsset(parts)
+        ? "public, max-age=31536000, immutable"
+        : "no-cache";
+    const compressible = isCompressibleMime(entry.contentType) && entry.raw.byteLength >= MIN_COMPRESS_BYTES;
+
+    const baseHeaders: Array<[string, string]> = [
+      ["cache-control", cacheControl],
+      ["etag", entry.etag],
+      ["content-security-policy", PAGE_POLICY],
+      ["x-content-type-options", "nosniff"],
+      ["referrer-policy", "no-referrer"],
+    ];
+    if (compressible) {
+      baseHeaders.push(["vary", "accept-encoding"]);
+    }
+
+    if (request && etagMatches(request.header("if-none-match"), entry.etag)) {
+      return new Response({
+        status: 304,
+        contentType: entry.contentType,
+        body: EMPTY_BODY,
+        headers: baseHeaders,
+      });
+    }
+
+    let body = entry.raw;
+    if (request && compressible) {
+      const encoding = negotiateEncoding(request.header("accept-encoding"));
+      if (encoding === "br") {
+        if (entry.br === undefined) {
+          entry.br = compressBytes(entry.raw, "br");
+          if (entry.br && staticFileCache.get(file) === entry) {
+            evictStaticCache(entry.br.byteLength);
+            entry.totalBytes += entry.br.byteLength;
+            staticCacheTotalBytes += entry.br.byteLength;
+          }
+        }
+        if (entry.br) {
+          body = entry.br;
+          baseHeaders.push(["content-encoding", "br"]);
+        }
+      } else if (encoding === "gzip") {
+        if (entry.gzip === undefined) {
+          entry.gzip = compressBytes(entry.raw, "gzip");
+          if (entry.gzip && staticFileCache.get(file) === entry) {
+            evictStaticCache(entry.gzip.byteLength);
+            entry.totalBytes += entry.gzip.byteLength;
+            staticCacheTotalBytes += entry.gzip.byteLength;
+          }
+        }
+        if (entry.gzip) {
+          body = entry.gzip;
+          baseHeaders.push(["content-encoding", "gzip"]);
+        }
+      }
+    }
+
     return new Response({
       status: 200,
-      contentType: contentType(file),
-      body: new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength),
-      headers: [
-        ["cache-control", "no-cache"],
-        ["content-security-policy", PAGE_POLICY],
-        ["x-content-type-options", "nosniff"],
-        ["referrer-policy", "no-referrer"],
-      ],
+      contentType: entry.contentType,
+      body,
+      headers: baseHeaders,
     });
   } catch {
     return Response.error(404, "Not found");
@@ -1552,7 +1914,7 @@ export async function handle(
     return Response.error(404, "Not found");
   }
   if (access.webDir !== undefined) {
-    return await webFile(access.webDir, request.path);
+    return await webFile(access.webDir, request.path, request);
   }
   return Response.error(404, "Not found");
 }

@@ -40,8 +40,49 @@ class ChatPage extends StatelessWidget {
   final VoidCallback onOpenSettings;
   final FilePicker picker;
 
+  @override
+  Widget build(BuildContext context) {
+    final strings = Strings.read(context);
+    final palette = Palette.of(context);
+    return ColoredBox(
+      color: palette.background,
+      child: Column(
+        children: [
+          PageHeader(
+            title: strings.chat,
+            subtitle: const LinkPill(),
+            actions: const [_ResetChatButton()],
+          ),
+          Expanded(
+            child: Selectable(
+              child: Column(
+                children: [
+                  LinkNotice(onOpenSettings: onOpenSettings),
+                  const Expanded(
+                    child: Stack(
+                      children: [
+                        Positioned.fill(child: _ChatBody()),
+                        // Floats over the newest messages, just above the composer.
+                        Positioned(right: 12, bottom: 6, child: ActivityTicker()),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          Composer(picker: picker),
+        ],
+      ),
+    );
+  }
+}
+
+class _ResetChatButton extends StatelessWidget {
+  const _ResetChatButton();
+
   Future<void> _reset(BuildContext context) async {
-    final state = AppScope.of(context);
+    final state = AppScope.read(context);
     final strings = Strings.read(context);
     final confirmed = await showCupertinoDialog<bool>(
       context: context,
@@ -77,54 +118,33 @@ class ChatPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final online = AppScope.of(context, aspect: AppAspect.connection).link == Link.online;
     final strings = Strings.read(context);
     final palette = Palette.of(context);
-    return ColoredBox(
-      color: palette.background,
-      child: Column(
-        children: [
-          PageHeader(
-            title: strings.chat,
-            subtitle: const LinkPill(),
-            actions: [
-              Tappable(
-                tooltip: strings.resetConversation,
-                onTap: state.link == Link.online ? () => unawaited(_reset(context)) : null,
-                padding: const EdgeInsets.all(8),
-                child: Icon(CupertinoIcons.arrow_counterclockwise, size: 19, color: palette.secondary),
-              ),
-            ],
-          ),
-          Expanded(
-            child: Selectable(
-              child: Column(
-                children: [
-                  LinkNotice(onOpenSettings: onOpenSettings),
-                  Expanded(
-                    child: Stack(
-                      children: [
-                        Positioned.fill(
-                          child: state.messages.isEmpty
-                              ? switch (state.link) {
-                                  Link.starting || Link.connecting => const Center(child: CupertinoActivityIndicator(radius: 12)),
-                                  _ => EmptyState(icon: CupertinoIcons.chat_bubble_2, title: strings.chatEmptyTitle, hint: strings.chatEmptyHint),
-                                }
-                              : Transcript(messages: state.messages),
-                        ),
-                        // Floats over the newest messages, just above the composer.
-                        const Positioned(right: 12, bottom: 6, child: ActivityTicker()),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          Composer(picker: picker),
-        ],
-      ),
+    return Tappable(
+      tooltip: strings.resetConversation,
+      onTap: online ? () => unawaited(_reset(context)) : null,
+      padding: const EdgeInsets.all(8),
+      child: Icon(CupertinoIcons.arrow_counterclockwise, size: 19, color: palette.secondary),
     );
+  }
+}
+
+class _ChatBody extends StatelessWidget {
+  const _ChatBody();
+
+  @override
+  Widget build(BuildContext context) {
+    final messages = AppScope.of(context, aspect: AppAspect.messages).messages;
+    if (messages.isEmpty) {
+      final link = AppScope.of(context, aspect: AppAspect.connection).link;
+      final strings = Strings.read(context);
+      return switch (link) {
+        Link.starting || Link.connecting => const Center(child: CupertinoActivityIndicator(radius: 12)),
+        _ => EmptyState(icon: CupertinoIcons.chat_bubble_2, title: strings.chatEmptyTitle, hint: strings.chatEmptyHint),
+      };
+    }
+    return Transcript(messages: messages);
   }
 }
 
@@ -141,15 +161,24 @@ class Transcript extends StatefulWidget {
 class _TranscriptState extends State<Transcript> {
   final ScrollController _scroll = ScrollController();
   bool _follow = true;
+  bool _jumpingToEnd = false;
+  double _lastPixels = 0;
+  double _lastMaxExtent = 0;
 
   @override
   void initState() {
     super.initState();
-    _scroll.addListener(() {
-      if (!_scroll.hasClients) return;
-      _follow = _scroll.position.maxScrollExtent - _scroll.position.pixels < 80;
-    });
+    _scroll.addListener(_onScroll);
     _toEnd();
+  }
+
+  void _onScroll() {
+    if (!_scroll.hasClients) return;
+    final pixels = _scroll.position.pixels;
+    final moved = (pixels - _lastPixels).abs() > 0.5;
+    _lastPixels = pixels;
+    if (_jumpingToEnd || !moved) return;
+    _follow = _scroll.position.maxScrollExtent - pixels < 80;
   }
 
   bool _messagesChanged(List<ChatMessage> prev, List<ChatMessage> next) {
@@ -165,35 +194,65 @@ class _TranscriptState extends State<Transcript> {
     if (_follow && _messagesChanged(oldWidget.messages, widget.messages)) _toEnd();
   }
 
-  void _toEnd() {
+  void _toEnd([int remaining = 5]) {
+    if (remaining <= 0) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || !_scroll.hasClients) return;
-      _scroll.jumpTo(_scroll.position.maxScrollExtent);
-      // What was just laid out may be taller than estimated: once more when it is known.
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted && _scroll.hasClients && _follow) _scroll.jumpTo(_scroll.position.maxScrollExtent);
-      });
+      if (!mounted || !_scroll.hasClients || !_follow) return;
+      final target = _scroll.position.maxScrollExtent;
+      _lastMaxExtent = target;
+      final gap = (target - _scroll.position.pixels).abs();
+      if (gap > 0.5) {
+        _jumpingToEnd = true;
+        try {
+          _scroll.jumpTo(target);
+          _lastPixels = _scroll.position.pixels;
+        } finally {
+          _jumpingToEnd = false;
+        }
+        // Newly laid-out variable-height items can expand maxScrollExtent; converge until settled.
+        _toEnd(remaining - 1);
+      } else if (remaining == 5) {
+        _toEnd(1);
+      }
     });
   }
 
   @override
   void dispose() {
+    _scroll.removeListener(_onScroll);
     _scroll.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return CupertinoScrollbar(
-      controller: _scroll,
-      child: Selectable(
-        child: ListView.builder(
+    return RepaintBoundary(
+      child: NotificationListener<ScrollMetricsNotification>(
+        onNotification: (notification) {
+          final maxExtent = notification.metrics.maxScrollExtent;
+          final grew = maxExtent > _lastMaxExtent + 0.5;
+          _lastMaxExtent = maxExtent;
+          if (grew && _follow && !_jumpingToEnd && _scroll.hasClients) {
+            if (maxExtent - notification.metrics.pixels > 0.5) {
+              _toEnd(2);
+            }
+          }
+          return false;
+        },
+        child: CupertinoScrollbar(
           controller: _scroll,
-          padding: const EdgeInsets.symmetric(horizontal: grid * 2.5, vertical: grid * 2),
-          itemCount: widget.messages.length,
-          itemBuilder: (context, index) => Padding(
-            padding: const EdgeInsets.only(bottom: grid * 2),
-            child: MessageView(key: ValueKey(widget.messages[index].id), message: widget.messages[index]),
+          child: Selectable(
+            child: ListView.builder(
+              controller: _scroll,
+              scrollCacheExtent: const ScrollCacheExtent.pixels(600),
+              addAutomaticKeepAlives: false,
+              padding: const EdgeInsets.symmetric(horizontal: grid * 2.5, vertical: grid * 2),
+              itemCount: widget.messages.length,
+              itemBuilder: (context, index) => Padding(
+                padding: const EdgeInsets.only(bottom: grid * 2),
+                child: MessageView(key: ValueKey(widget.messages[index].id), message: widget.messages[index]),
+              ),
+            ),
           ),
         ),
       ),
@@ -247,7 +306,13 @@ class MessageView extends StatelessWidget {
                   borderRadius: BorderRadius.circular(radius),
                   child: ConstrainedBox(
                     constraints: const BoxConstraints(maxWidth: 320, maxHeight: 320),
-                    child: Image.memory(image.bytes, semanticLabel: image.name, fit: BoxFit.contain, errorBuilder: (context, error, stack) => FileChip(name: image.name, detail: image.mediaType)),
+                    child: Image.memory(
+                      image.bytes,
+                      semanticLabel: image.name,
+                      fit: BoxFit.contain,
+                      gaplessPlayback: true,
+                      errorBuilder: (context, error, stack) => FileChip(name: image.name, detail: image.mediaType),
+                    ),
                   ),
                 ),
               ),
@@ -319,12 +384,6 @@ class _ComposerState extends State<Composer> {
   String? _pendingDraft;
 
   @override
-  void initState() {
-    super.initState();
-    _text.addListener(() => setState(() {}));
-  }
-
-  @override
   void dispose() {
     _text.dispose();
     _focus.dispose();
@@ -359,11 +418,11 @@ class _ComposerState extends State<Composer> {
   }
 
   Future<void> _send() async {
-    final state = AppScope.of(context);
+    final state = AppScope.read(context);
     final strings = Strings.read(context);
     final text = _text.text.trim();
     if (_sending || (text.isEmpty && _files.isEmpty) || state.link != Link.online) return;
-    if (text.characters.length > maxTextChars) {
+    if (text.length > maxTextChars && text.characters.length > maxTextChars) {
       setState(() => _error = strings.textTooLong(maxTextChars));
       return;
     }
@@ -394,13 +453,11 @@ class _ComposerState extends State<Composer> {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final online = AppScope.of(context, aspect: AppAspect.connection).link == Link.online;
     final strings = Strings.read(context);
     final palette = Palette.of(context);
     final typo = Typo.of(context);
-    final online = state.link == Link.online;
-    final ready = online && !_sending && (_text.text.trim().isNotEmpty || _files.isNotEmpty);
-    final length = _text.text.characters.length;
+    final hasFiles = _files.isNotEmpty;
     return Container(
       decoration: BoxDecoration(color: palette.background, border: Border(top: BorderSide(color: palette.separator, width: 0.5))),
       padding: EdgeInsets.fromLTRB(grid * 2, grid * 1.25, grid * 2, grid * 1.25 + MediaQuery.paddingOf(context).bottom),
@@ -409,7 +466,7 @@ class _ComposerState extends State<Composer> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           if (_error != null) Padding(padding: const EdgeInsets.only(bottom: grid), child: Selectable(child: Notice(_error!))),
-          if (_files.isNotEmpty)
+          if (hasFiles)
             Padding(
               padding: const EdgeInsets.only(bottom: grid),
               child: Wrap(
@@ -454,30 +511,47 @@ class _ComposerState extends State<Composer> {
                 ),
               ),
               const SizedBox(width: 8),
-              Semantics(
-                button: true,
-                label: strings.send,
-                child: GestureDetector(
-                  onTap: ready ? () => unawaited(_send()) : null,
-                  child: MouseRegion(
-                    cursor: ready ? SystemMouseCursors.click : MouseCursor.defer,
-                    child: AnimatedContainer(
-                      duration: const Duration(milliseconds: 120),
-                      width: 36,
-                      height: 36,
-                      decoration: BoxDecoration(color: ready ? palette.accent : palette.strongFill, shape: BoxShape.circle),
-                      child: _sending
-                          ? const CupertinoActivityIndicator(radius: 8)
-                          : Icon(CupertinoIcons.arrow_up, size: 18, color: ready ? CupertinoColors.white : palette.tertiary),
+              ValueListenableBuilder<TextEditingValue>(
+                valueListenable: _text,
+                builder: (context, value, _) {
+                  final ready = online && !_sending && (value.text.trim().isNotEmpty || hasFiles);
+                  return Semantics(
+                    button: true,
+                    label: strings.send,
+                    child: GestureDetector(
+                      onTap: ready ? () => unawaited(_send()) : null,
+                      child: MouseRegion(
+                        cursor: ready ? SystemMouseCursors.click : MouseCursor.defer,
+                        child: Container(
+                          width: 36,
+                          height: 36,
+                          decoration: BoxDecoration(color: ready ? palette.accent : palette.strongFill, shape: BoxShape.circle),
+                          child: _sending
+                              ? const CupertinoActivityIndicator(radius: 8)
+                              : Icon(CupertinoIcons.arrow_up, size: 18, color: ready ? CupertinoColors.white : palette.tertiary),
+                        ),
+                      ),
                     ),
-                  ),
-                ),
+                  );
+                },
               ),
             ],
           ),
           Padding(
             padding: const EdgeInsets.only(top: 5, left: 48),
-            child: Text(length > maxTextChars - 1000 ? '$length / $maxTextChars' : strings.sendShortcut, style: typo.caption.copyWith(color: length > maxTextChars ? palette.red : palette.tertiary)),
+            child: ValueListenableBuilder<TextEditingValue>(
+              valueListenable: _text,
+              builder: (context, value, _) {
+                final text = value.text;
+                // UTF-16 length is always >= grapheme cluster count; skip expensive grapheme iteration until near limit.
+                final int? nearLength = text.length > maxTextChars - 1000 ? text.characters.length : null;
+                final showCount = nearLength != null && nearLength > maxTextChars - 1000;
+                return Text(
+                  showCount ? '$nearLength / $maxTextChars' : strings.sendShortcut,
+                  style: typo.caption.copyWith(color: (nearLength ?? 0) > maxTextChars ? palette.red : palette.tertiary),
+                );
+              },
+            ),
           ),
         ],
       ),

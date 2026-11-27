@@ -24,7 +24,8 @@ for high in range(0xA1, 0xF8):
 
 options = subset.Options()
 options.font_number = face
-options.layout_features = ["kern", "liga", "locl", "vert"]
+# Face index already selects Noto Sans CJK SC; keep horizontal shaping only (drop unused locl/vert variants).
+options.layout_features = ["kern", "liga"]
 options.name_IDs = [1, 2, 3, 4, 6]
 options.notdef_outline = True
 options.desubroutinize = True

@@ -1,4 +1,4 @@
-/// Gives the pages the app's state.
+/// Gives the pages the app's state with granular per-aspect subscriptions so unrelated polls do not rebuild hidden or unaffected UI.
 library;
 
 import 'package:cupertino_ui/cupertino_ui.dart';
@@ -8,11 +8,99 @@ import '../state/app_state.dart';
 import 'theme.dart';
 import 'widgets.dart';
 
-/// Rebuilds the widgets that read it whenever the state changes.
-class AppScope extends InheritedNotifier<AppState> {
-  const AppScope({super.key, required AppState state, required super.child}) : super(notifier: state);
+/// Provides [AppState] to descendants using an [InheritedModel] keyed by [AppAspect].
+class AppScope extends StatelessWidget {
+  const AppScope({super.key, required this.state, required this.child});
 
-  static AppState of(BuildContext context) => context.dependOnInheritedWidgetOfExactType<AppScope>()!.notifier!;
+  final AppState state;
+  final Widget child;
+
+  /// Subscribes [context] to [AppState]. Pass [aspect] to rebuild only when that specific slice changes.
+  static AppState of(BuildContext context, {AppAspect? aspect}) {
+    if (aspect != null) {
+      return InheritedModel.inheritFrom<_AppModel>(context, aspect: aspect)!.state;
+    }
+    return context.dependOnInheritedWidgetOfExactType<_AppModel>()!.state;
+  }
+
+  /// Reads [AppState] without registering a rebuild dependency (for callbacks and event handlers).
+  static AppState read(BuildContext context) => context.getInheritedWidgetOfExactType<_AppModel>()!.state;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: state,
+      builder: (context, child) => _AppModel(
+        state: state,
+        connectionRev: state.connectionRev,
+        messagesRev: state.messagesRev,
+        workersRev: state.workersRev,
+        workerDetailRev: state.workerDetailRev,
+        activityRev: state.activityRev,
+        devicesRev: state.devicesRev,
+        healthRev: state.healthRev,
+        badgesRev: state.badgesRev,
+        child: child!,
+      ),
+      child: child,
+    );
+  }
+}
+
+class _AppModel extends InheritedModel<AppAspect> {
+  const _AppModel({
+    required this.state,
+    required this.connectionRev,
+    required this.messagesRev,
+    required this.workersRev,
+    required this.workerDetailRev,
+    required this.activityRev,
+    required this.devicesRev,
+    required this.healthRev,
+    required this.badgesRev,
+    required super.child,
+  });
+
+  final AppState state;
+  final int connectionRev;
+  final int messagesRev;
+  final int workersRev;
+  final int workerDetailRev;
+  final int activityRev;
+  final int devicesRev;
+  final int healthRev;
+  final int badgesRev;
+
+  @override
+  bool updateShouldNotify(_AppModel oldWidget) =>
+      !identical(state, oldWidget.state) ||
+      connectionRev != oldWidget.connectionRev ||
+      messagesRev != oldWidget.messagesRev ||
+      workersRev != oldWidget.workersRev ||
+      workerDetailRev != oldWidget.workerDetailRev ||
+      activityRev != oldWidget.activityRev ||
+      devicesRev != oldWidget.devicesRev ||
+      healthRev != oldWidget.healthRev ||
+      badgesRev != oldWidget.badgesRev;
+
+  @override
+  bool updateShouldNotifyDependent(_AppModel oldWidget, Set<AppAspect> dependencies) {
+    if (!identical(state, oldWidget.state)) return true;
+    for (final aspect in dependencies) {
+      final changed = switch (aspect) {
+        AppAspect.connection => connectionRev != oldWidget.connectionRev,
+        AppAspect.messages => messagesRev != oldWidget.messagesRev,
+        AppAspect.workers => workersRev != oldWidget.workersRev,
+        AppAspect.workerDetail => workerDetailRev != oldWidget.workerDetailRev,
+        AppAspect.activity => activityRev != oldWidget.activityRev,
+        AppAspect.devices => devicesRev != oldWidget.devicesRev,
+        AppAspect.health => healthRev != oldWidget.healthRev,
+        AppAspect.badges => badgesRev != oldWidget.badgesRev,
+      };
+      if (changed) return true;
+    }
+    return false;
+  }
 }
 
 /// The connection in one small label: connected, paused, or what is in the way.
@@ -21,7 +109,7 @@ class LinkPill extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(context, aspect: AppAspect.connection);
     final strings = Strings.read(context);
     final palette = Palette.of(context);
     final (text, color) = switch (state.link) {
@@ -46,7 +134,7 @@ class LinkNotice extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(context, aspect: AppAspect.connection);
     final strings = Strings.read(context);
     final palette = Palette.of(context);
     final typo = Typo.of(context);

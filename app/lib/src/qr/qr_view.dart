@@ -1,9 +1,30 @@
 /// Draws a QR code.
 library;
 
+import 'dart:collection';
+
 import 'package:flutter/widgets.dart';
 
 import 'qr_code.dart';
+
+final LinkedHashMap<String, QrCode?> _qrCache = LinkedHashMap<String, QrCode?>();
+
+QrCode? _cachedQrCode(String content) {
+  if (_qrCache.containsKey(content)) {
+    final hit = _qrCache.remove(content);
+    _qrCache[content] = hit;
+    return hit;
+  }
+  QrCode? encoded;
+  try {
+    encoded = QrCode.encode(content);
+  } on ArgumentError {
+    encoded = null;
+  }
+  if (_qrCache.length >= 16) _qrCache.remove(_qrCache.keys.first);
+  _qrCache[content] = encoded;
+  return encoded;
+}
 
 /// The QR code of [content], dark on light with the quiet zone the standard asks for; a mark in its place when the
 /// content is too long to encode.
@@ -15,16 +36,16 @@ class QrView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final QrCode code;
-    try {
-      code = QrCode.encode(content);
-    } on ArgumentError {
+    final code = _cachedQrCode(content);
+    if (code == null) {
       return SizedBox(width: size, height: size, child: const Center(child: Text('QR')));
     }
-    return Semantics(
-      label: 'QR',
-      image: true,
-      child: CustomPaint(size: Size.square(size), painter: _QrPainter(code)),
+    return RepaintBoundary(
+      child: Semantics(
+        label: 'QR',
+        image: true,
+        child: CustomPaint(size: Size.square(size), painter: _QrPainter(code)),
+      ),
     );
   }
 }

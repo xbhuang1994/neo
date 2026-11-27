@@ -4,6 +4,7 @@ library;
 import 'package:cupertino_ui/cupertino_ui.dart';
 
 import '../l10n/strings.dart';
+import '../state/app_state.dart';
 import 'activity_ticker.dart';
 import 'chat_page.dart';
 import 'devices_page.dart';
@@ -25,35 +26,41 @@ class Shell extends StatefulWidget {
 
 class _ShellState extends State<Shell> {
   int _page = 0;
+  // Mount non-initial tabs lazily on first visit, then keep them alive so drafts & scroll positions survive tab switches.
+  final List<bool> _visited = [true, false, false, false];
+
+  void _openDevices() => _go(2);
+  void _openSettings() => _go(3);
 
   void _go(int page) {
     if (page == _page) return;
     Selectable.clearActiveSelection();
-    setState(() => _page = page);
+    AppScope.read(context).setActiveTab(page);
+    setState(() {
+      _page = page;
+      _visited[page] = true;
+    });
+  }
+
+  Widget _tabChild(int index, Widget Function() builder) {
+    if (!_visited[index]) return const SizedBox.shrink();
+    return TickerMode(enabled: _page == index, child: builder());
   }
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
-    final strings = Strings.read(context);
     final palette = Palette.of(context);
-    final entries = [
-      (CupertinoIcons.chat_bubble_2, CupertinoIcons.chat_bubble_2_fill, strings.chat, 0),
-      (CupertinoIcons.square_stack_3d_up, CupertinoIcons.square_stack_3d_up_fill, strings.workers, state.activeWorkers),
-      (CupertinoIcons.desktopcomputer, CupertinoIcons.desktopcomputer, strings.devices, state.pendingDeviceApprovals),
-      (CupertinoIcons.gear, CupertinoIcons.gear_solid, strings.settings, 0),
-    ];
-    // Every page stays alive, so a draft or a scroll position survives a visit elsewhere.
+    // Every visited page stays alive, while offscreen tabs pause tickers so hidden animations never waste CPU.
     final pages = Stack(
       children: [
         Positioned.fill(
           child: IndexedStack(
             index: _page,
             children: [
-              ChatPage(onOpenSettings: () => _go(3), picker: widget.picker),
-              WorkersPage(onOpenSettings: () => _go(3)),
-              DevicesPage(onOpenSettings: () => _go(3)),
-              SettingsPage(onOpenDevices: () => _go(2)),
+              _tabChild(0, () => ChatPage(onOpenSettings: _openSettings, picker: widget.picker)),
+              _tabChild(1, () => WorkersPage(onOpenSettings: _openSettings)),
+              _tabChild(2, () => DevicesPage(onOpenSettings: _openSettings)),
+              _tabChild(3, () => SettingsPage(onOpenDevices: _openDevices)),
             ],
           ),
         ),
@@ -68,7 +75,7 @@ class _ShellState extends State<Shell> {
             color: palette.background,
             child: Row(
               children: [
-                _Sidebar(entries: entries, page: _page, onSelect: _go),
+                _Sidebar(page: _page, onSelect: _go),
                 Container(width: 0.5, color: palette.separator),
                 Expanded(child: pages),
               ],
@@ -80,7 +87,7 @@ class _ShellState extends State<Shell> {
           child: Column(
             children: [
               Expanded(child: pages),
-              _TabBar(entries: entries, page: _page, onSelect: _go),
+              _TabBar(page: _page, onSelect: _go),
             ],
           ),
         );
@@ -90,6 +97,17 @@ class _ShellState extends State<Shell> {
 }
 
 typedef _Entry = (IconData, IconData, String, int);
+
+List<_Entry> _navEntries(BuildContext context) {
+  final state = AppScope.of(context, aspect: AppAspect.badges);
+  final strings = Strings.read(context);
+  return [
+    (CupertinoIcons.chat_bubble_2, CupertinoIcons.chat_bubble_2_fill, strings.chat, 0),
+    (CupertinoIcons.square_stack_3d_up, CupertinoIcons.square_stack_3d_up_fill, strings.workers, state.activeWorkers),
+    (CupertinoIcons.desktopcomputer, CupertinoIcons.desktopcomputer, strings.devices, state.pendingDeviceApprovals),
+    (CupertinoIcons.gear, CupertinoIcons.gear_solid, strings.settings, 0),
+  ];
+}
 
 class _Badge extends StatelessWidget {
   const _Badge(this.count);
@@ -109,14 +127,14 @@ class _Badge extends StatelessWidget {
 }
 
 class _Sidebar extends StatelessWidget {
-  const _Sidebar({required this.entries, required this.page, required this.onSelect});
+  const _Sidebar({required this.page, required this.onSelect});
 
-  final List<_Entry> entries;
   final int page;
   final ValueChanged<int> onSelect;
 
   @override
   Widget build(BuildContext context) {
+    final entries = _navEntries(context);
     final strings = Strings.read(context);
     final palette = Palette.of(context);
     final typo = Typo.of(context);
@@ -173,14 +191,14 @@ class _Sidebar extends StatelessWidget {
 }
 
 class _TabBar extends StatelessWidget {
-  const _TabBar({required this.entries, required this.page, required this.onSelect});
+  const _TabBar({required this.page, required this.onSelect});
 
-  final List<_Entry> entries;
   final int page;
   final ValueChanged<int> onSelect;
 
   @override
   Widget build(BuildContext context) {
+    final entries = _navEntries(context);
     final palette = Palette.of(context);
     final typo = Typo.of(context);
     return Container(

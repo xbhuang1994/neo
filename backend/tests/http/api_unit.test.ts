@@ -3,6 +3,7 @@ import { Buffer } from "node:buffer";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as zlib from "node:zlib";
 import { StopWorkerError } from "../../src/app/context.ts";
 import type { AppContext, ChatAttachment, ChatReceipt, WeChatStatus } from "../../src/app/context.ts";
 import {
@@ -13,9 +14,11 @@ import {
   Request,
   contentType,
   decodeStrictBase64,
+  etagMatches,
   handle,
   hostName,
   isLoopback,
+  negotiateEncoding,
   parseAttachment,
   refused,
   sameSecret,
@@ -906,5 +909,153 @@ describe("fixture-agy stand-in CLI", () => {
     } finally {
       await mockMcp.close();
     }
+  });
+});
+
+describe("HTTP compression, ETag caching, and combined /api/poll", () => {
+  const local: SocketAddr = { host: "127.0.0.1", port: 50000 };
+
+  test("negotiateEncoding and etagMatches follow HTTP content negotiation rules", () => {
+    expect(negotiateEncoding(undefined)).toBeNull();
+    expect(negotiateEncoding("gzip, deflate, br")).toBe("br");
+    expect(negotiateEncoding("gzip, deflate")).toBe("gzip");
+    expect(negotiateEncoding("br;q=0, gzip;q=0.8")).toBe("gzip");
+    expect(negotiateEncoding("br;q=0, gzip;q=0")).toBeNull();
+    expect(negotiateEncoding("gzip;q=1.0, br;q=0.5")).toBe("gzip");
+
+    expect(etagMatches('W/"abc"', 'W/"abc"')).toBe(true);
+    expect(etagMatches('"abc"', 'W/"abc"')).toBe(true);
+    expect(etagMatches('W/"x", "abc", W/"y"', 'W/"abc"')).toBe(true);
+    expect(etagMatches("*", 'W/"anything"')).toBe(true);
+    expect(etagMatches('W/"other"', 'W/"abc"')).toBe(false);
+  });
+
+  test("webFile serves compressed br/gzip bodies, 304 Not Modified on ETag match, and immutable fallback fonts", async () => {
+    using dir = new TempDir("http-perf-web");
+    const web = dir.join("web");
+    const fontDir = path.join(web, "fonts", "fallback", "notocoloremoji", "v39");
+    fs.mkdirSync(fontDir, { recursive: true });
+    const bigJs = `console.log(${JSON.stringify("neo-client-perf-".repeat(200))});`;
+    fs.writeFileSync(path.join(web, "index.html"), "<!doctype html><title>Neo</title>");
+    fs.writeFileSync(path.join(web, "main.dart.js"), bigJs);
+    fs.writeFileSync(path.join(fontDir, "slice.0.woff2"), Uint8Array.from({ length: 1024 }, (_, i) => i & 255));
+
+    // Brotli compressed JS with ETag & Vary.
+    const brRes = await webFile(web, "/main.dart.js", makeRequest([["accept-encoding", "gzip, br"]]));
+    expect(brRes.status).toBe(200);
+    expect(responseHeader(brRes.headers, "content-encoding")).toBe("br");
+    expect(responseHeader(brRes.headers, "vary")).toBe("accept-encoding");
+    const etag = responseHeader(brRes.headers, "etag");
+    expect(etag).toBeDefined();
+    expect(brRes.body.byteLength).toBeLessThan(bigJs.length / 4);
+    expect(zlib.brotliDecompressSync(brRes.body).toString("utf8")).toBe(bigJs);
+
+    // Gzip compressed JS.
+    const gzRes = await webFile(web, "/main.dart.js", makeRequest([["accept-encoding", "gzip"]]));
+    expect(gzRes.status).toBe(200);
+    expect(responseHeader(gzRes.headers, "content-encoding")).toBe("gzip");
+    expect(zlib.gunzipSync(gzRes.body).toString("utf8")).toBe(bigJs);
+
+    // Conditional If-None-Match -> 304 with empty body.
+    const cachedRes = await webFile(
+      web,
+      "/main.dart.js",
+      makeRequest([
+        ["accept-encoding", "gzip, br"],
+        ["if-none-match", etag!],
+      ]),
+    );
+    expect(cachedRes.status).toBe(304);
+    expect(cachedRes.body.byteLength).toBe(0);
+    expect(responseHeader(cachedRes.headers, "etag")).toBe(etag);
+
+    // Versioned fallback woff2 fonts get immutable long-lived caching and are not re-compressed.
+    const fontRes = await webFile(
+      web,
+      "/fonts/fallback/notocoloremoji/v39/slice.0.woff2",
+      makeRequest([["accept-encoding", "gzip, br"]]),
+    );
+    expect(fontRes.status).toBe(200);
+    expect(responseHeader(fontRes.headers, "cache-control")).toBe("public, max-age=31536000, immutable");
+    expect(responseHeader(fontRes.headers, "content-encoding")).toBeUndefined();
+  });
+
+  test("GET /api/poll returns only changed slices, 304 when unchanged, and compresses large payloads", async () => {
+    let activityLine = "working step 1";
+    const bigText = "性能优化测试内容 ".repeat(120);
+    const app = mockApp({
+      panelMessages: () => [{ id: 0, role: "assistant", text: bigText, source: "chat-reply" }],
+      workerCards: async () => [{ ticketId: "t1", title: "Task 1", stage: { stage: "working" } }],
+      activityView: async () => ({ router: false, workers: [{ ticketId: "t1", title: "Task 1", doing: activityLine }] }),
+      workerDetail: async (id) => (id === "t1" ? { ticketId: "t1", recent: [{ id: 1, role: "assistant", text: "ok" }] } : null),
+    });
+
+    // Initial poll returns all requested slices compressed with brotli.
+    const firstReq = new Request({
+      method: "GET",
+      path: "/api/poll",
+      query: "include=m,w,a,wd,h&worker=t1&health=1",
+      headers: { host: "127.0.0.1:3082", "accept-encoding": "br, gzip" },
+    });
+    const first = await handle(app, {}, firstReq, local);
+    expect(first.status).toBe(200);
+    expect(responseHeader(first.headers, "content-encoding")).toBe("br");
+    const firstJson = JSON.parse(zlib.brotliDecompressSync(first.body).toString("utf8")) as {
+      changed: Record<string, unknown>;
+      etags: Record<string, string>;
+    };
+    expect(Object.keys(firstJson.changed).sort()).toEqual(["activity", "health", "messages", "workerDetail", "workers"]);
+
+    // Second poll with identical ETags returns 304 Not Modified (0 bytes).
+    const q2 = new URLSearchParams({
+      include: "m,w,a,wd,h",
+      worker: "t1",
+      health: "1",
+      ...firstJson.etags,
+    }).toString();
+    const unchanged = await handle(
+      app,
+      {},
+      new Request({ method: "GET", path: "/api/poll", query: q2, headers: { host: "127.0.0.1:3082" } }),
+      local,
+    );
+    expect(unchanged.status).toBe(304);
+    expect(unchanged.body.byteLength).toBe(0);
+
+    // Mutate only activity -> poll returns ONLY the activity slice.
+    activityLine = "working step 2";
+    const partial = await handle(
+      app,
+      {},
+      new Request({ method: "GET", path: "/api/poll", query: q2, headers: { host: "127.0.0.1:3082" } }),
+      local,
+    );
+    expect(partial.status).toBe(200);
+    const partialJson = parseJsonBody(partial.body) as {
+      changed: Record<string, unknown>;
+      etags: Record<string, string>;
+    };
+    expect(Object.keys(partialJson.changed)).toEqual(["activity"]);
+    expect(partialJson.etags.a).not.toBe(firstJson.etags.a);
+    expect(partialJson.etags.m).toBe(firstJson.etags.m);
+
+    // Conditional ETag on individual GET /api/messages returns 304 when unchanged.
+    const msg1 = await handle(app, {}, makeRequest([["host", "127.0.0.1:3082"]], { path: "/api/messages" }), local);
+    const msgEtag = responseHeader(msg1.headers, "etag");
+    expect(msgEtag).toBeDefined();
+    const msg2 = await handle(
+      app,
+      {},
+      makeRequest(
+        [
+          ["host", "127.0.0.1:3082"],
+          ["if-none-match", msgEtag!],
+        ],
+        { path: "/api/messages" },
+      ),
+      local,
+    );
+    expect(msg2.status).toBe(304);
+    expect(msg2.body.byteLength).toBe(0);
   });
 });

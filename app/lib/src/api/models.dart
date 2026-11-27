@@ -35,11 +35,96 @@ class ChatFile {
 
 /// One message of the conversation.
 class ChatMessage {
-  ChatMessage({required this.id, required this.fromUser, required this.text, this.at, this.source, this.images = const [], this.files = const []});
+  ChatMessage({
+    required this.id,
+    required this.fromUser,
+    required this.text,
+    this.at,
+    this.source,
+    this.images = const [],
+    this.files = const [],
+    int? imagesSignature,
+  }) : _imagesSignature = imagesSignature ?? _signatureOfImages(images);
+
+  static int _signatureOfImages(List<ChatImage> images) {
+    if (images.isEmpty) return 0;
+    return Object.hashAll([for (final img in images) Object.hash(img.name, img.mediaType, img.bytes.length)]);
+  }
+
+  static int _signatureOfRawImages(List<dynamic> rawImages) {
+    if (rawImages.isEmpty) return 0;
+    return Object.hashAll([
+      for (final raw in rawImages)
+        (() {
+          final fields = _map(raw);
+          final data = fields['data'] as String? ?? '';
+          return Object.hash(
+            fields['name'] as String? ?? 'image',
+            fields['mediaType'] as String? ?? 'image/png',
+            data.length,
+            data.isNotEmpty ? data.codeUnitAt(0) : 0,
+            data.length > 16 ? data.codeUnitAt(data.length >> 1) : 0,
+            data.isNotEmpty ? data.codeUnitAt(data.length - 1) : 0,
+          );
+        })(),
+    ]);
+  }
+
+  /// Parses a message list while reusing unchanged instances from [previous] so image [Uint8List]
+  /// buffers keep object identity for Flutter's [ImageCache] and avoid redundant base64 decoding.
+  static List<ChatMessage> parseList(List<dynamic> list, {List<ChatMessage> previous = const []}) {
+    if (list.isEmpty) return const [];
+    Map<int, ChatMessage>? prevById;
+    if (previous.isNotEmpty) {
+      prevById = {for (final msg in previous) msg.id: msg};
+    }
+    return List<ChatMessage>.unmodifiable([
+      for (final item in list) _parseOrReuse(_map(item), prevById),
+    ]);
+  }
+
+  static ChatMessage _parseOrReuse(Map<String, dynamic> json, Map<int, ChatMessage>? prevById) {
+    final id = (json['id'] as num?)?.toInt() ?? 0;
+    final prev = prevById?[id];
+    if (prev != null) {
+      final fromUser = json['role'] == 'user';
+      final text = json['text'] as String? ?? '';
+      final at = _time(json['at']);
+      final source = _text(json['source']);
+      final rawImages = _list(json['images']);
+      final rawFiles = _list(json['files']);
+      final rawImgSig = _signatureOfRawImages(rawImages);
+      if (prev.fromUser == fromUser &&
+          prev.text == text &&
+          prev.at == at &&
+          prev.source == source &&
+          prev.images.length == rawImages.length &&
+          prev.files.length == rawFiles.length &&
+          prev._imagesSignature == rawImgSig &&
+          _filesMatch(prev.files, rawFiles)) {
+        return prev;
+      }
+    }
+    return ChatMessage.fromJson(json);
+  }
+
+  static bool _filesMatch(List<ChatFile> prev, List<dynamic> rawFiles) {
+    for (var i = 0; i < prev.length; i++) {
+      final f = prev[i];
+      final m = _map(rawFiles[i]);
+      if (f.name != (m['name'] as String? ?? '') ||
+          f.mediaType != (m['mediaType'] as String? ?? '') ||
+          f.kind != (m['kind'] as String? ?? 'file')) {
+        return false;
+      }
+    }
+    return true;
+  }
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) {
+    final rawImages = _list(json['images']);
     final images = <ChatImage>[];
-    for (final image in _list(json['images'])) {
+    for (final image in rawImages) {
       final fields = _map(image);
       try {
         images.add(ChatImage(fields['name'] as String? ?? 'image', fields['mediaType'] as String? ?? 'image/png', base64Decode(fields['data'] as String? ?? '')));
@@ -58,6 +143,7 @@ class ChatMessage {
         for (final file in _list(json['files']))
           ChatFile(_map(file)['name'] as String? ?? '', _map(file)['mediaType'] as String? ?? '', _map(file)['kind'] as String? ?? 'file'),
       ],
+      imagesSignature: _signatureOfRawImages(rawImages),
     );
   }
 
@@ -70,6 +156,7 @@ class ChatMessage {
   final String? source;
   final List<ChatImage> images;
   final List<ChatFile> files;
+  final int _imagesSignature;
 }
 
 /// A file to send with a chat message.
@@ -135,7 +222,7 @@ class WorkerActivity {
 
 /// A ticket with its worker.
 class Worker {
-  Worker.fromJson(Map<String, dynamic> json)
+  Worker.fromJson(Map<String, dynamic> json, {String? raw})
     : ticketId = json['ticketId'] as String? ?? '',
       title = json['title'] as String? ?? '',
       stage = _map(json['stage'])['stage'] as String? ?? 'working',
@@ -154,7 +241,7 @@ class Worker {
       deliveryError = _text(_map(json['delivery'])['error']),
       pendingInputs = (json['pendingInputs'] as num?)?.toInt() ?? 0,
       recent = [for (final line in _list(json['recent'])) WorkerActivity.fromJson(_map(line))],
-      raw = jsonEncode(json);
+      raw = raw ?? '';
 
   final String ticketId;
   final String title;
@@ -400,10 +487,10 @@ class WorkerDoing {
 
 /// What is at work now: whether the router is thinking, and what each busy worker is doing.
 class Activity {
-  Activity.fromJson(Map<String, dynamic> json)
+  Activity.fromJson(Map<String, dynamic> json, {String? raw})
     : router = json['router'] == true,
       workers = [for (final worker in _list(json['workers'])) WorkerDoing.fromJson(_map(worker))],
-      raw = jsonEncode(json);
+      raw = raw ?? '';
 
   const Activity.idle() : router = false, workers = const [], raw = '';
 
@@ -715,7 +802,7 @@ class DeviceManifest {
 
 /// A persisted Device Twin for a Tier 1 OS agent or Tier 2 MCU.
 class DeviceTwin {
-  DeviceTwin.fromJson(Map<String, dynamic> json)
+  DeviceTwin.fromJson(Map<String, dynamic> json, {String? raw})
     : deviceId = json['deviceId'] as String? ?? '',
       clusterId = json['clusterId'] as String? ?? '',
       customName = _text(json['customName'])?.trim(),
@@ -742,7 +829,7 @@ class DeviceTwin {
       lastAckedSeqId = (json['lastAckedSeqId'] as num?)?.toInt() ?? 0,
       lastSeenAt = _time(json['lastSeenAt']) ?? _time(json['lastSeenMs']),
       updatedAt = _time(json['updatedAt']),
-      raw = jsonEncode(json);
+      raw = raw ?? '';
 
   final String deviceId;
   final String clusterId;
@@ -966,7 +1053,7 @@ class DeviceEnrollment {
 
 /// Snapshot returned by `GET /api/devices`.
 class DevicesOverview {
-  const DevicesOverview({
+  DevicesOverview({
     this.config = const DeviceControlConfig(),
     this.devices = const [],
     this.approvals = const [],
@@ -974,12 +1061,12 @@ class DevicesOverview {
     this.raw = '',
   });
 
-  DevicesOverview.fromJson(Map<String, dynamic> json)
+  DevicesOverview.fromJson(Map<String, dynamic> json, {String? raw})
     : config = DeviceControlConfig.fromJson(_map(json['config'])),
-      devices = [for (final item in _list(json['devices'])) DeviceTwin.fromJson(_map(item))],
-      approvals = [for (final item in _list(json['approvals'])) DeviceApproval.fromJson(_map(item))],
-      enrollments = [for (final item in _list(json['enrollments'])) DeviceEnrollment.fromJson(_map(item))],
-      raw = jsonEncode(json);
+      devices = List<DeviceTwin>.unmodifiable([for (final item in _list(json['devices'])) DeviceTwin.fromJson(_map(item))]),
+      approvals = List<DeviceApproval>.unmodifiable([for (final item in _list(json['approvals'])) DeviceApproval.fromJson(_map(item))]),
+      enrollments = List<DeviceEnrollment>.unmodifiable([for (final item in _list(json['enrollments'])) DeviceEnrollment.fromJson(_map(item))]),
+      raw = raw ?? '';
 
   final DeviceControlConfig config;
   final List<DeviceTwin> devices;
@@ -987,12 +1074,21 @@ class DevicesOverview {
   final List<DeviceEnrollment> enrollments;
   final String raw;
 
-  List<DeviceApproval> get pendingApprovals => [for (final item in approvals) if (item.isPending) item];
+  late final List<DeviceApproval> pendingApprovals = List<DeviceApproval>.unmodifiable([for (final item in approvals) if (item.isPending) item]);
   int get pendingApprovalsCount => pendingApprovals.length;
-  int get onlineDevicesCount => devices.where((device) => device.isOnline).length;
-  List<DeviceEnrollment> get activeEnrollments => [for (final item in enrollments) if (item.isActive) item];
-  List<DeviceTwin> get tier1Devices => [for (final device in devices) if (device.isTier1) device];
-  List<DeviceTwin> get mcuDevices => [for (final device in devices) if (device.isMcu) device];
+  late final int onlineDevicesCount = devices.where((device) => device.isOnline).length;
+  late final List<DeviceEnrollment> activeEnrollments = List<DeviceEnrollment>.unmodifiable([for (final item in enrollments) if (item.isActive) item]);
+  late final List<DeviceTwin> tier1Devices = List<DeviceTwin>.unmodifiable([for (final device in devices) if (device.isTier1) device]);
+  late final List<DeviceTwin> mcuDevices = List<DeviceTwin>.unmodifiable([for (final device in devices) if (device.isMcu) device]);
+  late final List<DeviceTwin> sortedDevices = List<DeviceTwin>.unmodifiable(
+    List<DeviceTwin>.from(devices)
+      ..sort((a, b) {
+        if (a.isTier1 != b.isTier1) return a.isTier1 ? -1 : 1;
+        if (a.isOnline != b.isOnline) return a.isOnline ? -1 : 1;
+        return a.deviceId.compareTo(b.deviceId);
+      }),
+  );
+  late final Map<String, DeviceTwin> deviceById = Map<String, DeviceTwin>.unmodifiable({for (final d in devices) d.deviceId: d});
 }
 
 /// Live enrollment status and newly onboarded device twins returned by `GET /api/devices/enrollments/:id`.

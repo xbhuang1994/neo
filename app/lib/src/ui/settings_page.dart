@@ -292,7 +292,7 @@ class SettingsPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(context, aspect: AppAspect.connection);
     final strings = Strings.read(context);
     final palette = Palette.of(context);
     final online = state.link == Link.online && state.client != null;
@@ -356,7 +356,7 @@ class _ConnectionSettingsState extends State<ConnectionSettings> {
   void didChangeDependencies() {
     super.didChangeDependencies();
     if (_local == null) {
-      final config = AppScope.of(context).config;
+      final config = AppScope.read(context).config;
       _local = config.local;
       _url.text = config.url;
       _token.text = config.token;
@@ -371,7 +371,7 @@ class _ConnectionSettingsState extends State<ConnectionSettings> {
   }
 
   Future<void> _apply() async {
-    final state = AppScope.of(context);
+    final state = AppScope.read(context);
     final strings = Strings.read(context);
     if (!_local! && state.host.isDesktop && parseServerAddress(_url.text) == null) {
       setState(() => _error = strings.invalidAddress);
@@ -383,7 +383,7 @@ class _ConnectionSettingsState extends State<ConnectionSettings> {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(context, aspect: AppAspect.connection);
     final strings = Strings.read(context);
     final desktop = state.host.isDesktop;
     final local = _local! && desktop;
@@ -944,15 +944,26 @@ class _WeChatSettingsState extends LoadingState<WeChatSettings, WeChatStatus> {
   Timer? _poll;
 
   @override
-  Future<WeChatStatus> load() => widget.api.wechat();
+  Future<WeChatStatus> load() async {
+    final status = await widget.api.wechat();
+    _watch(status);
+    return status;
+  }
+
+  /// Poll only while a WeChat login flow is in progress (zero idle timer overhead).
+  void _watch(WeChatStatus? status) {
+    _poll?.cancel();
+    if (status == null || !status.loggingIn) return;
+    _poll = Timer(const Duration(milliseconds: 1500), () async {
+      if (!mounted) return;
+      await reload();
+    });
+  }
 
   @override
-  void initState() {
-    super.initState();
-    // A login moves on the phone: follow it while one is under way.
-    _poll = Timer.periodic(const Duration(milliseconds: 1500), (_) {
-      if (data == null || data!.loggingIn) unawaited(reload());
-    });
+  Future<void> run(Future<WeChatStatus> Function() change, {String? done}) async {
+    await super.run(change, done: done);
+    if (mounted) _watch(data);
   }
 
   @override
@@ -1050,7 +1061,7 @@ class DevicesSummarySection extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(context, aspect: AppAspect.devices);
     final strings = Strings.read(context);
     final palette = Palette.of(context);
     final typo = Typo.of(context);
@@ -1120,7 +1131,7 @@ class AboutSection extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(context, aspect: AppAspect.health);
     final strings = Strings.read(context);
     final palette = Palette.of(context);
     final typo = Typo.of(context);

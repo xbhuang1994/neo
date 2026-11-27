@@ -183,6 +183,11 @@ function writeSseFrame(res: http.ServerResponse, frame: StreamFrame): void {
 export class EntryPointServer {
   private readonly options: EntryPointOptions;
   private readonly consoleHtml: string;
+  private readonly upstreamAgent = new http.Agent({
+    keepAlive: true,
+    maxSockets: 64,
+    keepAliveMsecs: 30_000,
+  });
   private server: http.Server | null = null;
   private boundPort: number;
   private readonly sseClients = new Set<{ res: http.ServerResponse; close: () => void }>();
@@ -237,6 +242,7 @@ export class EntryPointServer {
       client.close();
     }
     this.sseClients.clear();
+    this.upstreamAgent.destroy();
     if (!server) return;
     await new Promise<void>((resolve) => {
       const timer = setTimeout(resolve, 2000);
@@ -472,7 +478,6 @@ export class EntryPointServer {
       if (HOP_BY_HOP_HEADERS.has(lower)) continue;
       headers[lower] = val;
     }
-    headers.connection = "close";
 
     // Neo's strict HTTP/1.1 server rejects `Transfer-Encoding: chunked` with 411;
     // normalize chunked bodies to an exact `Content-Length`.
@@ -500,6 +505,7 @@ export class EntryPointServer {
         {
           host: "127.0.0.1",
           port: targetPort,
+          agent: this.upstreamAgent,
           method,
           path: req.url ?? "/",
           headers,

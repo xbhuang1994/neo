@@ -50,9 +50,14 @@ class NeoAgentApp extends StatelessWidget {
       supportedLocales: const [Locale('zh'), Locale('en')],
       localizationsDelegates: GlobalCupertinoLocalizations.delegates,
       scrollBehavior: const CupertinoScrollBehavior(),
-      builder: (context, child) => StringsScope(
-        strings: Strings.of(Localizations.localeOf(context)),
-        child: AppScope(state: state, child: _CopyShortcutScope(child: child!)),
+      builder: (context, child) => ThemeTokensScope(
+        child: StringsScope(
+          strings: Strings.of(Localizations.localeOf(context)),
+          child: AppScope(
+            state: state,
+            child: _CopyShortcutScope(state: state, child: child!),
+          ),
+        ),
       ),
       home: CupertinoPageScaffold(resizeToAvoidBottomInset: true, child: Shell(picker: picker)),
     );
@@ -62,27 +67,45 @@ class NeoAgentApp extends StatelessWidget {
 /// Ensures Cmd/Ctrl+C and native macOS Edit menu actions reliably copy selected text
 /// across pages, dialogs, drifted focus states, and non-HTTPS Web origins.
 class _CopyShortcutScope extends StatefulWidget {
-  const _CopyShortcutScope({required this.child});
+  const _CopyShortcutScope({required this.state, required this.child});
 
+  final AppState state;
   final Widget child;
 
   @override
   State<_CopyShortcutScope> createState() => _CopyShortcutScopeState();
 }
 
-class _CopyShortcutScopeState extends State<_CopyShortcutScope> {
+class _CopyShortcutScopeState extends State<_CopyShortcutScope> with WidgetsBindingObserver {
   static const _windowChannel = MethodChannel('neo_agent/window');
   late final _AppCopyAction _copyAction = _AppCopyAction();
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     HardwareKeyboard.instance.addHandler(_handleKeyEvent);
     _windowChannel.setMethodCallHandler(_handleWindowCall);
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    switch (state) {
+      case AppLifecycleState.resumed:
+        widget.state.setForeground(true);
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.paused:
+      case AppLifecycleState.detached:
+        widget.state.setForeground(false);
+      case AppLifecycleState.inactive:
+        // Unfocused desktop windows remain visible and keep live updates.
+        break;
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     HardwareKeyboard.instance.removeHandler(_handleKeyEvent);
     _windowChannel.setMethodCallHandler(null);
     super.dispose();

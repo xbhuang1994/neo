@@ -913,7 +913,10 @@ async function writeResponse(
   headOnly: boolean,
   writeTimeoutMs: number,
 ): Promise<boolean> {
-  let head = `HTTP/1.1 ${response.status} ${reason(response.status)}\r\ncontent-type: ${response.contentType}\r\ncontent-length: ${response.body.byteLength}\r\n`;
+  const noBodyStatus = response.status === 204 || response.status === 304;
+  let head = noBodyStatus
+    ? `HTTP/1.1 ${response.status} ${reason(response.status)}\r\n`
+    : `HTTP/1.1 ${response.status} ${reason(response.status)}\r\ncontent-type: ${response.contentType}\r\ncontent-length: ${response.body.byteLength}\r\n`;
   for (let i = 0; i < response.headers.length; i++) {
     const [name, value] = response.headers[i];
     head += `${name}: ${value}\r\n`;
@@ -921,7 +924,7 @@ async function writeResponse(
   head += keep ? "connection: keep-alive\r\n\r\n" : "connection: close\r\n\r\n";
 
   const headBytes = textEncoder.encode(head);
-  if (headOnly || response.body.byteLength === 0) {
+  if (headOnly || noBodyStatus || response.body.byteLength === 0) {
     return await writeAll(socket, [headBytes], writeTimeoutMs);
   }
   if (response.body.byteLength <= INLINE_BODY_LIMIT) {

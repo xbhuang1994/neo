@@ -79,28 +79,15 @@ class _DevicesPageState extends State<DevicesPage> {
   String? _toast;
   bool _toastGood = true;
   Timer? _toastTimer;
-  Timer? _ttlTimer;
 
   @override
   void dispose() {
     _toastTimer?.cancel();
-    _ttlTimer?.cancel();
     _scroll.dispose();
     for (final c in [_initRelayUrl, _initClusterId, _initClusterSecret, _initMasterNodeId, _initE2eKey]) {
       c.dispose();
     }
     super.dispose();
-  }
-
-  void _syncTtlTimer(bool hasActiveEnrollments) {
-    if (hasActiveEnrollments) {
-      _ttlTimer ??= Timer.periodic(const Duration(seconds: 1), (_) {
-        if (mounted) setState(() {});
-      });
-    } else {
-      _ttlTimer?.cancel();
-      _ttlTimer = null;
-    }
   }
 
   void _showToast(String message, {bool good = true}) {
@@ -530,13 +517,8 @@ class _DevicesPageState extends State<DevicesPage> {
     final (relayLabel, relayColor) = relayStatusAppearance(config, strings, palette);
     final pendingApprovals = overview.pendingApprovals;
     final activeEnrollments = overview.activeEnrollments;
-    final sortedDevices = List<DeviceTwin>.from(overview.devices)
-      ..sort((a, b) {
-        if (a.isTier1 != b.isTier1) return a.isTier1 ? -1 : 1;
-        if (a.isOnline != b.isOnline) return a.isOnline ? -1 : 1;
-        return a.deviceId.compareTo(b.deviceId);
-      });
-    final deviceById = {for (final d in overview.devices) d.deviceId: d};
+    final sortedDevices = overview.sortedDevices;
+    final deviceById = overview.deviceById;
 
     return CupertinoScrollbar(
       controller: _scroll,
@@ -651,7 +633,11 @@ class _DevicesPageState extends State<DevicesPage> {
                           ),
                         )
                       else
-                        for (final device in sortedDevices) _buildDeviceRow(state, device, overview.enrollments, masterVersion, deviceById),
+                        for (final device in sortedDevices)
+                          RepaintBoundary(
+                            key: ValueKey('device-boundary-${device.deviceId}'),
+                            child: _buildDeviceRow(state, device, overview.enrollments, masterVersion, deviceById),
+                          ),
                     ],
                   ),
                 ],
@@ -739,7 +725,6 @@ class _DevicesPageState extends State<DevicesPage> {
       'claimed' => (strings.enrollmentStatusClaimed, palette.accent),
       _ => (strings.enrollmentStatusPending, palette.orange),
     };
-    final ttl = formatRemainingTtl(enrollment.expiresAt);
 
     return Padding(
       key: ValueKey('enrollment-${enrollment.id}'),
@@ -757,7 +742,10 @@ class _DevicesPageState extends State<DevicesPage> {
               Text(enrollment.profile, style: typo.footnote),
               if (enrollment.requestedCustomName != null) Text(enrollment.requestedCustomName!, style: typo.headline.copyWith(fontSize: 13.5)),
               if (enrollment.requestedDeviceId != null) Text(enrollment.requestedDeviceId!, style: typo.mono.copyWith(color: palette.label)),
-              Text(strings.remainingTime(ttl), style: typo.caption.copyWith(fontFeatures: const [FontFeature.tabularFigures()])),
+              EnrollmentTtlBuilder(
+                expiresAt: enrollment.expiresAt,
+                builder: (context, ttl) => Text(strings.remainingTime(ttl), style: typo.caption.copyWith(fontFeatures: const [FontFeature.tabularFigures()])),
+              ),
               if (enrollment.maxUses > 1) Text(strings.usesCount(enrollment.usedCount, enrollment.maxUses), style: typo.caption),
             ],
           ),
@@ -1142,14 +1130,14 @@ class _DevicesPageState extends State<DevicesPage> {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(context, aspect: AppAspect.devices);
+    AppScope.of(context, aspect: AppAspect.connection);
     final strings = Strings.read(context);
     final palette = Palette.of(context);
     final online = state.link == Link.online && state.client != null;
     final overview = state.devicesOverview;
     final config = overview?.config;
     final configured = config != null && config.configured;
-    _syncTtlTimer(online && overview != null && overview.activeEnrollments.isNotEmpty);
 
     return ColoredBox(
       color: palette.grouped,

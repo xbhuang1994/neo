@@ -101,7 +101,7 @@ jobs:
       - run: flutter test
         working-directory: app
       - name: Build the web app
-        run: flutter build web --release --no-web-resources-cdn --csp --no-source-maps
+        run: flutter build web --wasm --release --no-web-resources-cdn --csp --no-source-maps
         working-directory: app
 
   desktop:
