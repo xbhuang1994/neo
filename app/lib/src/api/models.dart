@@ -556,9 +556,12 @@ class DeviceManifest {
   DeviceManifest.fromJson(Map<String, dynamic> json)
     : deviceId = _text(json['device_id']) ?? _text(json['deviceId']) ?? '',
       tier = _text(json['tier']) ?? 'os',
+      agentVersion = _text(json['agent_version']) ?? _text(json['agentVersion']) ?? _text(json['version']),
       os = _text(json['os']),
       arch = _text(json['arch']),
       hostname = _text(json['hostname']),
+      publicIp = _text(json['public_ip']) ?? _text(json['publicIp']),
+      location = _text(json['location']),
       cpus = (json['cpus'] as num?)?.toInt(),
       ramMb = (json['ram_mb'] as num?)?.toInt() ?? (json['ramMb'] as num?)?.toInt(),
       gpus = _parseGpus(json),
@@ -586,9 +589,12 @@ class DeviceManifest {
 
   final String deviceId;
   final String tier;
+  final String? agentVersion;
   final String? os;
   final String? arch;
   final String? hostname;
+  final String? publicIp;
+  final String? location;
   final int? cpus;
   final int? ramMb;
   final List<String> gpus;
@@ -626,6 +632,9 @@ class DeviceTwin {
       tier = _text(json['tier']) ?? 'os',
       status = _text(json['status']) ?? 'offline',
       route = _text(json['route']) ?? 'relay',
+      agentVersion = _text(json['agentVersion']) ?? _text(json['agent_version']),
+      publicIp = _text(json['publicIp']) ?? _text(json['public_ip']),
+      location = _text(json['location']),
       lanUrl = _text(json['lanUrl']),
       relayNodeId = _text(json['relayNodeId']),
       backupRelayNodeIds = _strings(json['backupRelayNodeIds']),
@@ -652,6 +661,9 @@ class DeviceTwin {
 
   /// `lan`, `p2p`, `relay`, or `via_tier1`.
   final String route;
+  final String? agentVersion;
+  final String? publicIp;
+  final String? location;
   final String? lanUrl;
   final String? relayNodeId;
   final List<String> backupRelayNodeIds;
@@ -670,6 +682,9 @@ class DeviceTwin {
   bool get isOnline => status == 'online';
   bool get isMcu => tier == 'mcu';
   bool get isTier1 => tier == 'os';
+  String? get effectiveVersion => agentVersion ?? manifest?.agentVersion ?? manifest?.fw;
+  String? get effectivePublicIp => publicIp ?? manifest?.publicIp;
+  String? get effectiveLocation => location ?? manifest?.location;
   bool get hasGpu => manifest?.hasGpu == true || capabilities.contains('gpu');
   List<String> get workspaces => manifest?.workspaces ?? const [];
   String? get mqttBind => manifest?.relayConfig?.mqttBind;

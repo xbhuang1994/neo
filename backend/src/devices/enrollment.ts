@@ -1382,6 +1382,13 @@ export class EnrollmentManager {
     return `${baseId}-${this.nowSec()}`;
   }
 
+  /** Return the last recorded claim IP for an enrollment record (synchronous local lookup). */
+  getLastClaimedIp(enrollId: string): string | undefined {
+    const record = this.findRecord(enrollId);
+    const ip = record?.lastClaimedIp?.trim();
+    return ip && ip.length > 0 ? ip : undefined;
+  }
+
   /** Mark an enrollment record completed when a device's `manifest` arrives carrying `body.enroll_id`. */
   markEnrollmentCompleted(
     enrollId: string,

@@ -299,6 +299,8 @@ pub struct BootstrapResponse {
     #[serde(default)]
     pub node_id: Option<String>,
     #[serde(default)]
+    pub observed_ip: Option<String>,
+    #[serde(default)]
     pub stun_servers: Vec<String>,
     #[serde(default)]
     pub relay_url: Option<String>,

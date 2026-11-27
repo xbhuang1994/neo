@@ -131,6 +131,9 @@ class FakeBackend {
     String tier = 'os',
     String status = 'online',
     String route = 'relay',
+    String? agentVersion,
+    String? publicIp,
+    String? location,
     String? relayNodeId,
     Map<String, dynamic>? manifest,
     List<String> capabilities = const ['exec', 'fs'],
@@ -143,16 +146,22 @@ class FakeBackend {
       'tier': tier,
       'status': status,
       'route': route,
+      'agentVersion': ?agentVersion,
+      'publicIp': ?publicIp,
+      'location': ?location,
       'relayNodeId': ?relayNodeId,
       'manifest': manifest ??
           (tier == 'mcu'
-              ? {'device_id': deviceId, 'tier': 'mcu', 'chip': 'ESP32', 'fw': '0.1.0', 'acts': ['get_temp']}
+              ? {'device_id': deviceId, 'tier': 'mcu', 'chip': 'ESP32', 'fw': agentVersion ?? '0.1.0', 'acts': ['get_temp']}
               : {
                   'device_id': deviceId,
                   'tier': 'os',
+                  'agent_version': ?agentVersion,
                   'os': 'linux',
                   'arch': 'amd64',
                   'hostname': deviceId,
+                  'public_ip': ?publicIp,
+                  'location': ?location,
                   'cpus': 8,
                   'ram_mb': 16384,
                   'capabilities': capabilities,

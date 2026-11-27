@@ -1094,3 +1094,91 @@ func TestKeyRingHotReloadPreservesWebSockets(t *testing.T) {
 		t.Fatalf("unexpected payload after reload: %+v err=%v", gotFrame, err)
 	}
 }
+
+func TestBootstrapAndPeersObservedIP(t *testing.T) {
+	secret := []byte("unit-test-secret-32-bytes-minimum!!")
+	h := hub.New(10<<20, 1<<20)
+	srv := server.New(server.Config{
+		KeyRing:       auth.KeyRing{RootSecret: secret},
+		MaxFrameBytes: 1 << 20,
+	}, h)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	wsBase := "ws" + strings.TrimPrefix(ts.URL, "http")
+
+	tokMaster, _ := auth.MintToken(secret, "geo-cluster", "master-1", "master", time.Hour, time.Now())
+	tokAgent, _ := auth.MintToken(secret, "geo-cluster", "os-shenzhen-1", "os", time.Hour, time.Now())
+
+	// Bootstrap reflects X-Forwarded-For as observed_ip
+	reqBoot, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/bootstrap", nil)
+	reqBoot.Header.Set("Authorization", "Bearer "+tokAgent)
+	reqBoot.Header.Set("X-Forwarded-For", "113.87.160.22, 10.0.0.1")
+	rBoot, err := http.DefaultClient.Do(reqBoot)
+	if err != nil {
+		t.Fatalf("bootstrap err: %v", err)
+	}
+	defer rBoot.Body.Close()
+	var boot map[string]any
+	if err := json.NewDecoder(rBoot.Body).Decode(&boot); err != nil {
+		t.Fatalf("decode boot err: %v", err)
+	}
+	if boot["observed_ip"] != "113.87.160.22" {
+		t.Fatalf("expected bootstrap observed_ip 113.87.160.22, got %v", boot["observed_ip"])
+	}
+
+	// Agent connects to /v1/relay with X-Forwarded-For -> /v1/peers exposes observed_ip
+	hdrAgent := http.Header{
+		"Authorization":   []string{"Bearer " + tokAgent},
+		"X-Forwarded-For": []string{"113.87.160.22"},
+	}
+	relAgent, _, err := ws.Dial(wsBase+"/v1/relay", hdrAgent, nil, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial relay agent: %v", err)
+	}
+	defer relAgent.Close()
+
+	// Also verify signal addr field populates reflexive_udp when reflexive_udp is absent
+	sigAgent, _, err := ws.Dial(wsBase+"/v1/signal", hdrAgent, nil, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial signal agent: %v", err)
+	}
+	defer sigAgent.Close()
+	_, _, _ = sigAgent.ReadMessage()
+	regMsg, _ := json.Marshal(hub.SignalMsg{
+		Type: "register",
+		Addr: "113.87.160.22:54321",
+	})
+	if err := sigAgent.WriteText(regMsg); err != nil {
+		t.Fatalf("signal register err: %v", err)
+	}
+	_, _, _ = sigAgent.ReadMessage()
+
+	reqPeers, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/peers", nil)
+	reqPeers.Header.Set("Authorization", "Bearer "+tokMaster)
+	rPeers, err := http.DefaultClient.Do(reqPeers)
+	if err != nil {
+		t.Fatalf("peers err: %v", err)
+	}
+	defer rPeers.Body.Close()
+	var peersBody struct {
+		Peers []hub.PeerInfo `json:"peers"`
+	}
+	if err := json.NewDecoder(rPeers.Body).Decode(&peersBody); err != nil {
+		t.Fatalf("decode peers err: %v", err)
+	}
+	found := false
+	for _, p := range peersBody.Peers {
+		if p.NodeID == "os-shenzhen-1" {
+			found = true
+			if p.ObservedIP != "113.87.160.22" {
+				t.Fatalf("expected peer observed_ip 113.87.160.22, got %q", p.ObservedIP)
+			}
+			if p.ReflexiveUDP != "113.87.160.22:54321" {
+				t.Fatalf("expected peer reflexive_udp 113.87.160.22:54321, got %q", p.ReflexiveUDP)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("os-shenzhen-1 not found in /v1/peers: %+v", peersBody.Peers)
+	}
+}

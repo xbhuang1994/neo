@@ -84,12 +84,18 @@ void main() {
             'tier': 'os',
             'status': 'online',
             'route': 'p2p',
+            'agentVersion': '0.9.2',
+            'publicIp': '113.87.160.22',
+            'location': '中国 广东 深圳',
             'manifest': {
               'device_id': 'edge-pi-01',
               'tier': 'os',
+              'agent_version': '0.9.2',
               'os': 'linux',
               'arch': 'arm64',
               'hostname': 'pi-rack',
+              'public_ip': '113.87.160.22',
+              'location': '中国 广东 深圳',
               'cpus': 4,
               'ram_mb': 8192,
               'capabilities': ['exec', 'relay', 'gpu'],
@@ -144,6 +150,7 @@ void main() {
 
       final device = overview.devices.single;
       expect((device.isTier1, device.isOnline, device.isRelayCapable, device.hasGpu), (true, true, true, true));
+      expect((device.effectiveVersion, device.effectivePublicIp, device.effectiveLocation), ('0.9.2', '113.87.160.22', '中国 广东 深圳'));
       expect((device.mqttBind, device.uartDevice), ('0.0.0.0:1883', '/dev/ttyUSB0'));
       expect(device.workspaces, ['/home/neo/work']);
 
@@ -662,6 +669,51 @@ void main() {
       expect(find.text('Multi-device control plane unavailable'), findsOneWidget);
 
       await app.close();
+    });
+
+    testWidgets('displays device version, external IP, and physical location in Chinese and English on wide and narrow viewports', (tester) async {
+      final backend = FakeBackend()
+        ..configureDevices(clusterId: 'neo-ad0101', relayState: 'connected')
+        ..addDevice(
+          'os-macbook-pro',
+          status: 'online',
+          route: 'relay',
+          agentVersion: '0.9.2',
+          publicIp: '113.87.160.22',
+          location: '中国 广东 深圳',
+        )
+        ..addDevice(
+          'os-win-pc',
+          status: 'online',
+          route: 'p2p',
+          agentVersion: '0.9.1',
+          publicIp: '58.248.102.18',
+          location: '中国 广东 广州',
+        );
+
+      final zhApp = await open(tester, backend, locale: const Locale('zh'), size: wide);
+      await tester.tap(nav(2));
+      await settle(tester);
+
+      expect(find.text('v0.9.2'), findsWidgets);
+      expect(find.text('v0.9.1'), findsOneWidget);
+      expect(find.byKey(const ValueKey('device-ip-os-macbook-pro')), findsOneWidget);
+      expect(find.text('113.87.160.22'), findsOneWidget);
+      expect(find.byKey(const ValueKey('device-location-os-macbook-pro')), findsOneWidget);
+      expect(find.text('中国 广东 深圳'), findsOneWidget);
+      expect(find.text('外网 IP'), findsNWidgets(2));
+      expect(find.text('物理地址'), findsNWidgets(2));
+      await zhApp.close();
+
+      final enApp = await open(tester, backend, locale: const Locale('en'), size: narrow, brightness: Brightness.dark);
+      await tester.tap(nav(2));
+      await settle(tester);
+
+      expect(find.text('Public IP'), findsNWidgets(2));
+      expect(find.text('Location'), findsNWidgets(2));
+      expect(find.text('58.248.102.18'), findsOneWidget);
+      expect(find.text('中国 广东 广州'), findsOneWidget);
+      await enApp.close();
     });
   });
 }
