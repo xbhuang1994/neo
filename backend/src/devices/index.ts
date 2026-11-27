@@ -7,4 +7,5 @@ export * from "./protocol.ts";
 export * from "./relay-client.ts";
 export * from "./enrollment.ts";
 export * from "./file-transfer.ts";
+export * from "./mcp-proxy.ts";
 export * from "./manager.ts";

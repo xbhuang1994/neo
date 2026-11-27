@@ -1,6 +1,7 @@
 mod enroll;
 mod executor;
 mod file_transfer;
+mod mcp;
 mod policy;
 mod prober;
 mod protocol;
@@ -387,12 +388,23 @@ async fn run_daemon_mode(args: RunArgs) {
     };
 
     if opts.print_manifest {
-        let manifest = CapabilityProber::probe(
+        let pol_shared = Arc::new(std::sync::RwLock::new(initial_policy.clone()));
+        let mcp_mgr = mcp::McpManager::new(
+            pol_shared,
+            opts.cluster.clone(),
+            Some(opts.policy_path.clone()),
+            sandbox_override_path.clone(),
+            opts.ota_cache_dir.clone(),
+        );
+        mcp_mgr.discover_initial().await;
+        let mcp_summary = mcp_mgr.catalog_summary().await;
+        let manifest = CapabilityProber::probe_with_mcp(
             &initial_policy,
             &opts.device_id,
             opts.relay,
             Some(&opts.mqtt_bind),
             opts.uart_device.as_deref(),
+            Some(mcp_summary),
         );
         println!(
             "{}",

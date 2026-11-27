@@ -116,6 +116,80 @@ const DESKTOP_EXTRA_ALLOWED_COMMANDS: &[&str] = &[
     "pwsh",
 ];
 
+/// Optional `[mcp]` policy section for proactive local MCP discovery and proxying.
+/// All fields default cleanly when `[mcp]` is omitted in existing TOML files.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct McpPolicyConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub discovery_mode: Option<String>,
+    #[serde(default)]
+    pub auto_enable_discovered: Option<bool>,
+    #[serde(default)]
+    pub allow_loopback_probe: Option<bool>,
+    #[serde(default)]
+    pub allowed_servers: Vec<String>,
+    #[serde(default)]
+    pub denied_servers: Vec<String>,
+    #[serde(default)]
+    pub extra_config_paths: Vec<String>,
+    #[serde(default)]
+    pub probe_ports: Vec<u16>,
+    #[serde(default)]
+    pub max_concurrent_servers: Option<usize>,
+    #[serde(default)]
+    pub idle_timeout_sec: Option<u64>,
+    #[serde(default)]
+    pub max_response_bytes: Option<usize>,
+}
+
+impl McpPolicyConfig {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn for_preset(level: SandboxLevel) -> Self {
+        match level {
+            SandboxLevel::Readonly => Self {
+                enabled: Some(false),
+                discovery_mode: Some("disabled".to_string()),
+                auto_enable_discovered: Some(false),
+                allow_loopback_probe: Some(false),
+                ..Self::default()
+            },
+            SandboxLevel::Corp => Self {
+                enabled: Some(true),
+                discovery_mode: Some("neo_only".to_string()),
+                auto_enable_discovered: Some(false),
+                allow_loopback_probe: Some(false),
+                ..Self::default()
+            },
+            SandboxLevel::Personal => Self {
+                enabled: Some(true),
+                discovery_mode: Some("configs_only".to_string()),
+                auto_enable_discovered: Some(false),
+                allow_loopback_probe: Some(false),
+                ..Self::default()
+            },
+            SandboxLevel::Desktop => Self {
+                enabled: Some(true),
+                discovery_mode: Some("configs_only".to_string()),
+                auto_enable_discovered: Some(false),
+                allow_loopback_probe: Some(true),
+                ..Self::default()
+            },
+            SandboxLevel::Unrestricted => Self {
+                enabled: Some(true),
+                discovery_mode: Some("configs_and_loopback".to_string()),
+                auto_enable_discovered: Some(false),
+                allow_loopback_probe: Some(true),
+                ..Self::default()
+            },
+        }
+    }
+}
+
 /// Local execution policy loaded from `agent-policy.toml` (or runtime sandbox override).
 /// Set `lock_sandbox = true` to refuse remote `set_sandbox` RPC transitions.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -140,6 +214,8 @@ pub struct PolicyConfig {
     pub read_only: bool,
     #[serde(default)]
     pub lock_sandbox: bool,
+    #[serde(default)]
+    pub mcp: McpPolicyConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -306,6 +382,7 @@ impl Policy {
             unrestricted,
             read_only,
             lock_sandbox,
+            mcp: McpPolicyConfig::for_preset(level),
         };
         Self::from_config(config)
     }
@@ -349,6 +426,57 @@ impl Policy {
             "max_output_bytes = {}\n",
             self.config.max_output_bytes
         ));
+
+        if !self.config.mcp.is_empty() {
+            let mcp = &self.config.mcp;
+            out.push_str("\n[mcp]\n");
+            if let Some(enabled) = mcp.enabled {
+                out.push_str(&format!("enabled = {enabled}\n"));
+            }
+            if let Some(ref mode) = mcp.discovery_mode {
+                out.push_str(&format!(
+                    "discovery_mode = \"{}\"\n",
+                    escape_toml_string(mode)
+                ));
+            }
+            if let Some(auto_en) = mcp.auto_enable_discovered {
+                out.push_str(&format!("auto_enable_discovered = {auto_en}\n"));
+            }
+            if let Some(probe) = mcp.allow_loopback_probe {
+                out.push_str(&format!("allow_loopback_probe = {probe}\n"));
+            }
+            if !mcp.allowed_servers.is_empty() {
+                out.push_str(&format!(
+                    "allowed_servers = {}\n",
+                    format_toml_string_array(&mcp.allowed_servers)
+                ));
+            }
+            if !mcp.denied_servers.is_empty() {
+                out.push_str(&format!(
+                    "denied_servers = {}\n",
+                    format_toml_string_array(&mcp.denied_servers)
+                ));
+            }
+            if !mcp.extra_config_paths.is_empty() {
+                out.push_str(&format!(
+                    "extra_config_paths = {}\n",
+                    format_toml_string_array(&mcp.extra_config_paths)
+                ));
+            }
+            if !mcp.probe_ports.is_empty() {
+                let ports: Vec<String> = mcp.probe_ports.iter().map(|p| p.to_string()).collect();
+                out.push_str(&format!("probe_ports = [{}]\n", ports.join(", ")));
+            }
+            if let Some(max_c) = mcp.max_concurrent_servers {
+                out.push_str(&format!("max_concurrent_servers = {max_c}\n"));
+            }
+            if let Some(idle) = mcp.idle_timeout_sec {
+                out.push_str(&format!("idle_timeout_sec = {idle}\n"));
+            }
+            if let Some(max_b) = mcp.max_response_bytes {
+                out.push_str(&format!("max_response_bytes = {max_b}\n"));
+            }
+        }
         out
     }
 
@@ -441,6 +569,71 @@ impl Policy {
         } else {
             SandboxLevel::Personal
         }
+    }
+
+    pub fn mcp_enabled(&self) -> bool {
+        self.config
+            .mcp
+            .enabled
+            .unwrap_or_else(|| self.effective_level() != SandboxLevel::Readonly)
+    }
+
+    pub fn mcp_discovery_mode(&self) -> &'static str {
+        if !self.mcp_enabled() {
+            return "disabled";
+        }
+        if let Some(ref raw) = self.config.mcp.discovery_mode {
+            match raw.trim().to_ascii_lowercase().as_str() {
+                "disabled" => return "disabled",
+                "neo_only" => return "neo_only",
+                "configs_only" => return "configs_only",
+                "configs_and_loopback" => return "configs_and_loopback",
+                _ => {}
+            }
+        }
+        match self.effective_level() {
+            SandboxLevel::Readonly => "disabled",
+            SandboxLevel::Corp => "neo_only",
+            SandboxLevel::Personal => "configs_only",
+            SandboxLevel::Desktop => "configs_only",
+            SandboxLevel::Unrestricted => "configs_and_loopback",
+        }
+    }
+
+    pub fn mcp_auto_enable_discovered(&self) -> bool {
+        self.config.mcp.auto_enable_discovered.unwrap_or(false)
+    }
+
+    pub fn mcp_allow_loopback_probe(&self) -> bool {
+        if !self.mcp_enabled() {
+            return false;
+        }
+        self.config.mcp.allow_loopback_probe.unwrap_or_else(|| {
+            matches!(
+                self.effective_level(),
+                SandboxLevel::Desktop | SandboxLevel::Unrestricted
+            )
+        })
+    }
+
+    pub fn mcp_max_concurrent_servers(&self) -> usize {
+        self.config.mcp.max_concurrent_servers.unwrap_or(8).max(1)
+    }
+
+    pub fn mcp_idle_timeout_sec(&self) -> u64 {
+        self.config.mcp.idle_timeout_sec.unwrap_or(300)
+    }
+
+    pub fn mcp_max_response_bytes(&self) -> usize {
+        self.config
+            .mcp
+            .max_response_bytes
+            .unwrap_or(4_194_304)
+            .max(4096)
+    }
+
+    pub fn mcp_soft_text_bytes(&self) -> usize {
+        self.mcp_max_response_bytes().min(1_048_576)
     }
 
     pub fn default_workspace(&self) -> Result<&Path, String> {
@@ -950,5 +1143,81 @@ allowed_workspaces = ["/definitely/does/not/exist/neo_missing_ws"]
         assert!(pol.validate_command("bad\0cmd").is_err());
 
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn mcp_policy_defaults_backwards_compat_and_toml_roundtrip() {
+        let ws = temp_dir("mcp_pol");
+        let ws_esc = toml_escape(&ws);
+
+        // Existing TOML without [mcp] continues to parse with level-based defaults
+        let legacy = Policy::from_toml_str(&format!(
+            "allowed_workspaces = [\"{ws_esc}\"]\nsandbox_level = \"personal\"\n"
+        ))
+        .unwrap();
+        assert!(legacy.config().mcp.is_empty());
+        assert!(legacy.mcp_enabled());
+        assert_eq!(legacy.mcp_discovery_mode(), "configs_only");
+        assert!(!legacy.mcp_auto_enable_discovered());
+        assert!(!legacy.mcp_allow_loopback_probe());
+        assert_eq!(legacy.mcp_max_concurrent_servers(), 8);
+        assert_eq!(legacy.mcp_idle_timeout_sec(), 300);
+        assert_eq!(legacy.mcp_max_response_bytes(), 4_194_304);
+        assert_eq!(legacy.mcp_soft_text_bytes(), 1_048_576);
+        assert!(!legacy.render_toml().contains("[mcp]"));
+
+        // Preset defaults across all 5 sandbox levels
+        for (lvl, en, mode, probe) in [
+            (SandboxLevel::Readonly, false, "disabled", false),
+            (SandboxLevel::Corp, true, "neo_only", false),
+            (SandboxLevel::Personal, true, "configs_only", false),
+            (SandboxLevel::Desktop, true, "configs_only", true),
+            (SandboxLevel::Unrestricted, true, "configs_and_loopback", true),
+        ] {
+            let pol = Policy::from_preset(lvl, vec![ws.to_string_lossy().into_owned()], false).unwrap();
+            assert_eq!(pol.mcp_enabled(), en);
+            assert_eq!(pol.mcp_discovery_mode(), mode);
+            assert!(!pol.mcp_auto_enable_discovered());
+            assert_eq!(pol.mcp_allow_loopback_probe(), probe);
+        }
+
+        // Explicit [mcp] section parses and round-trips cleanly
+        let custom_toml = format!(
+            r#"
+sandbox_level = "corp"
+allowed_workspaces = ["{ws_esc}"]
+
+[mcp]
+enabled = true
+discovery_mode = "configs_and_loopback"
+auto_enable_discovered = true
+allow_loopback_probe = true
+allowed_servers = ["neo:docs", "cursor:github"]
+denied_servers = ["loopback:*"]
+extra_config_paths = ["/etc/neo-agent/custom-mcp.json"]
+probe_ports = [3100, 8081]
+max_concurrent_servers = 4
+idle_timeout_sec = 120
+max_response_bytes = 2097152
+"#
+        );
+        let custom = Policy::from_toml_str(&custom_toml).unwrap();
+        assert!(custom.mcp_enabled());
+        assert_eq!(custom.mcp_discovery_mode(), "configs_and_loopback");
+        assert!(custom.mcp_auto_enable_discovered());
+        assert!(custom.mcp_allow_loopback_probe());
+        assert_eq!(custom.config().mcp.allowed_servers, vec!["neo:docs", "cursor:github"]);
+        assert_eq!(custom.config().mcp.denied_servers, vec!["loopback:*"]);
+        assert_eq!(custom.config().mcp.probe_ports, vec![3100, 8081]);
+        assert_eq!(custom.mcp_max_concurrent_servers(), 4);
+        assert_eq!(custom.mcp_idle_timeout_sec(), 120);
+        assert_eq!(custom.mcp_max_response_bytes(), 2_097_152);
+
+        let rendered = custom.render_toml();
+        assert!(rendered.contains("[mcp]"));
+        let reparsed = Policy::from_toml_str(&rendered).unwrap();
+        assert_eq!(reparsed.config(), custom.config());
+
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

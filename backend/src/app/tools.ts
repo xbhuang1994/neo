@@ -40,7 +40,7 @@ import {
   type PendingClarification,
 } from "./clarification.ts";
 import { Args, WORKTREE_NAME_RULE, validWorktreeName, type AppContext } from "./context.ts";
-import type { DeviceStatus, DeviceTier, McuTransportKind } from "../devices/index.ts";
+import type { DeviceStatus, DeviceTier, McpCallAction, McuTransportKind } from "../devices/index.ts";
 import { SIDECAR } from "./effects.ts";
 import { receiptNotice, reportRelay, threadFollowedNotice } from "./notices.ts";
 import { recallConfig, sanitizeCardText } from "./recall.ts";
@@ -130,6 +130,30 @@ const ALLOWED_DEVICE_FILE_TRANSFER: readonly string[] = [
   "transfer_id",
   "chunk_size",
   "timeout_ms",
+];
+const ALLOWED_DEVICE_MCP_LIST: readonly string[] = [
+  "device_id",
+  "refresh",
+  "include_loopback_probe",
+];
+const ALLOWED_DEVICE_MCP_INSPECT: readonly string[] = [
+  "device_id",
+  "server_id",
+  "query",
+  "include_resources",
+  "include_prompts",
+  "refresh",
+];
+const ALLOWED_DEVICE_MCP_CALL: readonly string[] = [
+  "device_id",
+  "server_id",
+  "action",
+  "tool_name",
+  "arguments",
+  "uri",
+  "prompt_name",
+  "timeout_ms",
+  "reason",
 ];
 const ALLOWED_ACK: readonly string[] = ["trigger_id", "text"];
 const ALLOWED_THREAD_REASON: readonly string[] = ["thread", "reason"];
@@ -382,6 +406,102 @@ function deviceSpecs(): ToolSpec[] {
         },
       },
       ["mcu_id", "relay_device_id", "transport"],
+    ),
+    spec(
+      "device_mcp_list",
+      "List discovered and enabled local MCP servers on a paired Tier 1 OS device (by device_id or unique custom name), or omit device_id to summarize across all paired OS devices. Pass refresh=true to trigger a live rescan.",
+      {
+        device_id: {
+          type: ["string", "null"],
+          description: "Optional Tier 1 OS device ID or unique custom display name. Omit to list across all paired OS devices.",
+        },
+        refresh: {
+          type: ["boolean", "null"],
+          description: "Trigger live MCP discovery scan on the target device (default false).",
+        },
+        include_loopback_probe: {
+          type: ["boolean", "null"],
+          description: "When refresh=true, also probe local 127.0.0.1 HTTP/SSE MCP listeners if permitted by sandbox policy.",
+        },
+      },
+      [],
+    ),
+    spec(
+      "device_mcp_inspect",
+      "Inspect tools (with inputSchema and annotations), and optionally resources or prompts, exposed by a local MCP server on a paired Tier 1 OS device. Accepts device_id or unique custom name. Use query to filter tools by keyword.",
+      {
+        device_id: {
+          type: "string",
+          description: "Target Tier 1 OS device ID or unique custom display name.",
+        },
+        server_id: {
+          type: "string",
+          description: "MCP server_id returned by device_mcp_list (e.g. cursor:github or neo:local-db).",
+        },
+        query: {
+          type: ["string", "null"],
+          description: "Optional case-insensitive substring filter matched against tool name and description.",
+        },
+        include_resources: {
+          type: ["boolean", "null"],
+          description: "Include MCP resources list when inspecting (default false).",
+        },
+        include_prompts: {
+          type: ["boolean", "null"],
+          description: "Include MCP prompts list when inspecting (default false).",
+        },
+        refresh: {
+          type: ["boolean", "null"],
+          description: "Bypass cache and re-inspect the remote MCP server (default false).",
+        },
+      },
+      ["device_id", "server_id"],
+    ),
+    spec(
+      "device_mcp_call",
+      "Call a tool, read a resource, or get a prompt on a local MCP server proxied via a paired Tier 1 OS device over E2EE. Accepts device_id or unique custom name. Mutating or destructive tool calls return pending_approval with a shortCode.",
+      {
+        device_id: {
+          type: "string",
+          description: "Target Tier 1 OS device ID or unique custom display name.",
+        },
+        server_id: {
+          type: "string",
+          description: "MCP server_id on the target device.",
+        },
+        action: {
+          type: ["string", "null"],
+          enum: ["tools/call", "resources/read", "prompts/get", null],
+          description: "MCP operation to execute (default 'tools/call').",
+        },
+        tool_name: {
+          type: ["string", "null"],
+          description: "Tool name to invoke (required when action is 'tools/call').",
+        },
+        arguments: {
+          type: ["object", "null"],
+          description: "JSON object arguments for tools/call or prompts/get.",
+        },
+        uri: {
+          type: ["string", "null"],
+          description: "Resource URI to read (required when action is 'resources/read').",
+        },
+        prompt_name: {
+          type: ["string", "null"],
+          description: "Prompt name to fetch (required when action is 'prompts/get').",
+        },
+        timeout_ms: {
+          type: ["integer", "null"],
+          minimum: 100,
+          maximum: 300000,
+          description: "Optional timeout in milliseconds (100..300000).",
+        },
+        reason: {
+          type: ["string", "null"],
+          description: "Optional human-readable reason shown if approval is required.",
+        },
+      },
+      ["device_id", "server_id"],
     ),
   ];
 }
@@ -1588,6 +1708,163 @@ async function runDeviceTool(
         direction === "pull"
           ? await app.devices.pullFile(shared)
           : await app.devices.pushFile(shared);
+      return { handled: true, result };
+    }
+    case "device_mcp_list": {
+      const args = Args.of(argumentsValue ?? {}, ALLOWED_DEVICE_MCP_LIST);
+      const rawRefresh = args.get("refresh");
+      if (rawRefresh !== undefined && rawRefresh !== null && typeof rawRefresh !== "boolean") {
+        throw new Error("refresh must be a boolean");
+      }
+      const rawProbe = args.get("include_loopback_probe");
+      if (rawProbe !== undefined && rawProbe !== null && typeof rawProbe !== "boolean") {
+        throw new Error("include_loopback_probe must be a boolean");
+      }
+      const rawTarget = args.text("device_id")?.trim();
+      if (!rawTarget) {
+        if (rawRefresh === true) {
+          const overviews = app.devices.listAllDevicesMcp();
+          const refreshErrors: Record<string, string> = {};
+          await Promise.all(
+            overviews
+              .filter((item) => item.supported && item.status === "online")
+              .map(async (item) => {
+                try {
+                  await app.devices.discoverDeviceMcp(item.deviceId, {
+                    ...(typeof rawProbe === "boolean" ? { includeLoopbackProbe: rawProbe } : {}),
+                  });
+                } catch (error) {
+                  refreshErrors[item.deviceId] = errorMessage(error);
+                }
+              }),
+          );
+          return {
+            handled: true,
+            result: {
+              devices: app.devices.listAllDevicesMcp(),
+              ...(Object.keys(refreshErrors).length > 0 ? { refreshErrors } : {}),
+            },
+          };
+        }
+        return {
+          handled: true,
+          result: {
+            devices: app.devices.listAllDevicesMcp(),
+          },
+        };
+      }
+      const resolved = app.devices.resolveDevice(rawTarget);
+      const deviceId = resolved !== null ? resolved.deviceId : rawTarget;
+      const result = await app.devices.listDeviceMcp(deviceId, {
+        ...(typeof rawRefresh === "boolean" ? { refresh: rawRefresh } : {}),
+        ...(typeof rawProbe === "boolean" ? { includeLoopbackProbe: rawProbe } : {}),
+      });
+      return { handled: true, result };
+    }
+    case "device_mcp_inspect": {
+      const args = Args.of(argumentsValue, ALLOWED_DEVICE_MCP_INSPECT);
+      const rawTarget = args.required("device_id").trim();
+      const serverId = args.required("server_id").trim();
+      const rawIncludeResources = args.get("include_resources");
+      if (
+        rawIncludeResources !== undefined &&
+        rawIncludeResources !== null &&
+        typeof rawIncludeResources !== "boolean"
+      ) {
+        throw new Error("include_resources must be a boolean");
+      }
+      const rawIncludePrompts = args.get("include_prompts");
+      if (
+        rawIncludePrompts !== undefined &&
+        rawIncludePrompts !== null &&
+        typeof rawIncludePrompts !== "boolean"
+      ) {
+        throw new Error("include_prompts must be a boolean");
+      }
+      const rawRefresh = args.get("refresh");
+      if (rawRefresh !== undefined && rawRefresh !== null && typeof rawRefresh !== "boolean") {
+        throw new Error("refresh must be a boolean");
+      }
+      const rawQuery = args.get("query");
+      if (rawQuery !== undefined && rawQuery !== null && typeof rawQuery !== "string") {
+        throw new Error("query must be a string");
+      }
+      const resolved = app.devices.resolveDevice(rawTarget);
+      const deviceId = resolved !== null ? resolved.deviceId : rawTarget;
+      const result = await app.devices.inspectDeviceMcp(deviceId, serverId, {
+        ...(typeof rawQuery === "string" && rawQuery.trim().length > 0 ? { query: rawQuery } : {}),
+        ...(typeof rawIncludeResources === "boolean" ? { includeResources: rawIncludeResources } : {}),
+        ...(typeof rawIncludePrompts === "boolean" ? { includePrompts: rawIncludePrompts } : {}),
+        ...(typeof rawRefresh === "boolean" ? { refresh: rawRefresh } : {}),
+      });
+      return { handled: true, result };
+    }
+    case "device_mcp_call": {
+      const args = Args.of(argumentsValue, ALLOWED_DEVICE_MCP_CALL);
+      const rawTarget = args.required("device_id").trim();
+      const serverId = args.required("server_id").trim();
+      const rawAction = args.text("action")?.trim() ?? "tools/call";
+      if (
+        rawAction !== "tools/call" &&
+        rawAction !== "resources/read" &&
+        rawAction !== "prompts/get"
+      ) {
+        throw new Error("action must be tools/call, resources/read, or prompts/get");
+      }
+      const rawArgs = args.get("arguments");
+      if (rawArgs !== undefined && rawArgs !== null && !isRecord(rawArgs)) {
+        throw new Error("arguments must be an object");
+      }
+      const rawTimeout = args.get("timeout_ms");
+      let timeoutMs: number | undefined;
+      if (rawTimeout !== undefined && rawTimeout !== null) {
+        if (
+          typeof rawTimeout !== "number" ||
+          !Number.isInteger(rawTimeout) ||
+          rawTimeout < 100 ||
+          rawTimeout > 300_000
+        ) {
+          throw new Error("timeout_ms must be an integer between 100 and 300000");
+        }
+        timeoutMs = rawTimeout;
+      }
+      let targetDeviceId = rawTarget;
+      try {
+        const resolved = app.devices.resolveDevice(rawTarget);
+        if (resolved !== null) {
+          targetDeviceId = resolved.deviceId;
+        }
+      } catch (error) {
+        const rpcAction =
+          rawAction === "tools/call"
+            ? "mcp.call"
+            : rawAction === "resources/read"
+              ? "mcp.resource.read"
+              : "mcp.prompt.get";
+        return {
+          handled: true,
+          result: {
+            status: "rejected",
+            deviceId: rawTarget,
+            action: rpcAction,
+            error: errorMessage(error),
+          },
+        };
+      }
+      const toolName = args.text("tool_name")?.trim();
+      const uri = args.text("uri")?.trim();
+      const promptName = args.text("prompt_name")?.trim();
+      const reason = args.text("reason");
+      const result = await app.devices.callDeviceMcp(targetDeviceId, {
+        serverId,
+        action: rawAction as McpCallAction,
+        ...(toolName !== undefined ? { toolName } : {}),
+        ...(isRecord(rawArgs) ? { arguments: rawArgs } : {}),
+        ...(uri !== undefined ? { uri } : {}),
+        ...(promptName !== undefined ? { promptName } : {}),
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        ...(reason !== undefined ? { reason } : {}),
+      });
       return { handled: true, result };
     }
     default:

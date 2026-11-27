@@ -362,6 +362,72 @@ class ApiClient {
     ),
   );
 
+  // Device Local MCP Discovery & Proxy
+
+  Future<DeviceMcpOverview> deviceMcp(String deviceId) async =>
+      DeviceMcpOverview.fromJson(await _object('GET', '/api/devices/${Uri.encodeComponent(deviceId)}/mcp', timeout: const Duration(seconds: 30)));
+
+  Future<DeviceMcpOverview> discoverDeviceMcp(String deviceId, {bool includeLoopbackProbe = false}) async => DeviceMcpOverview.fromJson(
+    await _object(
+      'POST',
+      '/api/devices/${Uri.encodeComponent(deviceId)}/mcp/discover',
+      body: {'includeLoopbackProbe': includeLoopbackProbe},
+      timeout: const Duration(seconds: 45),
+    ),
+  );
+
+  Future<DeviceMcpInspectResult> inspectDeviceMcp(
+    String deviceId,
+    String serverId, {
+    bool refresh = false,
+    String? query,
+  }) async => DeviceMcpInspectResult.fromJson(
+    await _object(
+      'POST',
+      '/api/devices/${Uri.encodeComponent(deviceId)}/mcp/${Uri.encodeComponent(serverId)}/inspect',
+      body: {
+        'refresh': refresh,
+        if (query != null && query.trim().isNotEmpty) 'query': query.trim(),
+      },
+      timeout: const Duration(seconds: 45),
+    ),
+  );
+
+  Future<DeviceMcpPolicyUpdateResult> updateDeviceMcpPolicy(
+    String deviceId,
+    String serverId, {
+    bool? enabled,
+    String? callMode,
+  }) async => DeviceMcpPolicyUpdateResult.fromJson(
+    await _object(
+      'PUT',
+      '/api/devices/${Uri.encodeComponent(deviceId)}/mcp/${Uri.encodeComponent(serverId)}/policy',
+      body: {
+        'enabled': ?enabled,
+        if (callMode != null && callMode.trim().isNotEmpty) 'callMode': callMode.trim(),
+      },
+      timeout: const Duration(seconds: 30),
+    ),
+  );
+
+  Future<void> stopDeviceMcpServer(String deviceId, String serverId) async {
+    await _call(
+      'POST',
+      '/api/devices/${Uri.encodeComponent(deviceId)}/mcp/${Uri.encodeComponent(serverId)}/stop',
+      body: const <String, dynamic>{},
+      timeout: const Duration(seconds: 30),
+    );
+  }
+
+  Future<void> restartDeviceMcpServer(String deviceId, String serverId) async {
+    await _call(
+      'POST',
+      '/api/devices/${Uri.encodeComponent(deviceId)}/mcp/${Uri.encodeComponent(serverId)}/restart',
+      body: const <String, dynamic>{},
+      timeout: const Duration(seconds: 45),
+    );
+  }
+
   Future<DeviceApproval> approveDeviceApproval(String id, {String? reason}) async {
     final body = await _object(
       'POST',

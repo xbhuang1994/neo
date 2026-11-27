@@ -398,6 +398,43 @@ abstract class Strings {
   String get mcuIdRequired;
   String get relayDeviceRequired;
   String get mcuE2eKeyLabel;
+
+  // Device Local MCP Discovery & Proxy
+  String mcpSummaryBadge(int enabled, int discovered);
+  String get mcpServersButton;
+  String mcpSheetTitle(String name);
+  String get mcpRescan;
+  String get mcpRescanning;
+  String get mcpIncludeLoopbackProbe;
+  String get mcpEnable;
+  String get mcpDisable;
+  String get mcpInspectTools;
+  String get mcpHideTools;
+  String get mcpInspecting;
+  String get mcpRestart;
+  String get mcpStop;
+  String get mcpDone;
+  String mcpTrustStateLabel(String state);
+  String mcpRuntimeStateLabel(String state);
+  String mcpCallModeLabel(String mode);
+  String mcpSourceLabel(String source);
+  String mcpTransportLabel(String transport);
+  String get mcpCallModeTitle;
+  String get mcpToolReadOnlyBadge;
+  String get mcpToolDestructiveBadge;
+  String mcpToolCount(int count);
+  String get mcpNoToolsFound;
+  String get mcpUnsupportedHint;
+  String get mcpOfflineNoCacheHint;
+  String get mcpOfflineCachedHint;
+  String get mcpEmptyDiscoveredHint;
+  String get mcpSecretSafetyNote;
+  String get mcpAuthRequiredBadge;
+  String mcpEnvKeysLabel(List<String> keys);
+  String mcpDuplicateOfLabel(String target);
+  String get mcpServerStoppedNotice;
+  String get mcpServerRestartedNotice;
+  String get mcpSandboxLockedHint;
 }
 
 /// Gives the widgets below it their words.
@@ -1179,6 +1216,117 @@ class ZhStrings extends Strings {
   String get relayDeviceRequired => '请选择或填写 Tier 1 中继主机 ID';
   @override
   String get mcuE2eKeyLabel => 'MCU E2E 密钥';
+
+  @override
+  String mcpSummaryBadge(int enabled, int discovered) => 'MCP $enabled/$discovered';
+  @override
+  String get mcpServersButton => 'MCP 服务';
+  @override
+  String mcpSheetTitle(String name) => '$name · 本机 MCP 服务';
+  @override
+  String get mcpRescan => '重新扫描';
+  @override
+  String get mcpRescanning => '扫描中…';
+  @override
+  String get mcpIncludeLoopbackProbe => '含本机端口探测';
+  @override
+  String get mcpEnable => '启用';
+  @override
+  String get mcpDisable => '停用';
+  @override
+  String get mcpInspectTools => '查看工具';
+  @override
+  String get mcpHideTools => '收起工具';
+  @override
+  String get mcpInspecting => '读取中…';
+  @override
+  String get mcpRestart => '重启';
+  @override
+  String get mcpStop => '停止';
+  @override
+  String get mcpDone => '关闭';
+  @override
+  String mcpTrustStateLabel(String state) => switch (state) {
+    'discovered' => '待启用',
+    'enabled' => '已启用',
+    'disabled' => '已停用',
+    'blocked_by_policy' => '策略禁止',
+    _ => state,
+  };
+  @override
+  String mcpRuntimeStateLabel(String state) => switch (state) {
+    'running' => '运行中',
+    'idle' => '空闲',
+    'stopped' => '未启动',
+    'starting' => '启动中',
+    'error' => '异常',
+    _ => state,
+  };
+  @override
+  String mcpCallModeLabel(String mode) => switch (mode) {
+    'disabled' => '禁止调用',
+    'confirm_all' => '全部需审批',
+    'auto_readonly' => '只读自动 / 写操作审批',
+    'auto_all' => '全部自动',
+    _ => mode,
+  };
+  @override
+  String mcpSourceLabel(String source) => switch (source) {
+    'neo' || 'neo_registry' || 'neo_dropin' => 'Neo',
+    'claude_desktop' => 'Claude Desktop',
+    'claude_code' => 'Claude Code',
+    'cursor' => 'Cursor',
+    'codex' => 'Codex',
+    'vscode' => 'VS Code',
+    'antigravity' => 'Antigravity',
+    'gemini' => 'Gemini',
+    'workspace' => '工作区',
+    'loopback_probe' || 'loopback' => '本机探测',
+    'windsurf' => 'Windsurf',
+    'zed' => 'Zed',
+    'cline' => 'Cline',
+    'cherry_studio' => 'Cherry Studio',
+    _ => source,
+  };
+  @override
+  String mcpTransportLabel(String transport) => switch (transport) {
+    'stdio' => 'stdio',
+    'streamable_http' || 'http' => 'http',
+    'sse' => 'sse',
+    _ => transport,
+  };
+  @override
+  String get mcpCallModeTitle => '调用策略';
+  @override
+  String get mcpToolReadOnlyBadge => '只读';
+  @override
+  String get mcpToolDestructiveBadge => '变更/高危';
+  @override
+  String mcpToolCount(int count) => '$count 个工具';
+  @override
+  String get mcpNoToolsFound => '该服务未返回可用工具。';
+  @override
+  String get mcpUnsupportedHint => '该设备当前版本的 neo-agent-os 暂不支持本机 MCP 发现与代理，请先更新设备程序。';
+  @override
+  String get mcpOfflineNoCacheHint => '设备当前离线且无已缓存的 MCP 目录，请等待设备上线后再扫描。';
+  @override
+  String get mcpOfflineCachedHint => '设备当前离线，以下展示最近一次缓存的 MCP 目录；上线后可重新扫描或修改策略。';
+  @override
+  String get mcpEmptyDiscoveredHint => '暂未发现本机 MCP 服务，点击“重新扫描”检测本机配置。';
+  @override
+  String get mcpSecretSafetyNote => '凭据与环境变量值仅保留在该设备本机，不会上传到主控。';
+  @override
+  String get mcpAuthRequiredBadge => '需鉴权';
+  @override
+  String mcpEnvKeysLabel(List<String> keys) => '环境变量键 (${keys.length}): ${keys.join(', ')}';
+  @override
+  String mcpDuplicateOfLabel(String target) => '与 $target 重复';
+  @override
+  String get mcpServerStoppedNotice => '已停止 MCP 服务会话';
+  @override
+  String get mcpServerRestartedNotice => '已重启 MCP 服务会话';
+  @override
+  String get mcpSandboxLockedHint => '该设备已启用本地策略锁定（lock_sandbox = true），无法远程修改 MCP 启用状态或调用策略。';
 }
 
 /// English.
@@ -1950,4 +2098,115 @@ class EnStrings extends Strings {
   String get relayDeviceRequired => 'Select or enter a Tier 1 relay device ID';
   @override
   String get mcuE2eKeyLabel => 'MCU E2E key';
+
+  @override
+  String mcpSummaryBadge(int enabled, int discovered) => 'MCP $enabled/$discovered';
+  @override
+  String get mcpServersButton => 'MCP Servers';
+  @override
+  String mcpSheetTitle(String name) => '$name · Local MCP';
+  @override
+  String get mcpRescan => 'Rescan';
+  @override
+  String get mcpRescanning => 'Scanning…';
+  @override
+  String get mcpIncludeLoopbackProbe => 'Include loopback probe';
+  @override
+  String get mcpEnable => 'Enable';
+  @override
+  String get mcpDisable => 'Disable';
+  @override
+  String get mcpInspectTools => 'Inspect tools';
+  @override
+  String get mcpHideTools => 'Hide tools';
+  @override
+  String get mcpInspecting => 'Inspecting…';
+  @override
+  String get mcpRestart => 'Restart';
+  @override
+  String get mcpStop => 'Stop';
+  @override
+  String get mcpDone => 'Done';
+  @override
+  String mcpTrustStateLabel(String state) => switch (state) {
+    'discovered' => 'Discovered',
+    'enabled' => 'Enabled',
+    'disabled' => 'Disabled',
+    'blocked_by_policy' => 'Blocked',
+    _ => state,
+  };
+  @override
+  String mcpRuntimeStateLabel(String state) => switch (state) {
+    'running' => 'Running',
+    'idle' => 'Idle',
+    'stopped' => 'Stopped',
+    'starting' => 'Starting',
+    'error' => 'Error',
+    _ => state,
+  };
+  @override
+  String mcpCallModeLabel(String mode) => switch (mode) {
+    'disabled' => 'Disabled',
+    'confirm_all' => 'Confirm all',
+    'auto_readonly' => 'Auto read-only',
+    'auto_all' => 'Auto all',
+    _ => mode,
+  };
+  @override
+  String mcpSourceLabel(String source) => switch (source) {
+    'neo' || 'neo_registry' || 'neo_dropin' => 'Neo',
+    'claude_desktop' => 'Claude Desktop',
+    'claude_code' => 'Claude Code',
+    'cursor' => 'Cursor',
+    'codex' => 'Codex',
+    'vscode' => 'VS Code',
+    'antigravity' => 'Antigravity',
+    'gemini' => 'Gemini',
+    'workspace' => 'Workspace',
+    'loopback_probe' || 'loopback' => 'Loopback',
+    'windsurf' => 'Windsurf',
+    'zed' => 'Zed',
+    'cline' => 'Cline',
+    'cherry_studio' => 'Cherry Studio',
+    _ => source,
+  };
+  @override
+  String mcpTransportLabel(String transport) => switch (transport) {
+    'stdio' => 'stdio',
+    'streamable_http' || 'http' => 'http',
+    'sse' => 'sse',
+    _ => transport,
+  };
+  @override
+  String get mcpCallModeTitle => 'Call policy';
+  @override
+  String get mcpToolReadOnlyBadge => 'Read-only';
+  @override
+  String get mcpToolDestructiveBadge => 'Destructive';
+  @override
+  String mcpToolCount(int count) => count == 1 ? '1 tool' : '$count tools';
+  @override
+  String get mcpNoToolsFound => 'This server reported no tools.';
+  @override
+  String get mcpUnsupportedHint => 'This device\'s neo-agent-os version does not support local MCP discovery and proxy yet. Please update the device agent first.';
+  @override
+  String get mcpOfflineNoCacheHint => 'Device is offline with no cached MCP catalog. Wait for it to reconnect to scan.';
+  @override
+  String get mcpOfflineCachedHint => 'Device is offline; showing the last cached MCP catalog. Rescan and policy edits require the device to be online.';
+  @override
+  String get mcpEmptyDiscoveredHint => 'No local MCP servers discovered yet. Click "Rescan" to inspect local configurations.';
+  @override
+  String get mcpSecretSafetyNote => 'Credentials and environment variable values stay local on the device and are never uploaded to Master Neo.';
+  @override
+  String get mcpAuthRequiredBadge => 'Auth';
+  @override
+  String mcpEnvKeysLabel(List<String> keys) => 'Env keys (${keys.length}): ${keys.join(', ')}';
+  @override
+  String mcpDuplicateOfLabel(String target) => 'Duplicate of $target';
+  @override
+  String get mcpServerStoppedNotice => 'MCP server session stopped';
+  @override
+  String get mcpServerRestartedNotice => 'MCP server session restarted';
+  @override
+  String get mcpSandboxLockedHint => 'Local policy lock (lock_sandbox = true) is enabled on this device; MCP enablement and call policies cannot be changed remotely.';
 }

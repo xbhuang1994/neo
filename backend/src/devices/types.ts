@@ -203,6 +203,273 @@ export interface SandboxSummary {
   [key: string]: unknown;
 }
 
+/** Transport kind for a local MCP server discovered on a Tier 1 OS device. */
+export type McpTransportKind = "stdio" | "streamable_http" | "sse";
+
+/** Ordered list of valid MCP transport kinds. */
+export const MCP_TRANSPORT_KINDS: readonly McpTransportKind[] = [
+  "stdio",
+  "streamable_http",
+  "sse",
+];
+
+/** Type guard for `McpTransportKind`. */
+export function isMcpTransportKind(value: unknown): value is McpTransportKind {
+  return typeof value === "string" && (MCP_TRANSPORT_KINDS as readonly string[]).includes(value);
+}
+
+/** Trust lifecycle state of a discovered local MCP server. */
+export type McpTrustState = "discovered" | "enabled" | "disabled" | "blocked_by_policy";
+
+/** Ordered list of valid MCP trust states. */
+export const MCP_TRUST_STATES: readonly McpTrustState[] = [
+  "discovered",
+  "enabled",
+  "disabled",
+  "blocked_by_policy",
+];
+
+/** Type guard for `McpTrustState`. */
+export function isMcpTrustState(value: unknown): value is McpTrustState {
+  return typeof value === "string" && (MCP_TRUST_STATES as readonly string[]).includes(value);
+}
+
+/** Call risk policy mode for a local MCP server. */
+export type McpCallPolicyMode = "disabled" | "confirm_all" | "auto_readonly" | "auto_all";
+
+/** Ordered list of valid MCP call policy modes. */
+export const MCP_CALL_POLICY_MODES: readonly McpCallPolicyMode[] = [
+  "disabled",
+  "confirm_all",
+  "auto_readonly",
+  "auto_all",
+];
+
+/** Type guard for `McpCallPolicyMode`. */
+export function isMcpCallPolicyMode(value: unknown): value is McpCallPolicyMode {
+  return typeof value === "string" && (MCP_CALL_POLICY_MODES as readonly string[]).includes(value);
+}
+
+/** Runtime process/session state of a local MCP server on Tier 1. */
+export type McpRuntimeState = "stopped" | "starting" | "running" | "idle" | "error";
+
+/** Ordered list of valid MCP runtime states. */
+export const MCP_RUNTIME_STATES: readonly McpRuntimeState[] = [
+  "stopped",
+  "starting",
+  "running",
+  "idle",
+  "error",
+];
+
+/** Type guard for `McpRuntimeState`. */
+export function isMcpRuntimeState(value: unknown): value is McpRuntimeState {
+  return typeof value === "string" && (MCP_RUNTIME_STATES as readonly string[]).includes(value);
+}
+
+/** Local MCP discovery scope active on a Tier 1 OS agent. */
+export type McpDiscoveryMode = "disabled" | "neo_only" | "configs_only" | "configs_and_loopback";
+
+/** Ordered list of valid MCP discovery modes. */
+export const MCP_DISCOVERY_MODES: readonly McpDiscoveryMode[] = [
+  "disabled",
+  "neo_only",
+  "configs_only",
+  "configs_and_loopback",
+];
+
+/** Type guard for `McpDiscoveryMode`. */
+export function isMcpDiscoveryMode(value: unknown): value is McpDiscoveryMode {
+  return typeof value === "string" && (MCP_DISCOVERY_MODES as readonly string[]).includes(value);
+}
+
+/** Compact per-server summary item carried inside `CapabilityManifest.mcp_summary`. */
+export interface McpServerSummaryItem {
+  server_id: string;
+  name: string;
+  source: string;
+  transport: McpTransportKind;
+  trust_state: McpTrustState;
+  call_mode: McpCallPolicyMode;
+  runtime_state: McpRuntimeState;
+  tool_count?: number | null;
+}
+
+/** Lightweight MCP discovery summary embedded in `CapabilityManifest` (never carries full tool schemas). */
+export interface McpSummary {
+  enabled: boolean;
+  discovery_mode: McpDiscoveryMode;
+  discovered_count: number;
+  enabled_count: number;
+  running_count: number;
+  catalog_hash: string;
+  servers: McpServerSummaryItem[];
+}
+
+/** Standard MCP ToolAnnotations hints used for risk classification. */
+export interface McpToolAnnotations {
+  title?: string;
+  readOnlyHint?: boolean;
+  destructiveHint?: boolean;
+  idempotentHint?: boolean;
+  openWorldHint?: boolean;
+}
+
+/** Normalized MCP tool metadata returned by `mcp.inspect`. */
+export interface McpToolInfo {
+  name: string;
+  description?: string;
+  inputSchema: Record<string, unknown>;
+  annotations?: McpToolAnnotations;
+}
+
+/** Redacted local MCP server descriptor reported by Tier 1 OS agents (secrets stay local). */
+export interface McpServerDescriptor {
+  server_id: string;
+  name: string;
+  source: string;
+  source_path?: string | null;
+  transport: McpTransportKind;
+  command_preview?: string | null;
+  url_sanitized?: string | null;
+  env_keys: string[];
+  auth_required: boolean;
+  trust_state: McpTrustState;
+  call_mode: McpCallPolicyMode;
+  runtime_state: McpRuntimeState;
+  tool_count?: number | null;
+  dedup_key?: string | null;
+  duplicate_of?: string | null;
+  fingerprint?: string | null;
+  last_error?: string | null;
+  discovered_at_ms?: number | null;
+}
+
+/** Cached tool/resource/prompt inspection payload for a single MCP server. */
+export interface McpInspectedServerRecord {
+  tools: McpToolInfo[];
+  resources?: unknown[];
+  prompts?: unknown[];
+  toolsSchemaHash?: string;
+  serverInfo?: Record<string, unknown>;
+  protocolVersion?: string;
+  inspectedAt: string;
+}
+
+/** Persisted per-device MCP catalog stored separately in KV under `device-mcp:<deviceId>`. */
+export interface DeviceMcpCatalogRecord {
+  deviceId: string;
+  clusterId: string;
+  discoveryMode: McpDiscoveryMode;
+  catalogHash: string;
+  scannedAtMs?: number;
+  updatedAt: string;
+  servers: McpServerDescriptor[];
+  warnings?: string[];
+  toolsByServer: Record<string, McpInspectedServerRecord>;
+  summary?: McpSummary;
+}
+
+/** Public overview of a Tier 1 OS device's MCP discovery catalog and support state. */
+export interface DeviceMcpOverview {
+  deviceId: string;
+  customName?: string;
+  status: DeviceStatus;
+  supported: boolean;
+  discoveryMode: McpDiscoveryMode;
+  catalogHash: string;
+  scannedAtMs?: number;
+  updatedAt: string;
+  servers: McpServerDescriptor[];
+  warnings?: string[];
+  summary?: McpSummary;
+}
+
+/** Options for `DeviceMcpProxy.discover`. */
+export interface DeviceMcpDiscoverOptions {
+  includeLoopbackProbe?: boolean;
+  sources?: string[];
+  timeoutMs?: number;
+}
+
+/** Options for `DeviceMcpProxy.list`. */
+export interface DeviceMcpListOptions {
+  refresh?: boolean;
+  includeLoopbackProbe?: boolean;
+  timeoutMs?: number;
+}
+
+/** Options for `DeviceMcpProxy.inspect`. */
+export interface DeviceMcpInspectOptions {
+  query?: string;
+  includeResources?: boolean;
+  includePrompts?: boolean;
+  refresh?: boolean;
+  timeoutMs?: number;
+}
+
+/** Outcome of `DeviceMcpProxy.inspect`. */
+export interface DeviceMcpInspectResult {
+  deviceId: string;
+  serverId: string;
+  server?: McpServerDescriptor;
+  tools: McpToolInfo[];
+  totalTools: number;
+  filtered: boolean;
+  resources?: unknown[];
+  prompts?: unknown[];
+  toolsSchemaHash?: string;
+  serverInfo?: Record<string, unknown>;
+  protocolVersion?: string;
+  cached: boolean;
+  inspectedAt: string;
+}
+
+/** Input to `DeviceMcpProxy.setServerPolicy`. */
+export interface DeviceMcpPolicyUpdateInput {
+  enabled?: boolean;
+  callMode?: McpCallPolicyMode;
+  timeoutMs?: number;
+}
+
+/** Outcome of `DeviceMcpProxy.setServerPolicy`. */
+export interface DeviceMcpPolicyUpdateResult {
+  deviceId: string;
+  serverId: string;
+  server?: McpServerDescriptor;
+  persisted?: boolean;
+  summary?: McpSummary;
+  result?: unknown;
+}
+
+/** Outcome of `DeviceMcpProxy.stopServer` / `restartServer`. */
+export interface DeviceMcpServerActionResult {
+  deviceId: string;
+  serverId: string;
+  action: "stop" | "restart";
+  stopped?: boolean;
+  restarted?: boolean;
+  runtimeState?: McpRuntimeState;
+  server?: McpServerDescriptor;
+  summary?: McpSummary;
+  result?: unknown;
+}
+
+/** Supported MCP invocation operations through `DeviceMcpProxy.callTool`. */
+export type McpCallAction = "tools/call" | "resources/read" | "prompts/get";
+
+/** Input to `DeviceMcpProxy.callTool`. */
+export interface DeviceMcpCallInput {
+  serverId: string;
+  action?: McpCallAction;
+  toolName?: string;
+  arguments?: Record<string, unknown>;
+  uri?: string;
+  promptName?: string;
+  timeoutMs?: number;
+  reason?: string;
+}
+
 /** Tier 1 or Tier 2 capability manifest reported by an agent. */
 export interface CapabilityManifest {
   device_id: string;
@@ -219,6 +486,7 @@ export interface CapabilityManifest {
   capabilities?: string[];
   actions?: DeviceActionSpec[];
   sandbox?: SandboxSummary;
+  mcp_summary?: McpSummary;
   relay_config?: {
     enabled?: boolean;
     mqtt_bind?: string;

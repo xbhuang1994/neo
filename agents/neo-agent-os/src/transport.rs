@@ -1,5 +1,6 @@
 use crate::executor::Executor;
 use crate::file_transfer::{FileTransferManager, OutboundFileFrame};
+use crate::mcp::{is_mcp_rpc_method, McpManager};
 use crate::policy::Policy;
 use crate::prober::{CapabilityManifest, CapabilityProber};
 use crate::protocol::{
@@ -567,6 +568,15 @@ pub async fn run_agent(
         Executor::new(Arc::clone(&policy), cfg.ota_cache_dir.clone())
             .with_policy_paths(cfg.policy_path.clone(), cfg.sandbox_override_path.clone()),
     );
+    let mcp_manager = Arc::new(McpManager::new(
+        Arc::clone(&policy),
+        Some(cfg.cluster_id.clone()),
+        cfg.policy_path.clone(),
+        cfg.sandbox_override_path.clone(),
+        cfg.ota_cache_dir.clone(),
+    ));
+    mcp_manager.discover_initial().await;
+    let mcp_reaper_handle = mcp_manager.spawn_idle_reaper();
     let updating_flag = Arc::new(AtomicBool::new(false));
     let (restart_tx, mut restart_rx) = oneshot::channel::<RestartPlan>();
     let restart_slot = Arc::new(Mutex::new(Some(restart_tx)));
@@ -672,12 +682,14 @@ pub async fn run_agent(
                     *observed_public_ip.lock().await = Some(ip);
                 }
                 let policy_snap = policy.read().unwrap_or_else(|e| e.into_inner()).clone();
-                let mut manifest = CapabilityProber::probe(
+                let mcp_summary = mcp_manager.catalog_summary().await;
+                let mut manifest = CapabilityProber::probe_with_mcp(
                     &policy_snap,
                     &cfg.device_id,
                     cfg.relay_enabled,
                     Some(&cfg.mqtt_bind),
                     cfg.uart_device.as_deref(),
+                    Some(mcp_summary),
                 );
                 manifest.public_ip = observed_public_ip.lock().await.clone();
                 let init_master = active_master.lock().await.clone();
@@ -711,13 +723,23 @@ pub async fn run_agent(
                     }
                 }
 
-                let mut hb_tick = tokio::time::interval(Duration::from_secs(25));
+                let mut hb_tick = tokio::time::interval_at(
+                    tokio::time::Instant::now() + Duration::from_secs(25),
+                    Duration::from_secs(25),
+                );
                 hb_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut mcp_tick = tokio::time::interval_at(
+                    tokio::time::Instant::now() + Duration::from_secs(60),
+                    Duration::from_secs(60),
+                );
+                mcp_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
                 loop {
                     tokio::select! {
                         biased;
                         Ok(plan) = &mut restart_rx => {
+                            mcp_reaper_handle.abort();
+                            mcp_manager.shutdown_all().await;
                             file_transfers
                                 .fail_all_for_disconnect("agent restarting for self_update")
                                 .await;
@@ -729,6 +751,29 @@ pub async fn run_agent(
                             let _ = ws_sink.flush().await;
                             drop(relay_bridge);
                             return Ok(AgentExit::Restart(plan));
+                        }
+                        _ = mcp_tick.tick() => {
+                            if let Some(changed) = mcp_manager.poll_catalog_changes().await {
+                                let dst = active_master.lock().await.clone();
+                                let ev = DeviceMessage {
+                                    v: 1,
+                                    kind: "event".to_string(),
+                                    req_id: format!("mcp-evt-{}", now_ms()),
+                                    cluster_id: cfg.cluster_id.clone(),
+                                    device_id: cfg.device_id.clone(),
+                                    ts_ms: now_ms(),
+                                    body: json!({
+                                        "event": "mcp.catalog_changed",
+                                        "catalog_hash": changed.catalog_hash,
+                                        "summary": changed.summary,
+                                        "servers": changed.servers,
+                                    }),
+                                };
+                                if send_encrypted_frame(&mut ws_sink, &e2e_key, &cfg.device_id, &dst, &ev).await.is_err() {
+                                    push_ring(&offline_ring, (dst, ev)).await;
+                                    break;
+                                }
+                            }
                         }
                         _ = hb_tick.tick() => {
                             let ping = RelayFrame {
@@ -830,6 +875,7 @@ pub async fn run_agent(
                                                                         &cfg,
                                                                         &policy,
                                                                         &executor,
+                                                                        &mcp_manager,
                                                                         &file_transfers,
                                                                         &relay_bridge,
                                                                         &observed_public_ip,
@@ -894,11 +940,15 @@ pub async fn run_agent(
             push_ring(&offline_ring, item).await;
         }
         if let Ok(plan) = restart_rx.try_recv() {
+            mcp_reaper_handle.abort();
+            mcp_manager.shutdown_all().await;
             drop(relay_bridge);
             return Ok(AgentExit::Restart(plan));
         }
         tokio::select! {
             Ok(plan) = &mut restart_rx => {
+                mcp_reaper_handle.abort();
+                mcp_manager.shutdown_all().await;
                 drop(relay_bridge);
                 return Ok(AgentExit::Restart(plan));
             }
@@ -912,6 +962,7 @@ async fn handle_device_message(
     cfg: &AgentConfig,
     policy: &Arc<std::sync::RwLock<Policy>>,
     executor: &Arc<Executor>,
+    mcp_manager: &Arc<McpManager>,
     file_transfers: &Arc<FileTransferManager>,
     relay_bridge: &Option<Arc<RelayBridge>>,
     observed_public_ip: &Arc<Mutex<Option<String>>>,
@@ -1129,12 +1180,14 @@ async fn handle_device_message(
 
             if method == "probe" {
                 let policy_snap = policy.read().unwrap_or_else(|e| e.into_inner()).clone();
-                let mut manifest = CapabilityProber::probe(
+                let mcp_summary = mcp_manager.catalog_summary().await;
+                let mut manifest = CapabilityProber::probe_with_mcp(
                     &policy_snap,
                     &cfg.device_id,
                     cfg.relay_enabled,
                     Some(&cfg.mqtt_bind),
                     cfg.uart_device.as_deref(),
+                    Some(mcp_summary),
                 );
                 manifest.public_ip = observed_public_ip.lock().await.clone();
                 let resp = DeviceMessage {
@@ -1153,13 +1206,16 @@ async fn handle_device_message(
             if method == "set_sandbox" || method == "sandbox.set" {
                 match executor.apply_sandbox_level(&params) {
                     Ok(mut result_val) => {
+                        mcp_manager.on_sandbox_changed().await;
                         let policy_snap = executor.policy_snapshot();
-                        let mut manifest = CapabilityProber::probe(
+                        let mcp_summary = mcp_manager.catalog_summary().await;
+                        let mut manifest = CapabilityProber::probe_with_mcp(
                             &policy_snap,
                             &cfg.device_id,
                             cfg.relay_enabled,
                             Some(&cfg.mqtt_bind),
                             cfg.uart_device.as_deref(),
+                            Some(mcp_summary),
                         );
                         manifest.public_ip = observed_public_ip.lock().await.clone();
                         if let Some(obj) = result_val.as_object_mut() {
@@ -1275,6 +1331,55 @@ async fn handle_device_message(
                 let _ = outbound_tx.send((src_node.to_string(), resp)).await;
                 return;
             }
+            if is_mcp_rpc_method(&method) {
+                let mcp = Arc::clone(mcp_manager);
+                let out = outbound_tx.clone();
+                let cluster_id = cfg.cluster_id.clone();
+                let device_id = cfg.device_id.clone();
+                let dst = src_node.to_string();
+                let req_id = msg.req_id.clone();
+                let is_set_policy = matches!(method.as_str(), "mcp.server.set_policy" | "mcp_set_policy");
+
+                tokio::spawn(async move {
+                    let res = mcp.dispatch_rpc(&method, &params, timeout_ms).await;
+                    let ok_flag = res.is_ok();
+                    let body = match res {
+                        Ok(result) => json!({ "ok": true, "result": result }),
+                        Err(error) => json!({ "ok": false, "error": error }),
+                    };
+                    let resp = DeviceMessage {
+                        v: 1,
+                        kind: "rpc_resp".to_string(),
+                        req_id,
+                        cluster_id: cluster_id.clone(),
+                        device_id: device_id.clone(),
+                        ts_ms: now_ms(),
+                        body,
+                    };
+                    let _ = out.send((dst.clone(), resp)).await;
+
+                    if is_set_policy && ok_flag {
+                        let changed = mcp.build_catalog_changed_event().await;
+                        let ev = DeviceMessage {
+                            v: 1,
+                            kind: "event".to_string(),
+                            req_id: format!("mcp-evt-{}", now_ms()),
+                            cluster_id,
+                            device_id,
+                            ts_ms: now_ms(),
+                            body: json!({
+                                "event": "mcp.catalog_changed",
+                                "catalog_hash": changed.catalog_hash,
+                                "summary": changed.summary,
+                                "servers": changed.servers,
+                            }),
+                        };
+                        let _ = out.send((dst, ev)).await;
+                    }
+                });
+                return;
+            }
+
             let exec = Arc::clone(executor);
             let out = outbound_tx.clone();
             let cluster_id = cfg.cluster_id.clone();
@@ -2576,5 +2681,260 @@ mod tests {
         agent_task.abort();
         assert_eq!(std::fs::read(&push_target).unwrap(), push_bytes);
         let _ = std::fs::remove_dir_all(&ws_dir);
+    }
+
+    #[tokio::test]
+    async fn mock_relay_ws_handles_mcp_discovery_policy_inspect_call_and_event() {
+        let root = std::env::temp_dir().join(format!(
+            "neo_transport_mcp_{}_{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let ws_dir = root.join("ws");
+        let cfg_dir = root.join("cfg");
+        let ota_dir = root.join("ota");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::create_dir_all(&ota_dir).unwrap();
+
+        let py_script = root.join("ws_mcp_mock.py");
+        std::fs::write(
+            &py_script,
+            r#"
+import sys, json
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    m = msg.get("method")
+    rid = msg.get("id")
+    if m == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"ws-stdio-mcp"},"capabilities":{"tools":{}}}}), flush=True)
+    elif m == "tools/list":
+        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"tools":[{"name":"ping_tool","inputSchema":{"type":"object"}}]}}), flush=True)
+    elif m == "tools/call":
+        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"content":[{"type":"text","text":"ws-pong"}]}}), flush=True)
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            cfg_dir.join("mcp-servers.json"),
+            serde_json::to_string_pretty(&json!({
+                "mcpServers": {
+                    "ws-test-mcp": {
+                        "command": "python3",
+                        "args": ["-u", py_script.to_string_lossy()]
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let policy_path = cfg_dir.join("policy.toml");
+        let ws_esc = ws_dir.display().to_string().replace('\\', "\\\\");
+        let policy = Arc::new(std::sync::RwLock::new(
+            Policy::from_toml_str(&format!(
+                r#"
+sandbox_level = "personal"
+allowed_workspaces = ["{ws_esc}"]
+
+[mcp]
+enabled = true
+discovery_mode = "neo_only"
+"#
+            ))
+            .unwrap(),
+        ));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let e2e_secret = "mcp-ws-secret";
+        let cluster_id = "cluster-mcp";
+        let e2e_key = derive_e2e_key(cluster_id, e2e_secret);
+
+        let server_task = tokio::spawn(async move {
+            let (tx_done, mut rx_done) = mpsc::channel::<()>(1);
+            loop {
+                tokio::select! {
+                    _ = rx_done.recv() => break,
+                    accept_res = listener.accept() => {
+                        let (mut stream, _) = accept_res.unwrap();
+                        let tx_done = tx_done.clone();
+                        tokio::spawn(async move {
+                            let mut peek_buf = [0u8; 512];
+                            let n = stream.peek(&mut peek_buf).await.unwrap_or(0);
+                            let head = String::from_utf8_lossy(&peek_buf[..n]);
+                            if head.starts_with("GET /v1/bootstrap ") {
+                                let mut sink = [0u8; 1024];
+                                let _ = stream.read(&mut sink).await;
+                                let body = br#"{"stun_servers":[]}"#;
+                                let resp = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(resp.as_bytes()).await;
+                                let _ = stream.write_all(body).await;
+                                return;
+                            }
+                            if head.starts_with("GET /v1/signal ") {
+                                if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
+                                    let _ = ws.next().await;
+                                }
+                                return;
+                            }
+                            if head.starts_with("GET /v1/relay ") {
+                                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                                async fn recv_msg<S>(
+                                    ws: &mut S,
+                                    key: &[u8; 32],
+                                    cluster: &str,
+                                ) -> DeviceMessage
+                                where
+                                    S: StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+                                {
+                                    loop {
+                                        if let Some(Ok(WsMessage::Binary(b))) = ws.next().await {
+                                            let rf = RelayFrame::decode(&b).unwrap();
+                                            if rf.flags == RelayFlags::Data {
+                                                let msg = open_device_message(key, cluster, "os-mcp", "master-1", &rf.payload).unwrap();
+                                                if msg.kind != "heartbeat" {
+                                                    return msg;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // 1. Manifest includes mcp_discovery, mcp_proxy, and mcp_summary
+                                let manifest = recv_msg(&mut ws, &e2e_key, cluster_id).await;
+                                assert_eq!(manifest.kind, "manifest");
+                                let caps: Vec<&str> = manifest.body["capabilities"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .filter_map(|v| v.as_str())
+                                    .collect();
+                                assert!(caps.contains(&"mcp_discovery"));
+                                assert!(caps.contains(&"mcp_proxy"));
+                                assert_eq!(manifest.body["mcp_summary"]["enabled"], true);
+                                assert!(manifest.body["mcp_summary"]["discovered_count"].as_u64().unwrap() >= 1);
+
+                                // Helper to send RPC
+                                let send_rpc = |req_id: &str, method: &str, params: serde_json::Value| {
+                                    let req = DeviceMessage {
+                                        v: 1,
+                                        kind: "rpc_req".to_string(),
+                                        req_id: req_id.to_string(),
+                                        cluster_id: cluster_id.to_string(),
+                                        device_id: "os-mcp".to_string(),
+                                        ts_ms: 1000,
+                                        body: json!({ "method": method, "params": params }),
+                                    };
+                                    let sealed = seal_device_message(&e2e_key, "master-1", "os-mcp", &req).unwrap();
+                                    let rf = RelayFrame {
+                                        flags: RelayFlags::Data,
+                                        src: "master-1".to_string(),
+                                        dst: "os-mcp".to_string(),
+                                        payload: sealed,
+                                    };
+                                    WsMessage::Binary(rf.encode().unwrap().into())
+                                };
+
+                                // 2. mcp.server.set_policy -> rpc_resp + mcp.catalog_changed event
+                                ws.send(send_rpc(
+                                    "req-policy",
+                                    "mcp.server.set_policy",
+                                    json!({"server_id": "neo:ws-test-mcp", "trust_state": "enabled"}),
+                                ))
+                                .await
+                                .unwrap();
+                                let resp_pol = recv_msg(&mut ws, &e2e_key, cluster_id).await;
+                                assert_eq!(resp_pol.kind, "rpc_resp");
+                                assert_eq!(resp_pol.req_id, "req-policy");
+                                assert_eq!(resp_pol.body["ok"], true);
+                                assert_eq!(resp_pol.body["result"]["persisted"], true);
+                                assert_eq!(resp_pol.body["result"]["server"]["trust_state"], "enabled");
+
+                                let evt = recv_msg(&mut ws, &e2e_key, cluster_id).await;
+                                assert_eq!(evt.kind, "event");
+                                assert_eq!(evt.body["event"], "mcp.catalog_changed");
+                                assert!(evt.body["catalog_hash"].as_str().unwrap().starts_with("sha256:"));
+
+                                // 3. mcp.inspect
+                                ws.send(send_rpc(
+                                    "req-inspect",
+                                    "mcp.inspect",
+                                    json!({"server_id": "neo:ws-test-mcp"}),
+                                ))
+                                .await
+                                .unwrap();
+                                let resp_insp = recv_msg(&mut ws, &e2e_key, cluster_id).await;
+                                assert_eq!(resp_insp.body["ok"], true);
+                                assert_eq!(resp_insp.body["result"]["tools"][0]["name"], "ping_tool");
+
+                                // 4. mcp.call (using underscore alias!)
+                                ws.send(send_rpc(
+                                    "req-call",
+                                    "mcp_call",
+                                    json!({"server_id": "neo:ws-test-mcp", "tool_name": "ping_tool", "arguments": {}}),
+                                ))
+                                .await
+                                .unwrap();
+                                let resp_call = recv_msg(&mut ws, &e2e_key, cluster_id).await;
+                                assert_eq!(resp_call.body["ok"], true);
+                                assert_eq!(resp_call.body["result"]["content"][0]["text"], "ws-pong");
+
+                                // 5. mcp.server.stop
+                                ws.send(send_rpc(
+                                    "req-stop",
+                                    "mcp.server.stop",
+                                    json!({"server_id": "neo:ws-test-mcp"}),
+                                ))
+                                .await
+                                .unwrap();
+                                let resp_stop = recv_msg(&mut ws, &e2e_key, cluster_id).await;
+                                assert_eq!(resp_stop.body["ok"], true);
+                                assert_eq!(resp_stop.body["result"]["stopped"], true);
+
+                                let _ = tx_done.send(()).await;
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
+        let cfg = AgentConfig {
+            cluster_id: cluster_id.to_string(),
+            device_id: "os-mcp".to_string(),
+            master_id: "master-1".to_string(),
+            relay_url: format!("http://{addr}"),
+            token: "neo1.dummy.sig".to_string(),
+            e2e_secret: e2e_secret.to_string(),
+            enroll_id: None,
+            relay_enabled: false,
+            mqtt_bind: "127.0.0.1:0".to_string(),
+            uart_device: None,
+            ota_cache_dir: Some(ota_dir),
+            updater_state_path: None,
+            policy_path: Some(policy_path),
+            sandbox_override_path: None,
+            self_update_target: None,
+        };
+
+        let agent_task = tokio::spawn(async move {
+            let _ = run_agent(cfg, policy).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(8), server_task)
+            .await
+            .unwrap()
+            .unwrap();
+        agent_task.abort();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

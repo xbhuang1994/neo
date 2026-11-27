@@ -110,6 +110,20 @@ class FakeBackend {
   bool mcuAutoDeploySuccess = true;
   int _enrollmentSeq = 0;
 
+  // Device MCP discovery & proxy fixture state.
+  final Map<String, Map<String, dynamic>> deviceMcpOverviews = {};
+  final Map<String, Map<String, List<Map<String, dynamic>>>> deviceMcpTools = {};
+  final List<Map<String, dynamic>> mcpDiscovers = [];
+  final List<Map<String, dynamic>> mcpInspects = [];
+  final List<Map<String, dynamic>> mcpPolicyUpdates = [];
+  final List<Map<String, dynamic>> mcpStops = [];
+  final List<Map<String, dynamic>> mcpRestarts = [];
+  String? mcpError;
+  String? mcpInspectError;
+  String? mcpPolicyError;
+  String? mcpRuntimeError;
+  List<Map<String, dynamic>> Function(String deviceId, bool includeLoopbackProbe)? onMcpDiscover;
+
   void configureDevices({
     String clusterId = 'personal',
     String masterNodeId = 'master-1',
@@ -158,6 +172,7 @@ class FakeBackend {
     String? sandboxSyncState,
     String? sandboxSyncError,
     bool sandboxLocked = false,
+    Map<String, dynamic>? mcpSummary,
   }) {
     final (memMb, timeoutSec) = switch (sandboxLevel) {
       'readonly' => (1024, 60),
@@ -210,6 +225,7 @@ class FakeBackend {
                     'max_child_mem_mb': memMb,
                     'max_exec_timeout_sec': timeoutSec,
                   },
+                  'mcp_summary': ?mcpSummary,
                 }),
       'capabilities': capabilities,
       'desiredState': <String, dynamic>{},
@@ -220,6 +236,106 @@ class FakeBackend {
       'lastSeenAt': '2026-05-01T09:42:00.000Z',
       'updatedAt': '2026-05-01T09:42:00.000Z',
     });
+  }
+
+  Map<String, dynamic> _buildMcpSummaryMap(
+    List<Map<String, dynamic>> servers, {
+    required bool supported,
+    required String discoveryMode,
+    String? catalogHash,
+  }) {
+    final enabledCount = servers.where((s) => (s['trustState'] ?? s['trust_state']) == 'enabled').length;
+    final runningCount = servers.where((s) {
+      final rt = s['runtimeState'] ?? s['runtime_state'];
+      return rt == 'running' || rt == 'idle';
+    }).length;
+    return {
+      'enabled': supported,
+      'discovery_mode': discoveryMode,
+      'discovered_count': servers.length,
+      'enabled_count': enabledCount,
+      'running_count': runningCount,
+      'catalog_hash': catalogHash ?? 'sha256:catalog-${servers.length}-$enabledCount',
+      'servers': [
+        for (final s in servers)
+          {
+            'server_id': s['serverId'] ?? s['server_id'] ?? '',
+            'name': s['name'] ?? '',
+            'source': s['source'] ?? '',
+            'transport': s['transport'] ?? 'stdio',
+            'trust_state': s['trustState'] ?? s['trust_state'] ?? 'discovered',
+            'call_mode': s['callMode'] ?? s['call_mode'] ?? 'disabled',
+            'runtime_state': s['runtimeState'] ?? s['runtime_state'] ?? 'stopped',
+            if ((s['toolCount'] ?? s['tool_count']) != null) 'tool_count': s['toolCount'] ?? s['tool_count'],
+          },
+      ],
+    };
+  }
+
+  void _syncDeviceMcpSummary(String deviceId) {
+    final overview = deviceMcpOverviews[deviceId];
+    if (overview == null) return;
+    final supported = overview['supported'] == true;
+    final discoveryMode = overview['discoveryMode'] as String? ?? 'standard';
+    final servers = [for (final s in (overview['servers'] as List)) (s as Map).cast<String, dynamic>()];
+    final summary = _buildMcpSummaryMap(
+      servers,
+      supported: supported,
+      discoveryMode: discoveryMode,
+      catalogHash: overview['catalogHash'] as String?,
+    );
+    overview['summary'] = summary;
+    final idx = devices.indexWhere((d) => d['deviceId'] == deviceId);
+    if (idx == -1) return;
+    final device = devices[idx];
+    final manifest = device['manifest'] is Map ? (device['manifest'] as Map).cast<String, dynamic>() : null;
+    if (manifest != null) {
+      if (supported) {
+        manifest['mcp_summary'] = summary;
+        final caps = (device['capabilities'] as List?)?.cast<String>().toList() ?? <String>[];
+        if (!caps.contains('mcp_discovery')) caps.add('mcp_discovery');
+        if (!caps.contains('mcp_proxy')) caps.add('mcp_proxy');
+        device['capabilities'] = caps;
+        manifest['capabilities'] = List<String>.from(caps);
+      } else {
+        manifest.remove('mcp_summary');
+      }
+    }
+  }
+
+  void setDeviceMcp(
+    String deviceId, {
+    bool supported = true,
+    String discoveryMode = 'standard',
+    String? catalogHash,
+    List<Map<String, dynamic>> servers = const [],
+    List<String> warnings = const [],
+    Map<String, List<Map<String, dynamic>>> toolsByServer = const {},
+    bool syncManifestSummary = true,
+  }) {
+    final copiedServers = [for (final s in servers) Map<String, dynamic>.from(s)];
+    deviceMcpOverviews[deviceId] = {
+      'deviceId': deviceId,
+      'supported': supported,
+      'discoveryMode': discoveryMode,
+      'catalogHash': catalogHash ?? 'sha256:catalog-$deviceId',
+      'updatedAt': '2026-05-01T09:50:00.000Z',
+      'servers': copiedServers,
+      'warnings': List<String>.from(warnings),
+    };
+    deviceMcpTools[deviceId] = {
+      for (final entry in toolsByServer.entries) entry.key: [for (final t in entry.value) Map<String, dynamic>.from(t)],
+    };
+    if (syncManifestSummary) {
+      _syncDeviceMcpSummary(deviceId);
+    } else {
+      deviceMcpOverviews[deviceId]!['summary'] = _buildMcpSummaryMap(
+        copiedServers,
+        supported: supported,
+        discoveryMode: discoveryMode,
+        catalogHash: catalogHash,
+      );
+    }
   }
 
   void addDeviceApproval(
@@ -494,12 +610,12 @@ class FakeBackend {
       return detail == null ? _json(404, {'error': 'Worker not found'}) : _json(200, detail);
     }
     if (path == '/api/devices' || path.startsWith('/api/devices/')) {
-      return _handleDevices(request.method, path, body);
+      return _handleDevices(request.method, path, request.url.pathSegments, body);
     }
     return _json(404, {'error': 'Not found'});
   }
 
-  http.Response _handleDevices(String method, String path, Object? body) {
+  http.Response _handleDevices(String method, String path, List<String> segments, Object? body) {
     if (!devicesSupported) return _json(404, {'error': 'Not found'});
     if (method == 'GET' && path == '/api/devices') {
       return _json(200, {
@@ -769,6 +885,184 @@ class FakeBackend {
         'targetVersion': masterVer,
         'message': 'Triggered remote update to v$masterVer',
       });
+    }
+    if (segments.length >= 4 && segments[0] == 'api' && segments[1] == 'devices' && segments[3] == 'mcp') {
+      final deviceId = segments[2];
+      final deviceIndex = devices.indexWhere((d) => d['deviceId'] == deviceId);
+      if (deviceIndex == -1) return _json(404, {'error': 'Device not found'});
+      final device = devices[deviceIndex];
+      final req = body is Map ? body.cast<String, dynamic>() : <String, dynamic>{};
+
+      if (segments.length == 4 && method == 'GET') {
+        if (mcpError != null) {
+          final error = mcpError!;
+          mcpError = null;
+          return _json(500, {'error': error});
+        }
+        final existing = deviceMcpOverviews[deviceId];
+        if (existing != null) return _json(200, existing);
+        final caps = (device['capabilities'] as List?)?.cast<String>() ?? const <String>[];
+        final supported = caps.contains('mcp_proxy') || caps.contains('mcp_discovery');
+        return _json(200, {
+          'deviceId': deviceId,
+          'supported': supported,
+          'discoveryMode': supported ? 'standard' : 'off',
+          'servers': <Map<String, dynamic>>[],
+          'warnings': <String>[],
+        });
+      }
+
+      if (segments.length == 5 && segments[4] == 'discover' && method == 'POST') {
+        final includeLoopback = req['includeLoopbackProbe'] == true;
+        mcpDiscovers.add({'deviceId': deviceId, 'includeLoopbackProbe': includeLoopback});
+        if (mcpError != null) {
+          final error = mcpError!;
+          mcpError = null;
+          return _json(400, {'error': error});
+        }
+        var overview = deviceMcpOverviews[deviceId];
+        if (overview == null) {
+          setDeviceMcp(deviceId, supported: true, servers: const []);
+          overview = deviceMcpOverviews[deviceId]!;
+        }
+        if (overview['supported'] != true) {
+          return _json(200, overview);
+        }
+        if (onMcpDiscover != null) {
+          overview['servers'] = [for (final s in onMcpDiscover!(deviceId, includeLoopback)) Map<String, dynamic>.from(s)];
+        } else if (includeLoopback) {
+          final list = (overview['servers'] as List).cast<Map<String, dynamic>>();
+          if (!list.any((s) => (s['serverId'] ?? s['server_id']) == 'loopback:local-http')) {
+            list.add({
+              'serverId': 'loopback:local-http',
+              'name': 'local-http',
+              'source': 'loopback_probe',
+              'transport': 'streamable_http',
+              'urlSanitized': 'http://127.0.0.1:8765/mcp',
+              'envKeys': <String>[],
+              'authRequired': false,
+              'trustState': 'discovered',
+              'callMode': 'disabled',
+              'runtimeState': 'running',
+            });
+          }
+        }
+        overview['updatedAt'] = DateTime.now().toIso8601String();
+        _syncDeviceMcpSummary(deviceId);
+        return _json(200, overview);
+      }
+
+      if (segments.length == 6) {
+        final serverId = segments[4];
+        final action = segments[5];
+        final overview = deviceMcpOverviews[deviceId];
+        if (overview == null) return _json(404, {'error': 'MCP catalog not found'});
+        final servers = (overview['servers'] as List).cast<Map<String, dynamic>>();
+        final serverIndex = servers.indexWhere((s) => (s['serverId'] ?? s['server_id']) == serverId);
+        if (serverIndex == -1) return _json(404, {'error': 'MCP server not found: $serverId'});
+        final server = servers[serverIndex];
+
+        if (action == 'inspect' && method == 'POST') {
+          mcpInspects.add({'deviceId': deviceId, 'serverId': serverId, ...req});
+          if (mcpInspectError != null) {
+            final error = mcpInspectError!;
+            mcpInspectError = null;
+            return _json(400, {'error': error});
+          }
+          if (mcpError != null) {
+            final error = mcpError!;
+            mcpError = null;
+            return _json(400, {'error': error});
+          }
+          final allTools = deviceMcpTools[deviceId]?[serverId] ?? const <Map<String, dynamic>>[];
+          final query = (req['query'] as String?)?.trim().toLowerCase();
+          final filteredTools = (query == null || query.isEmpty)
+              ? allTools
+              : [
+                  for (final t in allTools)
+                    if (((t['name'] as String?) ?? '').toLowerCase().contains(query) ||
+                        ((t['description'] as String?) ?? '').toLowerCase().contains(query))
+                      t,
+                ];
+          server['toolCount'] = allTools.length;
+          if ((server['runtimeState'] ?? server['runtime_state']) == 'stopped') {
+            server['runtimeState'] = 'running';
+          }
+          _syncDeviceMcpSummary(deviceId);
+          return _json(200, {
+            'deviceId': deviceId,
+            'server': server,
+            'protocolVersion': '2025-03-26',
+            'tools': filteredTools,
+            'toolsSchemaHash': 'sha256:tools-$serverId',
+          });
+        }
+
+        if (action == 'policy' && method == 'PUT') {
+          mcpPolicyUpdates.add({'deviceId': deviceId, 'serverId': serverId, ...req});
+          if (mcpPolicyError != null) {
+            final error = mcpPolicyError!;
+            mcpPolicyError = null;
+            return _json(400, {'error': error});
+          }
+          final manifest = (device['manifest'] as Map?)?.cast<String, dynamic>() ?? const <String, dynamic>{};
+          final sandbox = (manifest['sandbox'] as Map?)?.cast<String, dynamic>() ?? const <String, dynamic>{};
+          if (sandbox['locked'] == true || device['sandboxSyncState'] == 'locked') {
+            return _json(403, {'error': 'Device sandbox policy is locked locally (lock_sandbox = true)'});
+          }
+          if ((server['trustState'] ?? server['trust_state']) == 'blocked_by_policy') {
+            return _json(403, {'error': 'MCP server is blocked by local policy'});
+          }
+          if (req['enabled'] is bool) {
+            final enable = req['enabled'] as bool;
+            server['trustState'] = enable ? 'enabled' : 'disabled';
+            if (enable) {
+              final currentMode = server['callMode'] ?? server['call_mode'];
+              if (currentMode == null || currentMode == 'disabled') {
+                server['callMode'] = 'auto_readonly';
+              }
+            } else {
+              server['runtimeState'] = 'stopped';
+            }
+          }
+          if (req['callMode'] is String && (req['callMode'] as String).isNotEmpty) {
+            server['callMode'] = req['callMode'];
+          }
+          _syncDeviceMcpSummary(deviceId);
+          return _json(200, {
+            'deviceId': deviceId,
+            'server': server,
+            'persisted': true,
+            'summary': overview['summary'],
+          });
+        }
+
+        if (action == 'stop' && method == 'POST') {
+          mcpStops.add({'deviceId': deviceId, 'serverId': serverId});
+          if (mcpRuntimeError != null) {
+            final error = mcpRuntimeError!;
+            mcpRuntimeError = null;
+            return _json(400, {'error': error});
+          }
+          server['runtimeState'] = 'stopped';
+          _syncDeviceMcpSummary(deviceId);
+          return _json(200, {'ok': true, 'server': server});
+        }
+
+        if (action == 'restart' && method == 'POST') {
+          mcpRestarts.add({'deviceId': deviceId, 'serverId': serverId});
+          if (mcpRuntimeError != null) {
+            final error = mcpRuntimeError!;
+            mcpRuntimeError = null;
+            return _json(400, {'error': error});
+          }
+          server['runtimeState'] = 'running';
+          server.remove('lastError');
+          server.remove('last_error');
+          _syncDeviceMcpSummary(deviceId);
+          return _json(200, {'ok': true, 'server': server});
+        }
+      }
     }
     if ((method == 'PATCH' || method == 'PUT') && path.startsWith('/api/devices/') && path != '/api/devices/config') {
       final id = Uri.decodeComponent(path.substring('/api/devices/'.length));
