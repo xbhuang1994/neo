@@ -1146,14 +1146,16 @@ export class DeviceManager {
         return resolved;
       } catch {
         return null;
-      } finally {
-        if (this.locationLookups.get(key) === run) {
-          this.locationLookups.delete(key);
-        }
       }
     })();
     this.locationLookups.set(key, run);
-    return await run;
+    try {
+      return await run;
+    } finally {
+      if (this.locationLookups.get(key) === run) {
+        this.locationLookups.delete(key);
+      }
+    }
   }
 
   /** Fetch `/v1/peers` from `neo-relayd` and enrich persisted Device Twins with observed external IPs and locations. */
@@ -1223,14 +1225,16 @@ export class DeviceManager {
         return updatedCount;
       } catch {
         return 0;
-      } finally {
-        if (this.peerSyncInFlight === run) {
-          this.peerSyncInFlight = null;
-        }
       }
     })();
     this.peerSyncInFlight = run;
-    return await run;
+    try {
+      return await run;
+    } finally {
+      if (this.peerSyncInFlight === run) {
+        this.peerSyncInFlight = null;
+      }
+    }
   }
 
   /**

@@ -1282,4 +1282,49 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&ws);
     }
+
+    #[tokio::test]
+    async fn push_respects_live_readonly_and_unrestricted_sandbox_switches() {
+        use crate::policy::SandboxLevel;
+
+        let ws = make_temp_ws("sbx_ft");
+        let outside = ws.parent().unwrap().join(format!("neo_ft_outside_{}.bin", std::process::id()));
+        let ro_policy = Policy::from_preset(
+            SandboxLevel::Readonly,
+            vec![ws.to_string_lossy().into_owned()],
+            false,
+        )
+        .unwrap();
+        let shared = Arc::new(std::sync::RwLock::new(ro_policy));
+        let (tx, _rx) = mpsc::channel::<OutboundFileFrame>(16);
+        let mgr = FileTransferManager::new(Arc::clone(&shared), tx);
+
+        // Readonly blocks file.push.open inside workspace
+        let err = mgr
+            .open_push(
+                "master-1",
+                &json!({ "transfer_id": "ft_ro", "path": ws.join("a.bin").to_string_lossy(), "size": 4 }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("readonly"), "unexpected error: {err}");
+
+        // Live switch to unrestricted allows file.push.open outside workspace
+        *shared.write().unwrap() = Policy::from_preset(
+            SandboxLevel::Unrestricted,
+            vec![ws.to_string_lossy().into_owned()],
+            false,
+        )
+        .unwrap();
+        let ok = mgr
+            .open_push(
+                "master-1",
+                &json!({ "transfer_id": "ft_unr", "path": outside.to_string_lossy(), "size": 4 }),
+            )
+            .await;
+        assert!(ok.is_ok(), "expected unrestricted push to succeed: {ok:?}");
+        mgr.fail_all_for_disconnect("cleanup").await;
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
 }
