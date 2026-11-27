@@ -5,11 +5,11 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:cupertino_ui/cupertino_ui.dart';
-import 'package:flutter/services.dart';
 
 import '../api/client.dart';
 import '../api/models.dart';
 import '../l10n/strings.dart';
+import '../platform/host.dart';
 import '../state/app_state.dart';
 import 'device_enroll_sheet.dart';
 import 'format.dart';
@@ -246,7 +246,7 @@ class _DevicesPageState extends State<DevicesPage> {
   void _copyUninstall(DeviceTwin device, List<DeviceEnrollment> enrollments) {
     final strings = Strings.read(context);
     final cmd = _uninstallCommandFor(device, enrollments);
-    unawaited(Clipboard.setData(ClipboardData(text: cmd)));
+    unawaited(copyToClipboard(cmd));
     _showToast('${strings.uninstallCopied} (${device.deviceId})', good: true);
   }
 
@@ -597,7 +597,7 @@ class _DevicesPageState extends State<DevicesPage> {
               width: double.infinity,
               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
               decoration: BoxDecoration(color: palette.code, borderRadius: BorderRadius.circular(7)),
-              child: Selectable(child: Text(paramsText, style: typo.mono.copyWith(fontSize: 12, color: palette.secondary))),
+              child: Text(paramsText, style: typo.mono.copyWith(fontSize: 12, color: palette.secondary)),
             ),
           ],
           if (approval.reason != null) ...[
@@ -895,24 +895,26 @@ class _DevicesPageState extends State<DevicesPage> {
           ),
           LinkNotice(onOpenSettings: widget.onOpenSettings),
           Expanded(
-            child: !online
-                ? EmptyState(icon: CupertinoIcons.desktopcomputer, title: strings.devices, hint: strings.devicesConnectFirst)
-                : state.devicesUnsupported
-                ? EmptyState(icon: CupertinoIcons.desktopcomputer, title: strings.devicesUnsupportedTitle, hint: strings.devicesUnsupportedHint)
-                : overview == null
-                ? Center(
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const CupertinoActivityIndicator(radius: 9),
-                        const SizedBox(width: 10),
-                        Text(strings.loading, style: Typo.of(context).footnote),
-                      ],
-                    ),
-                  )
-                : !configured
-                ? _buildUninitialized(state, overview.config)
-                : _buildConfigured(state, overview),
+            child: Selectable(
+              child: !online
+                  ? EmptyState(icon: CupertinoIcons.desktopcomputer, title: strings.devices, hint: strings.devicesConnectFirst)
+                  : state.devicesUnsupported
+                  ? EmptyState(icon: CupertinoIcons.desktopcomputer, title: strings.devicesUnsupportedTitle, hint: strings.devicesUnsupportedHint)
+                  : overview == null
+                  ? Center(
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const CupertinoActivityIndicator(radius: 9),
+                          const SizedBox(width: 10),
+                          Text(strings.loading, style: Typo.of(context).footnote),
+                        ],
+                      ),
+                    )
+                  : !configured
+                  ? _buildUninitialized(state, overview.config)
+                  : _buildConfigured(state, overview),
+            ),
           ),
         ],
       ),
@@ -1019,9 +1021,10 @@ class _ClusterSettingsSheetState extends State<_ClusterSettingsSheet> {
               ),
               Container(height: 0.5, color: palette.separator),
               Flexible(
-                child: SingleChildScrollView(
-                  primary: false,
-                  padding: const EdgeInsets.all(14),
+                child: Selectable(
+                  child: SingleChildScrollView(
+                    primary: false,
+                    padding: const EdgeInsets.all(14),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
@@ -1082,6 +1085,7 @@ class _ClusterSettingsSheetState extends State<_ClusterSettingsSheet> {
                     ],
                   ),
                 ),
+              ),
               ),
             ],
           ),

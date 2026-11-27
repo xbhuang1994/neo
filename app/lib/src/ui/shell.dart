@@ -26,7 +26,11 @@ class Shell extends StatefulWidget {
 class _ShellState extends State<Shell> {
   int _page = 0;
 
-  void _go(int page) => setState(() => _page = page);
+  void _go(int page) {
+    if (page == _page) return;
+    Selectable.clearActiveSelection();
+    setState(() => _page = page);
+  }
 
   @override
   Widget build(BuildContext context) {

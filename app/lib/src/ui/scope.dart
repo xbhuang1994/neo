@@ -69,16 +69,20 @@ class LinkNotice extends StatelessWidget {
           Icon(CupertinoIcons.exclamationmark_triangle_fill, size: 16, color: palette.orange),
           const SizedBox(width: grid),
           Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(title, style: typo.headline.copyWith(fontSize: 13)),
-                if (detail != null && detail.isNotEmpty) Text(detail, style: typo.footnote, maxLines: 3, overflow: TextOverflow.ellipsis),
-              ],
+            child: Selectable(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(title, style: typo.headline.copyWith(fontSize: 13)),
+                  if (detail != null && detail.isNotEmpty) Text(detail, style: typo.footnote, maxLines: 3, overflow: TextOverflow.ellipsis),
+                ],
+              ),
             ),
           ),
           if (action != null)
-            CupertinoButton(padding: const EdgeInsets.symmetric(horizontal: 12), minimumSize: const Size(0, 30), onPressed: run, child: Text(action, style: typo.headline.copyWith(fontSize: 13, color: palette.accent))),
+            SelectionContainer.disabled(
+              child: CupertinoButton(padding: const EdgeInsets.symmetric(horizontal: 12), minimumSize: const Size(0, 30), onPressed: run, child: Text(action, style: typo.headline.copyWith(fontSize: 13, color: palette.accent))),
+            ),
         ],
       ),
     );

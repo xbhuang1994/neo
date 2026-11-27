@@ -6,6 +6,9 @@ import 'package:flutter/foundation.dart';
 
 import 'host_stub.dart' if (dart.library.io) 'host_io.dart' if (dart.library.js_interop) 'host_web.dart' as implementation;
 
+/// Copy [text] to the system clipboard, falling back to a DOM copy when the browser hides `navigator.clipboard`.
+Future<void> copyToClipboard(String text) => implementation.copyToClipboard(text);
+
 /// How far the local backend is.
 enum BackendPhase {
   /// Its process is starting, or restarting after it ended.

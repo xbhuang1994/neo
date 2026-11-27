@@ -253,16 +253,18 @@ class ActionButton extends StatelessWidget {
     final palette = Palette.of(context);
     final color = destructive ? palette.red : palette.accent;
     final enabled = onPressed != null && !busy;
-    return CupertinoButton(
-      padding: const EdgeInsets.symmetric(horizontal: 16),
-      minimumSize: const Size(0, 34),
-      borderRadius: BorderRadius.circular(8),
-      color: plain ? palette.fill : color,
-      disabledColor: palette.fill,
-      onPressed: enabled ? onPressed : null,
-      child: busy
-          ? const CupertinoActivityIndicator(radius: 8)
-          : Text(label, style: Typo.of(context).headline.copyWith(fontSize: 14, color: !enabled ? palette.tertiary : plain ? color : CupertinoColors.white)),
+    return SelectionContainer.disabled(
+      child: CupertinoButton(
+        padding: const EdgeInsets.symmetric(horizontal: 16),
+        minimumSize: const Size(0, 34),
+        borderRadius: BorderRadius.circular(8),
+        color: plain ? palette.fill : color,
+        disabledColor: palette.fill,
+        onPressed: enabled ? onPressed : null,
+        child: busy
+            ? const CupertinoActivityIndicator(radius: 8)
+            : Text(label, style: Typo.of(context).headline.copyWith(fontSize: 14, color: !enabled ? palette.tertiary : plain ? color : CupertinoColors.white)),
+      ),
     );
   }
 }
@@ -286,30 +288,32 @@ class SettingsPage extends StatelessWidget {
           PageHeader(title: strings.settings, subtitle: const LinkPill()),
           Expanded(
             child: CupertinoScrollbar(
-              child: ListView(
-                padding: const EdgeInsets.symmetric(horizontal: grid * 2.5, vertical: grid * 3),
-                children: [
-                  Center(
-                    child: ConstrainedBox(
-                      constraints: const BoxConstraints(maxWidth: 640),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: [
-                          const ConnectionSettings(),
-                          if (online) ...[
-                            // A new backend is new settings: each section starts over with its client.
-                            ModelsSettings(key: ValueKey(('models', state.client)), api: state.client!),
-                            AccountsSettings(key: ValueKey(('accounts', state.client)), api: state.client!),
-                            GeneralSettingsSection(key: ValueKey(('general', state.client)), api: state.client!),
-                            WeChatSettings(key: ValueKey(('wechat', state.client)), api: state.client!),
-                            if (!state.devicesUnsupported) DevicesSummarySection(onOpenDevices: onOpenDevices),
-                            const AboutSection(),
+              child: Selectable(
+                child: ListView(
+                  padding: const EdgeInsets.symmetric(horizontal: grid * 2.5, vertical: grid * 3),
+                  children: [
+                    Center(
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 640),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            const ConnectionSettings(),
+                            if (online) ...[
+                              // A new backend is new settings: each section starts over with its client.
+                              ModelsSettings(key: ValueKey(('models', state.client)), api: state.client!),
+                              AccountsSettings(key: ValueKey(('accounts', state.client)), api: state.client!),
+                              GeneralSettingsSection(key: ValueKey(('general', state.client)), api: state.client!),
+                              WeChatSettings(key: ValueKey(('wechat', state.client)), api: state.client!),
+                              if (!state.devicesUnsupported) DevicesSummarySection(onOpenDevices: onOpenDevices),
+                              const AboutSection(),
+                            ],
                           ],
-                        ],
+                        ),
                       ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             ),
           ),
@@ -377,13 +381,15 @@ class _ConnectionSettingsState extends State<ConnectionSettings> {
             padding: const EdgeInsets.all(12),
             child: SizedBox(
               width: double.infinity,
-              child: CupertinoSlidingSegmentedControl<bool>(
-                groupValue: local,
-                children: {true: Text(strings.thisComputer), false: Text(strings.remoteServer)},
-                onValueChanged: (value) {
-                  setState(() => _local = value ?? true);
-                  if (value == true) unawaited(_apply());
-                },
+              child: SelectionContainer.disabled(
+                child: CupertinoSlidingSegmentedControl<bool>(
+                  groupValue: local,
+                  children: {true: Text(strings.thisComputer), false: Text(strings.remoteServer)},
+                  onValueChanged: (value) {
+                    setState(() => _local = value ?? true);
+                    if (value == true) unawaited(_apply());
+                  },
+                ),
               ),
             ),
           ),
@@ -828,10 +834,12 @@ class _GeneralSettingsState extends LoadingState<GeneralSettingsSection, General
               padding: const EdgeInsets.all(12),
               child: SizedBox(
                 width: double.infinity,
-                child: CupertinoSlidingSegmentedControl<String>(
-                  groupValue: settings.evalMode,
-                  children: {'off': Text(strings.modeOff), 'observe': Text(strings.modeObserve), 'auto': Text(strings.modeAuto)},
-                  onValueChanged: (mode) => _edit(() => settings.evalMode = mode ?? settings.evalMode),
+                child: SelectionContainer.disabled(
+                  child: CupertinoSlidingSegmentedControl<String>(
+                    groupValue: settings.evalMode,
+                    children: {'off': Text(strings.modeOff), 'observe': Text(strings.modeObserve), 'auto': Text(strings.modeAuto)},
+                    onValueChanged: (mode) => _edit(() => settings.evalMode = mode ?? settings.evalMode),
+                  ),
                 ),
               ),
             ),

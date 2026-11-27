@@ -5,11 +5,11 @@ library;
 import 'dart:async';
 
 import 'package:cupertino_ui/cupertino_ui.dart';
-import 'package:flutter/services.dart';
 
 import '../api/client.dart';
 import '../api/models.dart';
 import '../l10n/strings.dart';
+import '../platform/host.dart';
 import '../qr/qr_view.dart';
 import 'settings_page.dart';
 import 'theme.dart';
@@ -304,7 +304,7 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
   }
 
   void _copyText(String text, {required VoidCallback onMark, required VoidCallback onReset}) {
-    unawaited(Clipboard.setData(ClipboardData(text: text)));
+    unawaited(copyToClipboard(text));
     onMark();
     _copyResetTimer?.cancel();
     _copyResetTimer = Timer(const Duration(seconds: 2), () {
@@ -464,17 +464,19 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
           _sectionLabel(strings.installMode),
           SizedBox(
             width: double.infinity,
-            child: CupertinoSlidingSegmentedControl<String>(
-              key: const ValueKey('enroll-install-mode'),
-              groupValue: _installMode,
-              children: {
-                'auto': _segmentLabel(strings.installModeAuto),
-                'system': _segmentLabel(strings.installModeSystem),
-                'user': _segmentLabel(strings.installModeUser),
-              },
-              onValueChanged: (value) {
-                if (value != null) setState(() => _installMode = value);
-              },
+            child: SelectionContainer.disabled(
+              child: CupertinoSlidingSegmentedControl<String>(
+                key: const ValueKey('enroll-install-mode'),
+                groupValue: _installMode,
+                children: {
+                  'auto': _segmentLabel(strings.installModeAuto),
+                  'system': _segmentLabel(strings.installModeSystem),
+                  'user': _segmentLabel(strings.installModeUser),
+                },
+                onValueChanged: (value) {
+                  if (value != null) setState(() => _installMode = value);
+                },
+              ),
             ),
           ),
         ],
@@ -587,16 +589,18 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
                       const SizedBox(height: 5),
                       SizedBox(
                         width: double.infinity,
-                        child: CupertinoSlidingSegmentedControl<String>(
-                          key: const ValueKey('enroll-transport-mode'),
-                          groupValue: _transportMode,
-                          children: {
-                            'relay': _segmentLabel(strings.transportRelay),
-                            'direct': _segmentLabel(strings.transportDirect),
-                          },
-                          onValueChanged: (value) {
-                            if (value != null) setState(() => _transportMode = value);
-                          },
+                        child: SelectionContainer.disabled(
+                          child: CupertinoSlidingSegmentedControl<String>(
+                            key: const ValueKey('enroll-transport-mode'),
+                            groupValue: _transportMode,
+                            children: {
+                              'relay': _segmentLabel(strings.transportRelay),
+                              'direct': _segmentLabel(strings.transportDirect),
+                            },
+                            onValueChanged: (value) {
+                              if (value != null) setState(() => _transportMode = value);
+                            },
+                          ),
                         ),
                       ),
                       if (_transportMode == 'direct') ...[
@@ -616,17 +620,19 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
                       const SizedBox(height: 4),
                       SizedBox(
                         width: double.infinity,
-                        child: CupertinoSlidingSegmentedControl<int>(
-                          key: const ValueKey('enroll-ttl'),
-                          groupValue: _ttlSec,
-                          children: {
-                            600: _segmentLabel('10m'),
-                            1800: _segmentLabel('30m'),
-                            86400: _segmentLabel('24h'),
-                          },
-                          onValueChanged: (v) {
-                            if (v != null) setState(() => _ttlSec = v);
-                          },
+                        child: SelectionContainer.disabled(
+                          child: CupertinoSlidingSegmentedControl<int>(
+                            key: const ValueKey('enroll-ttl'),
+                            groupValue: _ttlSec,
+                            children: {
+                              600: _segmentLabel('10m'),
+                              1800: _segmentLabel('30m'),
+                              86400: _segmentLabel('24h'),
+                            },
+                            onValueChanged: (v) {
+                              if (v != null) setState(() => _ttlSec = v);
+                            },
+                          ),
                         ),
                       ),
                       const SizedBox(height: 12),
@@ -634,17 +640,19 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
                       const SizedBox(height: 4),
                       SizedBox(
                         width: double.infinity,
-                        child: CupertinoSlidingSegmentedControl<int>(
-                          key: const ValueKey('enroll-max-uses'),
-                          groupValue: _maxUses,
-                          children: {
-                            1: _segmentLabel('1'),
-                            5: _segmentLabel('5'),
-                            10: _segmentLabel('10'),
-                          },
-                          onValueChanged: (v) {
-                            if (v != null) setState(() => _maxUses = v);
-                          },
+                        child: SelectionContainer.disabled(
+                          child: CupertinoSlidingSegmentedControl<int>(
+                            key: const ValueKey('enroll-max-uses'),
+                            groupValue: _maxUses,
+                            children: {
+                              1: _segmentLabel('1'),
+                              5: _segmentLabel('5'),
+                              10: _segmentLabel('10'),
+                            },
+                            onValueChanged: (v) {
+                              if (v != null) setState(() => _maxUses = v);
+                            },
+                          ),
                         ),
                       ),
                     ],
@@ -709,21 +717,23 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
           const SizedBox(height: 12),
           SizedBox(
             width: double.infinity,
-            child: CupertinoSlidingSegmentedControl<bool>(
-              key: const ValueKey('linux-root-toggle'),
-              groupValue: _linuxUseRoot,
-              children: {
-                true: _segmentLabel(strings.linuxRootMode),
-                false: _segmentLabel(strings.linuxUserMode),
-              },
-              onValueChanged: (value) {
-                if (value != null) {
-                  setState(() {
-                    _linuxUseRoot = value;
-                    _copiedCmd = false;
-                  });
-                }
-              },
+            child: SelectionContainer.disabled(
+              child: CupertinoSlidingSegmentedControl<bool>(
+                key: const ValueKey('linux-root-toggle'),
+                groupValue: _linuxUseRoot,
+                children: {
+                  true: _segmentLabel(strings.linuxRootMode),
+                  false: _segmentLabel(strings.linuxUserMode),
+                },
+                onValueChanged: (value) {
+                  if (value != null) {
+                    setState(() {
+                      _linuxUseRoot = value;
+                      _copiedCmd = false;
+                    });
+                  }
+                },
+              ),
             ),
           ),
         ],
@@ -736,9 +746,7 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
             borderRadius: BorderRadius.circular(10),
             border: Border.all(color: palette.separator.withValues(alpha: 0.5), width: 0.5),
           ),
-          child: Selectable(
-            child: Text(command, style: typo.mono.copyWith(color: palette.label)),
-          ),
+          child: Text(command, style: typo.mono.copyWith(color: palette.label)),
         ),
         const SizedBox(height: 12),
         Wrap(
@@ -803,7 +811,7 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
                   child: QrView(enrollment.enrollCode, size: 180),
                 ),
                 const SizedBox(height: 6),
-                Selectable(child: Text(enrollment.enrollCode, style: typo.mono.copyWith(fontSize: 11.5, color: palette.secondary))),
+                Text(enrollment.enrollCode, style: typo.mono.copyWith(fontSize: 11.5, color: palette.secondary)),
               ],
             ),
           ),
@@ -929,16 +937,18 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
                 label: strings.mcuTransport,
                 below: SizedBox(
                   width: double.infinity,
-                  child: CupertinoSlidingSegmentedControl<String>(
-                    key: const ValueKey('mcu-transport-segment'),
-                    groupValue: _mcuTransport,
-                    children: {
-                      'mqtt': _segmentLabel(strings.mcuTransportMqtt),
-                      'serial': _segmentLabel(strings.mcuTransportSerial),
-                    },
-                    onValueChanged: (value) {
-                      if (value != null) setState(() => _mcuTransport = value);
-                    },
+                  child: SelectionContainer.disabled(
+                    child: CupertinoSlidingSegmentedControl<String>(
+                      key: const ValueKey('mcu-transport-segment'),
+                      groupValue: _mcuTransport,
+                      children: {
+                        'mqtt': _segmentLabel(strings.mcuTransportMqtt),
+                        'serial': _segmentLabel(strings.mcuTransportSerial),
+                      },
+                      onValueChanged: (value) {
+                        if (value != null) setState(() => _mcuTransport = value);
+                      },
+                    ),
                   ),
                 ),
               ),
@@ -1110,7 +1120,7 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
                 margin: const EdgeInsets.only(top: 6),
                 padding: const EdgeInsets.all(10),
                 decoration: BoxDecoration(color: palette.code, borderRadius: BorderRadius.circular(8)),
-                child: Selectable(child: Text(result.configHeader, style: typo.mono.copyWith(fontSize: 11.5, color: palette.label))),
+                child: Text(result.configHeader, style: typo.mono.copyWith(fontSize: 11.5, color: palette.label)),
               ),
           ],
           if (result.installScript.isNotEmpty) ...[
@@ -1155,7 +1165,7 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
                 margin: const EdgeInsets.only(top: 6),
                 padding: const EdgeInsets.all(10),
                 decoration: BoxDecoration(color: palette.code, borderRadius: BorderRadius.circular(8)),
-                child: Selectable(child: Text(result.installScript, style: typo.mono.copyWith(fontSize: 11.5, color: palette.label))),
+                child: Text(result.installScript, style: typo.mono.copyWith(fontSize: 11.5, color: palette.label)),
               ),
           ],
           const SizedBox(height: 12),
@@ -1256,13 +1266,15 @@ class _DeviceEnrollSheetState extends State<DeviceEnrollSheet> {
               Flexible(
                 child: CupertinoScrollbar(
                   controller: _scroll,
-                  child: SingleChildScrollView(
-                    controller: _scroll,
-                    primary: false,
-                    padding: const EdgeInsets.fromLTRB(16, 6, 16, 18),
-                    child: _tab == 'mcu'
-                        ? _buildMcuTab()
-                        : (activeEnrollment != null ? _buildEnrollmentTracking(activeEnrollment) : _buildTier1Form()),
+                  child: Selectable(
+                    child: SingleChildScrollView(
+                      controller: _scroll,
+                      primary: false,
+                      padding: const EdgeInsets.fromLTRB(16, 6, 16, 18),
+                      child: _tab == 'mcu'
+                          ? _buildMcuTab()
+                          : (activeEnrollment != null ? _buildEnrollmentTracking(activeEnrollment) : _buildTier1Form()),
+                    ),
                   ),
                 ),
               ),

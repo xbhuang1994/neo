@@ -1,9 +1,12 @@
-import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 
 import 'host.dart';
 
 /// A host for platforms that are neither a desktop nor a browser: nothing local, nothing stored.
 Host createHost() => _NoHost();
+
+/// Copy [text] to the system clipboard.
+Future<void> copyToClipboard(String text) => Clipboard.setData(ClipboardData(text: text));
 
 class _NoHost implements Host {
   @override

@@ -1,10 +1,14 @@
 /// Small pieces the pages share.
 library;
 
+import 'dart:async';
+
 import 'package:cupertino_ui/cupertino_ui.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/rendering.dart';
 
 import '../l10n/strings.dart';
+import '../platform/host.dart';
 import 'format.dart';
 import 'theme.dart';
 
@@ -118,12 +122,14 @@ class _FoldableState extends State<Foldable> {
       children: [
         if (_open) widget.child else ClipRect(child: ConstrainedBox(constraints: BoxConstraints(maxHeight: widget.height), child: SingleChildScrollView(physics: const NeverScrollableScrollPhysics(), child: widget.child))),
         const SizedBox(height: 6),
-        GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onTap: () => setState(() => _open = !_open),
-          child: MouseRegion(
-            cursor: SystemMouseCursors.click,
-            child: Text(_open ? strings.collapse : strings.expand, style: Typo.of(context).caption.copyWith(color: color, fontWeight: FontWeight.w600)),
+        SelectionContainer.disabled(
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () => setState(() => _open = !_open),
+            child: MouseRegion(
+              cursor: SystemMouseCursors.click,
+              child: Text(_open ? strings.collapse : strings.expand, style: Typo.of(context).caption.copyWith(color: color, fontWeight: FontWeight.w600)),
+            ),
           ),
         ),
       ],
@@ -282,26 +288,100 @@ class Selectable extends StatefulWidget {
 
   final Widget child;
 
+  static _SelectableState? _active;
+
+  /// Whether any [Selectable] in the window currently has non-empty selected text.
+  static bool get hasActiveSelection => _active != null && _active!.mounted && _active!._selectedText.isNotEmpty;
+
+  /// Copies the active selection to the system clipboard, returning whether anything was copied.
+  static bool copyActiveSelection() {
+    final active = _active;
+    if (active == null || !active.mounted || active._selectedText.isEmpty) return false;
+    unawaited(copyToClipboard(active._selectedText));
+    return true;
+  }
+
+  /// Selects all text in the active [Selectable], if any is currently active.
+  static bool selectAllActive() {
+    final region = _active?.mounted == true ? _active!._regionKey.currentState : null;
+    if (region == null) return false;
+    region.selectAll(SelectionChangedCause.keyboard);
+    return true;
+  }
+
+  /// Clears any active selection, e.g. when switching tabs in an [IndexedStack].
+  static void clearActiveSelection() {
+    _active?._clearSelection();
+  }
+
   @override
   State<Selectable> createState() => _SelectableState();
 }
 
 class _SelectableState extends State<Selectable> {
   final FocusNode _focus = FocusNode();
+  final GlobalKey<SelectableRegionState> _regionKey = GlobalKey<SelectableRegionState>();
+  String _selectedText = '';
+
+  void _onSelectionChanged(SelectedContent? content) {
+    final text = content?.plainText ?? '';
+    _selectedText = text;
+    if (text.isNotEmpty) {
+      final previous = Selectable._active;
+      if (previous != null && previous != this) {
+        previous._clearSelection();
+      }
+      Selectable._active = this;
+    } else if (Selectable._active == this) {
+      Selectable._active = null;
+    }
+  }
+
+  void _clearSelection() {
+    _selectedText = '';
+    if (Selectable._active == this) Selectable._active = null;
+    if (!mounted) return;
+    _regionKey.currentState?.clearSelection();
+  }
 
   @override
   void dispose() {
+    if (Selectable._active == this) Selectable._active = null;
     _focus.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    // Avoid nesting duplicate SelectableRegions when an ancestor already provides selection.
+    if (SelectionContainer.maybeOf(context) != null) return widget.child;
     final touch = defaultTargetPlatform == TargetPlatform.iOS || defaultTargetPlatform == TargetPlatform.android;
     return SelectableRegion(
+      key: _regionKey,
       focusNode: _focus,
+      onSelectionChanged: _onSelectionChanged,
       selectionControls: touch ? cupertinoTextSelectionHandleControls : cupertinoDesktopTextSelectionHandleControls,
-      contextMenuBuilder: (context, state) => CupertinoAdaptiveTextSelectionToolbar.buttonItems(anchors: state.contextMenuAnchors, buttonItems: state.contextMenuButtonItems),
+      contextMenuBuilder: (context, state) {
+        final items = [
+          for (final item in state.contextMenuButtonItems)
+            if (item.type == ContextMenuButtonType.copy)
+              ContextMenuButtonItem(
+                type: item.type,
+                label: item.label,
+                onPressed: () {
+                  if (_selectedText.isNotEmpty) {
+                    unawaited(copyToClipboard(_selectedText));
+                    state.hideToolbar();
+                  } else {
+                    item.onPressed?.call();
+                  }
+                },
+              )
+            else
+              item,
+        ];
+        return CupertinoAdaptiveTextSelectionToolbar.buttonItems(anchors: state.contextMenuAnchors, buttonItems: items);
+      },
       child: widget.child,
     );
   }
