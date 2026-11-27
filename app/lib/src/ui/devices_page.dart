@@ -299,7 +299,7 @@ class _DevicesPageState extends State<DevicesPage> {
 
   void _copyUpgradeCommand(DeviceTwin device, String cmd) {
     final strings = Strings.read(context);
-    unawaited(Clipboard.setData(ClipboardData(text: cmd)));
+    unawaited(copyToClipboard(cmd));
     _showToast('${strings.upgradeCommandCopied} (${device.deviceId})', good: true);
   }
 
