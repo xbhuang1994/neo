@@ -431,7 +431,21 @@ export interface AppContext {
   healthView(): unknown;
   activityView(): Promise<unknown>;
   panelMessages(): unknown[];
+  panelMessagesPage?(options?: { limit?: number; beforeId?: number }): {
+    messages: unknown[];
+    hasMore: boolean;
+    total: number;
+    oldestId: number | null;
+  };
   workerCards(): Promise<unknown[]>;
+  workerCardsPage?(options?: { limit?: number; offset?: number }): Promise<{
+    workers: unknown[];
+    hasMore: boolean;
+    total: number;
+    activeCount: number;
+    offset: number;
+    limit: number;
+  }>;
   workerDetail(ticketId: string): Promise<unknown | null>;
   reportKernels(): void;
   modelsKnown(kernel: Kernel): { ok: true; models: ModelOption[] } | { ok: false; error: string } | null;

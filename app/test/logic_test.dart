@@ -370,5 +370,136 @@ void main() {
 
       state.dispose();
     });
+
+    for (final supportPoll in [true, false]) {
+      test('paginates messages and workers in 20-item pages, merges live updates, handles errors, and resets (poll=$supportPoll)', () async {
+        final backend = FakeBackend()..supportPoll = supportPoll;
+        for (var i = 0; i < 45; i++) {
+          backend.say(i.isEven ? 'user' : 'assistant', 'Message #$i');
+        }
+        // 2 active + 43 ended workers.
+        backend.addWorker('w-active-2', 'Active 2', {'stage': 'working'}, streaming: true);
+        backend.addWorker('w-active-1', 'Active 1', {'stage': 'person', 'action': 'answer'});
+        for (var i = 43; i >= 1; i--) {
+          backend.addWorker('w-ended-$i', 'Ended $i', {'stage': 'ended'}, outcome: 'completed');
+        }
+
+        final state = stateOver(backend, pollEvery: const Duration(hours: 1));
+        await state.start();
+        await state.refresh();
+
+        // Initial load fetches only the latest 20 messages and top 20 workers with accurate totals.
+        expect(state.messages, hasLength(20));
+        expect(state.messages.first.id, 25);
+        expect(state.messages.last.id, 44);
+        expect(state.messagesHasMore, isTrue);
+        expect(state.messagesTotal, 45);
+        expect(state.remainingOlderMessages, 25);
+
+        expect(state.workers, hasLength(20));
+        expect(state.workers.first.ticketId, 'w-active-2');
+        expect(state.workers.last.ticketId, 'w-ended-26');
+        expect(state.workersHasMore, isTrue);
+        expect(state.workersTotal, 45);
+        expect(state.activeWorkers, 2);
+        expect(state.remainingMoreWorkers, 25);
+
+        // Load earlier messages: transient error surfaces cleanly and retry succeeds.
+        backend.messagesPageError = 'temporary history error';
+        await state.loadMoreMessages();
+        expect(state.loadMoreMessagesError, 'temporary history error');
+        expect(state.messages, hasLength(20));
+
+        await state.loadMoreMessages();
+        expect(state.loadMoreMessagesError, isNull);
+        expect(state.messages, hasLength(40));
+        expect(state.messages.first.id, 5);
+        expect(state.messages.last.id, 44);
+        expect(state.messagesHasMore, isTrue);
+        expect(state.remainingOlderMessages, 5);
+
+        // Live new message arrives via poll and merges without discarding loaded older messages.
+        backend.say('assistant', 'Live reply #45');
+        await state.refresh();
+        expect(state.messages, hasLength(41));
+        expect(state.messages.first.id, 5);
+        expect(state.messages.last.id, 45);
+        expect(state.messagesHasMore, isTrue);
+        expect(state.messagesTotal, 46);
+
+        // Load final page of older messages.
+        await state.loadMoreMessages();
+        expect(state.messages, hasLength(46));
+        expect(state.messages.first.id, 0);
+        expect(state.messages.last.id, 45);
+        expect(state.messagesHasMore, isFalse);
+        expect(state.remainingOlderMessages, 0);
+
+        // Load more workers: transient error + retry.
+        backend.workersPageError = 'temporary worker error';
+        await state.loadMoreWorkers();
+        expect(state.loadMoreWorkersError, 'temporary worker error');
+        expect(state.workers, hasLength(20));
+
+        await state.loadMoreWorkers();
+        expect(state.loadMoreWorkersError, isNull);
+        expect(state.workers, hasLength(40));
+        expect(state.workers.last.ticketId, 'w-ended-6');
+        expect(state.workersHasMore, isTrue);
+
+        // New active worker appears at top; poll merges without duplicating or dropping loaded tail.
+        backend.workers.insert(0, {
+          'ticketId': 'w-active-3',
+          'title': 'Active 3',
+          'stage': {'stage': 'working'},
+          'outcome': null,
+          'updatedAt': '2026-05-01T10:00:00.000Z',
+          'session': {'loaded': true, 'streaming': true},
+          'background': <dynamic>[],
+          'assignment': {'id': 'a-3', 'state': 'running'},
+          'pendingInputs': 0,
+        });
+        await state.refresh();
+        expect(state.workers, hasLength(41));
+        expect(state.workers.first.ticketId, 'w-active-3');
+        expect(state.workers.last.ticketId, 'w-ended-6');
+        expect(state.activeWorkers, 3);
+        expect(state.workersTotal, 46);
+        expect(state.workersHasMore, isTrue);
+
+        // Load remaining workers.
+        await state.loadMoreWorkers();
+        expect(state.workers, hasLength(46));
+        expect(state.workers.last.ticketId, 'w-ended-1');
+        expect(state.workersHasMore, isFalse);
+
+        // Resetting conversation clears history and pagination state.
+        await state.resetConversation();
+        expect(state.messages, isEmpty);
+        expect(state.messagesHasMore, isFalse);
+        expect(state.messagesTotal, 0);
+
+        state.dispose();
+      });
+    }
+
+    test('stays backward-compatible with older backends that ignore pagination parameters', () async {
+      final backend = FakeBackend()..legacyPagination = true;
+      for (var i = 0; i < 25; i++) {
+        backend.say('user', 'Legacy msg $i');
+        backend.addWorker('legacy-$i', 'Legacy worker $i', {'stage': i == 0 ? 'working' : 'ended'}, outcome: i == 0 ? null : 'completed');
+      }
+      final state = stateOver(backend, pollEvery: const Duration(hours: 1));
+      await state.start();
+      await state.refresh();
+      expect(state.messages, hasLength(25));
+      expect(state.messagesHasMore, isFalse);
+      expect(state.messagesTotal, 25);
+      expect(state.workers, hasLength(25));
+      expect(state.workersHasMore, isFalse);
+      expect(state.workersTotal, 25);
+      expect(state.activeWorkers, 1);
+      state.dispose();
+    });
   });
 }

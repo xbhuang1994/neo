@@ -20,6 +20,18 @@ class FakeBackend {
 
   /// Refuse the next chat message with this error.
   String? chatError;
+
+  /// Refuse the next paginated older-messages load (`before` present) with this error.
+  String? messagesPageError;
+
+  /// Refuse the next paginated workers load (`offset > 0`) with this error.
+  String? workersPageError;
+
+  /// When true, implements `GET /api/poll` with per-slice ETags and `mLimit`/`wLimit` pagination.
+  bool supportPoll = false;
+
+  /// When true, ignores `limit`/`before`/`offset`/`mLimit`/`wLimit` to simulate an older backend.
+  bool legacyPagination = false;
   final List<Map<String, dynamic>> messages = [];
   final List<Map<String, dynamic>> workers = [];
   final Map<String, Map<String, dynamic>> details = {};
@@ -473,6 +485,124 @@ class FakeBackend {
     },
   };
 
+  Map<String, dynamic> _messagesPagePayload(int limit, int? beforeId) {
+    final filtered = beforeId == null
+        ? messages
+        : [for (final m in messages) if (((m['id'] as num?)?.toInt() ?? 0) < beforeId) m];
+    final start = filtered.length > limit ? filtered.length - limit : 0;
+    final slice = filtered.sublist(start);
+    return {
+      'messages': slice,
+      'hasMore': start > 0,
+      'total': messages.length,
+      'oldestId': slice.isNotEmpty ? slice.first['id'] : null,
+    };
+  }
+
+  Map<String, dynamic> _workersPagePayload(int limit, int offset) {
+    final safeOffset = offset < 0 ? 0 : offset;
+    final slice = safeOffset >= workers.length
+        ? <Map<String, dynamic>>[]
+        : workers.sublist(safeOffset, (safeOffset + limit).clamp(0, workers.length));
+    final activeCount = workers.where((w) => ((w['stage'] as Map?)?['stage']) != 'ended').length;
+    return {
+      'workers': slice,
+      'hasMore': safeOffset + slice.length < workers.length,
+      'total': workers.length,
+      'activeCount': activeCount,
+      'offset': safeOffset,
+      'limit': limit,
+    };
+  }
+
+  http.Response _handlePoll(http.Request request) {
+    final params = request.url.queryParameters;
+    final include = (params['include'] ?? 'm,w,a,d')
+        .split(',')
+        .map((s) => s.trim())
+        .where((s) => s.isNotEmpty)
+        .toSet();
+    final workerId = params['worker'];
+    if (params['health'] == '1') include.add('h');
+
+    final changed = <String, dynamic>{};
+    final meta = <String, dynamic>{};
+    final etags = <String, String>{};
+    var anyChanged = false;
+
+    void checkSlice(String key, String payloadKey, Object? value, {Object? hashSource, Object? metaValue}) {
+      final tag = '${jsonEncode(hashSource ?? value).hashCode}';
+      etags[key] = tag;
+      if (params[key] != tag) {
+        changed[payloadKey] = value;
+        if (metaValue != null) meta[payloadKey] = metaValue;
+        anyChanged = true;
+      }
+    }
+
+    if (include.contains('m')) {
+      final mLimit = legacyPagination ? null : int.tryParse(params['mLimit'] ?? '');
+      if (mLimit != null) {
+        final page = _messagesPagePayload(mLimit, null);
+        checkSlice(
+          'm',
+          'messages',
+          page['messages'],
+          hashSource: page,
+          metaValue: {'hasMore': page['hasMore'], 'total': page['total'], 'oldestId': page['oldestId']},
+        );
+      } else {
+        checkSlice('m', 'messages', messages);
+      }
+    }
+    if (include.contains('w')) {
+      final wLimit = legacyPagination ? null : int.tryParse(params['wLimit'] ?? '');
+      if (wLimit != null) {
+        final page = _workersPagePayload(wLimit, 0);
+        checkSlice(
+          'w',
+          'workers',
+          page['workers'],
+          hashSource: page,
+          metaValue: {'hasMore': page['hasMore'], 'total': page['total'], 'activeCount': page['activeCount']},
+        );
+      } else {
+        checkSlice('w', 'workers', workers);
+      }
+    }
+    if (include.contains('a') && activity != null) {
+      checkSlice('a', 'activity', activity);
+    }
+    if (include.contains('d') && devicesSupported) {
+      checkSlice('d', 'devices', {
+        'config': deviceConfig,
+        'devices': devices,
+        'approvals': deviceApprovals,
+        'enrollments': deviceEnrollments,
+      });
+    }
+    if (include.contains('wd') && workerId != null && workerId.isNotEmpty) {
+      checkSlice('wd', 'workerDetail', details[workerId]);
+    }
+    if (include.contains('h')) {
+      checkSlice('h', 'health', {
+        'ready': true,
+        'version': '0.2.0',
+        'kernel': 'antigravity',
+        'paused': general['paused'],
+        'activeWorkers': 0,
+        'components': {
+          'runtime': {'state': 'ready', 'detail': 'Ready'},
+          'kernel': kernelProblem == null ? {'state': 'ready', 'detail': 'Running on antigravity'} : {'state': 'error', 'detail': kernelProblem},
+        },
+      });
+    }
+    if (!anyChanged) {
+      return http.Response('', 304);
+    }
+    return _json(200, {'changed': changed, if (meta.isNotEmpty) 'meta': meta, 'etags': etags});
+  }
+
   http.Response _json(int status, Object body) => http.Response.bytes(utf8.encode(jsonEncode(body)), status, headers: {'content-type': 'application/json; charset=utf-8'});
 
   Future<http.Response> _handle(http.Request request) async {
@@ -496,9 +626,34 @@ class FakeBackend {
             'kernel': kernelProblem == null ? {'state': 'ready', 'detail': 'Running on antigravity'} : {'state': 'error', 'detail': kernelProblem},
           },
         });
+      case ('GET', '/api/poll'):
+        if (!supportPoll) return _json(404, {'error': 'Not found'});
+        return _handlePoll(request);
       case ('GET', '/api/messages'):
+        final params = request.url.queryParameters;
+        if (!legacyPagination && (params.containsKey('limit') || params.containsKey('before'))) {
+          final limit = int.tryParse(params['limit'] ?? '') ?? 20;
+          final before = params.containsKey('before') ? int.tryParse(params['before']!) : null;
+          if (before != null && messagesPageError != null) {
+            final error = messagesPageError!;
+            messagesPageError = null;
+            return _json(500, {'error': error});
+          }
+          return _json(200, _messagesPagePayload(limit, before));
+        }
         return _json(200, {'messages': messages});
       case ('GET', '/api/workers'):
+        final params = request.url.queryParameters;
+        if (!legacyPagination && (params.containsKey('limit') || params.containsKey('offset'))) {
+          final limit = int.tryParse(params['limit'] ?? '') ?? 20;
+          final offset = int.tryParse(params['offset'] ?? '') ?? 0;
+          if (offset > 0 && workersPageError != null) {
+            final error = workersPageError!;
+            workersPageError = null;
+            return _json(500, {'error': error});
+          }
+          return _json(200, _workersPagePayload(limit, offset));
+        }
         return _json(200, {'workers': workers});
       case ('GET', '/api/activity'):
         final now = activity;

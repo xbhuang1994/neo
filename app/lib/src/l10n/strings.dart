@@ -59,10 +59,18 @@ abstract class Strings {
   String textTooLong(int most);
   String get sendFailed;
   String get kernelMissing;
+  String get loadEarlierMessages;
+  String loadEarlierMessagesRemaining(int remaining);
+  String get loadingEarlierMessages;
+  String get loadEarlierFailed;
 
   // Workers
   String get workersEmpty;
   String workersSummary(int active, int total);
+  String get loadMoreWorkers;
+  String loadMoreWorkersRemaining(int remaining);
+  String get loadingMoreWorkers;
+  String get loadMoreWorkersFailed;
   String get selectWorker;
   String get statusRunning;
   String get statusBackground;
@@ -525,11 +533,27 @@ class ZhStrings extends Strings {
   String get sendFailed => '发送失败';
   @override
   String get kernelMissing => '执行内核不可用';
+  @override
+  String get loadEarlierMessages => '加载更早的记录';
+  @override
+  String loadEarlierMessagesRemaining(int remaining) => '加载更早的记录（还有 $remaining 条）';
+  @override
+  String get loadingEarlierMessages => '正在加载更早的记录…';
+  @override
+  String get loadEarlierFailed => '加载更早记录失败，点击重试';
 
   @override
   String get workersEmpty => '暂无任务。对话中的明确请求被接受后会显示在这里。';
   @override
   String workersSummary(int active, int total) => '$active 个进行中 · 共 $total 个';
+  @override
+  String get loadMoreWorkers => '加载更多任务';
+  @override
+  String loadMoreWorkersRemaining(int remaining) => '加载更多任务（还有 $remaining 个）';
+  @override
+  String get loadingMoreWorkers => '正在加载更多任务…';
+  @override
+  String get loadMoreWorkersFailed => '加载更多任务失败，点击重试';
   @override
   String get selectWorker => '选择一个任务查看详情';
   @override
@@ -1407,11 +1431,27 @@ class EnStrings extends Strings {
   String get sendFailed => 'Could not send';
   @override
   String get kernelMissing => 'The kernel cannot run';
+  @override
+  String get loadEarlierMessages => 'Load earlier messages';
+  @override
+  String loadEarlierMessagesRemaining(int remaining) => 'Load earlier messages ($remaining more)';
+  @override
+  String get loadingEarlierMessages => 'Loading earlier messages…';
+  @override
+  String get loadEarlierFailed => 'Failed to load earlier messages · Tap to retry';
 
   @override
   String get workersEmpty => 'No tasks yet. A request accepted in the conversation shows here.';
   @override
   String workersSummary(int active, int total) => '$active active · $total in all';
+  @override
+  String get loadMoreWorkers => 'Load more tasks';
+  @override
+  String loadMoreWorkersRemaining(int remaining) => 'Load more tasks ($remaining more)';
+  @override
+  String get loadingMoreWorkers => 'Loading more tasks…';
+  @override
+  String get loadMoreWorkersFailed => 'Failed to load more tasks · Tap to retry';
   @override
   String get selectWorker => 'Select a task to see its details';
   @override

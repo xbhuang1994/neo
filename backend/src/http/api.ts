@@ -11,6 +11,7 @@ import * as path from "node:path";
 import * as zlib from "node:zlib";
 import { StopWorkerError } from "../app/context.ts";
 import type { AppContext, ChatAttachment } from "../app/context.ts";
+import { DEFAULT_HISTORY_PAGE_SIZE, MAX_HISTORY_PAGE_SIZE } from "../app/views.ts";
 import {
   MCP_CALL_POLICY_MODES,
   SANDBOX_LEVELS,
@@ -1842,8 +1843,103 @@ async function routeDevices(
   return null;
 }
 
+function parseQueryInt(
+  params: URLSearchParams,
+  key: string,
+  min: number,
+  max: number,
+): { ok: true; value?: number } | { ok: false; response: Response } {
+  const raw = params.get(key);
+  if (raw === null) return { ok: true, value: undefined };
+  const trimmed = raw.trim();
+  if (trimmed.length === 0 || !isAllAsciiDigits(trimmed)) {
+    return {
+      ok: false,
+      response: Response.error(400, `${key} must be an integer between ${min} and ${max}`),
+    };
+  }
+  const value = Number(trimmed);
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    return {
+      ok: false,
+      response: Response.error(400, `${key} must be an integer between ${min} and ${max}`),
+    };
+  }
+  return { ok: true, value };
+}
+
+function readMessagesPage(
+  app: AppContext,
+  options: { limit?: number; beforeId?: number },
+): { messages: unknown[]; hasMore: boolean; total: number; oldestId: number | null } {
+  if (typeof app.panelMessagesPage === "function") {
+    return app.panelMessagesPage(options);
+  }
+  const limit = Math.max(1, Math.min(MAX_HISTORY_PAGE_SIZE, options.limit ?? DEFAULT_HISTORY_PAGE_SIZE));
+  const all = app.panelMessages();
+  const filtered =
+    options.beforeId !== undefined
+      ? all.filter((item) => {
+          const id = isRecord(item) && typeof item.id === "number" ? item.id : undefined;
+          return id !== undefined && id < options.beforeId!;
+        })
+      : all;
+  const start = Math.max(0, filtered.length - limit);
+  const slice = filtered.slice(start);
+  const first = slice[0];
+  const oldestId = isRecord(first) && typeof first.id === "number" ? first.id : null;
+  return {
+    messages: slice,
+    hasMore: start > 0,
+    total: all.length,
+    oldestId,
+  };
+}
+
+async function readWorkersPage(
+  app: AppContext,
+  options: { limit?: number; offset?: number },
+): Promise<{
+  workers: unknown[];
+  hasMore: boolean;
+  total: number;
+  activeCount: number;
+  offset: number;
+  limit: number;
+}> {
+  if (typeof app.workerCardsPage === "function") {
+    return await app.workerCardsPage(options);
+  }
+  const limit = Math.max(1, Math.min(MAX_HISTORY_PAGE_SIZE, options.limit ?? DEFAULT_HISTORY_PAGE_SIZE));
+  const offset = Math.max(0, options.offset ?? 0);
+  const all = await app.workerCards();
+  let activeCount = 0;
+  for (let i = 0; i < all.length; i += 1) {
+    const item = all[i];
+    if (isRecord(item) && isRecord(item.stage) && item.stage.stage !== "ended") {
+      activeCount += 1;
+    }
+  }
+  const slice = all.slice(offset, offset + limit);
+  return {
+    workers: slice,
+    hasMore: offset + slice.length < all.length,
+    total: all.length,
+    activeCount,
+    offset,
+    limit,
+  };
+}
+
 async function pollSnapshot(app: AppContext, request: Request): Promise<Response> {
   const params = new URLSearchParams(request.query);
+  const mLimitParsed = parseQueryInt(params, "mLimit", 1, MAX_HISTORY_PAGE_SIZE);
+  if (!mLimitParsed.ok) return mLimitParsed.response;
+  const wLimitParsed = parseQueryInt(params, "wLimit", 1, MAX_HISTORY_PAGE_SIZE);
+  if (!wLimitParsed.ok) return wLimitParsed.response;
+  const mLimit = mLimitParsed.value;
+  const wLimit = wLimitParsed.value;
+
   const rawInclude = params.get("include");
   const include = new Set<string>(
     rawInclude
@@ -1868,31 +1964,63 @@ async function pollSnapshot(app: AppContext, request: Request): Promise<Response
     app.devices.triggerBackgroundSync();
   }
 
-  const [workersValue, activityValue, detailValue] = await Promise.all([
-    wantWorkers ? app.workerCards() : Promise.resolve(undefined),
+  const [workersValue, workersPageValue, activityValue, detailValue] = await Promise.all([
+    wantWorkers && wLimit === undefined ? app.workerCards() : Promise.resolve(undefined),
+    wantWorkers && wLimit !== undefined
+      ? readWorkersPage(app, { limit: wLimit, offset: 0 })
+      : Promise.resolve(undefined),
     wantActivity ? app.activityView() : Promise.resolve(undefined),
     wantDetail ? app.workerDetail(workerId) : Promise.resolve(undefined),
   ]);
 
   const changed: Record<string, unknown> = {};
+  const meta: Record<string, unknown> = {};
   const etags: Record<string, string> = {};
   let anyChanged = false;
 
-  const checkSlice = (key: string, payloadKey: string, value: unknown): void => {
-    const serialized = JSON.stringify(value);
+  const checkSlice = (
+    key: string,
+    payloadKey: string,
+    value: unknown,
+    hashSource: unknown = value,
+    metaValue?: unknown,
+  ): void => {
+    const serialized = JSON.stringify(hashSource);
     const tag = fastSliceTag(serialized);
     etags[key] = tag;
     if (params.get(key) !== tag) {
       changed[payloadKey] = value;
+      if (metaValue !== undefined) {
+        meta[payloadKey] = metaValue;
+      }
       anyChanged = true;
     }
   };
 
   if (wantMessages) {
-    checkSlice("m", "messages", app.panelMessages());
+    if (mLimit !== undefined) {
+      const page = readMessagesPage(app, { limit: mLimit });
+      const pageMeta = {
+        hasMore: page.hasMore,
+        total: page.total,
+        oldestId: page.oldestId,
+      };
+      checkSlice("m", "messages", page.messages, page, pageMeta);
+    } else {
+      checkSlice("m", "messages", app.panelMessages());
+    }
   }
   if (wantWorkers) {
-    checkSlice("w", "workers", workersValue);
+    if (workersPageValue !== undefined) {
+      const pageMeta = {
+        hasMore: workersPageValue.hasMore,
+        total: workersPageValue.total,
+        activeCount: workersPageValue.activeCount,
+      };
+      checkSlice("w", "workers", workersPageValue.workers, workersPageValue, pageMeta);
+    } else {
+      checkSlice("w", "workers", workersValue);
+    }
   }
   if (wantActivity) {
     checkSlice("a", "activity", activityValue);
@@ -1921,7 +2049,9 @@ async function pollSnapshot(app: AppContext, request: Request): Promise<Response
     });
   }
 
-  return maybeCompressApiResponse(request, Response.json(200, { changed, etags }));
+  const payload =
+    Object.keys(meta).length > 0 ? { changed, meta, etags } : { changed, etags };
+  return maybeCompressApiResponse(request, Response.json(200, payload));
 }
 
 async function route(app: AppContext, request: Request): Promise<Response> {
@@ -1939,10 +2069,46 @@ async function route(app: AppContext, request: Request): Promise<Response> {
         return await pollSnapshot(app, request);
       case "/api/health":
         return jsonWithEtag(request, app.healthView());
-      case "/api/messages":
-        return jsonWithEtag(request, { messages: app.panelMessages() });
-      case "/api/workers":
-        return jsonWithEtag(request, { workers: await app.workerCards() });
+      case "/api/messages": {
+        if (request.query.length === 0) {
+          return jsonWithEtag(request, { messages: app.panelMessages() });
+        }
+        const params = new URLSearchParams(request.query);
+        if (!params.has("limit") && !params.has("before")) {
+          return jsonWithEtag(request, { messages: app.panelMessages() });
+        }
+        const limit = parseQueryInt(params, "limit", 1, MAX_HISTORY_PAGE_SIZE);
+        if (!limit.ok) return limit.response;
+        const before = parseQueryInt(params, "before", 0, Number.MAX_SAFE_INTEGER);
+        if (!before.ok) return before.response;
+        return jsonWithEtag(
+          request,
+          readMessagesPage(app, {
+            limit: limit.value ?? DEFAULT_HISTORY_PAGE_SIZE,
+            beforeId: before.value,
+          }),
+        );
+      }
+      case "/api/workers": {
+        if (request.query.length === 0) {
+          return jsonWithEtag(request, { workers: await app.workerCards() });
+        }
+        const params = new URLSearchParams(request.query);
+        if (!params.has("limit") && !params.has("offset")) {
+          return jsonWithEtag(request, { workers: await app.workerCards() });
+        }
+        const limit = parseQueryInt(params, "limit", 1, MAX_HISTORY_PAGE_SIZE);
+        if (!limit.ok) return limit.response;
+        const offset = parseQueryInt(params, "offset", 0, Number.MAX_SAFE_INTEGER);
+        if (!offset.ok) return offset.response;
+        return jsonWithEtag(
+          request,
+          await readWorkersPage(app, {
+            limit: limit.value ?? DEFAULT_HISTORY_PAGE_SIZE,
+            offset: offset.value ?? 0,
+          }),
+        );
+      }
       case "/api/activity":
         return jsonWithEtag(request, await app.activityView());
       case "/api/settings/models":

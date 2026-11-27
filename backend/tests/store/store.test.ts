@@ -902,6 +902,35 @@ describe("pagination, batch lookup, sent files, and commit hooks", () => {
     store.close();
   });
 
+  test("pages worker tickets open-first then updatedAt DESC with deterministic id tie-breaker and reports ticketCounts", () => {
+    const store = Store.memory();
+    expect(store.ticketCounts()).toEqual({ total: 0, active: 0 });
+    expect(store.workerTicketPage(0, 20)).toEqual([]);
+
+    const mk = (id: string, updatedAt: string, ended: boolean) => {
+      const t = makeTicket(id);
+      t.updatedAt = updatedAt;
+      if (ended) {
+        t.ended = { outcome: "completed", by: "executor", at: updatedAt, reason: "done" };
+      }
+      return t;
+    };
+
+    store.saveTicket(mk("ended-old", "2026-01-01T00:01:00.000Z", true));
+    store.saveTicket(mk("ended-tie-a", "2026-01-01T00:05:00.000Z", true));
+    store.saveTicket(mk("ended-tie-b", "2026-01-01T00:05:00.000Z", true));
+    store.saveTicket(mk("open-older", "2026-01-01T00:02:00.000Z", false));
+    store.saveTicket(mk("open-newer", "2026-01-01T00:09:00.000Z", false));
+
+    expect(store.ticketCounts()).toEqual({ total: 5, active: 2 });
+    expect(store.workerTicketPage(0, 2).map((t) => t.id)).toEqual(["open-newer", "open-older"]);
+    expect(store.workerTicketPage(2, 2).map((t) => t.id)).toEqual(["ended-tie-b", "ended-tie-a"]);
+    expect(store.workerTicketPage(4, 2).map((t) => t.id)).toEqual(["ended-old"]);
+    expect(store.workerTicketPage(5, 2)).toEqual([]);
+    expect(store.workerTicketPage(0, 0)).toEqual([]);
+    store.close();
+  });
+
   test("batch-fetches triggersByIds across empty, missing, duplicate, and >250 batches", () => {
     const store = Store.memory();
     expect(store.triggersByIds([]).size).toBe(0);

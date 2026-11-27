@@ -37,13 +37,79 @@ class ConditionalResult<T> {
   final String? etag;
 }
 
+/// Pagination metadata for chat messages.
+class MessagesPageMeta {
+  const MessagesPageMeta({required this.hasMore, required this.total, this.oldestId});
+
+  static MessagesPageMeta? maybeFromJson(Object? value) {
+    if (value is! Map) return null;
+    final map = value.cast<String, dynamic>();
+    if (map['hasMore'] is! bool || map['total'] is! num) return null;
+    return MessagesPageMeta(
+      hasMore: map['hasMore'] as bool,
+      total: (map['total'] as num).toInt(),
+      oldestId: (map['oldestId'] as num?)?.toInt(),
+    );
+  }
+
+  final bool hasMore;
+  final int total;
+  final int? oldestId;
+}
+
+/// Pagination metadata for task/worker cards.
+class WorkersPageMeta {
+  const WorkersPageMeta({required this.hasMore, required this.total, required this.activeCount});
+
+  static WorkersPageMeta? maybeFromJson(Object? value) {
+    if (value is! Map) return null;
+    final map = value.cast<String, dynamic>();
+    if (map['hasMore'] is! bool || map['total'] is! num || map['activeCount'] is! num) return null;
+    return WorkersPageMeta(
+      hasMore: map['hasMore'] as bool,
+      total: (map['total'] as num).toInt(),
+      activeCount: (map['activeCount'] as num).toInt(),
+    );
+  }
+
+  final bool hasMore;
+  final int total;
+  final int activeCount;
+}
+
+/// One page of chat messages together with optional server pagination metadata.
+class MessagesPage {
+  const MessagesPage({required this.messages, this.meta});
+
+  final List<ChatMessage> messages;
+  final MessagesPageMeta? meta;
+
+  bool get hasMore => meta?.hasMore ?? false;
+  int get total => meta?.total ?? messages.length;
+  int? get oldestId => meta?.oldestId ?? (messages.isNotEmpty ? messages.first.id : null);
+}
+
+/// One page of worker cards together with optional server pagination metadata.
+class WorkersPage {
+  const WorkersPage({required this.workers, this.meta});
+
+  final List<Worker> workers;
+  final WorkersPageMeta? meta;
+
+  bool get hasMore => meta?.hasMore ?? false;
+  int get total => meta?.total ?? workers.length;
+  int get activeCount => meta?.activeCount ?? workers.where((w) => w.active).length;
+}
+
 /// Result of one combined `GET /api/poll` call.
 class PollResult {
   const PollResult({
     this.unchanged = false,
     this.etags = const {},
     this.messages,
+    this.messagesMeta,
     this.workers,
+    this.workersMeta,
     this.activity,
     this.devices,
     this.hasWorkerDetail = false,
@@ -55,7 +121,9 @@ class PollResult {
     : unchanged = true,
       etags = const {},
       messages = null,
+      messagesMeta = null,
       workers = null,
+      workersMeta = null,
       activity = null,
       devices = null,
       hasWorkerDetail = false,
@@ -65,7 +133,9 @@ class PollResult {
   final bool unchanged;
   final Map<String, String> etags;
   final List<ChatMessage>? messages;
+  final MessagesPageMeta? messagesMeta;
   final List<Worker>? workers;
+  final WorkersPageMeta? workersMeta;
   final Activity? activity;
   final DevicesOverview? devices;
   final bool hasWorkerDetail;
@@ -177,12 +247,16 @@ class ApiClient {
     required Map<String, String> etags,
     String? workerId,
     bool wantHealth = false,
+    int? messagesLimit,
+    int? workersLimit,
     List<ChatMessage> previousMessages = const [],
   }) async {
     final query = <String, String>{
       'include': include.join(','),
       if (workerId != null && workerId.isNotEmpty) 'worker': workerId,
       if (wantHealth) 'health': '1',
+      if (messagesLimit != null && include.contains('m')) 'mLimit': '$messagesLimit',
+      if (workersLimit != null && include.contains('w')) 'wLimit': '$workersLimit',
       for (final key in include)
         if (etags[key] case final tag?)
           if (tag.isNotEmpty) key: tag,
@@ -199,6 +273,7 @@ class ApiClient {
     if (decoded is! Map) throw ApiException(0, 'The server answered something that is not Neo');
     final body = decoded.cast<String, dynamic>();
     final changed = body['changed'] is Map ? (body['changed'] as Map).cast<String, dynamic>() : const <String, dynamic>{};
+    final meta = body['meta'] is Map ? (body['meta'] as Map).cast<String, dynamic>() : const <String, dynamic>{};
     final nextEtags = <String, String>{};
     if (body['etags'] is Map) {
       for (final entry in (body['etags'] as Map).entries) {
@@ -206,14 +281,18 @@ class ApiClient {
       }
     }
     List<ChatMessage>? messages;
+    MessagesPageMeta? messagesMeta;
     if (changed.containsKey('messages')) {
       final list = changed['messages'] is List ? changed['messages'] as List<dynamic> : const <dynamic>[];
       messages = ChatMessage.parseList(list, previous: previousMessages);
+      messagesMeta = MessagesPageMeta.maybeFromJson(meta['messages']);
     }
     List<Worker>? workers;
+    WorkersPageMeta? workersMeta;
     if (changed.containsKey('workers')) {
       final list = changed['workers'] is List ? changed['workers'] as List<dynamic> : const <dynamic>[];
       workers = List<Worker>.unmodifiable([for (final item in list) Worker.fromJson((item as Map).cast<String, dynamic>())]);
+      workersMeta = WorkersPageMeta.maybeFromJson(meta['workers']);
     }
     Activity? activity;
     if (changed.containsKey('activity') && changed['activity'] is Map) {
@@ -234,7 +313,9 @@ class ApiClient {
     return PollResult(
       etags: nextEtags,
       messages: messages,
+      messagesMeta: messagesMeta,
       workers: workers,
+      workersMeta: workersMeta,
       activity: activity,
       devices: devices,
       hasWorkerDetail: hasWorkerDetail,
@@ -252,16 +333,41 @@ class ApiClient {
     return (ChatMessage.parseList(list), jsonEncode(list));
   }
 
-  Future<ConditionalResult<List<ChatMessage>>> messagesIfChanged({
-    String? ifNoneMatch,
-    String? previousRaw,
+  /// Fetches one page of older or latest chat messages (`GET /api/messages?limit=...&before=...`).
+  Future<MessagesPage> messagesPage({
+    int limit = 20,
+    int? beforeId,
     List<ChatMessage> previousMessages = const [],
   }) async {
-    final res = await _conditionalObject('/api/messages', ifNoneMatch: ifNoneMatch, previousRaw: previousRaw);
+    final query = <String, String>{
+      'limit': '$limit',
+      if (beforeId != null) 'before': '$beforeId',
+    };
+    final path = Uri(path: '/api/messages', queryParameters: query).toString();
+    final body = await _object('GET', path);
+    final list = body['messages'] is List ? body['messages'] as List<dynamic> : const <dynamic>[];
+    return MessagesPage(
+      messages: ChatMessage.parseList(list, previous: previousMessages),
+      meta: MessagesPageMeta.maybeFromJson(body),
+    );
+  }
+
+  Future<ConditionalResult<MessagesPage>> messagesIfChanged({
+    String? ifNoneMatch,
+    String? previousRaw,
+    int? limit,
+    List<ChatMessage> previousMessages = const [],
+  }) async {
+    final path = limit == null ? '/api/messages' : Uri(path: '/api/messages', queryParameters: {'limit': '$limit'}).toString();
+    final res = await _conditionalObject(path, ifNoneMatch: ifNoneMatch, previousRaw: previousRaw);
     if (!res.changed) return ConditionalResult.unchanged(raw: res.raw, etag: res.etag);
-    final list = res.value!['messages'] is List ? res.value!['messages'] as List<dynamic> : const <dynamic>[];
+    final body = res.value!;
+    final list = body['messages'] is List ? body['messages'] as List<dynamic> : const <dynamic>[];
     return ConditionalResult.changed(
-      value: ChatMessage.parseList(list, previous: previousMessages),
+      value: MessagesPage(
+        messages: ChatMessage.parseList(list, previous: previousMessages),
+        meta: MessagesPageMeta.maybeFromJson(body),
+      ),
       raw: res.raw,
       etag: res.etag,
     );
@@ -273,12 +379,28 @@ class ApiClient {
     return [for (final worker in list) Worker.fromJson((worker as Map).cast<String, dynamic>())];
   }
 
-  Future<ConditionalResult<List<Worker>>> workersIfChanged({String? ifNoneMatch, String? previousRaw}) async {
-    final res = await _conditionalObject('/api/workers', ifNoneMatch: ifNoneMatch, previousRaw: previousRaw);
+  /// Fetches one page of task cards (`GET /api/workers?limit=...&offset=...`).
+  Future<WorkersPage> workersPage({int limit = 20, int offset = 0}) async {
+    final path = Uri(path: '/api/workers', queryParameters: {'limit': '$limit', 'offset': '$offset'}).toString();
+    final body = await _object('GET', path);
+    final list = body['workers'] is List ? body['workers'] as List<dynamic> : const <dynamic>[];
+    return WorkersPage(
+      workers: List<Worker>.unmodifiable([for (final worker in list) Worker.fromJson((worker as Map).cast<String, dynamic>())]),
+      meta: WorkersPageMeta.maybeFromJson(body),
+    );
+  }
+
+  Future<ConditionalResult<WorkersPage>> workersIfChanged({String? ifNoneMatch, String? previousRaw, int? limit}) async {
+    final path = limit == null ? '/api/workers' : Uri(path: '/api/workers', queryParameters: {'limit': '$limit', 'offset': '0'}).toString();
+    final res = await _conditionalObject(path, ifNoneMatch: ifNoneMatch, previousRaw: previousRaw);
     if (!res.changed) return ConditionalResult.unchanged(raw: res.raw, etag: res.etag);
-    final list = res.value!['workers'] is List ? res.value!['workers'] as List<dynamic> : const <dynamic>[];
+    final body = res.value!;
+    final list = body['workers'] is List ? body['workers'] as List<dynamic> : const <dynamic>[];
     return ConditionalResult.changed(
-      value: List<Worker>.unmodifiable([for (final worker in list) Worker.fromJson((worker as Map).cast<String, dynamic>())]),
+      value: WorkersPage(
+        workers: List<Worker>.unmodifiable([for (final worker in list) Worker.fromJson((worker as Map).cast<String, dynamic>())]),
+        meta: WorkersPageMeta.maybeFromJson(body),
+      ),
       raw: res.raw,
       etag: res.etag,
     );

@@ -690,4 +690,115 @@ void main() {
 
     await app.close();
   });
+
+  testWidgets('loads latest 20 chat messages initially and paginates earlier history on demand without jumping', (tester) async {
+    final backend = FakeBackend()..supportPoll = true;
+    for (var i = 1; i <= 45; i++) {
+      backend.say(i.isOdd ? 'user' : 'assistant', '对话历史消息 #$i');
+    }
+    final app = await open(tester, backend);
+
+    // Only the latest 20 messages (#26..#45) are loaded initially.
+    expect(app.state.messages, hasLength(20));
+    expect(app.state.messages.first.text, '对话历史消息 #26');
+    expect(app.state.messages.last.text, '对话历史消息 #45');
+    expect(app.state.messagesHasMore, isTrue);
+    expect(find.text('对话历史消息 #45'), findsOneWidget);
+    expect(find.text('对话历史消息 #1'), findsNothing);
+
+    // Scroll upward near the top -> auto-loads page 2 (#6..#25) seamlessly without jumping back to bottom.
+    final transcriptScroll = tester.state<ScrollableState>(
+      find.descendant(of: find.byType(Transcript), matching: find.byType(Scrollable)),
+    );
+    transcriptScroll.position.jumpTo(transcriptScroll.position.minScrollExtent + 200);
+    await tester.pump();
+    // Simulate upward drag into the top threshold so auto-load fires.
+    await tester.drag(find.byType(Transcript), const Offset(0, 260));
+    await settle(tester);
+
+    expect(app.state.messages, hasLength(40));
+    expect(app.state.messages.first.text, '对话历史消息 #6');
+    expect(app.state.messagesHasMore, isTrue);
+    // Viewport stayed near the older anchor rather than jumping back to maxScrollExtent.
+    expect(transcriptScroll.position.pixels, lessThan(transcriptScroll.position.maxScrollExtent - 200));
+
+    // Scroll to the top header button; inject one-shot error, verify retry button works and loads final 5 (#1..#5).
+    backend.messagesPageError = 'network hiccup';
+    transcriptScroll.position.jumpTo(transcriptScroll.position.minScrollExtent);
+    await settle(tester);
+    final loadEarlierBtn = find.byKey(const ValueKey('load-earlier-messages'));
+    expect(loadEarlierBtn, findsOneWidget);
+    if (app.state.loadMoreMessagesError == null) {
+      await tester.tap(loadEarlierBtn);
+      await settle(tester);
+    }
+    expect(find.text('加载更早记录失败，点击重试'), findsOneWidget);
+
+    await tester.tap(loadEarlierBtn);
+    await settle(tester);
+    expect(app.state.messages, hasLength(45));
+    expect(app.state.messages.first.text, '对话历史消息 #1');
+    expect(app.state.messagesHasMore, isFalse);
+    expect(find.byKey(const ValueKey('load-earlier-messages')), findsNothing);
+
+    await app.close();
+  });
+
+  testWidgets('loads top 20 tasks initially with accurate total count and paginates remaining tasks on demand', (tester) async {
+    final backend = FakeBackend()..supportPoll = true;
+    backend.addWorker('tk-45', '进行中任务 #45', {'stage': 'working'}, streaming: true);
+    backend.addWorker('tk-44', '进行中任务 #44', {'stage': 'person', 'action': 'answer'});
+    for (var i = 43; i >= 1; i--) {
+      backend.addWorker('tk-$i', '历史任务 #$i', {'stage': 'ended'}, outcome: 'completed');
+    }
+    final app = await open(tester, backend);
+
+    // Sidebar badge reflects true active count (2), and navigating to Tasks shows 2 active · 45 total.
+    expect(find.descendant(of: nav(1), matching: find.text('2')), findsOneWidget);
+    await tester.tap(nav(1));
+    await settle(tester);
+
+    expect(app.state.workers, hasLength(20));
+    expect(app.state.workersHasMore, isTrue);
+    expect(find.text('2 个进行中 · 共 45 个'), findsOneWidget);
+    expect(find.text('进行中任务 #45'), findsOneWidget);
+    expect(find.text('历史任务 #1'), findsNothing);
+
+    // Scroll to bottom of the first 20 items -> reveals footer and loads page 2 (40 tasks).
+    final listFinder = find.byType(ListView);
+    final listScroll = tester.state<ScrollableState>(find.descendant(of: listFinder, matching: find.byType(Scrollable)));
+    listScroll.position.jumpTo(listScroll.position.maxScrollExtent);
+    await settle(tester);
+    final loadMoreBtn = find.byKey(const ValueKey('load-more-workers'));
+    if (app.state.workers.length == 20) {
+      expect(find.text('加载更多任务（还有 25 个）'), findsOneWidget);
+      await tester.tap(loadMoreBtn);
+      await settle(tester);
+    }
+    expect(app.state.workers, hasLength(40));
+    expect(app.state.workersHasMore, isTrue);
+
+    // Inject one-shot failure on page 3, verify retry notice, then tap to load final 5 tasks.
+    backend.workersPageError = 'timeout';
+    listScroll.position.jumpTo(listScroll.position.maxScrollExtent);
+    await settle(tester);
+    if (app.state.loadMoreWorkersError == null) {
+      await tester.tap(loadMoreBtn);
+      await settle(tester);
+    }
+    expect(find.text('加载更多任务失败，点击重试'), findsOneWidget);
+
+    await tester.tap(loadMoreBtn);
+    await settle(tester);
+    expect(app.state.workers, hasLength(45));
+    expect(app.state.workersHasMore, isFalse);
+    expect(find.byKey(const ValueKey('load-more-workers')), findsNothing);
+
+    // Scroll to the very end and confirm task #1 is rendered.
+    listScroll.position.jumpTo(listScroll.position.maxScrollExtent);
+    await settle(tester);
+    expect(find.text('历史任务 #1'), findsOneWidget);
+
+    await app.close();
+  });
 }

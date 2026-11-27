@@ -43,6 +43,17 @@ interface CountRow {
   count: number;
 }
 
+interface TicketCountsRow {
+  total: number;
+  active: number;
+}
+
+/** Aggregate counts of stored tickets. */
+export interface TicketCounts {
+  total: number;
+  active: number;
+}
+
 /** Escapes `LIKE` wildcards (`\`, `%`, `_`) for a pattern used with `ESCAPE '\'`. */
 export function escapeLike(text: string): string {
   let out = "";
@@ -99,6 +110,10 @@ const SQL_SUBSCRIBED_ALL =
   "SELECT value FROM thread INDEXED BY thread_subscribed WHERE subscribed IS NOT NULL ORDER BY rowid";
 const SQL_TICKET_PAGE = "SELECT value FROM ticket ORDER BY rowid DESC LIMIT ?1 OFFSET ?2";
 const SQL_TICKET_COUNT = "SELECT COUNT(*) AS count FROM ticket";
+const SQL_TICKET_COUNTS =
+  "SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN open = 1 THEN 1 ELSE 0 END), 0) AS active FROM ticket";
+const SQL_WORKER_TICKET_PAGE =
+  "SELECT value FROM ticket ORDER BY (open IS NULL) ASC, value ->> '$.updatedAt' DESC, id DESC LIMIT ?1 OFFSET ?2";
 const SQL_SENT_TICKET_OUTBOX =
   "SELECT value FROM outbox WHERE value ->> '$.status' = 'sent' AND value ->> '$.ticketId' IS NOT NULL AND value ->> '$.kind' = 'reply' ORDER BY rowid DESC";
 
@@ -269,6 +284,23 @@ export function getTicketPage(db: Database, offset: number, limit: number): Tick
 export function getTicketCount(db: Database): number {
   const row = db.query<CountRow, []>(SQL_TICKET_COUNT).get();
   return row?.count ?? 0;
+}
+
+/** Total and open (active) counts of stored tickets. */
+export function getTicketCounts(db: Database): TicketCounts {
+  const row = db.query<TicketCountsRow, []>(SQL_TICKET_COUNTS).get();
+  return {
+    total: row?.total ?? 0,
+    active: row?.active ?? 0,
+  };
+}
+
+/** One page of tickets in worker-list order: open first, then each group by `updatedAt DESC, id DESC`. */
+export function getWorkerTicketPage(db: Database, offset: number, limit: number): Ticket[] {
+  if (limit <= 0) return [];
+  return parseRows<Ticket>(
+    db.query<ValueRow, [number, number]>(SQL_WORKER_TICKET_PAGE).all(limit, Math.max(0, offset)),
+  );
 }
 
 /** Batch-fetch triggers by id in chunks of at most 200 placeholders to stay well under SQLite's bind limit. */

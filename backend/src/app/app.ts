@@ -885,8 +885,16 @@ export class App implements AppContext {
     return viewsMod.panelMessages(this);
   }
 
+  panelMessagesPage(options?: viewsMod.PanelMessagesPageOptions): viewsMod.PanelMessagesPageView {
+    return viewsMod.panelMessagesPage(this, options);
+  }
+
   workerCards(): Promise<unknown[]> {
     return viewsMod.workerCards(this);
+  }
+
+  workerCardsPage(options?: viewsMod.WorkerCardsPageOptions): Promise<viewsMod.WorkerCardsPageView> {
+    return viewsMod.workerCardsPage(this, options);
   }
 
   workerDetail(ticketId: string): Promise<unknown | null> {

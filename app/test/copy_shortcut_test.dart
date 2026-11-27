@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:neo_agent/main.dart';
 import 'package:neo_agent/src/state/app_state.dart';
+import 'package:neo_agent/src/ui/chat_page.dart';
 import 'package:neo_agent/src/ui/widgets.dart';
 
 import 'fake_backend.dart';
@@ -360,8 +361,8 @@ void main() {
     }
     final state = await _openApp(tester, backend);
 
-    final listFinder = find.byType(ListView);
-    final scrollable = tester.state<ScrollableState>(find.descendant(of: listFinder, matching: find.byType(Scrollable)));
+    final transcriptFinder = find.byType(Transcript);
+    final scrollable = tester.state<ScrollableState>(find.descendant(of: transcriptFinder, matching: find.byType(Scrollable)));
     final initialMax = scrollable.position.maxScrollExtent;
     expect(initialMax, greaterThan(100));
 

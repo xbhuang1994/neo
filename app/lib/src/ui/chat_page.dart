@@ -135,7 +135,8 @@ class _ChatBody extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final messages = AppScope.of(context, aspect: AppAspect.messages).messages;
+    final state = AppScope.of(context, aspect: AppAspect.messages);
+    final messages = state.messages;
     if (messages.isEmpty) {
       final link = AppScope.of(context, aspect: AppAspect.connection).link;
       final strings = Strings.read(context);
@@ -144,15 +145,36 @@ class _ChatBody extends StatelessWidget {
         _ => EmptyState(icon: CupertinoIcons.chat_bubble_2, title: strings.chatEmptyTitle, hint: strings.chatEmptyHint),
       };
     }
-    return Transcript(messages: messages);
+    return Transcript(
+      messages: messages,
+      hasMore: state.messagesHasMore,
+      loadingMore: state.loadingMoreMessages,
+      loadMoreError: state.loadMoreMessagesError,
+      remainingCount: state.remainingOlderMessages,
+      onLoadMore: state.loadMoreMessages,
+    );
   }
 }
 
 /// The messages, oldest first; it stays at the newest one unless the person scrolled up.
+/// Earlier pages grow above [_centerKey] so loading older history never jumps the viewport.
 class Transcript extends StatefulWidget {
-  const Transcript({super.key, required this.messages});
+  const Transcript({
+    super.key,
+    required this.messages,
+    this.hasMore = false,
+    this.loadingMore = false,
+    this.loadMoreError,
+    this.remainingCount = 0,
+    this.onLoadMore,
+  });
 
   final List<ChatMessage> messages;
+  final bool hasMore;
+  final bool loadingMore;
+  final String? loadMoreError;
+  final int remainingCount;
+  final Future<void> Function()? onLoadMore;
 
   @override
   State<Transcript> createState() => _TranscriptState();
@@ -160,6 +182,8 @@ class Transcript extends StatefulWidget {
 
 class _TranscriptState extends State<Transcript> {
   final ScrollController _scroll = ScrollController();
+  final Key _centerKey = UniqueKey();
+  int? _anchorId;
   bool _follow = true;
   bool _jumpingToEnd = false;
   double _lastPixels = 0;
@@ -168,39 +192,72 @@ class _TranscriptState extends State<Transcript> {
   @override
   void initState() {
     super.initState();
+    _anchorId = widget.messages.isNotEmpty ? widget.messages.first.id : null;
     _scroll.addListener(_onScroll);
     _toEnd();
   }
 
-  void _onScroll() {
-    if (!_scroll.hasClients) return;
-    final pixels = _scroll.position.pixels;
-    final moved = (pixels - _lastPixels).abs() > 0.5;
-    _lastPixels = pixels;
-    if (_jumpingToEnd || !moved) return;
-    _follow = _scroll.position.maxScrollExtent - pixels < 80;
+  void _triggerLoadMore() {
+    final loader = widget.onLoadMore;
+    if (loader == null || widget.loadingMore || !widget.hasMore) return;
+    _follow = false;
+    unawaited(loader());
   }
 
-  bool _messagesChanged(List<ChatMessage> prev, List<ChatMessage> next) {
+  void _onScroll() {
+    if (!_scroll.hasClients) return;
+    final pos = _scroll.position;
+    final pixels = pos.pixels;
+    final delta = pixels - _lastPixels;
+    final moved = delta.abs() > 0.5;
+    _lastPixels = pixels;
+    if (_jumpingToEnd || !moved) return;
+    _follow = pos.maxScrollExtent - pixels < 80;
+    if (delta < 0 &&
+        widget.hasMore &&
+        !widget.loadingMore &&
+        widget.loadMoreError == null &&
+        pixels - pos.minScrollExtent <= 120) {
+      _triggerLoadMore();
+    }
+  }
+
+  bool _tailChanged(List<ChatMessage> prev, List<ChatMessage> next) {
     if (identical(prev, next)) return false;
-    if (prev.length != next.length) return true;
-    if (prev.isEmpty) return false;
+    if (prev.isEmpty || next.isEmpty) return prev.length != next.length;
     return prev.last.id != next.last.id || prev.last.text != next.last.text;
   }
 
   @override
   void didUpdateWidget(Transcript oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (_follow && _messagesChanged(oldWidget.messages, widget.messages)) _toEnd();
+    if (widget.messages.isEmpty) {
+      _anchorId = null;
+      return;
+    }
+    final anchor = _anchorId;
+    final reset = anchor == null || widget.messages.last.id < anchor;
+    if (reset) {
+      _anchorId = widget.messages.first.id;
+      _follow = true;
+      _toEnd();
+      return;
+    }
+    if (_follow && _tailChanged(oldWidget.messages, widget.messages)) {
+      _toEnd();
+    }
   }
 
   void _toEnd([int remaining = 5]) {
     if (remaining <= 0) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || !_scroll.hasClients || !_follow) return;
-      final target = _scroll.position.maxScrollExtent;
-      _lastMaxExtent = target;
-      final gap = (target - _scroll.position.pixels).abs();
+      final pos = _scroll.position;
+      // When all messages fit inside the viewport and a top load-more header exists above center,
+      // show the header at minScrollExtent so it is immediately reachable without scrolling up first.
+      final target = pos.maxScrollExtent > 0.5 ? pos.maxScrollExtent : pos.minScrollExtent;
+      _lastMaxExtent = pos.maxScrollExtent;
+      final gap = (target - pos.pixels).abs();
       if (gap > 0.5) {
         _jumpingToEnd = true;
         try {
@@ -224,8 +281,82 @@ class _TranscriptState extends State<Transcript> {
     super.dispose();
   }
 
+  int _splitIndex(List<ChatMessage> messages, int anchorId) {
+    var lo = 0;
+    var hi = messages.length;
+    while (lo < hi) {
+      final mid = (lo + hi) >> 1;
+      if (messages[mid].id < anchorId) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
+  }
+
+  Widget _buildLoadMoreHeader(BuildContext context) {
+    final strings = Strings.read(context);
+    final palette = Palette.of(context);
+    final typo = Typo.of(context);
+    final hasError = widget.loadMoreError != null;
+    final label = widget.loadingMore
+        ? strings.loadingEarlierMessages
+        : hasError
+        ? strings.loadEarlierFailed
+        : widget.remainingCount > 0
+        ? strings.loadEarlierMessagesRemaining(widget.remainingCount)
+        : strings.loadEarlierMessages;
+    final tint = hasError ? palette.red : palette.accent;
+    return SelectionContainer.disabled(
+      child: Center(
+        child: widget.loadingMore
+            ? Container(
+                key: const ValueKey('load-earlier-messages'),
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+                decoration: BoxDecoration(color: palette.fill, borderRadius: BorderRadius.circular(999)),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const CupertinoActivityIndicator(radius: 7.5),
+                    const SizedBox(width: 8),
+                    Text(label, style: typo.caption.copyWith(color: palette.secondary)),
+                  ],
+                ),
+              )
+            : Tappable(
+                key: const ValueKey('load-earlier-messages'),
+                borderRadius: 999,
+                onTap: _triggerLoadMore,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+                  decoration: BoxDecoration(
+                    color: hasError ? palette.red.withValues(alpha: 0.12) : palette.fill,
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(hasError ? CupertinoIcons.exclamationmark_circle : CupertinoIcons.arrow_up_circle, size: 14, color: tint),
+                      const SizedBox(width: 6),
+                      Text(label, style: typo.caption.copyWith(color: tint, fontWeight: FontWeight.w600)),
+                    ],
+                  ),
+                ),
+              ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final messages = widget.messages;
+    final anchorId = _anchorId ?? (messages.isNotEmpty ? messages.first.id : 0);
+    final split = _splitIndex(messages, anchorId);
+    final olderCount = split;
+    final newerCount = messages.length - split;
+    final showLoadHeader = widget.hasMore || widget.loadingMore || widget.loadMoreError != null;
+
     return RepaintBoundary(
       child: NotificationListener<ScrollMetricsNotification>(
         onNotification: (notification) {
@@ -242,16 +373,52 @@ class _TranscriptState extends State<Transcript> {
         child: CupertinoScrollbar(
           controller: _scroll,
           child: Selectable(
-            child: ListView.builder(
+            child: CustomScrollView(
               controller: _scroll,
+              center: _centerKey,
               scrollCacheExtent: const ScrollCacheExtent.pixels(600),
-              addAutomaticKeepAlives: false,
-              padding: const EdgeInsets.symmetric(horizontal: grid * 2.5, vertical: grid * 2),
-              itemCount: widget.messages.length,
-              itemBuilder: (context, index) => Padding(
-                padding: const EdgeInsets.only(bottom: grid * 2),
-                child: MessageView(key: ValueKey(widget.messages[index].id), message: widget.messages[index]),
-              ),
+              slivers: [
+                if (showLoadHeader)
+                  SliverPadding(
+                    padding: const EdgeInsets.fromLTRB(grid * 2.5, grid * 2, grid * 2.5, grid * 1.5),
+                    sliver: SliverToBoxAdapter(child: _buildLoadMoreHeader(context)),
+                  ),
+                if (olderCount > 0)
+                  SliverPadding(
+                    padding: EdgeInsets.fromLTRB(grid * 2.5, showLoadHeader ? 0 : grid * 2, grid * 2.5, 0),
+                    sliver: SliverList.builder(
+                      addAutomaticKeepAlives: false,
+                      itemCount: olderCount,
+                      itemBuilder: (context, index) {
+                        final message = messages[olderCount - 1 - index];
+                        return Padding(
+                          padding: const EdgeInsets.only(bottom: grid * 2),
+                          child: MessageView(key: ValueKey(message.id), message: message),
+                        );
+                      },
+                    ),
+                  ),
+                SliverPadding(
+                  key: _centerKey,
+                  padding: EdgeInsets.fromLTRB(
+                    grid * 2.5,
+                    (showLoadHeader || olderCount > 0) ? 0 : grid * 2,
+                    grid * 2.5,
+                    grid * 2,
+                  ),
+                  sliver: SliverList.builder(
+                    addAutomaticKeepAlives: false,
+                    itemCount: newerCount,
+                    itemBuilder: (context, index) {
+                      final message = messages[split + index];
+                      return Padding(
+                        padding: const EdgeInsets.only(bottom: grid * 2),
+                        child: MessageView(key: ValueKey(message.id), message: message),
+                      );
+                    },
+                  ),
+                ),
+              ],
             ),
           ),
         ),
