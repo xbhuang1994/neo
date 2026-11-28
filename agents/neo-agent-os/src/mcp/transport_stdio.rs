@@ -1,6 +1,8 @@
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(windows))]
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;

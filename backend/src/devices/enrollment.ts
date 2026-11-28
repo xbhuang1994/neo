@@ -603,9 +603,12 @@ function Install-NeoAgent {
     if ($Upgrade) {
       Write-Host "[neo-install] Upgraded neo-agent-os.exe to v$Version at $binPath"
       if (-not [string]::IsNullOrWhiteSpace($Cluster)) {
+        try { & $binPath repair-service --cluster $Cluster 2>$null | Out-Null } catch {}
         $taskName = "NeoAgent-$Cluster"
         try { & schtasks /End /TN $taskName 2>$null | Out-Null } catch {}
         try { & schtasks /Run /TN $taskName 2>$null | Out-Null } catch {}
+      } else {
+        try { & $binPath repair-service 2>$null | Out-Null } catch {}
       }
       return
     }

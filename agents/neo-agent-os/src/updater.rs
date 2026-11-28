@@ -396,11 +396,25 @@ pub struct SelfUpdateRequest {
     pub force: bool,
 }
 
+/// Exit code emitted by `neo-agent-os` after staging a `self_update` when running under
+/// `neo-agent-os-bg` (`NEO_BG_SUPERVISED=1`), requesting a clean headless respawn.
+#[cfg(any(windows, test))]
+pub const RESTART_FOR_UPDATE_EXIT_CODE: i32 = 75;
+
 #[derive(Debug, Clone)]
 pub struct RestartPlan {
     pub binary_path: PathBuf,
     pub previous_version: String,
     pub target_version: String,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct RestartContext {
+    pub cluster_id: String,
+    pub env_file: Option<PathBuf>,
+    pub policy_path: PathBuf,
+    pub ota_cache_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -736,6 +750,56 @@ fn install_staged_binary(
     }
 }
 
+#[cfg(any(windows, test))]
+pub(crate) fn install_companion_binary_file(
+    staged_companion: &Path,
+    target_exe: &Path,
+    companion_name: &str,
+) -> Result<PathBuf, String> {
+    let parent = target_exe
+        .parent()
+        .ok_or_else(|| format!("target_exe {} has no parent directory", target_exe.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    let dest = parent.join(companion_name);
+
+    #[cfg(windows)]
+    {
+        let old_path = PathBuf::from(format!("{}.old", dest.to_string_lossy()));
+        let mut renamed_old = false;
+        if dest.exists() {
+            let _ = std::fs::remove_file(&old_path);
+            if std::fs::rename(&dest, &old_path).is_ok() {
+                renamed_old = true;
+            }
+        }
+        if let Err(e) = std::fs::copy(staged_companion, &dest) {
+            if renamed_old {
+                let _ = std::fs::rename(&old_path, &dest);
+            }
+            return Err(format!("failed to replace {}: {e}", dest.display()));
+        }
+        Ok(dest)
+    }
+
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp_path = parent.join(format!(
+            ".{companion_name}.new.{}.{}",
+            std::process::id(),
+            now_unix_secs()
+        ));
+        std::fs::copy(staged_companion, &tmp_path)
+            .map_err(|e| format!("failed to stage companion {}: {e}", dest.display()))?;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("failed to chmod companion {}: {e}", dest.display()))?;
+        std::fs::rename(&tmp_path, &dest)
+            .map_err(|e| format!("failed to install companion {}: {e}", dest.display()))?;
+        Ok(dest)
+    }
+}
+
 pub async fn execute_self_update(
     req: &SelfUpdateRequest,
     relay_url: &str,
@@ -891,6 +955,19 @@ pub async fn execute_self_update(
         let (installed_path, backup_path) =
             install_staged_binary(&staged_bin, &target_exe, &ota_base)?;
 
+        #[cfg(windows)]
+        {
+            if let Some(staged_bg) = find_extracted_binary(&extract_dir, "neo-agent-os-bg.exe") {
+                if let Err(e) =
+                    install_companion_binary_file(&staged_bg, &installed_path, "neo-agent-os-bg.exe")
+                {
+                    eprintln!(
+                        "[updater] warning: failed to update companion neo-agent-os-bg.exe: {e}"
+                    );
+                }
+            }
+        }
+
         let state_file = updater_state_path
             .map(Path::to_path_buf)
             .unwrap_or_else(|| ota_base.join("updater-state.json"));
@@ -935,6 +1012,11 @@ pub fn maybe_handoff_or_rollback_on_boot(
         if let Ok(exe) = std::env::current_exe() {
             let old = PathBuf::from(format!("{}.old", exe.to_string_lossy()));
             let _ = std::fs::remove_file(&old);
+            let bg_old = PathBuf::from(format!(
+                "{}.old",
+                crate::enroll::windows_bg_launcher_path(&exe).to_string_lossy()
+            ));
+            let _ = std::fs::remove_file(&bg_old);
         }
     }
 
@@ -995,7 +1077,10 @@ pub fn maybe_handoff_or_rollback_on_boot(
 }
 
 /// Replaces or relaunches the daemon process using the newly installed binary.
-pub fn perform_process_restart(plan: &RestartPlan) -> Result<(), String> {
+pub fn perform_process_restart_with_context(
+    plan: &RestartPlan,
+    ctx: Option<&RestartContext>,
+) -> Result<(), String> {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     eprintln!(
         "[updater] restarting neo-agent-os ({} -> {}) via {}",
@@ -1006,6 +1091,7 @@ pub fn perform_process_restart(plan: &RestartPlan) -> Result<(), String> {
 
     #[cfg(unix)]
     {
+        let _ = ctx;
         use std::os::unix::process::CommandExt;
         let err = std::process::Command::new(&plan.binary_path)
             .args(&args)
@@ -1022,17 +1108,89 @@ pub fn perform_process_restart(plan: &RestartPlan) -> Result<(), String> {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        std::process::Command::new(&plan.binary_path)
-            .args(&args)
-            .env("NEO_UPDATED_FROM", &plan.previous_version)
-            .env("NEO_UPDATE_WAIT_PID", std::process::id().to_string())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
-            .spawn()
-            .map_err(|e| format!("failed to spawn updated neo-agent-os: {e}"))?;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+        if let Some(c) = ctx {
+            crate::enroll::best_effort_self_heal_windows_service(
+                &c.cluster_id,
+                c.env_file.as_deref(),
+                &c.policy_path,
+                c.ota_cache_dir.as_deref(),
+            );
+        }
+
+        // Primary path: supervised by neo-agent-os-bg.exe (v0.11.1+).
+        // Exit with dedicated code 75 so the GUI-subsystem supervisor keeps Task Scheduler
+        // state intact, releases the old Job Object, and silently spawns the updated binary.
+        if std::env::var("NEO_BG_SUPERVISED").ok().as_deref() == Some("1") {
+            eprintln!(
+                "[updater] exiting with code {RESTART_FOR_UPDATE_EXIT_CODE} for neo-agent-os-bg supervised respawn"
+            );
+            std::process::exit(RESTART_FOR_UPDATE_EXIT_CODE);
+        }
+
+        // Secondary path: running outside v0.11.1+ supervision (e.g., legacy direct task or
+        // older neo-agent-os-bg.exe whose Job Object lacks BREAKAWAY_OK). Prefer handing off
+        // to Windows Task Scheduler (svchost.exe runs outside any Job Object and launches
+        // the migrated neo-agent-os-bg.exe silently with StopExisting).
+        if let Some(c) = ctx {
+            if crate::enroll::restart_windows_scheduled_task_replacing_existing(
+                &c.cluster_id,
+                &plan.binary_path,
+                c.env_file.as_deref(),
+                &c.policy_path,
+                c.ota_cache_dir.as_deref(),
+            ) {
+                std::process::exit(0);
+            }
+        }
+
+        // Fallback (e.g. HKCU Run or standalone invocation): spawn sibling neo-agent-os-bg.exe
+        // if present, else updated neo-agent-os.exe, using CREATE_NO_WINDOW (never combined
+        // with DETACHED_PROCESS, which Win32 docs specify ignores CREATE_NO_WINDOW).
+        let bg_candidate = crate::enroll::windows_bg_launcher_path(&plan.binary_path);
+        let (launch_bin, launch_args) = if bg_candidate.is_file() {
+            let mut full_args: Vec<std::ffi::OsString> = Vec::new();
+            if let Some(c) = ctx {
+                if let Some(log_file) = crate::enroll::windows_cluster_log_file(
+                    &c.cluster_id,
+                    c.env_file.as_deref(),
+                    &c.policy_path,
+                ) {
+                    full_args.push(std::ffi::OsString::from("--log-file"));
+                    full_args.push(log_file.into_os_string());
+                }
+            }
+            full_args.extend(args.iter().cloned());
+            (bg_candidate, full_args)
+        } else {
+            (plan.binary_path.clone(), args)
+        };
+
+        let spawn_with_flags = |flags: u32| {
+            std::process::Command::new(&launch_bin)
+                .args(&launch_args)
+                .env("NEO_UPDATED_FROM", &plan.previous_version)
+                .env("NEO_UPDATE_WAIT_PID", std::process::id().to_string())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .creation_flags(flags)
+                .spawn()
+        };
+
+        let base_flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
+        match spawn_with_flags(base_flags | CREATE_BREAKAWAY_FROM_JOB) {
+            Ok(_) => {}
+            Err(e) if e.raw_os_error() == Some(5) => {
+                spawn_with_flags(base_flags)
+                    .map_err(|e2| format!("failed to spawn updated neo-agent-os: {e2}"))?;
+            }
+            Err(e) => {
+                return Err(format!("failed to spawn updated neo-agent-os: {e}"));
+            }
+        }
         std::process::exit(0);
     }
 }
@@ -1055,7 +1213,9 @@ fn now_unix_nanos() -> u128 {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    #[cfg(unix)]
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[cfg(unix)]
     use tokio::net::TcpListener;
 
     #[test]
@@ -1322,6 +1482,35 @@ mod tests {
         assert!(mismatch_err.contains("version mismatch"));
 
         srv.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn companion_bg_launcher_installs_and_replaces_cleanly() {
+        assert_eq!(RESTART_FOR_UPDATE_EXIT_CODE, 75);
+        let tmp = std::env::temp_dir().join(format!(
+            "neo_companion_bg_test_{}_{}",
+            std::process::id(),
+            now_unix_nanos()
+        ));
+        let bin_dir = tmp.join("bin");
+        let stage_dir = tmp.join("stage");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&stage_dir).unwrap();
+
+        let target_exe = bin_dir.join("neo-agent-os.exe");
+        std::fs::write(&target_exe, b"main-v0.11.1").unwrap();
+        let existing_bg = bin_dir.join("neo-agent-os-bg.exe");
+        std::fs::write(&existing_bg, b"bg-v0.9.2").unwrap();
+
+        let staged_bg = stage_dir.join("neo-agent-os-bg.exe");
+        std::fs::write(&staged_bg, b"bg-v0.11.1").unwrap();
+
+        let installed =
+            install_companion_binary_file(&staged_bg, &target_exe, "neo-agent-os-bg.exe").unwrap();
+        assert_eq!(installed, existing_bg);
+        assert_eq!(std::fs::read(&installed).unwrap(), b"bg-v0.11.1");
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

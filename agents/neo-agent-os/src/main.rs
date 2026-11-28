@@ -110,6 +110,40 @@ enum Commands {
     Enroll(enroll::EnrollArgs),
     /// Uninstall an enrolled cluster agent service and local configuration
     Uninstall(uninstall::UninstallArgs),
+    /// Migrate/repair OS background service registration (e.g., Windows silent background launcher)
+    RepairService(enroll::RepairServiceArgs),
+}
+
+/// On Windows, when the daemon itself is launched directly (e.g. from a legacy Task Scheduler
+/// entry pointing at console-subsystem `neo-agent-os.exe` instead of `neo-agent-os-bg.exe`),
+/// Windows allocates a standalone visible console / Windows Terminal window exclusively for
+/// this process (`GetConsoleProcessList == 1`). Detach it immediately via `FreeConsole()`
+/// while leaving interactive terminal runs (`powershell.exe` / `cmd.exe`, where count >= 2)
+/// and explicit `NEO_KEEP_CONSOLE=1` debugging intact.
+#[cfg(target_os = "windows")]
+fn detach_standalone_console_if_owned() {
+    use std::ffi::c_void;
+
+    if std::env::var("NEO_KEEP_CONSOLE").ok().as_deref() == Some("1") {
+        return;
+    }
+
+    extern "system" {
+        fn GetConsoleWindow() -> *mut c_void;
+        fn GetConsoleProcessList(lpdw_process_list: *mut u32, dw_process_count: u32) -> u32;
+        fn FreeConsole() -> i32;
+    }
+
+    unsafe {
+        if GetConsoleWindow().is_null() {
+            return;
+        }
+        let mut pids = [0u32; 4];
+        let count = GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32);
+        if count == 1 {
+            let _ = FreeConsole();
+        }
+    }
 }
 
 pub(crate) fn parse_env_str(content: &str) -> HashMap<String, String> {
@@ -432,11 +466,28 @@ async fn run_daemon_mode(args: RunArgs) {
         .map(|d| d.join("updater-state.json"));
 
     if !opts.one_shot_check {
+        #[cfg(target_os = "windows")]
+        {
+            detach_standalone_console_if_owned();
+            enroll::best_effort_self_heal_windows_service(
+                &cluster_id,
+                args.env_file.as_deref(),
+                &opts.policy_path,
+                opts.ota_cache_dir.as_deref(),
+            );
+        }
         updater::maybe_handoff_or_rollback_on_boot(
             updater_state_path.as_deref(),
             opts.ota_cache_dir.as_deref(),
         );
     }
+
+    let restart_ctx = updater::RestartContext {
+        cluster_id: cluster_id.clone(),
+        env_file: args.env_file.clone(),
+        policy_path: opts.policy_path.clone(),
+        ota_cache_dir: opts.ota_cache_dir.clone(),
+    };
 
     let cfg = AgentConfig {
         cluster_id,
@@ -471,7 +522,9 @@ async fn run_daemon_mode(args: RunArgs) {
         res = run_agent(cfg, policy) => {
             match res {
                 Ok(AgentExit::Restart(plan)) => {
-                    if let Err(e) = updater::perform_process_restart(&plan) {
+                    if let Err(e) =
+                        updater::perform_process_restart_with_context(&plan, Some(&restart_ctx))
+                    {
                         eprintln!("neo-agent-os restart failed: {e}");
                         std::process::exit(1);
                     }
@@ -504,6 +557,12 @@ async fn main() {
         Some(Commands::Uninstall(args)) => {
             if let Err(e) = uninstall::run_uninstall(args) {
                 eprintln!("uninstall failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::RepairService(args)) => {
+            if let Err(e) = enroll::run_repair_service(args) {
+                eprintln!("repair-service failed: {e}");
                 std::process::exit(1);
             }
         }
@@ -648,6 +707,22 @@ NEO_EXTRA_ARGS="--relay --mqtt-bind 127.0.0.1:1884"
                 assert!(u.purge_workspace);
             }
             other => panic!("expected Uninstall subcommand, got {other:?}"),
+        }
+
+        // `repair-service` subcommand
+        let repair = Cli::try_parse_from([
+            "neo-agent-os",
+            "repair-service",
+            "--cluster",
+            "neo-ad0101",
+        ])
+        .unwrap();
+        match repair.command {
+            Some(Commands::RepairService(r)) => {
+                assert_eq!(r.cluster.as_deref(), Some("neo-ad0101"));
+                assert!(r.config_dir.is_none());
+            }
+            other => panic!("expected RepairService subcommand, got {other:?}"),
         }
     }
 

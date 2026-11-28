@@ -4,6 +4,22 @@ use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::time::{Duration, Instant};
+
+/// Exit code emitted by `neo-agent-os` after staging a `self_update` when running
+/// under `NEO_BG_SUPERVISED=1` supervision, asking `neo-agent-os-bg` to cleanly
+/// release the old Job Object and respawn the newly installed binary.
+const RESTART_FOR_UPDATE_EXIT_CODE: i32 = 75;
+const RAPID_RESTART_WINDOW: Duration = Duration::from_secs(30);
+const RAPID_RESTART_THRESHOLD: u32 = 5;
+
+fn restart_backoff(rapid_count: u32) -> Duration {
+    if rapid_count > RAPID_RESTART_THRESHOLD {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_millis(250)
+    }
+}
 
 fn parse_launcher_args<I: IntoIterator<Item = OsString>>(
     args: I,
@@ -52,6 +68,7 @@ mod win_job {
     type Handle = *mut c_void;
 
     const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: u32 = 9;
+    const JOB_OBJECT_LIMIT_BREAKAWAY_OK: u32 = 0x0000_0800;
     const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
 
     #[repr(C)]
@@ -112,7 +129,8 @@ mod win_job {
                     return None;
                 }
                 let mut info = JobObjectExtendedLimitInformation::default();
-                info.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                info.basic_limit_information.limit_flags =
+                    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
                 let ok = SetInformationJobObject(
                     job,
                     JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
@@ -166,36 +184,59 @@ fn main() -> ExitCode {
         Err(_) => return ExitCode::from(1),
     };
     let target_bin = sibling_agent_binary(&current_exe);
-    let (stdout, stderr) = open_log_stdio(log_file.as_deref());
 
-    let mut cmd = Command::new(&target_bin);
-    cmd.args(&forwarded)
-        .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(stderr);
+    let mut rapid_restarts: u32 = 0;
+    let mut last_restart_at: Option<Instant> = None;
 
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    loop {
+        let (stdout, stderr) = open_log_stdio(log_file.as_deref());
 
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(_) => return ExitCode::from(1),
-    };
+        let mut cmd = Command::new(&target_bin);
+        cmd.args(&forwarded)
+            .env("NEO_BG_SUPERVISED", "1")
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr);
 
-    #[cfg(target_os = "windows")]
-    let _job = win_job::KillOnCloseJob::attach(&child);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
 
-    match child.wait() {
-        Ok(status) => match status.code() {
-            Some(code) if (0..=255).contains(&code) => ExitCode::from(code as u8),
-            Some(_) => ExitCode::from(1),
-            None => ExitCode::SUCCESS,
-        },
-        Err(_) => ExitCode::from(1),
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(_) => return ExitCode::from(1),
+        };
+
+        #[cfg(target_os = "windows")]
+        let job = win_job::KillOnCloseJob::attach(&child);
+
+        let wait_res = child.wait();
+
+        #[cfg(target_os = "windows")]
+        drop(job);
+
+        match wait_res {
+            Ok(status) => match status.code() {
+                Some(RESTART_FOR_UPDATE_EXIT_CODE) => {
+                    let now = Instant::now();
+                    if last_restart_at.is_some_and(|prev| now.duration_since(prev) <= RAPID_RESTART_WINDOW) {
+                        rapid_restarts = rapid_restarts.saturating_add(1);
+                    } else {
+                        rapid_restarts = 1;
+                    }
+                    last_restart_at = Some(now);
+                    std::thread::sleep(restart_backoff(rapid_restarts));
+                    continue;
+                }
+                Some(code) if (0..=255).contains(&code) => return ExitCode::from(code as u8),
+                Some(_) => return ExitCode::from(1),
+                None => return ExitCode::SUCCESS,
+            },
+            Err(_) => return ExitCode::from(1),
+        }
     }
 }
 
@@ -232,5 +273,13 @@ mod tests {
         let (log2, fwd2) = parse_launcher_args(raw_eq);
         assert_eq!(log2, Some(PathBuf::from("/tmp/a.log")));
         assert_eq!(fwd2, vec![OsString::from("--one-shot-check")]);
+    }
+
+    #[test]
+    fn restart_backoff_escalates_on_rapid_restarts() {
+        assert_eq!(RESTART_FOR_UPDATE_EXIT_CODE, 75);
+        assert_eq!(restart_backoff(1), Duration::from_millis(250));
+        assert_eq!(restart_backoff(RAPID_RESTART_THRESHOLD), Duration::from_millis(250));
+        assert_eq!(restart_backoff(RAPID_RESTART_THRESHOLD + 1), Duration::from_secs(2));
     }
 }

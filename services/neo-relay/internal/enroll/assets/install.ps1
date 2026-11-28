@@ -164,9 +164,12 @@ function Install-NeoAgent {
         if ($Upgrade) {
             Write-Host "Upgraded neo-agent-os.exe to v$Version at $BinPath"
             if (-not [string]::IsNullOrWhiteSpace($Cluster)) {
+                try { & $BinPath repair-service --cluster $Cluster 2>$null | Out-Null } catch {}
                 $TaskName = "NeoAgent-$Cluster"
                 try { & schtasks /End /TN $TaskName 2>$null | Out-Null } catch {}
                 try { & schtasks /Run /TN $TaskName 2>$null | Out-Null } catch {}
+            } else {
+                try { & $BinPath repair-service 2>$null | Out-Null } catch {}
             }
             return
         }

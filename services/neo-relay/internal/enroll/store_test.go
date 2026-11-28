@@ -560,6 +560,8 @@ func TestBootstrapScriptsRenderingSyntaxAndRuntime(t *testing.T) {
 		"Get-FileHash",
 		"-Algorithm SHA256",
 		"neo-agent-os.exe",
+		"neo-agent-os-bg.exe",
+		"repair-service",
 		"--ticket-stdin",
 	} {
 		if !strings.Contains(ps1, want) {

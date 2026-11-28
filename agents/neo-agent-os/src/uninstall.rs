@@ -179,12 +179,16 @@ fn teardown_service_macos(cluster_id: &str, removed: &mut Vec<PathBuf>) -> Resul
 
 #[cfg(target_os = "windows")]
 fn teardown_service_windows(cluster_id: &str) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let task_name = format!("NeoAgent-{cluster_id}");
     let _ = std::process::Command::new("schtasks")
         .args(["/End", "/TN", &task_name])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
     let _ = std::process::Command::new("schtasks")
         .args(["/Delete", "/F", "/TN", &task_name])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
     let _ = std::process::Command::new("reg")
         .args([
@@ -194,6 +198,7 @@ fn teardown_service_windows(cluster_id: &str) -> Result<String, String> {
             &task_name,
             "/f",
         ])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
     Ok(format!("stopped & removed Windows Scheduled Task / HKCU Run entry ({task_name})"))
 }
