@@ -97,8 +97,8 @@ class FakeBackend {
     'relayState': 'idle',
     'localRelayDetected': false,
     'defaultRelayUrl': 'https://neo.1inch.cn:18443',
-    'agentVersion': '0.11.0',
-    'masterVersion': '0.11.0',
+    'agentVersion': '0.11.1',
+    'masterVersion': '0.11.1',
   };
   final List<Map<String, dynamic>> devices = [];
   final List<Map<String, dynamic>> deviceApprovals = [];

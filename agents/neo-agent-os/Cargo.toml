@@ -1,6 +1,6 @@
 [package]
 name = "neo-agent-os"
-version = "0.11.0"
+version = "0.11.1"
 edition = "2021"
 default-run = "neo-agent-os"
 description = "Tier 1 OS Agent and Tier 2 MCU Relay Bridge for Multi-Device Neo"
